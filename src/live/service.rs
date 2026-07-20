@@ -225,6 +225,7 @@ struct RuntimeState {
     blocked_reason: Option<&'static str>,
     lease: Option<ControlLease>,
     crypto: Option<Arc<LiveCrypto>>,
+    protected_egress_configured: bool,
     components: BTreeMap<LiveComponent, ComponentState>,
 }
 
@@ -246,6 +247,7 @@ impl Default for RuntimeState {
             blocked_reason: Some("not_initialized"),
             lease: None,
             crypto: None,
+            protected_egress_configured: false,
             components: LiveComponent::ALL
                 .into_iter()
                 .map(|component| (component, ComponentState::default()))
@@ -394,6 +396,53 @@ impl LiveService {
         self.egress_service.get().cloned()
     }
 
+    pub(crate) async fn refresh_builtin_egress(
+        &self,
+    ) -> Result<Option<Arc<LiveEgressService>>, LiveServiceError> {
+        let _guard = self.initialize_lock.lock().await;
+        let Some(egress) = self.egress_service() else {
+            return Ok(None);
+        };
+        let enabled = egress.refresh_builtin_profile().await;
+        let (fencing_token, already_ready) = {
+            let mut runtime = self.runtime.write().await;
+            runtime.protected_egress_configured = enabled;
+            let already_ready = runtime
+                .components
+                .get(&LiveComponent::ProtectedEgress)
+                .is_some_and(|component| component.ready);
+            let fencing_token = (runtime.lifecycle == LiveLifecycle::ControlReady)
+                .then(|| runtime.lease.as_ref().map(|lease| lease.fencing_token))
+                .flatten();
+            (fencing_token, already_ready)
+        };
+        if !enabled || already_ready {
+            return Ok(Some(egress));
+        }
+        let Some(fencing_token) = fencing_token else {
+            return Ok(Some(egress));
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(self.config.sessions.startup_queue_seconds),
+            egress.reconcile_startup(fencing_token),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                self.set_component_readiness(
+                    LiveComponent::ProtectedEgress,
+                    true,
+                    None,
+                    Some("live-egress-worker-v1".to_string()),
+                )
+                .await;
+                Ok(Some(egress))
+            }
+            Ok(Err(error)) => Err(LiveServiceError::Egress(error)),
+            Err(_) => Err(LiveServiceError::ReconciliationTimeout),
+        }
+    }
+
     pub fn admin_audit(&self) -> Option<Arc<LiveAuditChain>> {
         self.admin_audit.get().cloned()
     }
@@ -499,25 +548,30 @@ impl LiveService {
                 })
                 .await;
         }
-        if self.config.protected_egress_enabled {
-            let runtime = self
-                .runtime_manager
-                .clone()
-                .ok_or_else(|| LiveServiceError::Egress(LiveEgressError::Runtime))?;
-            self.egress_service
-                .get_or_try_init(|| async {
-                    LiveEgressService::new(
-                        self.pool.clone(),
-                        runtime,
-                        self.config.egress.clone(),
-                        self.admin_audit()
-                            .expect("Live audit initialized before protected egress"),
-                    )
-                    .map(Arc::new)
-                })
+        if self.egress_service.get().is_none() {
+            if let Some(runtime) = self.runtime_manager.clone() {
+                if let Some(service) = LiveEgressService::new_with_builtin_fallback(
+                    self.pool.clone(),
+                    runtime,
+                    self.config.egress.clone(),
+                    self.admin_audit()
+                        .expect("Live audit initialized before protected egress"),
+                    self.secrets.clone(),
+                )
                 .await
-                .map_err(LiveServiceError::Egress)?;
+                .map_err(LiveServiceError::Egress)?
+                {
+                    self.egress_service
+                        .get_or_init(|| async move { Arc::new(service) })
+                        .await;
+                }
+            } else if self.config.protected_egress_enabled {
+                return Err(LiveServiceError::Egress(LiveEgressError::Runtime));
+            }
         }
+        self.runtime.write().await.protected_egress_configured = self
+            .egress_service()
+            .is_some_and(|egress| egress.status().enabled);
         if self.config.relay_enabled {
             let repository = self
                 .session_repository()
@@ -619,7 +673,10 @@ impl LiveService {
                 runtime.crypto = Some(crypto);
                 drop(runtime);
 
-                if let Some(egress) = self.egress_service() {
+                if let Some(egress) = self
+                    .egress_service()
+                    .filter(|egress| egress.status().enabled)
+                {
                     match tokio::time::timeout(
                         Duration::from_secs(self.config.sessions.startup_queue_seconds),
                         egress.reconcile_startup(fencing_token),
@@ -1252,7 +1309,7 @@ fn snapshot(config: &LiveConfig, runtime: &RuntimeState) -> LiveServiceSnapshot 
     let features = LiveComponent::ALL
         .into_iter()
         .map(|component| {
-            let raw_enabled = component_raw_enabled(config, component);
+            let raw_enabled = component_raw_enabled(config, runtime, component);
             let state = runtime
                 .components
                 .get(&component)
@@ -1308,14 +1365,20 @@ fn snapshot(config: &LiveConfig, runtime: &RuntimeState) -> LiveServiceSnapshot 
     }
 }
 
-fn component_raw_enabled(config: &LiveConfig, component: LiveComponent) -> bool {
+fn component_raw_enabled(
+    config: &LiveConfig,
+    runtime: &RuntimeState,
+    component: LiveComponent,
+) -> bool {
     match component {
         LiveComponent::Catalog => config.catalog_enabled,
         LiveComponent::Playback => config.playback_enabled,
         LiveComponent::ClientDirect => config.client_direct_enabled,
         LiveComponent::Relay => config.relay_enabled,
         LiveComponent::Remux => config.remux_enabled,
-        LiveComponent::ProtectedEgress => config.protected_egress_enabled,
+        LiveComponent::ProtectedEgress => {
+            config.protected_egress_enabled || runtime.protected_egress_configured
+        }
         LiveComponent::StremioCompat => config.stremio_compat_enabled,
         LiveComponent::NativeDashRelay => config.native_dash_relay_enabled,
         LiveComponent::LowLatencyHls => config.low_latency_hls_enabled,
@@ -1346,6 +1409,45 @@ mod tests {
         .await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    #[test]
+    fn auto_created_egress_is_visible_to_readiness_and_planner_snapshots() {
+        let config = LiveConfig {
+            enabled: true,
+            ..LiveConfig::default()
+        };
+        let mut runtime = RuntimeState::default();
+        runtime.lifecycle = LiveLifecycle::ControlReady;
+        runtime.blocked_reason = None;
+        let dormant = snapshot(&config, &runtime);
+        let dormant_protected = dormant
+            .features
+            .iter()
+            .find(|feature| feature.flag == "protected_egress_enabled")
+            .expect("dormant protected egress feature");
+        assert!(!dormant_protected.raw_enabled);
+        assert!(!dormant_protected.effective_enabled);
+
+        runtime.protected_egress_configured = true;
+        runtime.components.insert(
+            LiveComponent::ProtectedEgress,
+            ComponentState {
+                ready: true,
+                disabled_reason: None,
+                certification_id: Some("live-egress-worker-v1".to_string()),
+            },
+        );
+
+        let snapshot = snapshot(&config, &runtime);
+        let protected = snapshot
+            .features
+            .iter()
+            .find(|feature| feature.flag == "protected_egress_enabled")
+            .expect("protected egress feature");
+        assert!(protected.raw_enabled);
+        assert!(protected.effective_enabled);
+        assert!(protected.dependency_ready);
     }
 
     #[tokio::test]

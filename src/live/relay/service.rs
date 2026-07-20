@@ -209,6 +209,9 @@ impl RelaySession {
     }
 
     fn allows_resource(&self, url: &Url, policy_authorities: &[Authority]) -> bool {
+        if !self.source.private_network {
+            return matches!(url.scheme(), "http" | "https");
+        }
         Authority::from_url(url).is_ok_and(|authority| {
             self.allowed_authorities.contains(&authority) || policy_authorities.contains(&authority)
         })
@@ -1023,7 +1026,7 @@ impl LiveRelayService {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| LiveRelayError::Unavailable)?;
-        if rows.is_empty() || rows.len() > MAX_POLICY_ROWS {
+        if rows.len() > MAX_POLICY_ROWS || (rows.is_empty() && source.private_network) {
             return Err(LiveRelayError::PolicyRejected);
         }
         let mut rules = Vec::with_capacity(rows.len() + usize::from(allow_discovered_target));
@@ -1062,6 +1065,9 @@ impl LiveRelayService {
                 }
                 _ => return Err(LiveRelayError::PolicyRejected),
             };
+            if source.private_network != (scope == NetworkScope::PrivateLan) {
+                continue;
+            }
             let rule = DestinationRule::new(&scheme, &host, port, &path, scope, true)
                 .map_err(|_| LiveRelayError::PolicyRejected)?;
             let authority = Authority::from_parts(&scheme, &host, port)?;
@@ -1070,7 +1076,7 @@ impl LiveRelayService {
             }
             rules.push(rule);
         }
-        if allow_discovered_target {
+        if allow_discovered_target && source.private_network {
             let target_authority = Authority::from_url(target)?;
             if !allowed_authorities.contains(&target_authority)
                 && !authorities.contains(&target_authority)
@@ -1107,12 +1113,12 @@ impl LiveRelayService {
             descriptor_requested: source.private_network,
             owner_rule: owner_private_rule,
         };
-        let policy = DestinationPolicy::new(
-            rules,
-            private_lan,
-            target.scheme() == "http" || root_url.scheme() == "http",
-            self.local_denylist.clone(),
-        )
+        let allow_http = target.scheme() == "http" || root_url.scheme() == "http";
+        let policy = if source.private_network {
+            DestinationPolicy::new(rules, private_lan, allow_http, self.local_denylist.clone())
+        } else {
+            DestinationPolicy::for_public_session(rules, allow_http, self.local_denylist.clone())
+        }
         .map_err(|_| LiveRelayError::PolicyRejected)?;
         #[cfg(test)]
         let policy = if self.allow_fixture_loopback {

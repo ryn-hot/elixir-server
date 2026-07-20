@@ -24,7 +24,8 @@ use crate::live::config::is_public_egress_ip;
 use super::control::{
     ControlKeys, ControlProtocolError, ControlSecretDocument, FetchControlRequest,
     ReadinessControlResponse, ResolveControlRequest, ResolveControlResponse,
-    bounded_connect_timeout, open_control_request, response_signature, verify_request_signature,
+    bounded_connect_timeout, open_control_request, readiness_ip_matches, response_signature,
+    verify_request_signature,
 };
 
 const MAX_CONTROL_BODY_BYTES: usize = 65_536;
@@ -179,13 +180,7 @@ async fn readiness(
         } else {
             None
         };
-        let expected = observed.is_some_and(|address| {
-            state
-                .secret
-                .readiness
-                .expected_egress_ips
-                .contains(&address)
-        });
+        let expected = readiness_ip_matches(&state.secret.readiness.expected_egress_ips, observed);
         let response = ReadinessControlResponse {
             route: observed.is_some(),
             dns,

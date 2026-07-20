@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -29,6 +29,10 @@ use crate::{
         GatewayTopologyLabels, GatewayTopologyProfile, GluetunOpenvpnGatewayRuntime,
         GluetunWireguardGatewayRuntime, compile_gateway_topology,
     },
+    network::protection::{
+        ActiveLiveEgressProfile, DownloadNetworkProfileKind, active_live_egress_profile,
+        resolve_live_egress_secret,
+    },
     runtime::{
         RuntimeManager,
         model::{
@@ -38,15 +42,17 @@ use crate::{
             apply_container_spec_fingerprint,
         },
     },
+    secrets::SecretsManager,
 };
 
 use super::{
     ProtectedEgressTransport,
-    control::{ControlKeys, ControlSecretDocument, WorkerReadinessConfig},
+    control::{ControlKeys, ControlSecretDocument, WorkerReadinessConfig, readiness_ip_matches},
     material::{
         GATEWAY_CONFIG_ROLE, OPENVPN_CONFIG_PATH, OPENVPN_CONFIG_ROOT, OPENVPN_PASSWORD_PATH,
         OPENVPN_PASSWORD_ROLE, OPENVPN_PASSWORD_ROOT, OPENVPN_USERNAME_PATH, OPENVPN_USERNAME_ROLE,
         OPENVPN_USERNAME_ROOT, WIREGUARD_CONFIG_ROOT, prepare_gateway_material,
+        prepare_gateway_material_from_secret_values,
     },
     policy::{
         EffectiveEgressPolicy, EgressPolicyMode, EgressPolicySelectionError, EgressPolicySource,
@@ -70,6 +76,9 @@ const WORKER_UID: u32 = 65_532;
 const WORKER_GID: u32 = 65_532;
 const WARP_UID: u32 = 1_000;
 const WARP_GID: u32 = 1_000;
+const PROJECTED_WIREGUARD_CONFIG_PATH: &str = "/run/elixir-live-egress/projected/wg0.conf";
+const PROJECTED_OPENVPN_CONFIG_PATH: &str = "/run/elixir-live-egress/projected/custom.conf";
+const PROJECTED_OPENVPN_AUTH_PATH: &str = "/run/elixir-live-egress/projected/auth.txt";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveEgressError {
@@ -111,6 +120,9 @@ pub struct LiveEgressProfileStatus {
 pub struct LiveEgressStatus {
     pub enabled: bool,
     pub ready: bool,
+    pub default_mode: LiveEgressDefaultMode,
+    pub default_policy_id: Option<String>,
+    pub default_allow_fallback: bool,
     pub active_bindings: usize,
     pub available_capacity: usize,
     pub profiles: Vec<LiveEgressProfileStatus>,
@@ -197,6 +209,13 @@ pub struct LiveEgressService {
     fallbacks: DashMap<Uuid, DirectFallback>,
     mutation_lock: Mutex<()>,
     control_root: PathBuf,
+    projected: OnceLock<ProjectedLiveEgress>,
+    secrets: Option<Arc<SecretsManager>>,
+}
+
+struct ProjectedLiveEgress {
+    config: LiveEgressConfig,
+    profile: ActiveLiveEgressProfile,
 }
 
 impl std::fmt::Debug for LiveEgressService {
@@ -217,6 +236,31 @@ impl LiveEgressService {
         config: LiveEgressConfig,
         audit: Arc<LiveAuditChain>,
     ) -> Result<Self, LiveEgressError> {
+        Self::build(pool, runtime, config, audit, None)
+    }
+
+    pub async fn new_with_builtin_fallback(
+        pool: sqlx::AnyPool,
+        runtime: Arc<dyn RuntimeManager>,
+        config: LiveEgressConfig,
+        audit: Arc<LiveAuditChain>,
+        secrets: Arc<SecretsManager>,
+    ) -> Result<Option<Self>, LiveEgressError> {
+        if !config.profiles.is_empty() {
+            return Self::new(pool, runtime, config, audit).map(Some);
+        }
+        let service = Self::build(pool, runtime, config, audit, Some(secrets))?;
+        service.refresh_builtin_profile().await;
+        Ok(Some(service))
+    }
+
+    fn build(
+        pool: sqlx::AnyPool,
+        runtime: Arc<dyn RuntimeManager>,
+        config: LiveEgressConfig,
+        audit: Arc<LiveAuditChain>,
+        secrets: Option<Arc<SecretsManager>>,
+    ) -> Result<Self, LiveEgressError> {
         let capacity = usize::try_from(config.max_concurrent)
             .ok()
             .filter(|value| *value > 0)
@@ -234,6 +278,8 @@ impl LiveEgressService {
             fallbacks: DashMap::new(),
             mutation_lock: Mutex::new(()),
             control_root,
+            projected: OnceLock::new(),
+            secrets,
         })
     }
 
@@ -242,13 +288,17 @@ impl LiveEgressService {
     }
 
     pub fn status(&self) -> LiveEgressStatus {
+        let config = self.effective_config();
         LiveEgressStatus {
-            enabled: true,
-            ready: !self.config.profiles.is_empty(),
+            enabled: !config.profiles.is_empty(),
+            ready: !config.profiles.is_empty(),
+            default_mode: config.default_mode,
+            default_policy_id: config.default_policy_id.clone(),
+            default_allow_fallback: config.default_allow_fallback,
             active_bindings: self.bindings.len(),
             available_capacity: self.capacity.available_permits(),
             profiles: self
-                .config
+                .effective_config()
                 .profiles
                 .iter()
                 .map(|profile| LiveEgressProfileStatus {
@@ -262,7 +312,112 @@ impl LiveEgressService {
     }
 
     pub fn profile(&self, id: &str) -> Option<&LiveEgressProfileConfig> {
-        self.config.profiles.iter().find(|profile| profile.id == id)
+        self.effective_config()
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+    }
+
+    pub(crate) async fn refresh_builtin_profile(&self) -> bool {
+        if !self.config.profiles.is_empty() || self.projected.get().is_some() {
+            return self.status().enabled;
+        }
+        let Some(secrets) = self.secrets.as_deref() else {
+            return false;
+        };
+        let Some(projected) = active_live_egress_profile(&self.pool, secrets)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        let mut config = self.config.clone();
+        let profile = install_projected_profile(&mut config, &projected);
+        if profile.kind != LiveEgressProfileKind::Warp
+            && self
+                .prepare_projected_material(&projected, &profile)
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        let _ = self.projected.set(ProjectedLiveEgress {
+            config,
+            profile: projected,
+        });
+        self.projected.get().is_some()
+    }
+
+    fn effective_config(&self) -> &LiveEgressConfig {
+        self.projected
+            .get()
+            .map(|projected| &projected.config)
+            .unwrap_or(&self.config)
+    }
+
+    async fn prepare_profile_material(
+        &self,
+        profile: &LiveEgressProfileConfig,
+    ) -> Result<Vec<super::material::PreparedMaterialFile>, LiveEgressError> {
+        if profile.kind == LiveEgressProfileKind::Warp {
+            return prepare_gateway_material(profile)
+                .await
+                .map_err(|_| LiveEgressError::InvalidPolicy);
+        }
+        let Some(projected) = self
+            .projected
+            .get()
+            .map(|projected| &projected.profile)
+            .filter(|projected| projected.profile_id == profile.id)
+        else {
+            return prepare_gateway_material(profile)
+                .await
+                .map_err(|_| LiveEgressError::InvalidPolicy);
+        };
+        self.prepare_projected_material(projected, profile).await
+    }
+
+    async fn prepare_projected_material(
+        &self,
+        projected: &ActiveLiveEgressProfile,
+        profile: &LiveEgressProfileConfig,
+    ) -> Result<Vec<super::material::PreparedMaterialFile>, LiveEgressError> {
+        let secrets = self
+            .secrets
+            .as_deref()
+            .ok_or(LiveEgressError::InvalidPolicy)?;
+        let config_secret_ref = projected
+            .config_secret_ref
+            .as_deref()
+            .ok_or(LiveEgressError::InvalidPolicy)?;
+        let config = resolve_live_egress_secret(&self.pool, secrets, config_secret_ref)
+            .await
+            .map_err(|_| LiveEgressError::InvalidPolicy)?;
+        let username = match projected.username_secret_ref.as_deref() {
+            Some(secret_ref) => Some(
+                resolve_live_egress_secret(&self.pool, secrets, secret_ref)
+                    .await
+                    .map_err(|_| LiveEgressError::InvalidPolicy)?,
+            ),
+            None => None,
+        };
+        let password = match projected.password_secret_ref.as_deref() {
+            Some(secret_ref) => Some(
+                resolve_live_egress_secret(&self.pool, secrets, secret_ref)
+                    .await
+                    .map_err(|_| LiveEgressError::InvalidPolicy)?,
+            ),
+            None => None,
+        };
+        prepare_gateway_material_from_secret_values(
+            profile.kind,
+            config.as_bytes(),
+            username.as_ref().map(|value| value.as_bytes()),
+            password.as_ref().map(|value| value.as_bytes()),
+        )
+        .await
+        .map_err(|_| LiveEgressError::InvalidPolicy)
     }
 
     pub async fn select_policy(
@@ -287,7 +442,7 @@ impl LiveEgressService {
                 request.policy_id = inherited
                     .policy_id
                     .clone()
-                    .or_else(|| self.config.default_policy_id.clone());
+                    .or_else(|| self.effective_config().default_policy_id.clone());
             }
             if request.mode == EgressPolicyMode::PreferProtected {
                 request.allow_fallback = inherited.mode == EgressPolicyMode::PreferProtected
@@ -534,15 +689,16 @@ impl LiveEgressService {
     }
 
     fn config_candidate(&self) -> Result<PolicyCandidate, LiveEgressError> {
-        let mode = match self.config.default_mode {
+        let config = self.effective_config();
+        let mode = match config.default_mode {
             LiveEgressDefaultMode::Off => EgressPolicyMode::Off,
             LiveEgressDefaultMode::PreferProtected => EgressPolicyMode::PreferProtected,
             LiveEgressDefaultMode::RequireProtected => EgressPolicyMode::RequireProtected,
         };
         let candidate = PolicyCandidate {
             mode,
-            policy_id: self.config.default_policy_id.clone(),
-            allow_fallback: self.config.default_allow_fallback,
+            policy_id: config.default_policy_id.clone(),
+            allow_fallback: config.default_allow_fallback,
             revision: 1,
             source: EgressPolicySource::ServerConfig,
         };
@@ -579,9 +735,7 @@ impl LiveEgressService {
         let worker_name = worker_name(session.id);
         let gateway_name = format!("{worker_name}-vpn");
         let result = async {
-            let gateway_material = prepare_gateway_material(&profile)
-                .await
-                .map_err(|_| LiveEgressError::InvalidPolicy)?;
+            let gateway_material = self.prepare_profile_material(&profile).await?;
             if profile.kind == LiveEgressProfileKind::Warp {
                 self.runtime
                     .ensure_owned_directory_volume(&OwnedDirectoryVolumeSpec {
@@ -834,9 +988,7 @@ impl LiveEgressService {
             let cancellation = CancellationToken::new();
             if let Ok(readiness) = transport.readiness(&cancellation).await
                 && readiness.ready()
-                && readiness
-                    .observed_egress_ip
-                    .is_some_and(|address| profile.expected_egress_ips.contains(&address))
+                && readiness_ip_matches(&profile.expected_egress_ips, readiness.observed_egress_ip)
             {
                 break readiness;
             }
@@ -1396,6 +1548,56 @@ fn egress_error_label(error: &LiveEgressError) -> &'static str {
     }
 }
 
+fn project_builtin_profile(projected: &ActiveLiveEgressProfile) -> LiveEgressProfileConfig {
+    let mut profile = LiveEgressProfileConfig {
+        id: projected.profile_id.clone(),
+        name: projected.name.clone(),
+        gateway_image: projected.gateway_image.clone(),
+        ..LiveEgressProfileConfig::default()
+    };
+    match &projected.kind {
+        DownloadNetworkProfileKind::WireguardConfig => {
+            profile.kind = LiveEgressProfileKind::Wireguard;
+            profile.config_host_path = Some(PROJECTED_WIREGUARD_CONFIG_PATH.to_string());
+        }
+        DownloadNetworkProfileKind::OpenvpnConfig => {
+            profile.kind = LiveEgressProfileKind::Openvpn;
+            profile.config_host_path = Some(PROJECTED_OPENVPN_CONFIG_PATH.to_string());
+            if projected.username_secret_ref.is_some() {
+                profile.auth_host_path = Some(PROJECTED_OPENVPN_AUTH_PATH.to_string());
+            }
+        }
+        DownloadNetworkProfileKind::CloudflareWarp => {
+            profile.kind = LiveEgressProfileKind::Warp;
+            profile.state_volume_name = Some(live_warp_state_volume_name(&projected.profile_id));
+            profile.enrollment_id = projected.enrollment_id.clone();
+            profile.identity_secret_ref = projected.identity_secret_ref.clone();
+        }
+        DownloadNetworkProfileKind::ExternalOnly
+        | DownloadNetworkProfileKind::Direct
+        | DownloadNetworkProfileKind::ProviderPreset
+        | DownloadNetworkProfileKind::DebridOnly => {}
+    }
+    profile
+}
+
+fn install_projected_profile(
+    config: &mut LiveEgressConfig,
+    projected: &ActiveLiveEgressProfile,
+) -> LiveEgressProfileConfig {
+    let profile = project_builtin_profile(projected);
+    config.default_mode = LiveEgressDefaultMode::RequireProtected;
+    config.default_policy_id = Some(profile.id.clone());
+    config.default_allow_fallback = false;
+    config.profiles.push(profile.clone());
+    profile
+}
+
+fn live_warp_state_volume_name(profile_id: &str) -> String {
+    let digest = blake3::hash(profile_id.as_bytes()).to_hex().to_string();
+    format!("elixir_live_warp_state_{}", &digest[..32])
+}
+
 fn gateway_runtime(profile: &LiveEgressProfileConfig) -> Result<GatewayRuntime, LiveEgressError> {
     match profile.kind {
         LiveEgressProfileKind::Wireguard => Ok(GatewayRuntime::GluetunWireguard(
@@ -1904,6 +2106,128 @@ mod tests {
     use crate::live::session::{DeliveryMode, SessionOwner, SessionProtocol, SessionState};
 
     use super::*;
+
+    #[test]
+    fn live_builtin_projection_is_fail_closed_private_and_live_owned() {
+        let projected = ActiveLiveEgressProfile {
+            profile_id: "builtin-wg".to_string(),
+            name: "Built-in WireGuard".to_string(),
+            kind: DownloadNetworkProfileKind::WireguardConfig,
+            gateway_image: "gluetun:test".to_string(),
+            config_secret_ref: Some("global:builtin_wg".to_string()),
+            username_secret_ref: None,
+            password_secret_ref: None,
+            enrollment_id: None,
+            identity_secret_ref: None,
+        };
+        let mut config = LiveEgressConfig::default();
+        let profile = install_projected_profile(&mut config, &projected);
+        assert_eq!(config.default_mode, LiveEgressDefaultMode::RequireProtected);
+        assert_eq!(config.default_policy_id.as_deref(), Some("builtin-wg"));
+        assert!(!config.default_allow_fallback);
+        assert!(!profile.selectable_by_profiles);
+        assert!(profile.expected_egress_ips.is_empty());
+        assert_eq!(
+            profile.config_host_path.as_deref(),
+            Some(PROJECTED_WIREGUARD_CONFIG_PATH)
+        );
+
+        let warp = project_builtin_profile(&ActiveLiveEgressProfile {
+            profile_id: "builtin-warp".to_string(),
+            name: "Built-in WARP".to_string(),
+            kind: DownloadNetworkProfileKind::CloudflareWarp,
+            gateway_image: "warp:test".to_string(),
+            config_secret_ref: None,
+            username_secret_ref: None,
+            password_secret_ref: None,
+            enrollment_id: Some("live-enrollment".to_string()),
+            identity_secret_ref: Some("global:warp_identity".to_string()),
+        });
+        let state_volume = warp.state_volume_name.expect("Live WARP state volume");
+        assert!(state_volume.starts_with("elixir_live_warp_state_"));
+        assert!(!state_volume.starts_with("elixir_warp_state_"));
+    }
+
+    #[tokio::test]
+    async fn explicit_live_profiles_take_precedence_over_builtin_projection() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = LiveEgressConfig {
+            control_root: temporary
+                .path()
+                .join("control")
+                .to_string_lossy()
+                .into_owned(),
+            default_mode: LiveEgressDefaultMode::RequireProtected,
+            default_policy_id: Some("explicit-wg".to_string()),
+            profiles: vec![LiveEgressProfileConfig {
+                id: "explicit-wg".to_string(),
+                name: "Explicit WireGuard".to_string(),
+                kind: LiveEgressProfileKind::Wireguard,
+                gateway_image: "gluetun:test".to_string(),
+                config_host_path: Some("/private/explicit-wg.conf".to_string()),
+                expected_egress_ips: vec!["1.1.1.1".parse().expect("public IP")],
+                ..LiveEgressProfileConfig::default()
+            }],
+            ..LiveEgressConfig::default()
+        };
+        let audit = Arc::new(LiveAuditChain::new(
+            crate::live::admin::LiveAuditKey::new("explicit-egress", [41_u8; 32])
+                .expect("audit key"),
+        ));
+        let service = LiveEgressService::new_with_builtin_fallback(
+            pool,
+            Arc::new(CleanupRuntime::default()),
+            config,
+            audit,
+            Arc::new(SecretsManager::from_key_bytes([42_u8; 32], true)),
+        )
+        .await
+        .expect("egress constructor")
+        .expect("explicit egress service");
+
+        assert!(service.projected.get().is_none());
+        let status = service.status();
+        assert_eq!(status.default_policy_id.as_deref(), Some("explicit-wg"));
+        assert_eq!(status.default_mode, LiveEgressDefaultMode::RequireProtected);
+        assert_eq!(status.profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_builtin_profile_keeps_a_dormant_service_for_lazy_refresh() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy database pool");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = LiveEgressConfig {
+            control_root: temporary
+                .path()
+                .join("control")
+                .to_string_lossy()
+                .into_owned(),
+            ..LiveEgressConfig::default()
+        };
+        let audit = Arc::new(LiveAuditChain::new(
+            crate::live::admin::LiveAuditKey::new("dormant-egress", [43_u8; 32])
+                .expect("audit key"),
+        ));
+        let service = LiveEgressService::new_with_builtin_fallback(
+            pool,
+            Arc::new(CleanupRuntime::default()),
+            config,
+            audit,
+            Arc::new(SecretsManager::from_key_bytes([44_u8; 32], true)),
+        )
+        .await
+        .expect("egress constructor")
+        .expect("dormant egress service");
+
+        let status = service.status();
+        assert!(!status.enabled);
+        assert!(!status.ready);
+        assert_eq!(status.default_mode, LiveEgressDefaultMode::Off);
+        assert!(status.profiles.is_empty());
+    }
 
     #[derive(Default)]
     struct CleanupRuntime {

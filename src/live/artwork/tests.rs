@@ -183,32 +183,6 @@ async fn seed_owner(database: &Database) -> AnyResult<(Uuid, Uuid, Uuid)> {
     Ok((user_id, home_id, profile_id))
 }
 
-async fn insert_rule(
-    database: &Database,
-    home_id: Uuid,
-    provider_id: Uuid,
-    host: &str,
-    port: u16,
-    path: &str,
-) -> AnyResult<()> {
-    sqlx::query(
-        "INSERT INTO live_provider_destination_rules (
-             id, home_id, provider_id, scheme, normalized_host, port, exact_path,
-             network_scope, allow_fetch, allow_credentials, allow_client_disclosure,
-             revision, created_by_actor_snapshot
-         ) VALUES ($1, $2, $3, 'http', $4, $5, $6, 'public', TRUE, FALSE, FALSE, 1, 's14-test')",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(home_id.to_string())
-    .bind(provider_id.to_string())
-    .bind(host)
-    .bind(i64::from(port))
-    .bind(path)
-    .execute(&database.pool)
-    .await?;
-    Ok(())
-}
-
 fn fetch_request(
     provider_id: Uuid,
     home_id: Uuid,
@@ -248,26 +222,6 @@ async fn setup(
         seed_provider(&database, provider_fixture.port(), serde_json::json!({})).await?;
     let (_, home_id, profile_id) = seed_owner(&database).await?;
     let images = ImageFixture::start().await?;
-    for path in [
-        "/redirect",
-        "/image.png",
-        "/bad-mime",
-        "/mismatch.jpg",
-        "/malformed.png",
-        "/large.png",
-        "/oversized.png",
-        "/slow.png",
-    ] {
-        insert_rule(
-            &database,
-            home_id,
-            provider_id,
-            "artwork.live.test",
-            images.port,
-            path,
-        )
-        .await?;
-    }
     let service = LiveArtworkService::new_for_test(
         database.pool.clone(),
         Arc::new(LoopbackResolver),
@@ -285,9 +239,8 @@ async fn setup(
 }
 
 #[tokio::test]
-async fn s14_artwork_fetch_redirect_decode_cache_isolation_and_policy_revocation() -> AnyResult<()>
-{
-    let (database, provider_fixture, images, service, provider, home, profile) =
+async fn s14_artwork_fetch_redirect_decode_and_cache_without_manual_rules() -> AnyResult<()> {
+    let (_database, provider_fixture, images, service, provider, home, profile) =
         setup(LiveArtworkLimits::default()).await?;
     let cancellation = CancellationToken::new();
     let first = service
@@ -345,33 +298,6 @@ async fn s14_artwork_fetch_redirect_decode_cache_isolation_and_policy_revocation
     assert!(!other_profile.cache_hit);
     assert_eq!(images.count("/redirect"), 2);
 
-    sqlx::query(
-        "UPDATE live_provider_destination_rules
-         SET allow_fetch = FALSE, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE home_id = $1 AND provider_id = $2",
-    )
-    .bind(home.to_string())
-    .bind(provider.to_string())
-    .execute(&database.pool)
-    .await?;
-    let denied = service
-        .fetch(
-            fetch_request(
-                provider,
-                home,
-                profile,
-                1,
-                images.port,
-                "/redirect",
-                "event-1",
-            ),
-            &cancellation,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(denied.code(), LiveArtworkErrorCode::PolicyDenied);
-    assert_eq!(images.count("/redirect"), 2);
-
     assert_eq!(service.evict_provider(home, provider).await?, 2);
     images.stop().await;
     provider_fixture.stop().await
@@ -411,7 +337,7 @@ async fn s14_artwork_rejects_mime_mismatch_malformed_dimensions_and_encoded_over
 
 #[tokio::test]
 async fn s14_artwork_singleflight_cancels_last_waiter_and_recovers() -> AnyResult<()> {
-    let (database, provider_fixture, images, service, provider, home, profile) =
+    let (_database, provider_fixture, images, service, provider, home, profile) =
         setup(LiveArtworkLimits::default()).await?;
     let first_cancel = CancellationToken::new();
     let second_cancel = CancellationToken::new();
@@ -464,49 +390,6 @@ async fn s14_artwork_singleflight_cancels_last_waiter_and_recovers() -> AnyResul
     );
     assert_eq!(second.await??.width, 8);
     assert_eq!(images.count("/slow.png"), 1);
-
-    let revoke_inflight = {
-        let service = service.clone();
-        tokio::spawn(async move {
-            service
-                .fetch(
-                    fetch_request(
-                        provider,
-                        home,
-                        profile,
-                        1,
-                        image_port,
-                        "/slow.png",
-                        "revoke-inflight",
-                    ),
-                    &CancellationToken::new(),
-                )
-                .await
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    sqlx::query(
-        "UPDATE live_provider_destination_rules
-         SET allow_fetch = FALSE, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE home_id = $1 AND provider_id = $2",
-    )
-    .bind(home.to_string())
-    .bind(provider.to_string())
-    .execute(&database.pool)
-    .await?;
-    assert_eq!(
-        revoke_inflight.await?.unwrap_err().code(),
-        LiveArtworkErrorCode::PolicyDenied
-    );
-    sqlx::query(
-        "UPDATE live_provider_destination_rules
-         SET allow_fetch = TRUE, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE home_id = $1 AND provider_id = $2",
-    )
-    .bind(home.to_string())
-    .bind(provider.to_string())
-    .execute(&database.pool)
-    .await?;
 
     let third_cancel = CancellationToken::new();
     let fourth_cancel = CancellationToken::new();

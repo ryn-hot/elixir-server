@@ -2116,6 +2116,7 @@ impl<'a> Executor<'a> {
         scope_json: Option<serde_json::Value>,
         endpoint: ProviderEndpoint,
     ) -> Result<()> {
+        let endpoint = resolve_provider_storage_endpoint(instance_id, endpoint).await?;
         let endpoint_json =
             serde_json::to_value(endpoint).context("serializing provider endpoint")?;
         self.store
@@ -4512,6 +4513,39 @@ async fn resolve_driver_transport_base_url(
     Ok(None)
 }
 
+async fn resolve_provider_storage_endpoint(
+    instance_id: Uuid,
+    endpoint: ProviderEndpoint,
+) -> Result<ProviderEndpoint> {
+    if endpoint_host_resolves(&endpoint.host, endpoint.port).await
+        || !endpoint_uses_container_network(&endpoint)
+    {
+        return Ok(endpoint);
+    }
+    let Some(base_url) = resolve_driver_transport_base_url(instance_id, &endpoint).await? else {
+        return Ok(endpoint);
+    };
+    provider_endpoint_from_transport_base_url(&base_url)
+}
+
+fn provider_endpoint_from_transport_base_url(base_url: &str) -> Result<ProviderEndpoint> {
+    let parsed = Url::parse(base_url).context("parsing provider transport base URL")?;
+    let host = parsed
+        .host_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("provider transport URL has no host: {base_url}"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("provider transport URL has no port: {base_url}"))?;
+    ProviderEndpoint::new(
+        parsed.scheme().to_string(),
+        host,
+        port,
+        Some(parsed.path().to_string()),
+        Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK.to_string()),
+    )
+}
+
 async fn ensure_candidate_provider_runtime_ready(provider: &Provider) -> Result<()> {
     let endpoint_json = provider.endpoint_json.as_ref().cloned().ok_or_else(|| {
         anyhow!(
@@ -4712,10 +4746,7 @@ async fn run_docker_stdout(args: &[String]) -> Result<String> {
 }
 
 fn endpoint_uses_container_network(endpoint: &ProviderEndpoint) -> bool {
-    endpoint
-        .network
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+    endpoint.network.as_deref() == Some("elixir_net")
 }
 
 fn driver_transport_base_url(endpoint: &ProviderEndpoint, host_port: u16) -> String {
@@ -6035,6 +6066,19 @@ mod tests {
         let ports_json = r#"{"6789/tcp":[{"HostIp":"0.0.0.0","HostPort":"32932"}]}"#;
         let host_port = parse_docker_published_port(ports_json, 6789)?;
         assert_eq!(host_port, Some(32932));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_transport_endpoint_is_marked_for_host_runtime() -> Result<()> {
+        let endpoint = provider_endpoint_from_transport_base_url("http://127.0.0.1:32932/live/")?;
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 32932);
+        assert_eq!(endpoint.base_path, "/live/");
+        assert_eq!(
+            endpoint.network.as_deref(),
+            Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK)
+        );
         Ok(())
     }
 

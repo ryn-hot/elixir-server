@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{AnyPool, Row, TypeInfo, Value as SqlxValue, ValueRef, any::AnyRow};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::config::Settings;
 use crate::db::models::{ExtensionInstance, Provider, SecretScope};
@@ -323,6 +324,7 @@ const CLOUDFLARE_WARP_DISCLOSURE_VERSION: &str = "2026-04-29";
 const CLOUDFLARE_WARP_IDENTITY_SECRET_KEY: &str = "cloudflare_warp_identity";
 const DEFAULT_CLOUDFLARE_WARP_GATEWAY_IMAGE: &str =
     "caomingjun/warp:2026.3.846.0-2.12.0-bf3508b88dc075e973e8b09d078c897a414d84e8";
+const DEFAULT_LIVE_GLUETUN_GATEWAY_IMAGE: &str = "qmcgaw/gluetun:v3.39.0";
 
 fn default_true() -> bool {
     true
@@ -592,6 +594,19 @@ pub enum ActiveManagedDownloaderRuntime {
         profile_id: String,
         kind: DownloadNetworkProfileKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveLiveEgressProfile {
+    pub profile_id: String,
+    pub name: String,
+    pub kind: DownloadNetworkProfileKind,
+    pub gateway_image: String,
+    pub config_secret_ref: Option<String>,
+    pub username_secret_ref: Option<String>,
+    pub password_secret_ref: Option<String>,
+    pub enrollment_id: Option<String>,
+    pub identity_secret_ref: Option<String>,
 }
 
 const VALID_DOWNLOAD_PROFILE_SCOPES: &[&str] = &[
@@ -1171,6 +1186,184 @@ pub async fn active_managed_downloader_runtime(
             })
         }
     }
+}
+
+pub(crate) async fn active_live_egress_profile(
+    pool: &AnyPool,
+    secrets: &SecretsManager,
+) -> Result<Option<ActiveLiveEgressProfile>> {
+    let Some(profile) = load_active_download_network_profile(pool).await? else {
+        return Ok(None);
+    };
+    if !profile.enabled
+        || !profile.strict
+        || profile.status != DownloadProtectionState::Protected
+        || !live_profile_component(&profile.id)
+        || profile.name.trim().is_empty()
+        || profile.name.len() > 128
+    {
+        return Ok(None);
+    }
+
+    let projected = match profile.kind {
+        DownloadNetworkProfileKind::WireguardConfig => {
+            let Some(config_secret_ref) =
+                load_profile_secret_ref(pool, &profile.id, "wireguard_config")
+                    .await?
+                    .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(None);
+            };
+            if resolve_live_egress_secret(pool, secrets, &config_secret_ref)
+                .await
+                .is_err()
+            {
+                return Ok(None);
+            }
+            ActiveLiveEgressProfile {
+                profile_id: profile.id,
+                name: profile.name,
+                kind: DownloadNetworkProfileKind::WireguardConfig,
+                gateway_image: wireguard_gateway_image_from_config(&profile.config_json)
+                    .unwrap_or_else(|| DEFAULT_LIVE_GLUETUN_GATEWAY_IMAGE.to_string()),
+                config_secret_ref: Some(config_secret_ref),
+                username_secret_ref: None,
+                password_secret_ref: None,
+                enrollment_id: None,
+                identity_secret_ref: None,
+            }
+        }
+        DownloadNetworkProfileKind::OpenvpnConfig => {
+            let Some(config_secret_ref) =
+                load_profile_secret_ref(pool, &profile.id, "openvpn_config")
+                    .await?
+                    .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(None);
+            };
+            let username_secret_ref =
+                load_profile_secret_ref(pool, &profile.id, "openvpn_username").await?;
+            let password_secret_ref =
+                load_profile_secret_ref(pool, &profile.id, "openvpn_password").await?;
+            if username_secret_ref.is_some() != password_secret_ref.is_some()
+                || resolve_live_egress_secret(pool, secrets, &config_secret_ref)
+                    .await
+                    .is_err()
+            {
+                return Ok(None);
+            }
+            if let (Some(username), Some(password)) = (
+                username_secret_ref.as_deref(),
+                password_secret_ref.as_deref(),
+            ) {
+                if resolve_live_egress_secret(pool, secrets, username)
+                    .await
+                    .is_err()
+                    || resolve_live_egress_secret(pool, secrets, password)
+                        .await
+                        .is_err()
+                {
+                    return Ok(None);
+                }
+            }
+            ActiveLiveEgressProfile {
+                profile_id: profile.id,
+                name: profile.name,
+                kind: DownloadNetworkProfileKind::OpenvpnConfig,
+                gateway_image: openvpn_gateway_image_from_config(&profile.config_json)
+                    .unwrap_or_else(|| DEFAULT_LIVE_GLUETUN_GATEWAY_IMAGE.to_string()),
+                config_secret_ref: Some(config_secret_ref),
+                username_secret_ref,
+                password_secret_ref,
+                enrollment_id: None,
+                identity_secret_ref: None,
+            }
+        }
+        DownloadNetworkProfileKind::CloudflareWarp => {
+            let Some(enrollment) = load_cloudflare_warp_enrollment(pool, &profile.id).await? else {
+                return Ok(None);
+            };
+            if enrollment.status != "ready"
+                || !live_profile_component(&enrollment.enrollment_id)
+                || !valid_live_global_secret_ref(&enrollment.identity_secret_ref)
+            {
+                return Ok(None);
+            }
+            ActiveLiveEgressProfile {
+                profile_id: profile.id,
+                name: profile.name,
+                kind: DownloadNetworkProfileKind::CloudflareWarp,
+                gateway_image: warp_gateway_image_from_config(&profile.config_json),
+                config_secret_ref: None,
+                username_secret_ref: None,
+                password_secret_ref: None,
+                enrollment_id: Some(enrollment.enrollment_id),
+                identity_secret_ref: Some(enrollment.identity_secret_ref),
+            }
+        }
+        DownloadNetworkProfileKind::ExternalOnly
+        | DownloadNetworkProfileKind::Direct
+        | DownloadNetworkProfileKind::ProviderPreset
+        | DownloadNetworkProfileKind::DebridOnly => return Ok(None),
+    };
+
+    if projected.gateway_image.trim().is_empty() || projected.gateway_image.len() > 512 {
+        return Ok(None);
+    }
+    Ok(Some(projected))
+}
+
+pub(crate) async fn resolve_live_egress_secret(
+    pool: &AnyPool,
+    secrets: &SecretsManager,
+    secret_ref: &str,
+) -> Result<Zeroizing<String>> {
+    let (scope, scope_id, key) = parse_live_egress_secret_ref(secret_ref)?;
+    let store = ExtensionStore::new(pool);
+    let secret = store
+        .get_secret(scope, scope_id, key)
+        .await?
+        .ok_or_else(|| anyhow!("Live egress secret is unavailable"))?;
+    let value = Zeroizing::new(
+        secrets
+            .decrypt(&secret.value_encrypted)
+            .context("decrypting Live egress secret")?,
+    );
+    if value.trim().is_empty() {
+        bail!("Live egress secret is empty");
+    }
+    Ok(value)
+}
+
+fn parse_live_egress_secret_ref(secret_ref: &str) -> Result<(SecretScope, Option<Uuid>, &str)> {
+    if let Some(key) = secret_ref.strip_prefix("global:") {
+        if live_profile_component(key) {
+            return Ok((SecretScope::Global, None, key));
+        }
+    } else if let Some(rest) = secret_ref.strip_prefix("provider:") {
+        if let Some((provider_id, key)) = rest.split_once(':') {
+            if live_profile_component(key) {
+                let provider_id = Uuid::parse_str(provider_id)
+                    .map_err(|_| anyhow!("Live egress provider secret reference is invalid"))?;
+                return Ok((SecretScope::Provider, Some(provider_id), key));
+            }
+        }
+    }
+    bail!("Live egress secret reference is invalid")
+}
+
+fn valid_live_global_secret_ref(secret_ref: &str) -> bool {
+    secret_ref
+        .strip_prefix("global:")
+        .is_some_and(live_profile_component)
+}
+
+fn live_profile_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 pub(crate) async fn active_download_network_profile_identity(
@@ -5999,6 +6192,115 @@ mod tests {
             ..NetworkConfig::default()
         };
         settings
+    }
+
+    #[tokio::test]
+    async fn live_egress_projects_only_an_active_strict_protected_builtin_profile() -> Result<()> {
+        let database = test_database().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let secrets = SecretsManager::from_key_bytes([51_u8; 32], true);
+        insert_global_secret(&store, &secrets, "live_wg", "wireguard material").await?;
+        insert_profile(
+            &database.pool,
+            "live-wg",
+            "Live WireGuard",
+            "wireguard_config",
+            true,
+            true,
+            Some("gluetun_wireguard"),
+        )
+        .await?;
+        insert_profile_secret(
+            &database.pool,
+            "live-wg",
+            "wireguard_config",
+            "global:live_wg",
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE download_network_profiles SET status = 'protected' WHERE id = $1",
+        )
+        .bind("live-wg")
+        .execute(&database.pool)
+        .await?;
+
+        let projected = active_live_egress_profile(&database.pool, &secrets)
+            .await?
+            .expect("eligible Live egress profile");
+        assert_eq!(projected.profile_id, "live-wg");
+        assert_eq!(projected.kind, DownloadNetworkProfileKind::WireguardConfig);
+        assert_eq!(
+            projected.config_secret_ref.as_deref(),
+            Some("global:live_wg")
+        );
+        assert_eq!(projected.gateway_image, DEFAULT_LIVE_GLUETUN_GATEWAY_IMAGE);
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE download_network_profiles SET strict = FALSE WHERE id = $1",
+        )
+        .bind("live-wg")
+        .execute(&database.pool)
+        .await?;
+        assert!(
+            active_live_egress_profile(&database.pool, &secrets)
+                .await?
+                .is_none()
+        );
+        sqlx::query::<sqlx::Any>(
+            "UPDATE download_network_profiles SET strict = TRUE, kind = 'direct', status = 'direct' WHERE id = $1",
+        )
+        .bind("live-wg")
+        .execute(&database.pool)
+        .await?;
+        assert!(
+            active_live_egress_profile(&database.pool, &secrets)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_egress_resolves_global_and_provider_secrets_but_not_instance_refs() -> Result<()>
+    {
+        let database = test_database().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let secrets = SecretsManager::from_key_bytes([52_u8; 32], true);
+        let provider_id = Uuid::new_v4();
+        insert_global_secret(&store, &secrets, "live_global", "global-value").await?;
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Provider,
+                scope_id: Some(provider_id),
+                key: "live_provider".to_string(),
+                value_encrypted: secrets.encrypt("provider-value")?,
+                rotatable: true,
+            })
+            .await?;
+
+        assert_eq!(
+            resolve_live_egress_secret(&database.pool, &secrets, "global:live_global")
+                .await?
+                .as_str(),
+            "global-value"
+        );
+        assert_eq!(
+            resolve_live_egress_secret(
+                &database.pool,
+                &secrets,
+                &format!("provider:{provider_id}:live_provider"),
+            )
+            .await?
+            .as_str(),
+            "provider-value"
+        );
+        assert!(
+            resolve_live_egress_secret(&database.pool, &secrets, "instance:live_provider")
+                .await
+                .is_err()
+        );
+        Ok(())
     }
 
     #[tokio::test]

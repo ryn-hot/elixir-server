@@ -7,7 +7,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use config::{Config, Environment as ConfigEnvironment, File};
+use config::{
+    Config, Environment as ConfigEnvironment, File,
+    builder::{ConfigBuilder, DefaultState},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::live::config::LiveConfig;
@@ -95,7 +98,7 @@ impl Settings {
         let env_override = std::env::var("ELIXIR_ENV").ok().map(|v| v.to_lowercase());
         let config_paths = discover_config_paths();
 
-        let mut builder = Config::builder()
+        let builder = Config::builder()
             .set_default("environment", RunEnvironment::default().as_str())?
             .set_default("server.host", default_host())?
             .set_default("server.port", default_port())?
@@ -305,8 +308,8 @@ impl Settings {
             .set_default("playback.max_startup_queue_length", None::<u32>)?
             .set_default("playback.max_temp_dir_bytes", None::<u64>)?
             .set_default("playback.max_ffmpeg_log_bytes", None::<u64>)?
-            .set_default("media_interactions.support_api_enabled", default_false())?
-            .set_default("live.enabled", default_false())?
+            .set_default("media_interactions.support_api_enabled", default_false())?;
+        let mut builder = apply_live_product_defaults(builder)?
             .set_default("telemetry.log_directives", default_log_directives())?
             .add_source(File::from(config_paths.default_file.clone()).required(false))
             .add_source(File::from(config_paths.local_file.clone()).required(false))
@@ -365,6 +368,18 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+fn apply_live_product_defaults(
+    builder: ConfigBuilder<DefaultState>,
+) -> Result<ConfigBuilder<DefaultState>> {
+    Ok(builder
+        .set_default("live.enabled", default_true())?
+        .set_default("live.catalog_enabled", default_true())?
+        .set_default("live.playback_enabled", default_true())?
+        .set_default("live.client_direct_enabled", default_true())?
+        .set_default("live.relay_enabled", default_true())?
+        .set_default("live.remux_enabled", default_true())?)
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1545,6 +1560,28 @@ mod tests {
         assert!(!playback.performance_benchmark_enabled);
         assert!(playback.performance_envelope_artifacts.is_empty());
         assert_eq!(playback.performance_benchmark_timeout_seconds, 20);
+    }
+
+    #[test]
+    fn live_product_defaults_enable_only_certified_delivery_paths() -> Result<()> {
+        let settings: Settings = apply_live_product_defaults(Config::builder())?
+            .build()?
+            .try_deserialize()?;
+
+        assert!(settings.live.enabled);
+        assert!(settings.live.catalog_enabled);
+        assert!(settings.live.playback_enabled);
+        assert!(settings.live.client_direct_enabled);
+        assert!(settings.live.relay_enabled);
+        assert!(settings.live.remux_enabled);
+        assert!(!settings.live.protected_egress_enabled);
+        assert!(!settings.live.native_dash_relay_enabled);
+        assert!(!settings.live.low_latency_hls_enabled);
+        assert!(!settings.live.rtmp_remux_enabled);
+        assert!(!settings.live.srt_remux_enabled);
+        assert!(!settings.live.allow_private_lan_sources);
+        settings.live.validate()?;
+        Ok(())
     }
 
     #[test]

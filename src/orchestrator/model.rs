@@ -61,6 +61,8 @@ pub struct ProviderEndpoint {
     pub network: Option<String>,
 }
 
+pub const HOST_RUNTIME_NETWORK: &str = "elixir_host";
+
 impl ProviderEndpoint {
     pub fn new(
         scheme: String,
@@ -96,7 +98,10 @@ impl ProviderEndpoint {
         if self.port == 0 {
             bail!("endpoint port must be non-zero");
         }
-        validate_host(&self.host)?;
+        validate_host(
+            &self.host,
+            self.network.as_deref() == Some(HOST_RUNTIME_NETWORK),
+        )?;
         Ok(())
     }
 }
@@ -121,7 +126,7 @@ fn normalize_base_path(value: Option<String>) -> String {
     format!("/{}", trimmed)
 }
 
-fn validate_host(host: &str) -> Result<()> {
+fn validate_host(host: &str, allow_host_runtime: bool) -> Result<()> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
         bail!("endpoint host is required");
@@ -130,10 +135,14 @@ fn validate_host(host: &str) -> Result<()> {
         bail!("endpoint host must not include a scheme");
     }
     let lowered = trimmed.to_ascii_lowercase();
-    if matches!(
-        lowered.as_str(),
-        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "host.docker.internal"
-    ) {
+    let address = lowered
+        .trim_matches(|character| matches!(character, '[' | ']'))
+        .parse::<std::net::IpAddr>()
+        .ok();
+    if matches!(lowered.as_str(), "localhost" | "host.docker.internal")
+        || address.is_some_and(|address| address.is_unspecified())
+        || (address.is_some_and(|address| address.is_loopback()) && !allow_host_runtime)
+    {
         bail!("endpoint host '{}' is not allowed", trimmed);
     }
     Ok(())
@@ -162,6 +171,30 @@ mod tests {
             None,
         );
         assert!(endpoint.is_err());
+    }
+
+    #[test]
+    fn endpoint_allows_only_marked_host_runtime_loopback() {
+        let endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "127.0.0.1".to_string(),
+            32_932,
+            None,
+            Some(HOST_RUNTIME_NETWORK.to_string()),
+        )
+        .expect("host runtime endpoint");
+        assert_eq!(endpoint.network.as_deref(), Some(HOST_RUNTIME_NETWORK));
+
+        assert!(
+            ProviderEndpoint::new(
+                "http".to_string(),
+                "0.0.0.0".to_string(),
+                32_932,
+                None,
+                Some(HOST_RUNTIME_NETWORK.to_string()),
+            )
+            .is_err()
+        );
     }
 
     #[test]

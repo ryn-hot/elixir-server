@@ -448,6 +448,7 @@ pub async fn create(
             policy: &planner_policy,
             requirements: PlaybackRequirements {
                 require_time_shift: false,
+                require_server_delivery: false,
             },
             now,
         })
@@ -854,6 +855,7 @@ async fn recovery_response(
                     &mut stored,
                     &item_id,
                     requested_source_id.as_deref(),
+                    request.reason,
                     &context,
                     &client,
                     &planner_policy,
@@ -1207,6 +1209,7 @@ async fn prepare_same_source_refresh(
         client,
         planner_policy,
         loaded_policy,
+        false,
         context.now,
     )
     .await?;
@@ -1223,6 +1226,7 @@ async fn prepare_source_failover(
     stored: &mut StoredSessionDescriptor,
     item_id: &str,
     requested_source_id: Option<&str>,
+    reason: RecoveryReason,
     context: &ProviderRequestContext,
     client: &ClientCapabilities,
     planner_policy: &PlannerPolicy,
@@ -1235,6 +1239,29 @@ async fn prepare_source_failover(
         .ok_or_else(contract_invalid)?
         .stream_id
         .clone();
+    if should_replan_direct_through_server(
+        session.delivery_mode,
+        reason,
+        requested_source_id.is_some(),
+    ) {
+        let resolved = resolved_from_stored(stored, &current)?;
+        if let Ok(prepared) = prepare_recovery_plan(
+            state,
+            resolved,
+            &current,
+            stored.recovery.requested_egress,
+            &stored.egress,
+            client,
+            planner_policy,
+            loaded_policy,
+            true,
+            context.now,
+        )
+        .await
+        {
+            return Ok(Some(prepared));
+        }
+    }
     stored
         .recovery
         .mark_source_failed(&current, context.now, recovery_policy)
@@ -1305,6 +1332,7 @@ async fn prepare_source_failover(
             client,
             planner_policy,
             loaded_policy,
+            false,
             context.now,
         )
         .await
@@ -1390,6 +1418,7 @@ async fn prepare_recovery_plan(
     client: &ClientCapabilities,
     planner_policy: &PlannerPolicy,
     loaded_policy: &LoadedPolicy,
+    require_server_delivery: bool,
     now: DateTime<Utc>,
 ) -> Result<PreparedRecovery, LiveHttpRejection> {
     resolved = order_resolved(resolved, preferred_source_id)?;
@@ -1405,6 +1434,7 @@ async fn prepare_recovery_plan(
         policy: &planner_policy,
         requirements: PlaybackRequirements {
             require_time_shift: false,
+            require_server_delivery,
         },
         now,
     })
@@ -1446,6 +1476,16 @@ async fn prepare_recovery_plan(
         plan,
         egress,
     })
+}
+
+fn should_replan_direct_through_server(
+    delivery_mode: DeliveryMode,
+    reason: RecoveryReason,
+    explicit_source: bool,
+) -> bool {
+    delivery_mode == DeliveryMode::ClientDirect
+        && !explicit_source
+        && matches!(reason, RecoveryReason::Transport | RecoveryReason::Stalled)
 }
 
 fn resolved_from_stored(
@@ -2506,6 +2546,11 @@ async fn select_session_egress_policy(
     principal: &CurrentPrincipal,
     request: &SessionCreateRequest,
 ) -> Result<EffectiveEgressPolicy, LiveHttpRejection> {
+    state
+        .live
+        .refresh_builtin_egress()
+        .await
+        .map_err(|_| egress_unavailable())?;
     let requested = match request.egress_mode {
         EgressModeRequest::Inherit => None,
         EgressModeRequest::Off => Some(SessionEgressPolicyRequest {
@@ -3094,6 +3139,35 @@ mod tests {
         state: RelayOriginState,
         shutdown: Option<oneshot::Sender<()>>,
         task: JoinHandle<()>,
+    }
+
+    #[test]
+    fn direct_transport_recovery_escalates_without_overriding_source_selection() {
+        assert!(should_replan_direct_through_server(
+            DeliveryMode::ClientDirect,
+            RecoveryReason::Transport,
+            false,
+        ));
+        assert!(should_replan_direct_through_server(
+            DeliveryMode::ClientDirect,
+            RecoveryReason::Stalled,
+            false,
+        ));
+        assert!(!should_replan_direct_through_server(
+            DeliveryMode::ClientDirect,
+            RecoveryReason::Transport,
+            true,
+        ));
+        assert!(!should_replan_direct_through_server(
+            DeliveryMode::ClientDirect,
+            RecoveryReason::UpstreamUnauthorized,
+            false,
+        ));
+        assert!(!should_replan_direct_through_server(
+            DeliveryMode::ServerRelay,
+            RecoveryReason::Transport,
+            false,
+        ));
     }
 
     impl DirectOriginFixture {
@@ -4877,7 +4951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn r12_authenticated_hls_relay_coalesces_reconstructs_and_fences() -> Result<()> {
+    async fn r12_authenticated_hls_relay_needs_no_manual_destination_rules() -> Result<()> {
         let origin = RelayOriginFixture::start().await?;
         let fixture = DirectProviderFixture::start_for_relay(origin.port).await?;
         let mut settings = settings();
@@ -4928,35 +5002,12 @@ mod tests {
         let access = signup["access_token"].as_str().unwrap().to_string();
         let home_id = Uuid::parse_str(signup["home_id"].as_str().unwrap())?;
         let profile_id = Uuid::parse_str(signup["profile_id"].as_str().unwrap())?;
-        let user_id: Uuid =
-            sqlx::query_scalar::<_, String>("SELECT owner_user_id FROM homes WHERE id = $1")
-                .bind(home_id.to_string())
-                .fetch_one(&pool)
-                .await?
-                .parse()?;
         let authorization_revision: i64 = sqlx::query_scalar(
             "SELECT revision FROM profile_authorization_revisions WHERE profile_id = $1",
         )
         .bind(profile_id.to_string())
         .fetch_one(&pool)
         .await?;
-        sqlx::query(
-            "INSERT INTO live_provider_destination_rules (
-                id, home_id, provider_id, scheme, normalized_host, port, exact_path,
-                network_scope, allow_fetch, allow_credentials, allow_client_disclosure,
-                revision, created_by_user_id, created_by_actor_snapshot
-             ) VALUES ($1, $2, $3, 'http', '127.0.0.1', $4, '/master.m3u8', 'public',
-                       TRUE, FALSE, FALSE, 1, $5, $6)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(home_id.to_string())
-        .bind(provider_id.to_string())
-        .bind(i64::from(origin.port))
-        .bind(user_id.to_string())
-        .bind(json!({"userId": user_id, "role": "owner"}).to_string())
-        .execute(&pool)
-        .await?;
-
         let codec = LivePublicKeyCodec::new(state.live.crypto().await.expect("Live crypto"));
         let scope = LivePublicKeyScope {
             home_id,

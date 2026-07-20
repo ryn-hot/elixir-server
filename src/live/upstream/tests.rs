@@ -268,6 +268,38 @@ fn r10_url_destination_and_debug_policy_is_exact_and_redacted() {
 }
 
 #[test]
+fn r10_public_session_policy_allows_dynamic_cdns_but_never_private_addresses() {
+    let policy =
+        DestinationPolicy::for_public_session(Vec::new(), false, LocalDestinationDenylist::empty())
+            .expect("public session policy");
+    let initial = policy
+        .validate_initial("https://origin.example/live/master.m3u8?token=one")
+        .expect("dynamic source is admitted");
+    let redirected = policy
+        .validate_redirect(&initial, "https://cdn.example/events/index.m3u8?token=two")
+        .expect("public CDN redirect is admitted");
+    assert!(
+        policy
+            .resolve_target(redirected.clone(), vec!["8.8.8.8".parse().unwrap()])
+            .is_ok()
+    );
+    assert_eq!(
+        policy
+            .resolve_target(redirected, vec!["10.0.0.8".parse().unwrap()])
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::NetworkScopeMismatch
+    );
+    assert_eq!(
+        policy
+            .validate_initial("http://cdn.example/events/index.m3u8")
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::SchemeForbidden
+    );
+}
+
+#[test]
 fn r10_ip_policy_rejects_special_mixed_and_wrong_scope_answers() {
     let public = rule(
         "https",

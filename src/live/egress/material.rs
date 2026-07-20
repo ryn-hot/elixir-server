@@ -66,12 +66,7 @@ pub(crate) async fn prepare_gateway_material(
                 .as_deref()
                 .ok_or(GatewayMaterialError)?;
             let source = read_private_file(Path::new(path), MAX_CONFIG_BYTES)?;
-            let normalized = normalize_wireguard(&source).await?;
-            Ok(vec![PreparedMaterialFile {
-                role: GATEWAY_CONFIG_ROLE,
-                file_name: "wg0.conf",
-                contents: Zeroizing::new(normalized.as_bytes().to_vec()),
-            }])
+            prepare_wireguard_material(&source).await
         }
         LiveEgressProfileKind::Openvpn => {
             let path = profile
@@ -79,34 +74,100 @@ pub(crate) async fn prepare_gateway_material(
                 .as_deref()
                 .ok_or(GatewayMaterialError)?;
             let source = read_private_file(Path::new(path), MAX_CONFIG_BYTES)?;
-            let requires_credentials = openvpn_requires_credentials(&source)?;
-            let normalized = normalize_openvpn(&source).await?;
-            let mut files = vec![PreparedMaterialFile {
-                role: GATEWAY_CONFIG_ROLE,
-                file_name: "custom.conf",
-                contents: Zeroizing::new(normalized.as_bytes().to_vec()),
-            }];
-            match (requires_credentials, profile.auth_host_path.as_deref()) {
-                (false, None) => {}
-                (true, Some(auth_path)) => {
+            let credentials = match profile.auth_host_path.as_deref() {
+                Some(auth_path) => {
                     let auth = read_private_file(Path::new(auth_path), MAX_AUTH_BYTES)?;
-                    let (username, password) = parse_openvpn_auth(&auth)?;
-                    files.push(PreparedMaterialFile {
-                        role: OPENVPN_USERNAME_ROLE,
-                        file_name: "username",
-                        contents: Zeroizing::new(username.as_bytes().to_vec()),
-                    });
-                    files.push(PreparedMaterialFile {
-                        role: OPENVPN_PASSWORD_ROLE,
-                        file_name: "password",
-                        contents: Zeroizing::new(password.as_bytes().to_vec()),
-                    });
+                    Some(parse_openvpn_auth(&auth)?)
                 }
-                _ => return Err(GatewayMaterialError),
-            }
-            Ok(files)
+                None => None,
+            };
+            prepare_openvpn_material(&source, credentials).await
         }
     }
+}
+
+pub(crate) async fn prepare_gateway_material_from_secret_values(
+    kind: LiveEgressProfileKind,
+    config: &[u8],
+    username: Option<&[u8]>,
+    password: Option<&[u8]>,
+) -> Result<Vec<PreparedMaterialFile>, GatewayMaterialError> {
+    if config.is_empty()
+        || config.len() as u64 > MAX_CONFIG_BYTES
+        || config.contains(&0)
+        || username.is_some() != password.is_some()
+    {
+        return Err(GatewayMaterialError);
+    }
+    match kind {
+        LiveEgressProfileKind::Wireguard if username.is_none() => {
+            prepare_wireguard_material(config).await
+        }
+        LiveEgressProfileKind::Openvpn => {
+            let credentials = match (username, password) {
+                (Some(username), Some(password)) => {
+                    let mut auth = Zeroizing::new(Vec::with_capacity(
+                        username
+                            .len()
+                            .saturating_add(password.len())
+                            .saturating_add(2),
+                    ));
+                    auth.extend_from_slice(username);
+                    auth.push(b'\n');
+                    auth.extend_from_slice(password);
+                    auth.push(b'\n');
+                    if auth.len() as u64 > MAX_AUTH_BYTES || auth.contains(&0) {
+                        return Err(GatewayMaterialError);
+                    }
+                    Some(parse_openvpn_auth(&auth)?)
+                }
+                (None, None) => None,
+                _ => return Err(GatewayMaterialError),
+            };
+            prepare_openvpn_material(config, credentials).await
+        }
+        _ => Err(GatewayMaterialError),
+    }
+}
+
+async fn prepare_wireguard_material(
+    source: &[u8],
+) -> Result<Vec<PreparedMaterialFile>, GatewayMaterialError> {
+    let normalized = normalize_wireguard(source).await?;
+    Ok(vec![PreparedMaterialFile {
+        role: GATEWAY_CONFIG_ROLE,
+        file_name: "wg0.conf",
+        contents: Zeroizing::new(normalized.as_bytes().to_vec()),
+    }])
+}
+
+async fn prepare_openvpn_material(
+    source: &[u8],
+    credentials: Option<(Zeroizing<String>, Zeroizing<String>)>,
+) -> Result<Vec<PreparedMaterialFile>, GatewayMaterialError> {
+    let requires_credentials = openvpn_requires_credentials(source)?;
+    if requires_credentials != credentials.is_some() {
+        return Err(GatewayMaterialError);
+    }
+    let normalized = normalize_openvpn(source).await?;
+    let mut files = vec![PreparedMaterialFile {
+        role: GATEWAY_CONFIG_ROLE,
+        file_name: "custom.conf",
+        contents: Zeroizing::new(normalized.as_bytes().to_vec()),
+    }];
+    if let Some((username, password)) = credentials {
+        files.push(PreparedMaterialFile {
+            role: OPENVPN_USERNAME_ROLE,
+            file_name: "username",
+            contents: Zeroizing::new(username.as_bytes().to_vec()),
+        });
+        files.push(PreparedMaterialFile {
+            role: OPENVPN_PASSWORD_ROLE,
+            file_name: "password",
+            contents: Zeroizing::new(password.as_bytes().to_vec()),
+        });
+    }
+    Ok(files)
 }
 
 fn read_private_file(
@@ -841,6 +902,46 @@ mod tests {
         assert_eq!(password.as_str(), "service-password");
         assert!(parse_openvpn_auth(b"one-line-only\n").is_err());
         assert!(parse_openvpn_auth(b" user\npassword\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn live_projected_material_accepts_zeroizing_secret_values() {
+        let wireguard = prepare_gateway_material_from_secret_values(
+            LiveEgressProfileKind::Wireguard,
+            wireguard("1.1.1.1:51820").as_bytes(),
+            None,
+            None,
+        )
+        .await
+        .expect("projected WireGuard material");
+        assert_eq!(wireguard.len(), 1);
+        assert_eq!(wireguard[0].file_name, "wg0.conf");
+
+        let openvpn = prepare_gateway_material_from_secret_values(
+            LiveEgressProfileKind::Openvpn,
+            openvpn("").as_bytes(),
+            Some(b"service-user"),
+            Some(b"service-password"),
+        )
+        .await
+        .expect("projected OpenVPN material");
+        assert_eq!(openvpn.len(), 3);
+        assert_eq!(openvpn[1].contents(), b"service-user");
+        assert_eq!(openvpn[2].contents(), b"service-password");
+    }
+
+    #[tokio::test]
+    async fn live_projected_material_rejects_incomplete_credentials() {
+        assert!(
+            prepare_gateway_material_from_secret_values(
+                LiveEgressProfileKind::Openvpn,
+                openvpn("").as_bytes(),
+                Some(b"service-user"),
+                None,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

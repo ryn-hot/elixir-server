@@ -134,8 +134,6 @@ pub enum HlsRewriteError {
     InvalidNumericValue,
     #[error("the HLS manifest uses an unsupported encryption mode")]
     UnsupportedEncryption,
-    #[error("the HLS manifest uses LL-HLS before certification")]
-    LowLatencyNotCertified,
     #[error("the HLS manifest contains an invalid resource URI")]
     InvalidResourceUri,
     #[error("the HLS relay route base is invalid")]
@@ -235,9 +233,13 @@ impl HlsRewriter {
         self.validate_parent_url(parent_url)?;
         validate_route_base(route_base)?;
 
+        let skipped_segments = skipped_segment_count(text)?;
         let mut staged = resources.clone();
         staged.begin_revision(scope, control_fencing_token)?;
-        let mut state = RewriteState::default();
+        let mut state = RewriteState {
+            skipped_segments,
+            ..RewriteState::default()
+        };
         let options = ParsingOptionsBuilder::new()
             .with_parsing_for_all_tags()
             .build();
@@ -363,10 +365,17 @@ impl HlsRewriter {
                 state.require_no_pending()?;
                 write_line(writer, HlsLine::from(tag))
             }
-            hls::Tag::MediaSequence(tag) => {
+            hls::Tag::MediaSequence(mut tag) => {
                 state.mark_media()?;
                 mark_singleton(&mut state.has_media_sequence)?;
-                state.media_sequence = Some(tag.media_sequence());
+                let mut media_sequence = tag.media_sequence();
+                if let Some(skipped_segments) = state.skipped_segments {
+                    media_sequence = media_sequence
+                        .checked_add(skipped_segments)
+                        .ok_or(HlsRewriteError::InvalidNumericValue)?;
+                    tag.set_media_sequence(media_sequence);
+                }
+                state.media_sequence = Some(media_sequence);
                 state.require_no_pending()?;
                 write_line(writer, HlsLine::from(tag))
             }
@@ -394,12 +403,79 @@ impl HlsRewriter {
                 state.require_no_pending()?;
                 write_line(writer, HlsLine::from(tag))
             }
-            hls::Tag::PartInf(_)
-            | hls::Tag::ServerControl(_)
-            | hls::Tag::Part(_)
-            | hls::Tag::Skip(_)
-            | hls::Tag::PreloadHint(_)
-            | hls::Tag::RenditionReport(_) => Err(HlsRewriteError::LowLatencyNotCertified),
+            hls::Tag::PartInf(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                mark_singleton(&mut state.part_inf)?;
+                if !valid_ignored_duration(tag.part_target()) {
+                    return Err(HlsRewriteError::InvalidNumericValue);
+                }
+                Ok(())
+            }
+            hls::Tag::ServerControl(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                mark_singleton(&mut state.server_control)?;
+                if [tag.can_skip_until(), tag.hold_back(), tag.part_hold_back()]
+                    .into_iter()
+                    .flatten()
+                    .any(|duration| !valid_ignored_duration(duration))
+                {
+                    return Err(HlsRewriteError::InvalidNumericValue);
+                }
+                Ok(())
+            }
+            hls::Tag::Part(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                if !valid_ignored_duration(tag.duration()) {
+                    return Err(HlsRewriteError::InvalidNumericValue);
+                }
+                resolve_resource_uri(parent_url, tag.uri(), self.config.max_uri_bytes)?;
+                if tag.byterange().is_some_and(|range| {
+                    range.length == 0
+                        || range.length > MAX_BYTE_RANGE_LENGTH
+                        || range
+                            .offset
+                            .is_some_and(|offset| offset.checked_add(range.length).is_none())
+                }) {
+                    return Err(HlsRewriteError::InvalidNumericValue);
+                }
+                Ok(())
+            }
+            hls::Tag::Skip(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                if !state.has_media_sequence
+                    || !state.segment_durations.is_empty()
+                    || state.skipped_segments != Some(tag.skipped_segments())
+                {
+                    return Err(HlsRewriteError::InvalidTagOrder);
+                }
+                Ok(())
+            }
+            hls::Tag::PreloadHint(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                if tag.hint_type().known().is_none() {
+                    return Err(HlsRewriteError::UnsupportedTag);
+                }
+                resolve_resource_uri(parent_url, tag.uri(), self.config.max_uri_bytes)?;
+                if tag.byterange_length().is_some_and(|length| {
+                    length == 0
+                        || length > MAX_BYTE_RANGE_LENGTH
+                        || tag.byterange_start().checked_add(length).is_none()
+                }) {
+                    return Err(HlsRewriteError::InvalidNumericValue);
+                }
+                Ok(())
+            }
+            hls::Tag::RenditionReport(tag) => {
+                state.mark_media()?;
+                state.require_no_pending()?;
+                resolve_resource_uri(parent_url, tag.uri(), self.config.max_uri_bytes)?;
+                Ok(())
+            }
             hls::Tag::Inf(tag) => {
                 state.mark_media()?;
                 state.require_no_pending()?;
@@ -737,6 +813,8 @@ struct RewriteState {
     discontinuity_sequence: bool,
     playlist_type: bool,
     i_frames_only: bool,
+    part_inf: bool,
+    server_control: bool,
     end_list: bool,
     saw_master: bool,
     saw_media: bool,
@@ -744,6 +822,7 @@ struct RewriteState {
     pending_byte_range: Option<HlsByteRange>,
     target_duration: Option<u64>,
     media_sequence: Option<u64>,
+    skipped_segments: Option<u64>,
     segment_durations: Vec<f64>,
     touched_resources: HashSet<HlsResourceId>,
     last_segment_range: Option<(Url, u64)>,
@@ -808,6 +887,31 @@ fn mark_singleton(seen: &mut bool) -> Result<(), HlsRewriteError> {
     }
     *seen = true;
     Ok(())
+}
+
+fn skipped_segment_count(text: &str) -> Result<Option<u64>, HlsRewriteError> {
+    let options = ParsingOptionsBuilder::new()
+        .with_parsing_for_all_tags()
+        .build();
+    let mut reader = Reader::from_str(text, options);
+    let mut skipped_segments = None;
+    while let Some(line) = reader
+        .read_line()
+        .map_err(|_| HlsRewriteError::ParseFailed)?
+    {
+        if let HlsLine::KnownTag(KnownTag::Hls(hls::Tag::Skip(tag))) = line {
+            if tag.skipped_segments() == 0
+                || skipped_segments.replace(tag.skipped_segments()).is_some()
+            {
+                return Err(HlsRewriteError::InvalidNumericValue);
+            }
+        }
+    }
+    Ok(skipped_segments)
+}
+
+fn valid_ignored_duration(duration: f64) -> bool {
+    duration.is_finite() && duration > 0.0 && duration <= MAX_SEGMENT_DURATION_SECONDS
 }
 
 fn write_line<'a>(writer: &mut Writer<Vec<u8>>, line: HlsLine<'a>) -> Result<(), HlsRewriteError> {

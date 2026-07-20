@@ -14,7 +14,7 @@ use crate::{
         },
         store::{ExtensionStore, ReadyLiveCatalogProvider},
     },
-    orchestrator::model::ProviderEndpoint,
+    orchestrator::model::{HOST_RUNTIME_NETWORK, ProviderEndpoint},
 };
 
 use super::super::contract::{
@@ -268,8 +268,9 @@ fn snapshot_from_ready(
         .base_path
         .as_deref()
         .ok_or_else(invalid_snapshot)?;
+    let host_runtime = is_host_runtime_endpoint(&persisted);
     if persisted.scheme != declared_scheme
-        || persisted.port != declared_port
+        || (!host_runtime && persisted.port != declared_port)
         || normalize_path(&persisted.base_path)? != normalize_path(declared_base_path)?
     {
         return Err(invalid_snapshot());
@@ -386,7 +387,8 @@ fn validate_runtime_endpoint(
     {
         return Err(invalid_snapshot());
     }
-    if !allow_loopback && forbidden_runtime_host(&endpoint.host) {
+    let host_runtime = is_host_runtime_endpoint(endpoint);
+    if !allow_loopback && !host_runtime && forbidden_runtime_host(&endpoint.host) {
         return Err(invalid_snapshot());
     }
     let base_path = normalize_path(&endpoint.base_path)?;
@@ -429,6 +431,15 @@ fn forbidden_runtime_host(host: &str) -> bool {
     normalized
         .parse::<std::net::IpAddr>()
         .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
+}
+
+fn is_host_runtime_endpoint(endpoint: &ProviderEndpoint) -> bool {
+    endpoint.network.as_deref() == Some(HOST_RUNTIME_NETWORK)
+        && endpoint
+            .host
+            .trim_matches(|character| matches!(character, '[' | ']'))
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn normalize_path(value: &str) -> Result<String, ProviderDirectoryError> {

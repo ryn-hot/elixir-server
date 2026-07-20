@@ -13,6 +13,8 @@ use sha2::Sha256;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::live::config::is_public_egress_ip;
+
 const CONTROL_VERSION: &str = "elixir-live-egress-v1";
 const MAX_CLOCK_SKEW_SECONDS: i64 = 30;
 
@@ -120,13 +122,26 @@ impl WorkerReadinessConfig {
             || url.fragment().is_some()
             || self.dns_probe_host.is_empty()
             || self.dns_probe_host.len() > 253
-            || self.expected_egress_ips.is_empty()
             || self.expected_egress_ips.len() > 16
+            || self
+                .expected_egress_ips
+                .iter()
+                .any(|address| !is_public_egress_ip(*address))
         {
             return Err(ControlProtocolError::Invalid);
         }
         Ok(())
     }
+}
+
+pub(crate) fn readiness_ip_matches(
+    expected_egress_ips: &[IpAddr],
+    observed_egress_ip: Option<IpAddr>,
+) -> bool {
+    observed_egress_ip.is_some_and(|address| {
+        is_public_egress_ip(address)
+            && (expected_egress_ips.is_empty() || expected_egress_ips.contains(&address))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,5 +430,30 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 1;
         assert!(verify_request_signature(&keys, &tampered, &signature).is_err());
         assert_eq!(format!("{keys:?}"), "ControlKeys([REDACTED])");
+    }
+
+    #[test]
+    fn live_auto_readiness_accepts_any_public_ip_but_explicit_readiness_is_exact() {
+        let any_public = WorkerReadinessConfig {
+            external_ip_url: "https://egress.example/ip".to_string(),
+            dns_probe_host: "example.com".to_string(),
+            expected_egress_ips: Vec::new(),
+        };
+        any_public.validate().expect("auto readiness config");
+        assert!(readiness_ip_matches(
+            &any_public.expected_egress_ips,
+            Some("1.1.1.1".parse().expect("public IP")),
+        ));
+        assert!(!readiness_ip_matches(
+            &any_public.expected_egress_ips,
+            Some("127.0.0.1".parse().expect("loopback IP")),
+        ));
+
+        let exact = vec!["1.1.1.1".parse().expect("public IP")];
+        assert!(readiness_ip_matches(&exact, Some(exact[0])));
+        assert!(!readiness_ip_matches(
+            &exact,
+            Some("8.8.8.8".parse().expect("other public IP")),
+        ));
     }
 }

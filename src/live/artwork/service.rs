@@ -12,9 +12,8 @@ use std::{
 
 use axum::body::Bytes;
 use image::{ImageFormat, ImageReader, Limits};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::{Url, header::CONTENT_TYPE};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -23,13 +22,10 @@ use crate::live::{
     catalog::{LiveArtworkKind, LivePublicKeyScope, OpenedArtworkKey},
     contract::SensitiveString,
     upstream::{
-        DestinationPolicy, DestinationRule, DnsResolver, LocalDestinationDenylist, NetworkScope,
-        SafeRequestHeaders, SystemDnsResolver, UpstreamErrorCode, UpstreamFetcher, UpstreamLimits,
-        UpstreamMethod,
+        DestinationPolicy, DnsResolver, LocalDestinationDenylist, SafeRequestHeaders,
+        SystemDnsResolver, UpstreamErrorCode, UpstreamFetcher, UpstreamLimits, UpstreamMethod,
     },
 };
-
-const MAX_POLICY_ROWS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveArtworkErrorCode {
@@ -393,71 +389,21 @@ impl LiveArtworkService {
 
 impl ArtworkInner {
     async fn load_policy(&self, request: &ArtworkFetchRequest) -> Result<PolicySnapshot> {
-        let rows = sqlx::query(
-            "SELECT scheme, normalized_host, port, exact_path, network_scope, \
-                    CAST(CASE WHEN allow_fetch THEN 1 ELSE 0 END AS BIGINT) AS allow_fetch, \
-                    revision \
-             FROM live_provider_destination_rules \
-             WHERE home_id = $1 AND provider_id = $2 \
-             ORDER BY scheme, normalized_host, port, exact_path, network_scope",
-        )
-        .bind(request.scope.home_id.to_string())
-        .bind(request.provider_id.to_string())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-        if rows.len() > MAX_POLICY_ROWS {
+        let source = Url::parse(request.source.expose())
+            .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?;
+        if !matches!(source.scheme(), "http" | "https")
+            || !source.username().is_empty()
+            || source.password().is_some()
+            || source.fragment().is_some()
+        {
             return Err(LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied));
         }
-        let mut rules = Vec::new();
         let mut digest = Sha256::new();
-        let mut allow_http = false;
-        for row in rows {
-            let scheme: String = row
-                .try_get("scheme")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let host: String = row
-                .try_get("normalized_host")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let port: i64 = row
-                .try_get("port")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let path: String = row
-                .try_get("exact_path")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let scope: String = row
-                .try_get("network_scope")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let allow_fetch: i64 = row
-                .try_get("allow_fetch")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            let revision: i64 = row
-                .try_get("revision")
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
-            if allow_fetch != 1 || scope != "public" {
-                continue;
-            }
-            let port = u16::try_from(port)
-                .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?;
-            let rule =
-                DestinationRule::new(&scheme, &host, port, &path, NetworkScope::Public, true)
-                    .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?;
-            allow_http |= scheme == "http";
-            for value in [&scheme, &host, &path] {
-                digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-                digest.update(value.as_bytes());
-            }
-            digest.update(port.to_be_bytes());
-            digest.update(revision.to_be_bytes());
-            rules.push(rule);
-        }
-        if rules.is_empty() {
-            return Err(LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied));
-        }
-        let policy = DestinationPolicy::new(
-            rules,
-            Default::default(),
-            allow_http,
+        digest.update(b"live-artwork-public-session-v1");
+        digest.update(request.source.expose().as_bytes());
+        let policy = DestinationPolicy::for_public_session(
+            Vec::new(),
+            source.scheme() == "http",
             LocalDestinationDenylist::empty(),
         )
         .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?;
@@ -492,7 +438,7 @@ impl ArtworkInner {
                     request.source,
                     UpstreamMethod::Get,
                     policy,
-                    cancellation.clone(),
+                    cancellation.child_token(),
                 )
                 .with_safe_headers(headers),
             )

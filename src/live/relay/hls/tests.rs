@@ -292,7 +292,116 @@ fn r11_encryption_policy_accepts_only_aes128_identity() {
 }
 
 #[test]
-fn r11_low_latency_tags_remain_explicitly_uncertified() {
+fn r11_low_latency_tags_fall_back_to_complete_standard_segments() {
+    let mut resources = resource_map(HlsResourceLimits::default());
+    let result = rewriter()
+        .rewrite(
+            &mut resources,
+            7,
+            &parent("/hls/ll/index.m3u8"),
+            ROUTE_BASE,
+            LOW_LATENCY.as_bytes(),
+        )
+        .expect("LL-HLS extensions fall back to the complete segment");
+
+    assert_eq!(result.kind(), HlsManifestKind::Media);
+    assert_eq!(result.target_duration_seconds(), Some(4));
+    assert_eq!(result.media_sequence(), Some(100));
+    assert_eq!(result.resource_count(), 1);
+    assert_eq!(resources.len(), 1);
+
+    let output = std::str::from_utf8(result.body()).expect("UTF-8 output");
+    assert!(output.contains("#EXTINF:4.000"));
+    for ignored_tag in [
+        "#EXT-X-PART-INF",
+        "#EXT-X-SERVER-CONTROL",
+        "#EXT-X-PART:",
+        "#EXT-X-PRELOAD-HINT",
+        "#EXT-X-RENDITION-REPORT",
+    ] {
+        assert!(!output.contains(ignored_tag));
+    }
+    assert!(!output.contains("?part="));
+
+    let routes = route_uris(result.body());
+    assert_eq!(routes.len(), 1);
+    let descriptor = resources
+        .resolve(&resource_id(&routes[0]), 7)
+        .expect("complete segment resolves");
+    assert_eq!(descriptor.kind(), HlsResourceKind::MediaSegment);
+    assert_eq!(descriptor.url().path(), "/hls/media/segment-100.ts");
+    assert_eq!(descriptor.url().query(), None);
+}
+
+#[test]
+fn r11_delta_update_skip_falls_back_with_adjusted_media_sequence() {
+    const DELTA: &str = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-VERSION:9\n",
+        "#EXT-X-TARGETDURATION:4\n",
+        "#EXT-X-MEDIA-SEQUENCE:100\n",
+        "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n",
+        "#EXTINF:4.000,\n",
+        "segment-102.ts\n",
+    );
+    let mut resources = resource_map(HlsResourceLimits::default());
+    let result = rewriter()
+        .rewrite(
+            &mut resources,
+            7,
+            &parent("/hls/ll/index.m3u8"),
+            ROUTE_BASE,
+            DELTA.as_bytes(),
+        )
+        .expect("delta update falls back to its complete segment");
+
+    assert_eq!(result.media_sequence(), Some(102));
+    assert_eq!(result.resource_count(), 1);
+    let output = std::str::from_utf8(result.body()).expect("UTF-8 output");
+    assert!(output.contains("#EXT-X-MEDIA-SEQUENCE:102"));
+    assert!(!output.contains("#EXT-X-SKIP"));
+}
+
+#[test]
+fn r11_malformed_low_latency_extensions_fail_transactionally() {
+    let cases = [
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PART-INF:PART-TARGET=0\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PART:DURATION=0,URI=\"part.ts\"\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PART:DURATION=1,URI=\"file:///etc/passwd\"\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PRELOAD-HINT:TYPE=UNKNOWN,URI=\"part.ts\"\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-RENDITION-REPORT:URI=\"file:///etc/passwd\",LAST-MSN=1\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXTINF:4,\na.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n#EXT-X-PART:DURATION=1,URI=\"part.ts\"\na.ts\n",
+    ];
+    for manifest in cases {
+        let mut resources = resource_map(HlsResourceLimits::default());
+        assert!(
+            rewriter()
+                .rewrite(
+                    &mut resources,
+                    7,
+                    &parent("/hls/ll/index.m3u8"),
+                    ROUTE_BASE,
+                    manifest.as_bytes(),
+                )
+                .is_err(),
+            "manifest unexpectedly accepted: {manifest}"
+        );
+        assert!(resources.is_empty());
+    }
+}
+
+#[test]
+fn r11_partial_only_low_latency_playlist_is_not_exposed_as_empty_media() {
+    const PARTIAL_ONLY: &str = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-VERSION:9\n",
+        "#EXT-X-TARGETDURATION:4\n",
+        "#EXT-X-PART-INF:PART-TARGET=1\n",
+        "#EXT-X-MEDIA-SEQUENCE:100\n",
+        "#EXT-X-PART:DURATION=1,URI=\"segment-100.part0.ts\"\n",
+        "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"segment-100.part1.ts\"\n",
+    );
     let mut resources = resource_map(HlsResourceLimits::default());
     assert_eq!(
         rewriter().rewrite(
@@ -300,9 +409,9 @@ fn r11_low_latency_tags_remain_explicitly_uncertified() {
             7,
             &parent("/hls/ll/index.m3u8"),
             ROUTE_BASE,
-            LOW_LATENCY.as_bytes(),
+            PARTIAL_ONLY.as_bytes(),
         ),
-        Err(HlsRewriteError::LowLatencyNotCertified)
+        Err(HlsRewriteError::MissingResource)
     );
     assert!(resources.is_empty());
 }

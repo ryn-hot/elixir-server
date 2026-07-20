@@ -31,6 +31,7 @@ pub enum PlannerReason {
     ProtectedEgressRequiresRelay,
     ProtectedEgressPreferredRelay,
     PrivateNetworkRequiresRelay,
+    DirectRecoveryRequiresServer,
     CompatibleServerRelay,
     ClientProtocolRequiresRemux,
     UnsupportedContainerRequiresRemux,
@@ -54,6 +55,7 @@ impl PlannerReason {
             Self::ProtectedEgressRequiresRelay => "protected_egress_requires_relay",
             Self::ProtectedEgressPreferredRelay => "protected_egress_preferred_relay",
             Self::PrivateNetworkRequiresRelay => "private_network_requires_relay",
+            Self::DirectRecoveryRequiresServer => "direct_recovery_requires_server",
             Self::CompatibleServerRelay => "compatible_server_relay",
             Self::ClientProtocolRequiresRemux => "client_protocol_requires_remux",
             Self::UnsupportedContainerRequiresRemux => "unsupported_container_requires_remux",
@@ -330,6 +332,7 @@ impl PlannerPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaybackRequirements {
     pub require_time_shift: bool,
+    pub require_server_delivery: bool,
 }
 
 pub struct PlannerInput<'a> {
@@ -428,7 +431,7 @@ fn evaluate_source(
         return Err(PlannerRejectionCode::ClientCodecUnsupported);
     }
 
-    let direct_constraint = direct_constraint(source, &url, input.policy);
+    let direct_constraint = direct_constraint(source, &url, input.policy, input.requirements);
     let direct_protocol = input.client.supports_protocol(source.protocol);
     let direct_container = input.client.supports_container(
         source
@@ -479,6 +482,7 @@ fn direct_constraint(
     source: &SourceDescriptor,
     url: &Url,
     policy: &PlannerPolicy,
+    requirements: PlaybackRequirements,
 ) -> Option<PlannerReason> {
     if source.private_network {
         return Some(PlannerReason::PrivateNetworkRequiresRelay);
@@ -526,6 +530,9 @@ fn direct_constraint(
     }
     if !policy.disclosure_rules.iter().any(|rule| rule.permits(url)) {
         return Some(PlannerReason::DisclosureRuleMissingRequiresRelay);
+    }
+    if requirements.require_server_delivery {
+        return Some(PlannerReason::DirectRecoveryRequiresServer);
     }
     if !policy.client_direct_enabled {
         return Some(PlannerReason::DirectDisabledRequiresRelay);
@@ -743,6 +750,7 @@ mod tests {
             policy,
             requirements: PlaybackRequirements {
                 require_time_shift: false,
+                require_server_delivery: false,
             },
             now: now(),
         })
@@ -1005,6 +1013,56 @@ mod tests {
     }
 
     #[test]
+    fn p11_recovery_replans_the_same_direct_source_through_the_server() {
+        let client = client();
+        let policy = policy();
+        let direct = source(
+            StreamProtocol::Hls,
+            "https://media.example.invalid/live/main.m3u8",
+        );
+        let sources = ResolvedSources {
+            descriptor: direct,
+            alternatives: Vec::new(),
+        };
+        let relay = plan_delivery(&PlannerInput {
+            sources: &sources,
+            client: &client,
+            policy: &policy,
+            requirements: PlaybackRequirements {
+                require_time_shift: false,
+                require_server_delivery: true,
+            },
+            now: now(),
+        })
+        .unwrap();
+        assert_eq!(relay.mode, DeliveryMode::ServerRelay);
+        assert_eq!(relay.reason, PlannerReason::DirectRecoveryRequiresServer);
+
+        let mut dash_client = client.clone();
+        dash_client.protocols.insert(StreamProtocol::Dash);
+        let dash_sources = ResolvedSources {
+            descriptor: source(
+                StreamProtocol::Dash,
+                "https://media.example.invalid/live/manifest.mpd",
+            ),
+            alternatives: Vec::new(),
+        };
+        let remux = plan_delivery(&PlannerInput {
+            sources: &dash_sources,
+            client: &dash_client,
+            policy: &policy,
+            requirements: PlaybackRequirements {
+                require_time_shift: false,
+                require_server_delivery: true,
+            },
+            now: now(),
+        })
+        .unwrap();
+        assert_eq!(remux.mode, DeliveryMode::ServerRemux);
+        assert_eq!(remux.remux_profile, Some(RemuxProfile::DashToHlsCopy));
+    }
+
+    #[test]
     fn p11_capacity_flags_and_optional_transport_certifications_are_enforced() {
         let client = client();
         let mut policy = policy();
@@ -1067,6 +1125,7 @@ mod tests {
             policy: &policy,
             requirements: PlaybackRequirements {
                 require_time_shift: false,
+                require_server_delivery: false,
             },
             now: now(),
         })
@@ -1097,6 +1156,7 @@ mod tests {
                 policy: &policy,
                 requirements: PlaybackRequirements {
                     require_time_shift: true,
+                    require_server_delivery: false,
                 },
                 now: now(),
             })

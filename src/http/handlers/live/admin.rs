@@ -397,6 +397,11 @@ pub async fn egress_status(
     let result = async {
         reject_query(raw_query.as_deref())?;
         let _admission = admit(principal.user_id)?;
+        state
+            .live
+            .refresh_builtin_egress()
+            .await
+            .map_err(|_| service_unavailable())?;
         let assignments = EgressPolicyRepository::new(state.db_pool.clone())
             .assignments_for_home(principal.home_id)
             .await
@@ -404,15 +409,29 @@ pub async fn egress_status(
             .into_iter()
             .map(EgressAssignmentDto::from)
             .collect();
-        let (ready, active_bindings, available_capacity, profiles) = state
+        let config = &state.live.config().egress;
+        let (
+            enabled,
+            ready,
+            active_bindings,
+            available_capacity,
+            default_mode,
+            default_policy_id,
+            default_allow_fallback,
+            profiles,
+        ) = state
             .live
             .egress_service()
             .map(|service| {
                 let status = service.status();
                 (
+                    status.enabled,
                     status.ready,
                     status.active_bindings,
                     status.available_capacity,
+                    status.default_mode,
+                    status.default_policy_id,
+                    status.default_allow_fallback,
                     status
                         .profiles
                         .into_iter()
@@ -425,17 +444,25 @@ pub async fn egress_status(
                         .collect(),
                 )
             })
-            .unwrap_or((false, 0, 0, Vec::new()));
-        let config = &state.live.config().egress;
+            .unwrap_or((
+                state.live.config().protected_egress_enabled,
+                false,
+                0,
+                0,
+                config.default_mode,
+                config.default_policy_id.clone(),
+                config.default_allow_fallback,
+                Vec::new(),
+            ));
         let response = EgressStatusDto {
-            enabled: state.live.config().protected_egress_enabled,
+            enabled,
             ready,
             active_bindings,
             available_capacity,
             default_policy: EgressDefaultPolicyDto {
-                mode: egress_default_mode(config.default_mode),
-                policy_id: config.default_policy_id.clone(),
-                allow_fallback: config.default_allow_fallback,
+                mode: egress_default_mode(default_mode),
+                policy_id: default_policy_id,
+                allow_fallback: default_allow_fallback,
             },
             profiles,
             assignments,

@@ -184,6 +184,7 @@ pub struct DestinationPolicy {
     rules: Vec<DestinationRule>,
     private_lan: PrivateLanGate,
     allow_http: bool,
+    allow_public_discovery: bool,
     local_denylist: LocalDestinationDenylist,
     #[cfg(test)]
     allow_fixture_loopback: bool,
@@ -196,6 +197,7 @@ impl fmt::Debug for DestinationPolicy {
             .field("rule_count", &self.rules.len())
             .field("private_lan", &self.private_lan)
             .field("allow_http", &self.allow_http)
+            .field("allow_public_discovery", &self.allow_public_discovery)
             .field("local_denylist", &self.local_denylist)
             .finish()
     }
@@ -208,7 +210,31 @@ impl DestinationPolicy {
         allow_http: bool,
         local_denylist: LocalDestinationDenylist,
     ) -> Result<Self> {
-        if rules.is_empty() || rules.len() > MAX_RULES {
+        Self::build(rules, private_lan, allow_http, false, local_denylist)
+    }
+
+    pub(crate) fn for_public_session(
+        rules: Vec<DestinationRule>,
+        allow_http: bool,
+        local_denylist: LocalDestinationDenylist,
+    ) -> Result<Self> {
+        Self::build(
+            rules,
+            PrivateLanGate::default(),
+            allow_http,
+            true,
+            local_denylist,
+        )
+    }
+
+    fn build(
+        rules: Vec<DestinationRule>,
+        private_lan: PrivateLanGate,
+        allow_http: bool,
+        allow_public_discovery: bool,
+        local_denylist: LocalDestinationDenylist,
+    ) -> Result<Self> {
+        if rules.len() > MAX_RULES || (rules.is_empty() && !allow_public_discovery) {
             return Err(UpstreamErrorCode::DestinationForbidden.into());
         }
         if rules
@@ -222,6 +248,7 @@ impl DestinationPolicy {
             rules,
             private_lan,
             allow_http,
+            allow_public_discovery,
             local_denylist,
             #[cfg(test)]
             allow_fixture_loopback: false,
@@ -293,7 +320,7 @@ impl DestinationPolicy {
             host,
             port,
         };
-        if !self.rules.iter().any(|rule| rule.matches(&candidate)) {
+        if !self.allow_public_discovery && !self.rules.iter().any(|rule| rule.matches(&candidate)) {
             return Err(UpstreamErrorCode::DestinationForbidden.into());
         }
         Ok(candidate)
@@ -336,6 +363,7 @@ impl DestinationPolicy {
             .iter()
             .find(|rule| rule.matches(&target))
             .map(|rule| rule.network_scope)
+            .or_else(|| self.allow_public_discovery.then_some(NetworkScope::Public))
             .ok_or(UpstreamErrorCode::DestinationForbidden)?;
         match scope.ok_or(UpstreamErrorCode::DnsEmpty)? {
             AddressClass::Public if expected != NetworkScope::Public => {
