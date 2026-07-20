@@ -406,6 +406,35 @@ impl<'a> Executor<'a> {
         self.health_gate(provider_id, 60).await
     }
 
+    pub(crate) async fn refresh_provider_runtime_endpoint(
+        &self,
+        provider: &Provider,
+        declared_endpoint: ProviderEndpoint,
+    ) -> Result<bool> {
+        let endpoint =
+            resolve_provider_storage_endpoint(provider.instance_id, declared_endpoint).await?;
+        let endpoint_json =
+            serde_json::to_value(endpoint).context("serializing provider runtime endpoint")?;
+        if provider.endpoint_json.as_ref() == Some(&endpoint_json) {
+            return Ok(false);
+        }
+
+        self.store
+            .upsert_provider(&NewProvider {
+                provider_id: provider.provider_id,
+                instance_id: provider.instance_id,
+                capability: provider.capability.clone(),
+                slot_id: provider.slot_id.clone(),
+                cardinality: provider.cardinality,
+                implementation: provider.implementation.clone(),
+                scope_json: provider.scope_json.clone(),
+                endpoint_json: Some(endpoint_json),
+                health_state: provider.health_state,
+            })
+            .await?;
+        Ok(true)
+    }
+
     pub async fn apply_builtin_downloader_profiles_now(&self) -> Result<()> {
         let providers = self.store.list_providers(None).await?;
         for provider in providers {
@@ -7393,6 +7422,104 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    #[tokio::test]
+    async fn refresh_provider_runtime_endpoint_replaces_stale_port_without_resetting_state()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "ext.live", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.live".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let provider_id = Uuid::new_v4();
+        let stale_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "127.0.0.1".to_string(),
+            32_781,
+            Some("/".to_string()),
+            Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK.to_string()),
+        )?;
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "live.catalog_provider".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::Many,
+                implementation: Some("stremio_live_adapter".to_string()),
+                scope_json: Some(json!({ "actions": ["catalog", "resolve"] })),
+                endpoint_json: Some(serde_json::to_value(stale_endpoint)?),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        store
+            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
+            .await?;
+
+        let provider = store.get_provider(provider_id).await?.expect("provider");
+        let fresh_endpoint = ProviderEndpoint::new(
+            "http".to_string(),
+            "127.0.0.1".to_string(),
+            32_803,
+            Some("/".to_string()),
+            Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK.to_string()),
+        )?;
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = StubRuntime;
+        let temp_dir = TempDir::new()?;
+        let runtime_paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            runtime_paths,
+            &secrets,
+        );
+
+        assert!(
+            executor
+                .refresh_provider_runtime_endpoint(&provider, fresh_endpoint.clone())
+                .await?
+        );
+        let refreshed = store.get_provider(provider_id).await?.expect("provider");
+        let endpoint: ProviderEndpoint =
+            serde_json::from_value(refreshed.endpoint_json.as_ref().expect("endpoint").clone())?;
+        assert_eq!(endpoint, fresh_endpoint);
+        assert_eq!(refreshed.health_state, ProviderHealthState::Healthy);
+        assert_eq!(
+            store
+                .get_provider_readiness(provider_id)
+                .await?
+                .expect("readiness")
+                .readiness_phase,
+            ProviderReadinessPhase::DriverReady
+        );
+        assert!(
+            !executor
+                .refresh_provider_runtime_endpoint(&refreshed, fresh_endpoint)
+                .await?
+        );
+        Ok(())
     }
 
     async fn insert_extension(

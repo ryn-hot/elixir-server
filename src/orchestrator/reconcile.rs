@@ -857,7 +857,31 @@ impl<'a> Reconciler<'a> {
                 }
             };
 
-            if provider.endpoint_json.is_none() {
+            let mut endpoint_available = provider.endpoint_json.is_some();
+            match self
+                .refresh_provider_runtime_endpoint(
+                    &executor, provider, instance, extension, manifests,
+                )
+                .await
+            {
+                Ok(Some(changed)) => {
+                    endpoint_available = true;
+                    if changed {
+                        tracing::info!(
+                            provider_id = %provider.provider_id,
+                            instance_id = %instance.instance_id,
+                            "refreshed provider runtime endpoint"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => warn!(
+                    "reconcile: failed to refresh runtime endpoint for provider {}: {}",
+                    provider.provider_id, err
+                ),
+            }
+
+            if !endpoint_available {
                 let _ = self
                     .store
                     .update_provider_health(provider.provider_id, ProviderHealthState::Unhealthy)
@@ -939,6 +963,17 @@ impl<'a> Reconciler<'a> {
                         metrics::RECONCILE_ACTIONS
                             .with_label_values(&["restart_runtime", "ok"])
                             .inc();
+                        if let Err(err) = self
+                            .refresh_provider_runtime_endpoint(
+                                &executor, provider, instance, extension, manifests,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "reconcile: failed to refresh runtime endpoint after restarting provider {}: {}",
+                                provider.provider_id, err
+                            );
+                        }
                     }
                     restarted = true;
                 }
@@ -997,6 +1032,46 @@ impl<'a> Reconciler<'a> {
         }
 
         Ok(())
+    }
+
+    async fn refresh_provider_runtime_endpoint(
+        &self,
+        executor: &Executor<'_>,
+        provider: &crate::db::models::Provider,
+        instance: &crate::db::models::ExtensionInstance,
+        extension: &crate::db::models::Extension,
+        manifests: &mut HashMap<String, ExtensionManifest>,
+    ) -> Result<Option<bool>> {
+        let manifest = if let Some(manifest) = manifests.get(&extension.extension_id) {
+            manifest.clone()
+        } else {
+            let manifest: ExtensionManifest =
+                serde_json::from_value(extension.manifest_json.clone())
+                    .context("parsing extension manifest")?;
+            manifest.validate()?;
+            manifests.insert(extension.extension_id.clone(), manifest.clone());
+            manifest
+        };
+        let Some(provide) = manifest.provides.iter().find(|provide| {
+            provide.capability == provider.capability && provide.slot == provider.slot_id
+        }) else {
+            return Ok(None);
+        };
+        let (_, primary_alias) = build_aliases(
+            &extension.extension_id,
+            &instance.instance_name,
+            instance.instance_id,
+            manifest
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.service_name.clone()),
+        );
+        let declared_endpoint =
+            build_provider_endpoint(provide, &manifest.networking, &primary_alias)?;
+        executor
+            .refresh_provider_runtime_endpoint(provider, declared_endpoint)
+            .await
+            .map(Some)
     }
 
     async fn restart_runtime(
