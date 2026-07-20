@@ -426,6 +426,9 @@ impl<'a> Reconciler<'a> {
             if !extension.enabled || extension.kind != ExtensionKind::Module {
                 continue;
             }
+            if manifest_uses_internal_runtime(&extension.manifest_json) {
+                continue;
+            }
 
             let manifest = if let Some(manifest) = manifests.get(&extension.extension_id) {
                 manifest.clone()
@@ -856,6 +859,9 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             };
+            if manifest_uses_internal_runtime(&extension.manifest_json) {
+                continue;
+            }
 
             let mut endpoint_available = provider.endpoint_json.is_some();
             match self
@@ -1504,6 +1510,13 @@ fn provider_requires_runtime_readiness(provider: &crate::db::models::Provider) -
         provider.implementation.as_deref(),
         Some("sonarr" | "radarr" | "prowlarr" | "qbittorrent" | "nzbget")
     )
+}
+
+fn manifest_uses_internal_runtime(manifest: &serde_json::Value) -> bool {
+    manifest
+        .pointer("/runtime/type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|runtime_type| runtime_type.eq_ignore_ascii_case("internal"))
 }
 
 fn readiness_satisfies(current: ProviderReadinessPhase, required: ProviderReadinessPhase) -> bool {
@@ -3486,5 +3499,15 @@ mod tests {
         let config = ReconcileConfig::from_settings(&settings);
 
         assert_eq!(config.startup_settle, Duration::from_secs(23));
+    }
+
+    #[test]
+    fn internal_runtime_is_not_owned_by_container_reconciliation() {
+        assert!(manifest_uses_internal_runtime(&json!({
+            "runtime": { "type": "internal" }
+        })));
+        assert!(!manifest_uses_internal_runtime(&json!({
+            "runtime": { "type": "container" }
+        })));
     }
 }
