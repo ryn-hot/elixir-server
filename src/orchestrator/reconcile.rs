@@ -412,7 +412,7 @@ impl<'a> Reconciler<'a> {
                 );
                 break;
             }
-            if !instance.enabled || provider_instances.contains(&instance.instance_id) {
+            if !instance.enabled {
                 continue;
             }
 
@@ -424,6 +424,11 @@ impl<'a> Reconciler<'a> {
                 continue;
             };
             if !extension.enabled || extension.kind != ExtensionKind::Module {
+                continue;
+            }
+            if provider_instances.contains(&instance.instance_id)
+                && instance.runtime_version.as_deref() == Some(extension.version.as_str())
+            {
                 continue;
             }
             if manifest_uses_internal_runtime(&extension.manifest_json) {
@@ -3242,7 +3247,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_does_not_activate_instances_that_already_have_providers() -> Result<()> {
+    async fn reconcile_only_reactivates_provider_backed_instances_when_runtime_is_stale()
+    -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
 
@@ -3295,8 +3301,11 @@ mod tests {
                 enabled: true,
             })
             .await?;
+        store
+            .update_instance_runtime_version(instance_id, "1.0.0", None)
+            .await?;
 
-        let provider_id = Uuid::new_v4();
+        let provider_id = stable_provider_id(instance_id, "downloader.nzb", "default");
         let endpoint = ProviderEndpoint::new(
             "http".to_string(),
             "elx-nzbget".to_string(),
@@ -3376,6 +3385,72 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].provider_id, provider_id);
         assert_eq!(providers[0].health_state, ProviderHealthState::Healthy);
+
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: extension_id.to_string(),
+                name: "NZBGet".to_string(),
+                version: "1.1.0".to_string(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Verified,
+                manifest_json: json!({
+                    "id": extension_id,
+                    "version": "1.1.0",
+                    "kind": "module",
+                    "name": "NZBGet",
+                    "provides": [
+                        {
+                            "capability": "downloader.nzb",
+                            "slot": "default",
+                            "implementation": "nzbget"
+                        }
+                    ],
+                    "runtime": {
+                        "type": "container",
+                        "image": "lscr.io/linuxserver/nzbget:1.1.0",
+                        "service_name": "elx-nzbget"
+                    },
+                    "networking": {
+                        "service_port": {
+                            "scheme": "http",
+                            "container_port": 6789
+                        }
+                    }
+                }),
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+
+        reconciler.run_once().await?;
+
+        let runs = store.list_runs(Some(1)).await?;
+        let run = runs.first().expect("upgrade reconcile run");
+        let action_types = store
+            .list_steps(run.run_id)
+            .await?
+            .into_iter()
+            .map(|step| step.action_type)
+            .collect::<Vec<_>>();
+        assert!(
+            action_types.contains(&"ensure_runtime_running".to_string()),
+            "stale provider-backed runtime must enter the upgrade path: {action_types:?}"
+        );
+        assert!(
+            action_types.contains(&"create_or_update_provider".to_string()),
+            "provider endpoint and declaration must be refreshed after upgrade: {action_types:?}"
+        );
+
+        let instance = store
+            .get_instance(instance_id)
+            .await?
+            .expect("upgraded instance");
+        assert_eq!(instance.runtime_version.as_deref(), Some("1.1.0"));
+        let providers = store.list_providers(Some(instance_id)).await?;
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, provider_id);
 
         Ok(())
     }

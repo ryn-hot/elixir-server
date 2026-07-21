@@ -209,6 +209,59 @@ fn r11_media_rewrites_aes_map_ranges_and_preserves_dvr_semantics() {
 }
 
 #[test]
+fn r11_legacy_allow_cache_media_playlist_rewrites_without_weakening_unknown_tag_policy() {
+    const MEDIA: &str = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-VERSION:3\n",
+        "#EXT-X-TARGETDURATION:6\n",
+        "#EXT-X-MEDIA-SEQUENCE:14525\n",
+        "#EXT-X-DISCONTINUITY-SEQUENCE:15\n",
+        "#EXT-X-ALLOW-CACHE:NO\n",
+        "#EXT-X-PROGRAM-DATE-TIME:2026-07-21T04:02:08.834Z\n",
+        "#EXTINF:6.000,\n",
+        "segment.ts?token=SIGNED_CANARY\n",
+    );
+    let mut resources = resource_map(HlsResourceLimits::default());
+    let result = rewriter()
+        .rewrite(
+            &mut resources,
+            7,
+            &parent("/hls/live/index.m3u8"),
+            ROUTE_BASE,
+            MEDIA.as_bytes(),
+        )
+        .expect("legacy provider playlist rewrites");
+
+    assert_eq!(result.kind(), HlsManifestKind::Media);
+    assert_eq!(result.resource_count(), 1);
+    let output = std::str::from_utf8(result.body()).expect("UTF-8 output");
+    assert!(!output.contains("EXT-X-ALLOW-CACHE"));
+    assert!(!output.contains("SIGNED_CANARY"));
+
+    for rejected in [
+        MEDIA.replace("EXT-X-ALLOW-CACHE:NO", "EXT-X-ALLOW-CACHE:MAYBE"),
+        MEDIA.replace(
+            "#EXT-X-ALLOW-CACHE:NO\n",
+            "#EXT-X-ALLOW-CACHE:NO\n#EXT-X-ALLOW-CACHE:YES\n",
+        ),
+    ] {
+        let mut resources = resource_map(HlsResourceLimits::default());
+        assert!(
+            rewriter()
+                .rewrite(
+                    &mut resources,
+                    7,
+                    &parent("/hls/live/index.m3u8"),
+                    ROUTE_BASE,
+                    rejected.as_bytes(),
+                )
+                .is_err()
+        );
+        assert!(resources.is_empty());
+    }
+}
+
+#[test]
 fn r11_checked_in_dvr_and_frozen_playlists_preserve_window_metadata() {
     for (manifest, expected_sequence, expected_resources) in [(DVR, 400, 4), (FROZEN, 900, 1)] {
         let mut resources = resource_map(HlsResourceLimits::default());

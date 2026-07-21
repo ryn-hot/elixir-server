@@ -262,6 +262,13 @@ impl HlsRewriter {
                         &mut writer,
                     )?;
                 }
+                HlsLine::UnknownTag(tag) if is_legacy_allow_cache(&tag) => {
+                    state.mark_media()?;
+                    state.require_no_pending()?;
+                    mark_singleton(&mut state.allow_cache)?;
+                    // EXT-X-ALLOW-CACHE was removed from newer HLS revisions and has no
+                    // effect on Elixir's no-store relay responses.
+                }
                 HlsLine::KnownTag(_) | HlsLine::UnknownTag(_) => {
                     return Err(HlsRewriteError::UnsupportedTag);
                 }
@@ -811,6 +818,7 @@ struct RewriteState {
     has_target_duration: bool,
     has_media_sequence: bool,
     discontinuity_sequence: bool,
+    allow_cache: bool,
     playlist_type: bool,
     i_frames_only: bool,
     part_inf: bool,
@@ -887,6 +895,14 @@ fn mark_singleton(seen: &mut bool) -> Result<(), HlsRewriteError> {
     }
     *seen = true;
     Ok(())
+}
+
+fn is_legacy_allow_cache(tag: &quick_m3u8::tag::UnknownTag<'_>) -> bool {
+    tag.validation_error().is_none()
+        && matches!(
+            tag.as_bytes(),
+            b"#EXT-X-ALLOW-CACHE:YES" | b"#EXT-X-ALLOW-CACHE:NO"
+        )
 }
 
 fn skipped_segment_count(text: &str) -> Result<Option<u64>, HlsRewriteError> {

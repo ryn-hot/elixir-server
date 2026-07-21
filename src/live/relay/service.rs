@@ -950,13 +950,25 @@ impl LiveRelayService {
                 .with_credentials(relay.credentials.clone()),
             )
             .await?;
-        validate_resource_status(&response, upstream_range.as_deref())?;
+        let upstream_ignored_range =
+            upstream_range.is_some() && response.status() == StatusCode::OK;
+        validate_resource_status(
+            response.status(),
+            upstream_range.as_deref(),
+            upstream_ignored_range && descriptor.byte_range().is_none() && client_requested_range,
+        )?;
         validate_resource_content_type(descriptor.kind(), response.headers())?;
-        if let Some(expected) = upstream_range.as_deref() {
+        if let Some(expected) = upstream_range
+            .as_deref()
+            .filter(|_| !upstream_ignored_range)
+        {
             validate_content_range(response.headers(), expected)?;
         }
         let mut headers = relay_response_headers(response.headers());
         let mut status = response.status();
+        if upstream_ignored_range {
+            headers.remove(CONTENT_RANGE);
+        }
         if descriptor.byte_range().is_some() && !client_requested_range {
             status = StatusCode::OK;
             headers.remove(CONTENT_RANGE);
@@ -1331,11 +1343,14 @@ fn validate_range(value: &str) -> Result<String, LiveRelayError> {
 }
 
 fn validate_resource_status(
-    response: &UpstreamResponse,
+    status: StatusCode,
     range: Option<&str>,
+    allow_ignored_range: bool,
 ) -> Result<(), LiveRelayError> {
-    match (range.is_some(), response.status()) {
-        (true, StatusCode::PARTIAL_CONTENT) | (false, StatusCode::OK) => Ok(()),
+    match (range.is_some(), status, allow_ignored_range) {
+        (true, StatusCode::PARTIAL_CONTENT, _)
+        | (false, StatusCode::OK, _)
+        | (true, StatusCode::OK, true) => Ok(()),
         _ => Err(LiveRelayError::UpstreamStatus),
     }
 }
@@ -1463,6 +1478,30 @@ mod tests {
         assert_eq!(
             validate_content_range(&malformed, "bytes=0-"),
             Err(LiveRelayError::RangeRejected)
+        );
+    }
+
+    #[test]
+    fn r12_range_status_accepts_standard_full_response_only_when_explicitly_allowed() {
+        assert_eq!(
+            validate_resource_status(StatusCode::OK, None, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_resource_status(StatusCode::PARTIAL_CONTENT, Some("bytes=0-65535"), false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_resource_status(StatusCode::OK, Some("bytes=0-65535"), true),
+            Ok(())
+        );
+        assert_eq!(
+            validate_resource_status(StatusCode::OK, Some("bytes=0-65535"), false),
+            Err(LiveRelayError::UpstreamStatus)
+        );
+        assert_eq!(
+            validate_resource_status(StatusCode::PARTIAL_CONTENT, None, false),
+            Err(LiveRelayError::UpstreamStatus)
         );
     }
 

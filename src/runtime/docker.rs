@@ -1773,7 +1773,7 @@ impl RuntimeManager for DockerRuntimeManager {
             "destination=\"/run/elixir-seed/output/$1\"; ",
             "test ! -e \"$destination\"; ",
             "umask 077; ",
-            "cp --no-preserve=mode,ownership,timestamps /run/elixir-seed/input \"$destination.tmp\"; ",
+            "cp /run/elixir-seed/input \"$destination.tmp\"; ",
             "chmod 0600 \"$destination.tmp\"; ",
             "mv \"$destination.tmp\" \"$destination\"; ",
             "sync -f \"$destination\"; ",

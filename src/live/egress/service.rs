@@ -743,7 +743,7 @@ impl LiveEgressService {
                             .state_volume_name
                             .clone()
                             .ok_or(LiveEgressError::InvalidPolicy)?,
-                        image: self.config.worker_image.clone(),
+                        image: profile.gateway_image.clone(),
                         owner_uid: WARP_UID,
                         owner_gid: WARP_GID,
                         labels: warp_state_volume_labels(&profile),
@@ -773,7 +773,7 @@ impl LiveEgressService {
             self.runtime
                 .create_private_file_volume(&PrivateFileVolumeSpec {
                     name: control_volume_name.clone(),
-                    image: self.config.worker_image.clone(),
+                    image: profile.gateway_image.clone(),
                     source_path: secret_path.to_string_lossy().into_owned(),
                     file_name: "control.json".to_string(),
                     owner_uid: WORKER_UID,
@@ -788,7 +788,7 @@ impl LiveEgressService {
                 self.runtime
                     .create_private_file_volume(&PrivateFileVolumeSpec {
                         name: material_volume_name(binding_id, material.role),
-                        image: self.config.worker_image.clone(),
+                        image: profile.gateway_image.clone(),
                         source_path: staged_path.to_string_lossy().into_owned(),
                         file_name: material.file_name.to_string(),
                         owner_uid: WORKER_UID,
@@ -1586,9 +1586,9 @@ fn install_projected_profile(
     projected: &ActiveLiveEgressProfile,
 ) -> LiveEgressProfileConfig {
     let profile = project_builtin_profile(projected);
-    config.default_mode = LiveEgressDefaultMode::RequireProtected;
+    config.default_mode = LiveEgressDefaultMode::PreferProtected;
     config.default_policy_id = Some(profile.id.clone());
-    config.default_allow_fallback = false;
+    config.default_allow_fallback = true;
     config.profiles.push(profile.clone());
     profile
 }
@@ -2108,7 +2108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_builtin_projection_is_fail_closed_private_and_live_owned() {
+    fn live_builtin_projection_prefers_privacy_without_blocking_playback() {
         let projected = ActiveLiveEgressProfile {
             profile_id: "builtin-wg".to_string(),
             name: "Built-in WireGuard".to_string(),
@@ -2122,9 +2122,9 @@ mod tests {
         };
         let mut config = LiveEgressConfig::default();
         let profile = install_projected_profile(&mut config, &projected);
-        assert_eq!(config.default_mode, LiveEgressDefaultMode::RequireProtected);
+        assert_eq!(config.default_mode, LiveEgressDefaultMode::PreferProtected);
         assert_eq!(config.default_policy_id.as_deref(), Some("builtin-wg"));
-        assert!(!config.default_allow_fallback);
+        assert!(config.default_allow_fallback);
         assert!(!profile.selectable_by_profiles);
         assert!(profile.expected_egress_ips.is_empty());
         assert_eq!(
