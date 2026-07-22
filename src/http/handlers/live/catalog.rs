@@ -32,7 +32,8 @@ use crate::{
         catalog::{
             CacheFreshness, CatalogServiceError, LiveArtworkKind, LiveCatalogAccessContext,
             LivePublicKeyCodec, LivePublicKeyError, LivePublicKeyScope, ProviderCatalog,
-            ProviderScopedError, VisibleLiveProvider, VisibleProviderReadiness,
+            ProviderScopedError, VisibleLiveProvider, VisibleProviderAccountState,
+            VisibleProviderReadiness,
         },
         contract::{
             ArtworkSource, CatalogDefinition, CatalogPageRequest, Fact, FilterDefinition,
@@ -170,6 +171,7 @@ pub struct LiveHttpRejection {
     message: &'static str,
     retryable: bool,
     retry_after_seconds: Option<u32>,
+    provider_id: Option<Uuid>,
 }
 
 impl LiveHttpRejection {
@@ -250,7 +252,13 @@ impl LiveHttpRejection {
             message,
             retryable,
             retry_after_seconds: None,
+            provider_id: None,
         }
+    }
+
+    pub(super) fn with_provider(mut self, provider_id: Uuid) -> Self {
+        self.provider_id = Some(provider_id);
+        self
     }
 
     pub(super) fn from_auth_error(error: ApiError) -> Self {
@@ -299,10 +307,12 @@ struct LiveEnvelope<T: Serialize> {
 #[serde(rename_all = "camelCase")]
 struct ProviderSummaryDto {
     provider_id: Uuid,
+    instance_id: Uuid,
     extension_id: String,
     name: String,
     readiness: &'static str,
     disabled_reason: Option<String>,
+    account_state: &'static str,
     contract_version: u32,
     item_types: Vec<LiveItemType>,
     protocols: Vec<StreamProtocol>,
@@ -504,7 +514,7 @@ pub async fn catalog_items(
         let (definition, definition_freshness) = service
             .catalog_definition(&context, provider_id, &catalog_id, cancellation.token())
             .await
-            .map_err(map_service_error)?;
+            .map_err(|error| map_service_error(error).with_provider(provider_id))?;
         let query = parse_catalog_query(raw_query.as_deref(), &definition)?;
         let cursor = query
             .cursor
@@ -527,7 +537,7 @@ pub async fn catalog_items(
                 cancellation.token(),
             )
             .await
-            .map_err(map_service_error)?;
+            .map_err(|error| map_service_error(error).with_provider(provider_id))?;
         let stable_etag = catalog_page_etag(provider_id, &catalog_id, &page.page);
         let next_cursor = page
             .page
@@ -608,7 +618,7 @@ pub async fn item(
                 cancellation.token(),
             )
             .await
-            .map_err(map_service_error)?;
+            .map_err(|error| map_service_error(error).with_provider(provider_id))?;
         let stable_etag = item_metadata_etag(provider_id, &metadata.metadata);
         let item = item_dto(
             &keys,
@@ -794,15 +804,22 @@ fn parse_filter_value(
 fn provider_dto(provider: VisibleLiveProvider) -> ProviderSummaryDto {
     ProviderSummaryDto {
         provider_id: provider.provider_id,
+        instance_id: provider.instance_id,
         extension_id: provider.extension_id,
         name: provider.name,
         readiness: match provider.readiness {
             VisibleProviderReadiness::Ready => "ready",
             VisibleProviderReadiness::Degraded => "degraded",
+            VisibleProviderReadiness::NeedsAccount => "needs_account",
             VisibleProviderReadiness::Unavailable => "unavailable",
             VisibleProviderReadiness::Disabled => "disabled",
         },
         disabled_reason: provider.disabled_reason.map(str::to_string),
+        account_state: match provider.account_state {
+            VisibleProviderAccountState::NotRequired => "not_required",
+            VisibleProviderAccountState::NeedsAccount => "needs_account",
+            VisibleProviderAccountState::Connected => "connected",
+        },
         contract_version: 1,
         item_types: provider.item_types,
         protocols: provider.protocols,
@@ -964,6 +981,11 @@ fn provider_error_dto(error: ProviderScopedError) -> LiveApiError {
 
 fn provider_error_fields(code: &str) -> (&'static str, &'static str, bool) {
     match code {
+        "provider_account_required" => (
+            "LIVE_ACCOUNT_REQUIRED",
+            "Connect or reconnect this Live provider account.",
+            false,
+        ),
         "provider_request_timeout" | "provider_hard_timeout" => (
             "LIVE_PROVIDER_TIMEOUT",
             "The Live provider did not respond in time.",
@@ -992,6 +1014,14 @@ fn map_service_error(error: CatalogServiceError) -> LiveHttpRejection {
             "The Live request was cancelled.",
             true,
         ),
+        CatalogServiceError::Provider(code) if code == "provider_account_required" => {
+            LiveHttpRejection::new(
+                StatusCode::CONFLICT,
+                "LIVE_ACCOUNT_REQUIRED",
+                "Connect or reconnect this Live provider account.",
+                false,
+            )
+        }
         CatalogServiceError::Provider(code)
             if matches!(code, "provider_request_timeout" | "provider_hard_timeout") =>
         {
@@ -1177,6 +1207,7 @@ fn apply_success_headers(headers: &mut HeaderMap, etag: &str) {
 pub(super) fn error_response(error: LiveHttpRejection, request_id: Option<Uuid>) -> Response {
     let status = error.status;
     let retry_after_seconds = error.retry_after_seconds;
+    let provider_id = error.provider_id;
     let envelope = LiveEnvelope {
         data: Value::Null,
         meta: ApiMeta {
@@ -1190,7 +1221,7 @@ pub(super) fn error_response(error: LiveHttpRejection, request_id: Option<Uuid>)
             message: error.message,
             retryable: error.retryable,
             retry_after_seconds,
-            provider_id: None,
+            provider_id,
         }],
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
@@ -1258,6 +1289,32 @@ mod tests {
         secrets::SecretsManager,
         state::AppState,
     };
+
+    #[test]
+    fn lpi2_account_required_is_distinct_and_provider_scoped() {
+        let provider_id = Uuid::new_v4();
+        let rejection =
+            map_service_error(CatalogServiceError::Provider("provider_account_required"))
+                .with_provider(provider_id);
+        assert_eq!(rejection.status, StatusCode::CONFLICT);
+        assert_eq!(rejection.code, "LIVE_ACCOUNT_REQUIRED");
+        assert!(!rejection.retryable);
+        assert_eq!(rejection.provider_id, Some(provider_id));
+
+        let aggregated = provider_error_dto(ProviderScopedError {
+            provider_id,
+            code: "provider_account_required",
+        });
+        assert_eq!(aggregated.code, "LIVE_ACCOUNT_REQUIRED");
+        assert!(!aggregated.retryable);
+        assert_eq!(aggregated.provider_id, Some(provider_id));
+
+        let unavailable = map_service_error(CatalogServiceError::Provider(
+            "provider_upstream_unavailable",
+        ));
+        assert_eq!(unavailable.code, "LIVE_PROVIDER_UNAVAILABLE");
+        assert!(unavailable.retryable);
+    }
 
     fn settings() -> Settings {
         Settings {

@@ -436,7 +436,7 @@ pub async fn create(
                 &cancellation,
             )
             .await
-            .map_err(map_provider_error)?;
+            .map_err(|error| map_provider_error(error).with_provider(request.provider_id))?;
         let selected_egress = select_session_egress_policy(&state, &principal, &request).await?;
         let loaded_policy = load_policy(&state, principal.home_id, request.provider_id).await?;
         let client = planner_capabilities(&request.client)?;
@@ -1401,7 +1401,7 @@ async fn refresh_provider_source(
             cancellation,
         )
         .await
-        .map_err(map_provider_error)?;
+        .map_err(|error| map_provider_error(error).with_provider(provider.provider_id))?;
     if resolved.descriptor.stream_id != source.stream_id {
         return Err(contract_invalid());
     }
@@ -2798,6 +2798,15 @@ fn map_repository_error(error: SessionRepositoryError) -> LiveHttpRejection {
 fn map_provider_error(error: crate::live::provider::ProviderInvocationError) -> LiveHttpRejection {
     use crate::live::provider::ProviderInvocationError;
     match error {
+        ProviderInvocationError::Provider(crate::live::contract::ProviderFailure {
+            code: crate::live::contract::ProviderFailureCode::AccountRequired,
+            ..
+        }) => LiveHttpRejection::new(
+            StatusCode::CONFLICT,
+            "LIVE_ACCOUNT_REQUIRED",
+            "Connect or reconnect this Live provider account.",
+            false,
+        ),
         ProviderInvocationError::RequestTimeout | ProviderInvocationError::HardTimeout => {
             LiveHttpRejection::new(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -3112,6 +3121,43 @@ mod tests {
         secrets::SecretsManager,
         state::AppState,
     };
+
+    #[tokio::test]
+    async fn lpi2_session_provider_mapping_stops_on_account_required() {
+        let provider_id = Uuid::new_v4();
+        let rejection =
+            map_provider_error(crate::live::provider::ProviderInvocationError::Provider(
+                crate::live::contract::ProviderFailure {
+                    code: crate::live::contract::ProviderFailureCode::AccountRequired,
+                    message: "upstream detail must not escape".to_string(),
+                    retryable: true,
+                    retry_after_seconds: Some(5),
+                },
+            ))
+            .with_provider(provider_id);
+        let response = rejection.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let payload = body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("account error body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("account error JSON");
+        assert_eq!(payload["errors"][0]["code"], "LIVE_ACCOUNT_REQUIRED");
+        assert_eq!(payload["errors"][0]["retryable"], false);
+        assert_eq!(payload["errors"][0]["providerId"], provider_id.to_string());
+        assert!(!payload.to_string().contains("upstream"));
+
+        let timeout =
+            map_provider_error(crate::live::provider::ProviderInvocationError::RequestTimeout);
+        let timeout = timeout.into_response();
+        let payload = body::to_bytes(timeout.into_body(), 64 * 1024)
+            .await
+            .expect("timeout error body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("timeout error JSON");
+        assert_eq!(payload["errors"][0]["code"], "LIVE_PROVIDER_TIMEOUT");
+        assert_eq!(payload["errors"][0]["retryable"], true);
+    }
 
     struct DirectProviderFixture {
         port: u16,

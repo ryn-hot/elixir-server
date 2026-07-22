@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::models::SecretScope;
 use crate::extensions::manifest::{ManifestControlOwnedSetting, ManifestControlSurface};
@@ -74,8 +74,29 @@ impl ExtensionControlProvider for GenericManifestControlProvider {
             return Ok(Vec::new());
         };
 
-        let mut sections =
-            build_owned_setting_sections(state, store, context, &control_surface).await?;
+        let account_setting_ids = live_account_setting_ids(context, &control_surface);
+        let mut sections = Vec::new();
+        if let Some(section) = build_live_account_section(
+            state,
+            store,
+            context,
+            &control_surface,
+            &account_setting_ids,
+        )
+        .await?
+        {
+            sections.push(section);
+        }
+        sections.extend(
+            build_owned_setting_sections(
+                state,
+                store,
+                context,
+                &control_surface,
+                &account_setting_ids,
+            )
+            .await?,
+        );
         sections.extend(build_native_only_sections(&control_surface));
         if let Some(section) = build_runtime_bridge_gap_section(&control_surface) {
             sections.push(section);
@@ -118,6 +139,35 @@ impl ExtensionControlProvider for GenericManifestControlProvider {
         }
 
         Ok(())
+    }
+
+    async fn execute_action(
+        &self,
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        context: &ExtensionControlContext,
+        action_id: &str,
+        _params: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        if action_id != "disconnect_live_account" {
+            anyhow::bail!("unsupported control action '{action_id}'");
+        }
+        let Some(control_surface) = load_manifest_control_surface(context)? else {
+            anyhow::bail!("this extension does not expose a generic control contract");
+        };
+        let setting_ids = live_account_setting_ids(context, &control_surface);
+        if setting_ids.is_empty() {
+            anyhow::bail!("this extension does not declare a Live account");
+        }
+        for setting in control_surface
+            .owned_settings
+            .iter()
+            .filter(|setting| setting_ids.contains(setting.id.as_str()))
+        {
+            clear_owned_setting_value(store, context, setting).await?;
+        }
+        trigger_extensions_reconcile(state, "Live provider account disconnected");
+        Ok("Account disconnected.".to_string())
     }
 }
 
@@ -196,6 +246,7 @@ async fn build_owned_setting_sections(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
     control_surface: &ManifestControlSurface,
+    excluded_setting_ids: &HashSet<String>,
 ) -> anyhow::Result<Vec<ExtensionControlSection>> {
     let mut seeded_fields = Vec::new();
     let mut seeded_advanced_fields = Vec::new();
@@ -207,6 +258,9 @@ async fn build_owned_setting_sections(
     let mut managed_advanced_requires_instance = false;
 
     for setting in &control_surface.owned_settings {
+        if excluded_setting_ids.contains(&setting.id) {
+            continue;
+        }
         let field = read_owned_setting_field(state, store, context, setting).await?;
         let requires_instance =
             field.readonly && uses_instance_scope(setting) && context.selected_instance.is_none();
@@ -262,6 +316,138 @@ async fn build_owned_setting_sections(
     }
 
     Ok(sections)
+}
+
+fn live_account_setting_ids(
+    context: &ExtensionControlContext,
+    control_surface: &ManifestControlSurface,
+) -> HashSet<String> {
+    let required_storage_keys = context
+        .manifest
+        .provides
+        .iter()
+        .filter(|provide| {
+            provide.capability == crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY
+        })
+        .filter_map(|provide| provide.scope.as_ref())
+        .filter(|scope| scope.requires_account)
+        .flat_map(|scope| scope.required_fields.iter().cloned())
+        .collect::<HashSet<_>>();
+    control_surface
+        .owned_settings
+        .iter()
+        .filter(|setting| required_storage_keys.contains(&setting.storage.key))
+        .map(|setting| setting.id.clone())
+        .collect()
+}
+
+async fn build_live_account_section(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    control_surface: &ManifestControlSurface,
+    setting_ids: &HashSet<String>,
+) -> anyhow::Result<Option<ExtensionControlSection>> {
+    if setting_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = Vec::new();
+    let mut configured = context.selected_instance.is_some();
+    for setting in control_surface
+        .owned_settings
+        .iter()
+        .filter(|setting| setting_ids.contains(setting.id.as_str()))
+    {
+        let field = read_owned_setting_field(state, store, context, setting).await?;
+        configured &= owned_setting_field_is_present(&field);
+        fields.push(field);
+    }
+
+    let mut notices = Vec::new();
+    if !configured {
+        notices.push(control_notice(
+            "warning",
+            "live_account_required",
+            "Connect account",
+            "Enter the required provider account details to load this Live service.",
+        ));
+    }
+
+    let mut actions = Vec::new();
+    if let (Some(account_setup), Some(instance)) = (
+        control_surface.account_setup.as_ref(),
+        context.selected_instance.as_ref(),
+    ) {
+        actions.push(ExtensionControlAction {
+            id: "start_live_account_setup".to_string(),
+            label: if configured {
+                "Reconnect account".to_string()
+            } else {
+                "Connect account".to_string()
+            },
+            description: "Open the provider's account setup page and return the configured account to this extension instance."
+                .to_string(),
+            kind: "primary".to_string(),
+            params: Some(serde_json::json!({
+                "accountSetup": account_setup.mode.clone(),
+                "instanceId": instance.instance_id,
+            })),
+            confirm_text: None,
+            navigate_extension_id: None,
+            navigate_view: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
+        });
+    }
+    if configured {
+        actions.push(ExtensionControlAction {
+            id: "disconnect_live_account".to_string(),
+            label: "Disconnect account".to_string(),
+            description: "Remove this instance's provider account details from Elixir.".to_string(),
+            kind: "danger".to_string(),
+            params: None,
+            confirm_text: Some(
+                "Disconnect this provider account? This does not cancel the upstream subscription."
+                    .to_string(),
+            ),
+            navigate_extension_id: None,
+            navigate_view: None,
+            open_url: None,
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
+        });
+    }
+
+    Ok(Some(ExtensionControlSection {
+        id: "liveAccount".to_string(),
+        title: "Account".to_string(),
+        description: if configured {
+            "This extension instance has the account details required by its Live provider."
+                .to_string()
+        } else {
+            "Connect the account used by this Live provider. Elixir stores it only for this extension instance."
+                .to_string()
+        },
+        policy: Some(control_policy_managed(
+            "Elixir stores these extension-declared account fields for this instance.",
+        )),
+        notices,
+        fields,
+        entities: Vec::new(),
+        actions,
+    }))
+}
+
+fn owned_setting_field_is_present(field: &ExtensionControlField) -> bool {
+    match &field.value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        _ => true,
+    }
 }
 
 fn seed_settings_section(
@@ -419,7 +605,7 @@ async fn read_owned_setting_value(
     }
 }
 
-async fn write_owned_setting_value(
+pub(super) async fn write_owned_setting_value(
     state: &AppState,
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
@@ -481,7 +667,48 @@ async fn write_owned_setting_value(
     Ok(())
 }
 
-fn normalize_owned_setting_value(
+async fn clear_owned_setting_value(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    setting: &ManifestControlOwnedSetting,
+) -> anyhow::Result<()> {
+    let instance = context
+        .selected_instance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no extension instance is available"))?;
+    match setting.storage.r#type.trim().to_ascii_lowercase().as_str() {
+        "instance_setting" => {
+            let current = store
+                .get_instance(instance.instance_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("extension instance not found"))?;
+            let updated = merge_instance_control_setting(
+                current.config_json.as_ref(),
+                &setting.storage.key,
+                serde_json::Value::Null,
+            )?;
+            store
+                .update_instance_config(instance.instance_id, Some(&updated))
+                .await?;
+        }
+        "instance_secret" => {
+            for secret in store
+                .list_secrets(
+                    Some(SecretScope::Instance),
+                    Some(instance.instance_id),
+                    Some(&setting.storage.key),
+                )
+                .await?
+            {
+                store.delete_secret(secret.secret_id).await?;
+            }
+        }
+        other => anyhow::bail!("unsupported Live account storage type '{other}'"),
+    }
+    Ok(())
+}
+
+pub(super) fn normalize_owned_setting_value(
     setting: &ManifestControlOwnedSetting,
     raw_value: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
@@ -650,6 +877,164 @@ fn build_runtime_bridge_gap_section(
         entities: Vec::new(),
         actions: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::{
+        config::DatabaseConfig,
+        db::{
+            Database,
+            models::{ExtensionKind, ExtensionTrustLevel},
+        },
+        extensions::store::{NewExtension, NewExtensionInstance, NewSecret},
+    };
+
+    #[tokio::test]
+    async fn disconnect_clears_only_declared_instance_account_fields() -> anyhow::Result<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "id": "fixture.live.account",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Fixture Live Account",
+            "provides": [{
+                "capability": "live.catalog_provider",
+                "slot": "default",
+                "scope": {
+                    "requires_account": true,
+                    "required_fields": ["username", "password"]
+                }
+            }],
+            "control_surface": {
+                "adapter": "generic_v1",
+                "owned_settings": [
+                    {
+                        "id": "username",
+                        "label": "Username",
+                        "type": "text",
+                        "required": true,
+                        "ownership": "managed",
+                        "storage": {"type": "instance_setting", "key": "username"}
+                    },
+                    {
+                        "id": "password",
+                        "label": "Password",
+                        "type": "password",
+                        "required": true,
+                        "secret": true,
+                        "ownership": "managed",
+                        "storage": {"type": "instance_secret", "key": "password"}
+                    }
+                ]
+            }
+        }))?;
+        let manifest_json = serde_json::to_value(&manifest)?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json,
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: manifest.id.clone(),
+                instance_name: "default".to_string(),
+                config_json: Some(serde_json::json!({
+                    "username": "viewer",
+                    "region": "us"
+                })),
+                enabled: true,
+            })
+            .await?;
+        for key in ["password", "unrelated_secret"] {
+            store
+                .upsert_secret(&NewSecret {
+                    secret_id: Uuid::new_v4(),
+                    scope: SecretScope::Instance,
+                    scope_id: Some(instance_id),
+                    key: key.to_string(),
+                    value_encrypted: format!("encrypted-{key}"),
+                    rotatable: false,
+                })
+                .await?;
+        }
+        let extension = store.get_extension(&manifest.id).await?.expect("extension");
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let context = ExtensionControlContext {
+            extension,
+            manifest: manifest.clone(),
+            summary: ExtensionStatusSummaryItem {
+                extension_id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                kind: ExtensionKind::Module,
+                trust_level: ExtensionTrustLevel::Community,
+                enabled: true,
+                severity: "ready".to_string(),
+                status_code: "ready".to_string(),
+                label: "Ready".to_string(),
+                description: "Ready".to_string(),
+                primary_action: "open".to_string(),
+                primary_action_label: "Open".to_string(),
+                auto_update: None,
+                optional_addons: Vec::new(),
+            },
+            instances: vec![instance.clone()],
+            selected_instance: Some(instance),
+            providers: Vec::new(),
+            selected_provider: None,
+            control_binding: ExtensionControlBinding::GenericManifest,
+        };
+        let settings = &manifest
+            .control_surface
+            .as_ref()
+            .expect("control surface")
+            .owned_settings;
+        for setting in settings {
+            clear_owned_setting_value(&store, &context, setting).await?;
+        }
+
+        let updated = store
+            .get_instance(instance_id)
+            .await?
+            .expect("updated instance");
+        assert_eq!(
+            updated.config_json,
+            Some(serde_json::json!({"region": "us"}))
+        );
+        assert!(
+            store
+                .get_secret(SecretScope::Instance, Some(instance_id), "password")
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .get_secret(SecretScope::Instance, Some(instance_id), "unrelated_secret")
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
 }
 
 fn default_owned_setting_description(setting: &ManifestControlOwnedSetting) -> String {

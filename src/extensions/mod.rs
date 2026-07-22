@@ -16,6 +16,7 @@ use elixir_classifier::HintParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
 
+pub mod account_setup;
 pub mod auto_managed;
 pub mod cloudstream_registry;
 pub mod managed_paths;

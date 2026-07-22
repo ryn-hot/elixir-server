@@ -35,6 +35,7 @@ pub struct AppState {
     pub auth_service: AuthService,
     pub secrets: Arc<SecretsManager>,
     pub extensions: Arc<ExtensionManager>,
+    pub extension_account_setup: crate::extensions::account_setup::AccountSetupSessions,
     pub metadata: Arc<MetadataService>,
     pub linkers: Arc<LinkerService>,
     pub artwork: Arc<ArtworkService>,
@@ -192,6 +193,8 @@ impl AppState {
             auth_service,
             secrets,
             extensions: Arc::new(extensions),
+            extension_account_setup:
+                crate::extensions::account_setup::AccountSetupSessions::default(),
             metadata: Arc::new(metadata),
             linkers: Arc::new(linkers),
             artwork: Arc::new(artwork),

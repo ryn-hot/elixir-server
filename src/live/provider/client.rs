@@ -22,9 +22,9 @@ use crate::live::{
     contract::{
         CatalogPage, CatalogPageRequest, CatalogSet, CatalogsRequest, ContractError,
         ContractErrorCode, ItemMetadata, LIVE_PROVIDER_CONTRACT_VERSION,
-        MAX_PROVIDER_RESPONSE_BYTES, MetaRequest, ProviderFailure, ProviderHealth,
-        ProviderOperation, ProviderRequest, ProviderRequestContext, RefreshRequest, ResolveRequest,
-        ResolvedSources, parse_catalog_page_response, parse_catalogs_response,
+        MAX_PROVIDER_RESPONSE_BYTES, MetaRequest, ProviderFailure, ProviderFailureCode,
+        ProviderHealth, ProviderOperation, ProviderRequest, ProviderRequestContext, RefreshRequest,
+        ResolveRequest, ResolvedSources, parse_catalog_page_response, parse_catalogs_response,
         parse_health_response, parse_meta_response, parse_provider_failure, parse_refresh_response,
         parse_resolve_response,
     },
@@ -98,7 +98,10 @@ impl ProviderInvocationError {
             Self::InvalidContentType => "provider_content_type_invalid",
             Self::ResponseTooLarge => "provider_response_too_large",
             Self::Contract(_) => "provider_contract_failure",
-            Self::Provider(_) => "provider_reported_failure",
+            Self::Provider(failure) => match failure.code {
+                ProviderFailureCode::AccountRequired => "provider_account_required",
+                _ => "provider_reported_failure",
+            },
         }
     }
 }

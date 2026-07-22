@@ -213,6 +213,18 @@ pub fn router(state: AppState) -> Router {
             post(handlers::extensions::run_extension_control_action),
         )
         .route(
+            "/api/v1/extensions/:id/instances/:instance_id/account-setup",
+            post(handlers::extensions::start_extension_account_setup),
+        )
+        .route(
+            "/api/v1/extensions/:id/instances/:instance_id/account-setup/:setup_id",
+            get(handlers::extensions::get_extension_account_setup_status),
+        )
+        .route(
+            "/api/v1/extensions/account-setup/complete/:token",
+            post(handlers::extensions::complete_extension_account_setup),
+        )
+        .route(
             "/api/v1/extensions/instances/:id/ui/start",
             get(handlers::extensions::start_extension_ui_session),
         )

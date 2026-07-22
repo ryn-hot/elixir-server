@@ -29,6 +29,7 @@ use tokio::net::lookup_host;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::auth::home_profiles::HomeRole;
 use crate::config::{DownloaderPerformanceProfile, RunEnvironment};
 use crate::db::models::{
     Binding, BindingStatus, DesiredBlueprint, Extension, ExtensionInstance, ExtensionKind,
@@ -41,6 +42,7 @@ use crate::debrid::{
     active_debrid_service_from_config, debrid_secret_exists_for_instance, is_debrid_extension_id,
 };
 use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
+use crate::extensions::account_setup::{AccountSetupSessionError, AccountSetupState};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::cloudstream_registry::{
     CLOUDSTREAM_COMPAT_EXTENSION_ID, seed_cloudstream_recommended_source_pack_for_instance,
@@ -67,7 +69,7 @@ use crate::extensions::store::{
     NewOperationStep, NewOrchestratorRun, NewSecret,
 };
 use crate::extensions::updater::{ProxyRuntimeUpdateState, load_proxy_runtime_update_state};
-use crate::http::auth::CurrentUser;
+use crate::http::auth::{CurrentPrincipal, CurrentUser};
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::executor::ExecutorAction;
 use crate::orchestrator::model::ProviderEndpoint;
@@ -581,6 +583,12 @@ pub struct UpdateExtensionControlSettingsRequest {
     pub values: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionControlQuery {
+    pub instance_id: Option<Uuid>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunExtensionControlActionRequest {
@@ -594,6 +602,39 @@ pub struct ExtensionControlActionResponse {
     pub success: bool,
     pub message: String,
     pub control_surface: ExtensionControlSurface,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartExtensionAccountSetupResponse {
+    pub setup_id: Uuid,
+    pub extension_id: String,
+    pub instance_id: Uuid,
+    pub configure_url: String,
+    pub status_url: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteExtensionAccountSetupRequest {
+    pub values: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteExtensionAccountSetupResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionAccountSetupStatusResponse {
+    pub setup_id: Uuid,
+    pub extension_id: String,
+    pub instance_id: Uuid,
+    pub status: &'static str,
+    pub completed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1187,9 +1228,10 @@ pub async fn get_extension(
 pub async fn get_extension_control_surface(
     State(state): State<AppState>,
     Path(extension_id): Path<String>,
+    Query(query): Query<ExtensionControlQuery>,
 ) -> ApiResult<Json<ExtensionControlSurface>> {
     let store = ExtensionStore::new(&state.db_pool);
-    let surface = build_extension_control_surface(&state, &store, &extension_id)
+    let surface = build_extension_control_surface(&state, &store, &extension_id, query.instance_id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(surface))
@@ -1198,18 +1240,27 @@ pub async fn get_extension_control_surface(
 pub async fn update_extension_control_surface_settings(
     State(state): State<AppState>,
     Path(extension_id): Path<String>,
+    Query(query): Query<ExtensionControlQuery>,
     Json(payload): Json<UpdateExtensionControlSettingsRequest>,
 ) -> ApiResult<Json<ExtensionControlSurface>> {
     let store = ExtensionStore::new(&state.db_pool);
     if !payload.values.is_empty() {
-        let context = load_extension_control_context(&state, &store, &extension_id)
-            .await
-            .map_err(ApiError::from)?;
+        let context = load_extension_control_context_for_instance(
+            &state,
+            &store,
+            &extension_id,
+            query.instance_id,
+        )
+        .await
+        .map_err(ApiError::from)?;
         control::update_settings(&state, &store, &context, &payload.values)
             .await
             .map_err(ApiError::from)?;
     }
-    let surface = build_extension_control_surface(&state, &store, &extension_id)
+    if !payload.values.is_empty() {
+        trigger_extensions_reconcile(&state, "extension control settings updated");
+    }
+    let surface = build_extension_control_surface(&state, &store, &extension_id, query.instance_id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(surface))
@@ -1218,6 +1269,7 @@ pub async fn update_extension_control_surface_settings(
 pub async fn run_extension_control_action(
     State(state): State<AppState>,
     Path((extension_id, action_id)): Path<(String, String)>,
+    Query(query): Query<ExtensionControlQuery>,
     payload: Option<Json<RunExtensionControlActionRequest>>,
 ) -> ApiResult<Json<ExtensionControlActionResponse>> {
     let params = payload
@@ -1225,11 +1277,17 @@ pub async fn run_extension_control_action(
         .map(|value| value.params.clone())
         .unwrap_or_default();
     let store = ExtensionStore::new(&state.db_pool);
-    let message =
-        execute_extension_control_action(&state, &store, &extension_id, &action_id, &params)
-            .await
-            .map_err(ApiError::from)?;
-    let surface = build_extension_control_surface(&state, &store, &extension_id)
+    let message = execute_extension_control_action_for_instance(
+        &state,
+        &store,
+        &extension_id,
+        query.instance_id,
+        &action_id,
+        &params,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let surface = build_extension_control_surface(&state, &store, &extension_id, query.instance_id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ExtensionControlActionResponse {
@@ -1237,6 +1295,270 @@ pub async fn run_extension_control_action(
         message,
         control_surface: surface,
     }))
+}
+
+pub async fn start_extension_account_setup(
+    State(state): State<AppState>,
+    Path((extension_id, instance_id)): Path<(String, Uuid)>,
+    principal: CurrentPrincipal,
+    headers: AxumHeaderMap,
+) -> ApiResult<Json<StartExtensionAccountSetupResponse>> {
+    principal.require_home_role(HomeRole::Owner)?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let context = load_extension_control_context_for_instance(
+        &state,
+        &store,
+        &extension_id,
+        Some(instance_id),
+    )
+    .await
+    .map_err(|_| ApiError::not_found("Live provider extension instance not found"))?;
+    let account_setup = context
+        .manifest
+        .control_surface
+        .as_ref()
+        .and_then(|surface| surface.account_setup.as_ref())
+        .ok_or_else(|| ApiError::conflict("this Live provider uses native account fields"))?;
+
+    let started = state
+        .extension_account_setup
+        .start(
+            principal.user_id,
+            context.extension.extension_id.clone(),
+            context.extension.version.clone(),
+            instance_id,
+            account_setup.result_settings.clone(),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(map_account_setup_session_error)?;
+    let return_url = extension_account_setup_return_url(&headers, &started.token)?;
+    let mut configure_url = Url::parse(&account_setup.configure_url)
+        .map_err(|_| ApiError::conflict("the provider account setup URL is invalid"))?;
+    configure_url
+        .query_pairs_mut()
+        .append_pair("elixir_return_url", return_url.as_str());
+    let status_url = format!(
+        "/api/v1/extensions/{}/instances/{}/account-setup/{}",
+        context.extension.extension_id, instance_id, started.session.setup_id
+    );
+
+    Ok(Json(StartExtensionAccountSetupResponse {
+        setup_id: started.session.setup_id,
+        extension_id: context.extension.extension_id,
+        instance_id,
+        configure_url: configure_url.to_string(),
+        status_url,
+        expires_at: started.session.expires_at,
+    }))
+}
+
+pub async fn complete_extension_account_setup(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Json(payload): Json<CompleteExtensionAccountSetupRequest>,
+) -> ApiResult<Json<CompleteExtensionAccountSetupResponse>> {
+    if token.len() < 32 || token.len() > 128 || payload.values.len() > 16 {
+        return Err(ApiError::bad_request("invalid account setup result"));
+    }
+    let now = chrono::Utc::now();
+    let session = state
+        .extension_account_setup
+        .claim(&token, now)
+        .await
+        .map_err(map_account_setup_session_error)?;
+    let completion = persist_extension_account_setup(&state, &session, &payload.values).await;
+    if let Err(error) = completion {
+        state
+            .extension_account_setup
+            .release(session.setup_id)
+            .await;
+        return Err(error);
+    }
+    state
+        .extension_account_setup
+        .finish(session.setup_id, now)
+        .await
+        .map_err(map_account_setup_session_error)?;
+    trigger_extensions_reconcile(&state, "Live provider account setup completed");
+    Ok(Json(CompleteExtensionAccountSetupResponse {
+        success: true,
+    }))
+}
+
+pub async fn get_extension_account_setup_status(
+    State(state): State<AppState>,
+    Path((extension_id, instance_id, setup_id)): Path<(String, Uuid, Uuid)>,
+    principal: CurrentPrincipal,
+) -> ApiResult<Json<ExtensionAccountSetupStatusResponse>> {
+    principal.require_home_role(HomeRole::Owner)?;
+    let status = state
+        .extension_account_setup
+        .status(
+            setup_id,
+            principal.user_id,
+            &extension_id,
+            instance_id,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(map_account_setup_session_error)?;
+    Ok(Json(ExtensionAccountSetupStatusResponse {
+        setup_id,
+        extension_id,
+        instance_id,
+        status: match status {
+            AccountSetupState::Completed => "completed",
+            AccountSetupState::Pending | AccountSetupState::Completing => "pending",
+        },
+        completed: status == AccountSetupState::Completed,
+    }))
+}
+
+async fn persist_extension_account_setup(
+    state: &AppState,
+    session: &crate::extensions::account_setup::AccountSetupSession,
+    values: &HashMap<String, serde_json::Value>,
+) -> ApiResult<()> {
+    let store = ExtensionStore::new(&state.db_pool);
+    let context = load_extension_control_context_for_instance(
+        state,
+        &store,
+        &session.extension_id,
+        Some(session.instance_id),
+    )
+    .await
+    .map_err(|_| ApiError::conflict("the extension instance changed during account setup"))?;
+    if context.extension.version != session.extension_version {
+        return Err(ApiError::conflict(
+            "the extension was updated during account setup; reconnect again",
+        ));
+    }
+    let control_surface = context
+        .manifest
+        .control_surface
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("the extension account contract changed"))?;
+    let current_result_ids = control_surface
+        .account_setup
+        .as_ref()
+        .map(|setup| setup.result_settings.as_slice())
+        .ok_or_else(|| ApiError::conflict("the extension account contract changed"))?;
+    if current_result_ids != session.result_setting_ids.as_slice() {
+        return Err(ApiError::conflict(
+            "the extension account contract changed; reconnect again",
+        ));
+    }
+    let expected = session
+        .result_setting_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if values.len() != expected.len()
+        || values
+            .keys()
+            .any(|field_id| !expected.contains(field_id.as_str()))
+    {
+        return Err(ApiError::bad_request(
+            "account setup returned unexpected or missing fields",
+        ));
+    }
+
+    let settings = control_surface
+        .owned_settings
+        .iter()
+        .map(|setting| (setting.id.as_str(), setting))
+        .collect::<HashMap<_, _>>();
+    for field_id in &session.result_setting_ids {
+        let setting = settings
+            .get(field_id.as_str())
+            .copied()
+            .ok_or_else(|| ApiError::conflict("the extension account contract changed"))?;
+        control_contract::normalize_owned_setting_value(
+            setting,
+            values
+                .get(field_id)
+                .ok_or_else(|| ApiError::bad_request("account setup field is missing"))?,
+        )
+        .map_err(|_| ApiError::bad_request("account setup returned an invalid field"))?;
+    }
+    for field_id in &session.result_setting_ids {
+        let setting = settings
+            .get(field_id.as_str())
+            .copied()
+            .ok_or_else(|| ApiError::conflict("the extension account contract changed"))?;
+        control_contract::write_owned_setting_value(
+            state,
+            &store,
+            &context,
+            setting,
+            values
+                .get(field_id)
+                .ok_or_else(|| ApiError::bad_request("account setup field is missing"))?,
+        )
+        .await
+        .map_err(|_| ApiError::internal("account setup could not be saved"))?;
+    }
+    Ok(())
+}
+
+fn extension_account_setup_return_url(headers: &AxumHeaderMap, token: &str) -> ApiResult<Url> {
+    let scheme = first_forwarded_header(headers, "x-forwarded-proto")
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    let host = first_forwarded_header(headers, "x-forwarded-host")
+        .or_else(|| {
+            headers
+                .get(axum_header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        })
+        .ok_or_else(|| ApiError::bad_request("account setup requires a server host"))?;
+    if host.is_empty() || host.len() > 512 || host.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "account setup server host is invalid",
+        ));
+    }
+    host.parse::<axum::http::uri::Authority>()
+        .map_err(|_| ApiError::bad_request("account setup server host is invalid"))?;
+    Url::parse(&format!(
+        "{scheme}://{host}/api/v1/extensions/account-setup/complete/{token}"
+    ))
+    .map_err(|_| ApiError::bad_request("account setup return URL is invalid"))
+}
+
+fn first_forwarded_header<'a>(headers: &'a AxumHeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+}
+
+fn map_account_setup_session_error(error: AccountSetupSessionError) -> ApiError {
+    match error {
+        AccountSetupSessionError::NotFound => {
+            ApiError::not_found("account setup session not found")
+        }
+        AccountSetupSessionError::Expired => ApiError::structured(
+            StatusCode::GONE,
+            "account_setup_expired",
+            "account setup session expired",
+            None,
+        ),
+        AccountSetupSessionError::Forbidden => {
+            ApiError::forbidden("account setup session does not belong to this account")
+        }
+        AccountSetupSessionError::AlreadyUsed => {
+            ApiError::conflict("account setup session was already used")
+        }
+        AccountSetupSessionError::Capacity => ApiError::structured(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account_setup_unavailable",
+            "account setup is temporarily unavailable",
+            None,
+        ),
+    }
 }
 
 pub async fn resume_prism_certification_jobs(state: AppState) {
@@ -4734,8 +5056,11 @@ async fn build_extension_control_surface(
     state: &AppState,
     store: &ExtensionStore<'_>,
     extension_id: &str,
+    instance_id: Option<Uuid>,
 ) -> anyhow::Result<ExtensionControlSurface> {
-    let context = load_extension_control_context(state, store, extension_id).await?;
+    let context =
+        load_extension_control_context_for_instance(state, store, extension_id, instance_id)
+            .await?;
     let live_snapshot = match tokio::time::timeout(
         Duration::from_secs(2),
         control::load_live_snapshot(state, store, &context),
@@ -4798,6 +5123,21 @@ async fn build_extension_control_surface(
         sections.push(section);
     }
     sections.push(build_extension_control_overview_section(&context));
+
+    if sections.iter().any(|section| {
+        section
+            .notices
+            .iter()
+            .any(|notice| notice.code == "live_account_required")
+    }) {
+        status.health = "needs_setup".to_string();
+        status.summary = "Needs account".to_string();
+        status.details.insert(
+            0,
+            "Connect this extension instance to its provider account to use Live content."
+                .to_string(),
+        );
+    }
 
     let mut managed_drift_titles = Vec::new();
     for section in &sections {
@@ -5346,6 +5686,15 @@ async fn load_extension_control_context(
     store: &ExtensionStore<'_>,
     extension_id: &str,
 ) -> anyhow::Result<ExtensionControlContext> {
+    load_extension_control_context_for_instance(state, store, extension_id, None).await
+}
+
+async fn load_extension_control_context_for_instance(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    instance_id: Option<Uuid>,
+) -> anyhow::Result<ExtensionControlContext> {
     let extension_id = resolve_extension_control_extension_id(store, extension_id).await?;
     let extension = store
         .get_extension(&extension_id)
@@ -5359,7 +5708,16 @@ async fn load_extension_control_context(
         .find(|item| item.extension_id == extension_id)
         .ok_or_else(|| anyhow::anyhow!("extension status not found"))?;
     let instances = store.list_instances(Some(&extension_id)).await?;
-    let selected_instance = choose_extension_control_instance(&instances);
+    let selected_instance = match instance_id {
+        Some(instance_id) => Some(
+            instances
+                .iter()
+                .find(|instance| instance.instance_id == instance_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("extension instance not found"))?,
+        ),
+        None => choose_extension_control_instance(&instances),
+    };
     let providers = if let Some(instance) = selected_instance.as_ref() {
         store.list_providers(Some(instance.instance_id)).await?
     } else {
@@ -8370,7 +8728,28 @@ async fn execute_extension_control_action(
     action_id: &str,
     params: &HashMap<String, serde_json::Value>,
 ) -> anyhow::Result<String> {
-    let context = load_extension_control_context(state, store, extension_id).await?;
+    execute_extension_control_action_for_instance(
+        state,
+        store,
+        extension_id,
+        None,
+        action_id,
+        params,
+    )
+    .await
+}
+
+async fn execute_extension_control_action_for_instance(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    instance_id: Option<Uuid>,
+    action_id: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let context =
+        load_extension_control_context_for_instance(state, store, extension_id, instance_id)
+            .await?;
     control::execute_action(state, store, &context, action_id, params).await
 }
 

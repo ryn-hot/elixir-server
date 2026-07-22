@@ -21,7 +21,7 @@ pub use public_keys::{
 pub use service::{
     AggregatedCatalogs, CatalogServiceError, LiveCatalogAccessContext, LiveCatalogService,
     ProviderCatalog, ProviderCatalogPage, ProviderItemMetadata, ProviderScopedError,
-    VisibleLiveProvider, VisibleProviderReadiness,
+    VisibleLiveProvider, VisibleProviderAccountState, VisibleProviderReadiness,
 };
 
 #[cfg(test)]

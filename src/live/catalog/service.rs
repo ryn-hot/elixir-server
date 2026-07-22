@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     auth::home_profiles::{HomeRole, ProfileType},
+    db::models::SecretScope,
+    extensions::store::ExtensionStore,
     live::{
         contract::{
             CatalogDefinition, CatalogPage, CatalogPageRequest, CatalogSet, ItemMetadata,
@@ -99,10 +101,12 @@ pub struct ProviderItemMetadata {
 #[derive(Debug, Clone)]
 pub struct VisibleLiveProvider {
     pub provider_id: Uuid,
+    pub instance_id: Uuid,
     pub extension_id: String,
     pub name: String,
     pub readiness: VisibleProviderReadiness,
     pub disabled_reason: Option<&'static str>,
+    pub account_state: VisibleProviderAccountState,
     pub item_types: Vec<LiveItemType>,
     pub protocols: Vec<StreamProtocol>,
 }
@@ -111,8 +115,16 @@ pub struct VisibleLiveProvider {
 pub enum VisibleProviderReadiness {
     Ready,
     Degraded,
+    NeedsAccount,
     Unavailable,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleProviderAccountState {
+    NotRequired,
+    NeedsAccount,
+    Connected,
 }
 
 #[derive(Debug, Error)]
@@ -190,8 +202,9 @@ impl LiveCatalogService {
     ) -> Result<Vec<VisibleLiveProvider>, CatalogServiceError> {
         self.validate_context(context)?;
         let providers = sqlx::query(
-            "SELECT p.provider_id, e.extension_id, e.name,
+            "SELECT p.provider_id, p.instance_id, e.extension_id, e.name,
                     CAST(p.scope_json AS TEXT) AS scope_json,
+                    CAST(i.config_json AS TEXT) AS instance_config_json,
                     p.health_state,
                     CAST(CASE WHEN e.enabled THEN 1 ELSE 0 END AS BIGINT) AS extension_enabled,
                     CAST(CASE WHEN i.enabled THEN 1 ELSE 0 END AS BIGINT) AS instance_enabled,
@@ -219,6 +232,14 @@ impl LiveCatalogService {
                 .and_then(|value| Uuid::parse_str(&value).ok());
             let Some(provider_id) = provider_id else {
                 tracing::warn!("excluding Live provider with invalid persisted identifier");
+                continue;
+            };
+            let instance_id = row
+                .try_get::<String, _>("instance_id")
+                .ok()
+                .and_then(|value| Uuid::parse_str(&value).ok());
+            let Some(instance_id) = instance_id else {
+                tracing::warn!(provider_id = %provider_id, "excluding Live provider with invalid instance identifier");
                 continue;
             };
             match self.require_visibility(context, provider_id).await {
@@ -262,6 +283,25 @@ impl LiveCatalogService {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            let instance_config = row
+                .try_get::<Option<String>, _>("instance_config_json")
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+            let account_state = if !scope.requires_account {
+                VisibleProviderAccountState::NotRequired
+            } else if live_account_fields_present(
+                &self.pool,
+                instance_id,
+                instance_config.as_ref(),
+                &scope.required_fields,
+            )
+            .await?
+            {
+                VisibleProviderAccountState::Connected
+            } else {
+                VisibleProviderAccountState::NeedsAccount
+            };
             let extension_enabled = row
                 .try_get::<i64, _>("extension_enabled")
                 .unwrap_or_default()
@@ -275,41 +315,48 @@ impl LiveCatalogService {
             let readiness_phase = row
                 .try_get::<Option<String>, _>("readiness_phase")
                 .unwrap_or_default();
-            let (readiness, disabled_reason) = if !extension_enabled {
-                (
-                    VisibleProviderReadiness::Disabled,
-                    Some("extension_disabled"),
-                )
-            } else if !instance_enabled {
-                (
-                    VisibleProviderReadiness::Disabled,
-                    Some("instance_disabled"),
-                )
-            } else if trust_level == "untrusted" {
-                (
-                    VisibleProviderReadiness::Disabled,
-                    Some("provider_untrusted"),
-                )
-            } else if health == "degraded" {
-                (
-                    VisibleProviderReadiness::Degraded,
-                    Some("provider_degraded"),
-                )
-            } else if health != "healthy" {
-                (
-                    VisibleProviderReadiness::Unavailable,
-                    Some("provider_unhealthy"),
-                )
-            } else if readiness_phase.as_deref() != Some("driver_ready") {
-                (
-                    VisibleProviderReadiness::Unavailable,
-                    Some("runtime_not_ready"),
-                )
-            } else {
-                (VisibleProviderReadiness::Ready, None)
-            };
+            let (readiness, disabled_reason) =
+                if account_state == VisibleProviderAccountState::NeedsAccount {
+                    (
+                        VisibleProviderReadiness::NeedsAccount,
+                        Some("account_required"),
+                    )
+                } else if !extension_enabled {
+                    (
+                        VisibleProviderReadiness::Disabled,
+                        Some("extension_disabled"),
+                    )
+                } else if !instance_enabled {
+                    (
+                        VisibleProviderReadiness::Disabled,
+                        Some("instance_disabled"),
+                    )
+                } else if trust_level == "untrusted" {
+                    (
+                        VisibleProviderReadiness::Disabled,
+                        Some("provider_untrusted"),
+                    )
+                } else if health == "degraded" {
+                    (
+                        VisibleProviderReadiness::Degraded,
+                        Some("provider_degraded"),
+                    )
+                } else if health != "healthy" {
+                    (
+                        VisibleProviderReadiness::Unavailable,
+                        Some("provider_unhealthy"),
+                    )
+                } else if readiness_phase.as_deref() != Some("driver_ready") {
+                    (
+                        VisibleProviderReadiness::Unavailable,
+                        Some("runtime_not_ready"),
+                    )
+                } else {
+                    (VisibleProviderReadiness::Ready, None)
+                };
             visible.push(VisibleLiveProvider {
                 provider_id,
+                instance_id,
                 extension_id: row
                     .try_get("extension_id")
                     .map_err(|_| CatalogServiceError::ProviderUnavailable)?,
@@ -318,6 +365,7 @@ impl LiveCatalogService {
                     .map_err(|_| CatalogServiceError::ProviderUnavailable)?,
                 readiness,
                 disabled_reason,
+                account_state,
                 item_types,
                 protocols,
             });
@@ -668,16 +716,181 @@ impl LiveCatalogService {
     }
 }
 
+async fn live_account_fields_present(
+    pool: &sqlx::AnyPool,
+    instance_id: Uuid,
+    instance_config: Option<&serde_json::Value>,
+    required_fields: &[String],
+) -> Result<bool, CatalogServiceError> {
+    if required_fields.is_empty() {
+        return Ok(false);
+    }
+    let store = ExtensionStore::new(pool);
+    for key in required_fields {
+        let config_present = instance_config
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| config.get(key))
+            .is_some_and(config_value_is_present);
+        if config_present {
+            continue;
+        }
+        let secret_present = store
+            .get_secret(SecretScope::Instance, Some(instance_id), key)
+            .await
+            .map_err(|_| CatalogServiceError::ProviderUnavailable)?
+            .is_some();
+        if !secret_present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn config_value_is_present(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        _ => true,
+    }
+}
+
 fn circuit_failure(error: &ProviderInvocationError) -> bool {
-    matches!(
-        error,
-        ProviderInvocationError::RequestTimeout
-            | ProviderInvocationError::HardTimeout
-            | ProviderInvocationError::Transport
-            | ProviderInvocationError::RedirectRejected
-            | ProviderInvocationError::InvalidContentType
-            | ProviderInvocationError::ResponseTooLarge
-            | ProviderInvocationError::Contract(_)
-            | ProviderInvocationError::Provider(_)
-    )
+    match error {
+        ProviderInvocationError::Provider(failure) => {
+            failure.code != crate::live::contract::ProviderFailureCode::AccountRequired
+        }
+        _ => matches!(
+            error,
+            ProviderInvocationError::RequestTimeout
+                | ProviderInvocationError::HardTimeout
+                | ProviderInvocationError::Transport
+                | ProviderInvocationError::RedirectRejected
+                | ProviderInvocationError::InvalidContentType
+                | ProviderInvocationError::ResponseTooLarge
+                | ProviderInvocationError::Contract(_)
+        ),
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::{
+        config::DatabaseConfig,
+        db::Database,
+        extensions::store::{NewExtensionInstance, NewSecret},
+    };
+
+    #[tokio::test]
+    async fn account_state_uses_only_the_exact_instance_fields() -> anyhow::Result<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let instance_id = Uuid::new_v4();
+        let other_instance_id = Uuid::new_v4();
+        for id in [instance_id, other_instance_id] {
+            sqlx::query(
+                "INSERT INTO extensions (
+                    extension_id, name, version, kind, trust_level,
+                    manifest_json, enabled
+                 ) VALUES ($1, $2, '1.0.0', 'module', 'community', '{}', TRUE)
+                 ON CONFLICT(extension_id) DO NOTHING",
+            )
+            .bind(format!("fixture-{id}"))
+            .bind("Fixture")
+            .execute(&database.pool)
+            .await?;
+            store
+                .create_instance(&NewExtensionInstance {
+                    instance_id: id,
+                    extension_id: format!("fixture-{id}"),
+                    instance_name: "default".to_string(),
+                    config_json: None,
+                    enabled: true,
+                })
+                .await?;
+        }
+
+        let required = vec!["username".to_string(), "password".to_string()];
+        assert!(
+            !live_account_fields_present(
+                &database.pool,
+                instance_id,
+                Some(&serde_json::json!({"username": "viewer"})),
+                &required,
+            )
+            .await?
+        );
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(other_instance_id),
+                key: "password".to_string(),
+                value_encrypted: "other-instance".to_string(),
+                rotatable: false,
+            })
+            .await?;
+        assert!(
+            !live_account_fields_present(
+                &database.pool,
+                instance_id,
+                Some(&serde_json::json!({"username": "viewer"})),
+                &required,
+            )
+            .await?
+        );
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: "password".to_string(),
+                value_encrypted: "exact-instance".to_string(),
+                rotatable: false,
+            })
+            .await?;
+        assert!(
+            live_account_fields_present(
+                &database.pool,
+                instance_id,
+                Some(&serde_json::json!({"username": "viewer"})),
+                &required,
+            )
+            .await?
+        );
+        assert!(
+            !live_account_fields_present(
+                &database.pool,
+                instance_id,
+                Some(&serde_json::json!({"username": "   "})),
+                &required,
+            )
+            .await?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_required_does_not_trip_the_provider_circuit() {
+        let account = ProviderInvocationError::Provider(crate::live::contract::ProviderFailure {
+            code: crate::live::contract::ProviderFailureCode::AccountRequired,
+            message: "connect".to_string(),
+            retryable: false,
+            retry_after_seconds: None,
+        });
+        let upstream = ProviderInvocationError::Provider(crate::live::contract::ProviderFailure {
+            code: crate::live::contract::ProviderFailureCode::UpstreamUnavailable,
+            message: "unavailable".to_string(),
+            retryable: true,
+            retry_after_seconds: None,
+        });
+        assert!(!circuit_failure(&account));
+        assert!(circuit_failure(&upstream));
+    }
 }
