@@ -959,7 +959,7 @@ impl LiveEgressService {
             profile,
             &worker_state,
             &gateway_state,
-            &gateway.name,
+            &gateway,
             &worker_spec.security,
             self.config.control_port,
         )?;
@@ -1816,11 +1816,11 @@ fn verify_runtime_state(
     profile: &LiveEgressProfileConfig,
     worker: &crate::runtime::model::ContainerRuntimeState,
     gateway: &crate::runtime::model::ContainerRuntimeState,
-    gateway_name: &str,
+    gateway_handle: &ContainerHandle,
     expected_security: &ContainerSecurityOptions,
     control_port: u16,
 ) -> Result<(), LiveEgressError> {
-    let expected_network = format!("container:{gateway_name}");
+    let gateway_name = gateway_handle.name.as_str();
     let binding_id = binding_id.to_string();
     let expected_worker_name = worker_name(session.id);
     let worker_labels_match = runtime_owned_by_binding(
@@ -1868,7 +1868,7 @@ fn verify_runtime_state(
             && mount.read_only
     });
     let gateway_material_match = gateway_material_mounts_match(profile, &binding_id, gateway);
-    if worker.network_mode.as_deref() != Some(expected_network.as_str())
+    if !shares_container_network_namespace(worker.network_mode.as_deref(), gateway_handle)
         || !worker_labels_match
         || !gateway_labels_match
         || !security_match
@@ -1879,6 +1879,18 @@ fn verify_runtime_state(
         return Err(LiveEgressError::Runtime);
     }
     Ok(())
+}
+
+fn shares_container_network_namespace(
+    network_mode: Option<&str>,
+    gateway: &ContainerHandle,
+) -> bool {
+    let Some(target) = network_mode.and_then(|mode| mode.strip_prefix("container:")) else {
+        return false;
+    };
+
+    // Docker inspect resolves a name-based namespace target to the container's full ID.
+    !target.is_empty() && (target == gateway.id || target == gateway.name)
 }
 
 fn gateway_material_mounts_match(
@@ -2106,6 +2118,43 @@ mod tests {
     use crate::live::session::{DeliveryMode, SessionOwner, SessionProtocol, SessionState};
 
     use super::*;
+
+    #[test]
+    fn live_runtime_namespace_accepts_exact_gateway_identity() {
+        let gateway = ContainerHandle {
+            id: "66294ecf8051959686cf9c5b06970c85189a1850b40b068dd30405fa74f03761".to_string(),
+            name: "elixir-live-egress-gateway".to_string(),
+        };
+
+        assert!(shares_container_network_namespace(
+            Some("container:66294ecf8051959686cf9c5b06970c85189a1850b40b068dd30405fa74f03761"),
+            &gateway,
+        ));
+        assert!(shares_container_network_namespace(
+            Some("container:elixir-live-egress-gateway"),
+            &gateway,
+        ));
+    }
+
+    #[test]
+    fn live_runtime_namespace_rejects_any_other_target() {
+        let gateway = ContainerHandle {
+            id: "66294ecf8051959686cf9c5b06970c85189a1850b40b068dd30405fa74f03761".to_string(),
+            name: "elixir-live-egress-gateway".to_string(),
+        };
+
+        for network_mode in [
+            None,
+            Some("bridge"),
+            Some("host"),
+            Some("container:"),
+            Some("container:66294ecf8051"),
+            Some("container:unrelated-gateway"),
+            Some("container:elixir-live-egress-gateway-other"),
+        ] {
+            assert!(!shares_container_network_namespace(network_mode, &gateway));
+        }
+    }
 
     #[test]
     fn live_builtin_projection_prefers_privacy_without_blocking_playback() {
