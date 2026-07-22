@@ -214,6 +214,7 @@ impl ExtensionManifest {
         if let Some(control_surface) = &self.control_surface {
             control_surface.validate()?;
         }
+        validate_live_account_configuration(self)?;
         if let Some(owner_release) = &self.owner_release {
             owner_release.validate()?;
         }
@@ -1357,6 +1358,8 @@ pub struct ManifestControlSurface {
     #[serde(default = "default_control_surface_adapter")]
     pub adapter: String,
     #[serde(default)]
+    pub account_setup: Option<ManifestControlAccountSetup>,
+    #[serde(default)]
     pub owned_settings: Vec<ManifestControlOwnedSetting>,
     #[serde(default)]
     pub observed_state: Vec<ManifestControlObservedState>,
@@ -1422,6 +1425,9 @@ impl ManifestControlSurface {
         for setting in &self.owned_settings {
             setting.validate()?;
         }
+        if let Some(account_setup) = self.account_setup.as_ref() {
+            account_setup.validate(&self.owned_settings)?;
+        }
         for state in &self.observed_state {
             state.validate()?;
         }
@@ -1440,6 +1446,84 @@ impl ManifestControlSurface {
             area.validate()?;
         }
 
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestControlAccountSetup {
+    pub mode: String,
+    pub configure_url: String,
+    #[serde(default)]
+    pub result_settings: Vec<String>,
+}
+
+impl ManifestControlAccountSetup {
+    fn validate(&self, owned_settings: &[ManifestControlOwnedSetting]) -> Result<()> {
+        if self.mode.trim() != "external" {
+            bail!(
+                "unsupported control_surface.account_setup.mode '{}'; expected external",
+                self.mode
+            );
+        }
+        if self.configure_url.trim() != self.configure_url || self.configure_url.len() > 2_048 {
+            bail!(
+                "control_surface.account_setup.configure_url must be a bounded absolute HTTP(S) URL"
+            );
+        }
+        let configure_url = reqwest::Url::parse(&self.configure_url).map_err(|_| {
+            anyhow::anyhow!(
+                "control_surface.account_setup.configure_url must be a bounded absolute HTTP(S) URL"
+            )
+        })?;
+        if !matches!(configure_url.scheme(), "http" | "https")
+            || configure_url.host_str().is_none()
+            || !configure_url.username().is_empty()
+            || configure_url.password().is_some()
+            || configure_url.fragment().is_some()
+            || configure_url
+                .query_pairs()
+                .any(|(key, _)| key == "elixir_return_url")
+        {
+            bail!(
+                "control_surface.account_setup.configure_url must be a bounded absolute HTTP(S) URL without credentials, fragments, or elixir_return_url"
+            );
+        }
+        if self.result_settings.is_empty() || self.result_settings.len() > 16 {
+            bail!("control_surface.account_setup.result_settings requires 1-16 setting IDs");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for setting_id in &self.result_settings {
+            if setting_id.trim() != setting_id
+                || setting_id.is_empty()
+                || !seen.insert(setting_id.as_str())
+            {
+                bail!(
+                    "control_surface.account_setup.result_settings must contain unique non-empty setting IDs"
+                );
+            }
+            let setting = owned_settings
+                .iter()
+                .find(|setting| setting.id == *setting_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "control_surface.account_setup.result_settings references unknown owned setting '{}'",
+                        setting_id
+                    )
+                })?;
+            if !setting.ownership_mode().eq_ignore_ascii_case("managed")
+                || !matches!(
+                    setting.storage.r#type.trim().to_ascii_lowercase().as_str(),
+                    "instance_setting" | "instance_secret"
+                )
+            {
+                bail!(
+                    "control_surface.account_setup result setting '{}' must be managed and instance-scoped",
+                    setting_id
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -2638,6 +2722,96 @@ fn validate_live_catalog_provider_contract(
     Ok(())
 }
 
+fn validate_live_account_configuration(manifest: &ExtensionManifest) -> Result<()> {
+    let live_scopes = manifest
+        .provides
+        .iter()
+        .filter(|provide| provide.capability == LIVE_CATALOG_PROVIDER_CAPABILITY)
+        .filter_map(|provide| provide.scope.as_ref())
+        .collect::<Vec<_>>();
+    let account_setup = manifest
+        .control_surface
+        .as_ref()
+        .and_then(|surface| surface.account_setup.as_ref());
+
+    if live_scopes.is_empty() {
+        if account_setup.is_some() {
+            bail!("control_surface.account_setup is only supported for live.catalog_provider");
+        }
+        return Ok(());
+    }
+
+    let Some(control_surface) = manifest.control_surface.as_ref() else {
+        if live_scopes.iter().any(|scope| scope.requires_account) {
+            bail!(
+                "live.catalog_provider with requires_account=true requires a generic control_surface"
+            );
+        }
+        return Ok(());
+    };
+
+    let mut required_storage_keys = std::collections::HashSet::new();
+    for scope in &live_scopes {
+        if !scope.requires_account {
+            continue;
+        }
+        if scope.required_fields.is_empty() {
+            bail!(
+                "live.catalog_provider with requires_account=true requires at least one required_fields entry"
+            );
+        }
+        for required_field in &scope.required_fields {
+            let matches = control_surface
+                .owned_settings
+                .iter()
+                .filter(|setting| setting.storage.key == *required_field)
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                bail!(
+                    "live.catalog_provider required field '{}' must map to exactly one control_surface owned-setting storage key",
+                    required_field
+                );
+            }
+            let setting = matches[0];
+            if !setting.required
+                || !matches!(
+                    setting.storage.r#type.trim().to_ascii_lowercase().as_str(),
+                    "instance_setting" | "instance_secret"
+                )
+            {
+                bail!(
+                    "live.catalog_provider required field '{}' must map to a required instance-scoped owned setting",
+                    required_field
+                );
+            }
+            required_storage_keys.insert(required_field.as_str());
+        }
+    }
+
+    if let Some(account_setup) = account_setup {
+        if !live_scopes.iter().any(|scope| scope.requires_account) {
+            bail!(
+                "control_surface.account_setup requires a live.catalog_provider with requires_account=true"
+            );
+        }
+        for setting_id in &account_setup.result_settings {
+            let setting = control_surface
+                .owned_settings
+                .iter()
+                .find(|setting| setting.id == *setting_id)
+                .expect("account setup setting validated");
+            if !required_storage_keys.contains(setting.storage.key.as_str()) {
+                bail!(
+                    "control_surface.account_setup result setting '{}' must satisfy a live.catalog_provider required field",
+                    setting_id
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn valid_live_implementation_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     (1..=128).contains(&bytes.len())
@@ -3650,6 +3824,90 @@ runtime:
             }
         }));
         assert!(validate_manifest_json(manifest).is_err());
+    }
+
+    #[test]
+    fn lpi0_live_manifest_accepts_native_and_external_account_settings() -> Result<()> {
+        let mut native = valid_live_manifest_json();
+        native["provides"][0]["scope"]["requires_account"] = json!(true);
+        native["provides"][0]["scope"]["required_fields"] = json!(["api_token"]);
+        native["control_surface"] = json!({
+            "adapter": "generic_v1",
+            "owned_settings": [{
+                "id": "apiToken",
+                "label": "API token",
+                "type": "password",
+                "required": true,
+                "secret": true,
+                "ownership": "managed",
+                "storage": {"type": "instance_secret", "key": "api_token"}
+            }]
+        });
+        validate_manifest_json(native)?;
+
+        let mut external = valid_live_manifest_json();
+        external["provides"][0]["scope"]["requires_account"] = json!(true);
+        external["provides"][0]["scope"]["required_fields"] = json!(["manifest_url"]);
+        external["control_surface"] = json!({
+            "adapter": "generic_v1",
+            "account_setup": {
+                "mode": "external",
+                "configure_url": "https://provider.example/configure",
+                "result_settings": ["manifestUrl"]
+            },
+            "owned_settings": [{
+                "id": "manifestUrl",
+                "label": "Configured provider",
+                "type": "password",
+                "required": true,
+                "secret": true,
+                "ownership": "managed",
+                "storage": {"type": "instance_secret", "key": "manifest_url"}
+            }]
+        });
+        let parsed = validate_manifest_json(external)?;
+        assert_eq!(
+            parsed
+                .control_surface
+                .and_then(|surface| surface.account_setup)
+                .map(|setup| setup.mode),
+            Some("external".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lpi0_live_manifest_rejects_ambiguous_or_unowned_account_fields() {
+        let mut missing_mapping = valid_live_manifest_json();
+        missing_mapping["provides"][0]["scope"]["requires_account"] = json!(true);
+        missing_mapping["provides"][0]["scope"]["required_fields"] = json!(["api_token"]);
+        missing_mapping["control_surface"] = json!({
+            "adapter": "generic_v1",
+            "owned_settings": []
+        });
+        assert!(validate_manifest_json(missing_mapping).is_err());
+
+        let mut unknown_result = valid_live_manifest_json();
+        unknown_result["provides"][0]["scope"]["requires_account"] = json!(true);
+        unknown_result["provides"][0]["scope"]["required_fields"] = json!(["manifest_url"]);
+        unknown_result["control_surface"] = json!({
+            "adapter": "generic_v1",
+            "account_setup": {
+                "mode": "external",
+                "configure_url": "https://provider.example/configure",
+                "result_settings": ["missing"]
+            },
+            "owned_settings": [{
+                "id": "manifestUrl",
+                "label": "Configured provider",
+                "type": "password",
+                "required": true,
+                "secret": true,
+                "ownership": "managed",
+                "storage": {"type": "instance_secret", "key": "manifest_url"}
+            }]
+        });
+        assert!(validate_manifest_json(unknown_result).is_err());
     }
 
     #[test]
