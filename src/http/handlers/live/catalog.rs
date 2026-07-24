@@ -50,28 +50,72 @@ const MAX_QUERY_PAIRS: usize = 32;
 const MAX_ADMISSION_USERS: usize = 10_000;
 const MAX_REQUESTS_PER_MINUTE: u32 = 120;
 const MAX_CONCURRENT_REQUESTS: u32 = 16;
+const MAX_ARTWORK_REQUESTS_PER_MINUTE: u32 = 600;
+const MAX_CONCURRENT_ARTWORK_REQUESTS: u32 = 32;
+const ADMISSION_WINDOW: Duration = Duration::from_secs(60);
 const ADMISSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 
 static ADMISSION: OnceLock<Mutex<HashMap<Uuid, AdmissionState>>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionClass {
+    Interactive,
+    Artwork,
+}
+
 #[derive(Debug)]
 struct AdmissionState {
-    window_started: Instant,
     last_seen: Instant,
+    interactive: AdmissionWindow,
+    artwork: AdmissionWindow,
+}
+
+impl AdmissionState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_seen: now,
+            interactive: AdmissionWindow::new(now),
+            artwork: AdmissionWindow::new(now),
+        }
+    }
+
+    fn window_mut(&mut self, class: AdmissionClass) -> &mut AdmissionWindow {
+        match class {
+            AdmissionClass::Interactive => &mut self.interactive,
+            AdmissionClass::Artwork => &mut self.artwork,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdmissionWindow {
+    window_started: Instant,
     requests: u32,
     concurrent: u32,
+}
+
+impl AdmissionWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            requests: 0,
+            concurrent: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct AdmissionGuard {
     user_id: Uuid,
+    class: AdmissionClass,
 }
 
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
         if let Ok(mut states) = admission().lock() {
             if let Some(state) = states.get_mut(&self.user_id) {
-                state.concurrent = state.concurrent.saturating_sub(1);
+                let window = state.window_mut(self.class);
+                window.concurrent = window.concurrent.saturating_sub(1);
                 state.last_seen = Instant::now();
             }
         }
@@ -83,6 +127,14 @@ fn admission() -> &'static Mutex<HashMap<Uuid, AdmissionState>> {
 }
 
 pub(super) fn admit(user_id: Uuid) -> Result<AdmissionGuard, LiveHttpRejection> {
+    admit_class(user_id, AdmissionClass::Interactive)
+}
+
+pub(super) fn admit_artwork(user_id: Uuid) -> Result<AdmissionGuard, LiveHttpRejection> {
+    admit_class(user_id, AdmissionClass::Artwork)
+}
+
+fn admit_class(user_id: Uuid, class: AdmissionClass) -> Result<AdmissionGuard, LiveHttpRejection> {
     let now = Instant::now();
     let mut states = admission()
         .lock()
@@ -90,26 +142,39 @@ pub(super) fn admit(user_id: Uuid) -> Result<AdmissionGuard, LiveHttpRejection> 
     if states.len() >= MAX_ADMISSION_USERS && !states.contains_key(&user_id) {
         states.retain(|_, state| now.duration_since(state.last_seen) < ADMISSION_IDLE_TTL);
         if states.len() >= MAX_ADMISSION_USERS {
-            return Err(LiveHttpRejection::rate_limited());
+            return Err(LiveHttpRejection::rate_limited(1));
         }
     }
-    let state = states.entry(user_id).or_insert(AdmissionState {
-        window_started: now,
-        last_seen: now,
-        requests: 0,
-        concurrent: 0,
-    });
-    if now.duration_since(state.window_started) >= Duration::from_secs(60) {
-        state.window_started = now;
-        state.requests = 0;
+    let state = states
+        .entry(user_id)
+        .or_insert_with(|| AdmissionState::new(now));
+    let (max_requests, max_concurrent) = match class {
+        AdmissionClass::Interactive => (MAX_REQUESTS_PER_MINUTE, MAX_CONCURRENT_REQUESTS),
+        AdmissionClass::Artwork => (
+            MAX_ARTWORK_REQUESTS_PER_MINUTE,
+            MAX_CONCURRENT_ARTWORK_REQUESTS,
+        ),
+    };
+    let window = state.window_mut(class);
+    if now.duration_since(window.window_started) >= ADMISSION_WINDOW {
+        window.window_started = now;
+        window.requests = 0;
     }
-    if state.requests >= MAX_REQUESTS_PER_MINUTE || state.concurrent >= MAX_CONCURRENT_REQUESTS {
-        return Err(LiveHttpRejection::rate_limited());
+    if window.requests >= max_requests {
+        let remaining = ADMISSION_WINDOW.saturating_sub(now.duration_since(window.window_started));
+        let retry_after_seconds = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        return Err(LiveHttpRejection::rate_limited(retry_after_seconds));
     }
-    state.requests += 1;
-    state.concurrent += 1;
+    if window.concurrent >= max_concurrent {
+        return Err(LiveHttpRejection::rate_limited(1));
+    }
+    window.requests += 1;
+    window.concurrent += 1;
     state.last_seen = now;
-    Ok(AdmissionGuard { user_id })
+    Ok(AdmissionGuard { user_id, class })
 }
 
 pub(super) struct CancelOnDrop(CancellationToken);
@@ -229,14 +294,14 @@ impl LiveHttpRejection {
         )
     }
 
-    fn rate_limited() -> Self {
+    fn rate_limited(retry_after_seconds: u32) -> Self {
         let mut error = Self::new(
             StatusCode::TOO_MANY_REQUESTS,
             "LIVE_RATE_LIMITED",
             "The Live request rate limit was reached.",
             true,
         );
-        error.retry_after_seconds = Some(1);
+        error.retry_after_seconds = Some(retry_after_seconds.max(1));
         error
     }
 
@@ -1464,9 +1529,12 @@ mod tests {
         for _ in 0..MAX_REQUESTS_PER_MINUTE {
             drop(admit(rate_user).expect("request admitted"));
         }
-        assert_eq!(
-            admit(rate_user).expect_err("rate limit").status,
-            StatusCode::TOO_MANY_REQUESTS
+        let rate_error = admit(rate_user).expect_err("rate limit");
+        assert_eq!(rate_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            rate_error
+                .retry_after_seconds
+                .is_some_and(|seconds| seconds > 1)
         );
 
         let concurrent_user = Uuid::new_v4();
@@ -1481,6 +1549,39 @@ mod tests {
         );
         drop(guards);
         assert!(admit(concurrent_user).is_ok());
+    }
+
+    #[test]
+    fn s13_artwork_admission_cannot_starve_interactive_requests() {
+        let artwork_user = Uuid::new_v4();
+        for _ in 0..MAX_ARTWORK_REQUESTS_PER_MINUTE {
+            drop(admit_artwork(artwork_user).expect("artwork request admitted"));
+        }
+        assert_eq!(
+            admit_artwork(artwork_user)
+                .expect_err("artwork rate limit")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(
+            admit(artwork_user).is_ok(),
+            "bulk artwork traffic must not block playback or browsing"
+        );
+
+        let interactive_user = Uuid::new_v4();
+        for _ in 0..MAX_REQUESTS_PER_MINUTE {
+            drop(admit(interactive_user).expect("interactive request admitted"));
+        }
+        assert_eq!(
+            admit(interactive_user)
+                .expect_err("interactive rate limit")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(
+            admit_artwork(interactive_user).is_ok(),
+            "interactive traffic must not prevent artwork from loading"
+        );
     }
 
     #[tokio::test]

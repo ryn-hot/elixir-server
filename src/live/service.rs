@@ -35,6 +35,7 @@ use super::{
 const ENVELOPE_SECRET_PREFIX: &str = "live.crypto.envelope.";
 const TOKEN_HASH_SECRET_PREFIX: &str = "live.crypto.token_hash.";
 const AUDIT_SECRET_PREFIX: &str = "live.crypto.audit.";
+const CONTROL_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum LiveServiceError {
@@ -663,12 +664,12 @@ impl LiveService {
                 .await
                 .map_err(LiveServiceError::Artwork)?;
         }
-        match self.lease_repository.acquire(self.owner_instance_id).await {
+        let control_acquired = match self.lease_repository.acquire(self.owner_instance_id).await {
             Ok(lease) => {
                 let fencing_token = lease.fencing_token;
                 let mut runtime = self.runtime.write().await;
-                runtime.lifecycle = LiveLifecycle::ControlReady;
-                runtime.blocked_reason = None;
+                runtime.lifecycle = LiveLifecycle::LeaseHeld;
+                runtime.blocked_reason = Some("control_lease_initializing");
                 runtime.lease = Some(lease);
                 runtime.crypto = Some(crypto);
                 drop(runtime);
@@ -833,6 +834,7 @@ impl LiveService {
                         }
                     }
                 }
+                true
             }
             Err(ControlLeaseError::Held) => {
                 let mut runtime = self.runtime.write().await;
@@ -840,6 +842,7 @@ impl LiveService {
                 runtime.blocked_reason = Some("control_lease_held");
                 runtime.lease = None;
                 runtime.crypto = Some(crypto);
+                false
             }
             Err(ControlLeaseError::FenceExhausted) => {
                 let mut runtime = self.runtime.write().await;
@@ -847,6 +850,7 @@ impl LiveService {
                 runtime.blocked_reason = Some("control_fence_exhausted");
                 runtime.lease = None;
                 runtime.crypto = Some(crypto);
+                false
             }
             Err(error) => {
                 let mut runtime = self.runtime.write().await;
@@ -856,10 +860,15 @@ impl LiveService {
                 runtime.crypto = Some(crypto);
                 return Err(LiveServiceError::Lease(error));
             }
-        }
+        };
         if self.config.catalog_enabled {
             self.set_component_readiness(LiveComponent::Catalog, true, None, None)
                 .await;
+        }
+        if control_acquired {
+            let mut runtime = self.runtime.write().await;
+            runtime.lifecycle = LiveLifecycle::ControlReady;
+            runtime.blocked_reason = None;
         }
         Ok(self.snapshot().await)
     }
@@ -899,16 +908,42 @@ impl LiveService {
         }
         let interval = self.lease_repository.heartbeat_interval();
         loop {
+            let lease = self.runtime.read().await.lease.clone();
+            let Some(lease) = lease else {
+                if self.runtime.read().await.lifecycle != LiveLifecycle::LeaseHeld {
+                    return;
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        self.release_on_shutdown().await;
+                        return;
+                    }
+                    _ = tokio::time::sleep(CONTROL_LEASE_RETRY_INTERVAL) => {}
+                }
+                match self.initialize().await {
+                    Ok(snapshot) if snapshot.lifecycle == LiveLifecycle::ControlReady => {
+                        tracing::info!(
+                            lease_generation = snapshot.lease_generation,
+                            "Live control lease acquired after waiting for the prior owner"
+                        );
+                    }
+                    Ok(snapshot) if snapshot.lifecycle == LiveLifecycle::LeaseHeld => {}
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Live control lease takeover attempt failed; retrying"
+                        );
+                    }
+                }
+                continue;
+            };
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     self.release_on_shutdown().await;
                     return;
                 }
                 _ = tokio::time::sleep(interval) => {
-                    let lease = self.runtime.read().await.lease.clone();
-                    let Some(lease) = lease else {
-                        return;
-                    };
                     match self.lease_repository.renew(&lease).await {
                         Ok(Some(renewed)) => {
                             let renewed_fencing_token = renewed.fencing_token;
@@ -961,8 +996,17 @@ impl LiveService {
         let Some(lifecycle) = self.session_lifecycle() else {
             return;
         };
-        let Some(fencing_token) = self.control_fencing_token().await else {
-            return;
+        let fencing_token = loop {
+            if let Some(fencing_token) = self.control_fencing_token().await {
+                break fencing_token;
+            }
+            if self.runtime.read().await.lifecycle != LiveLifecycle::LeaseHeld {
+                return;
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(CONTROL_LEASE_RETRY_INTERVAL) => {}
+            }
         };
         let shutdown_observer = shutdown.clone();
         if let Err(error) = lifecycle.run(fencing_token, notifier, shutdown).await {
@@ -1554,6 +1598,67 @@ mod tests {
         } else {
             second.clone().run_lease_heartbeat(shutdown).await;
         }
+        assert!(
+            ControlLeaseRepository::new(database.pool.clone(), Duration::from_secs(30))
+                .current()
+                .await?
+                .owner_instance_id
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s10_lease_held_service_takes_control_after_owner_releases() -> Result<()> {
+        let database = test_database().await?;
+        let config = LiveConfig {
+            enabled: true,
+            ..LiveConfig::default()
+        };
+        let secrets = Arc::new(SecretsManager::from_key_bytes([50u8; 32], true));
+        let first = Arc::new(LiveService::new(
+            config.clone(),
+            RunEnvironment::Development,
+            database.pool.clone(),
+            secrets.clone(),
+        ));
+        let second = Arc::new(LiveService::new(
+            config,
+            RunEnvironment::Development,
+            database.pool.clone(),
+            secrets,
+        ));
+        assert_eq!(
+            first.initialize().await?.lifecycle,
+            LiveLifecycle::ControlReady
+        );
+        assert_eq!(
+            second.initialize().await?.lifecycle,
+            LiveLifecycle::LeaseHeld
+        );
+
+        let second_shutdown = CancellationToken::new();
+        let second_task = tokio::spawn(second.clone().run_lease_heartbeat(second_shutdown.clone()));
+        tokio::task::yield_now().await;
+        assert!(!second_task.is_finished());
+
+        let first_shutdown = CancellationToken::new();
+        first_shutdown.cancel();
+        first.run_lease_heartbeat(first_shutdown).await;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if second.snapshot().await.lifecycle == LiveLifecycle::ControlReady {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+        assert_eq!(second.snapshot().await.lease_generation, Some(2));
+
+        second_shutdown.cancel();
+        second_task.await?;
         assert!(
             ControlLeaseRepository::new(database.pool.clone(), Duration::from_secs(30))
                 .current()

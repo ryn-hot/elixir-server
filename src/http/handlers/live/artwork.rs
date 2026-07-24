@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::catalog::{
-    CancelOnDrop, LiveBrowsePrincipal, LiveHttpRejection, access_context, admit, error_response,
-    key_scope, reject_query, request_id,
+    CancelOnDrop, LiveBrowsePrincipal, LiveHttpRejection, access_context, admit_artwork,
+    error_response, key_scope, reject_query, request_id,
 };
 
 pub async fn get(
@@ -31,7 +31,7 @@ pub async fn get(
     let request_id = request_id();
     let result = async {
         reject_query(raw_query.as_deref())?;
-        let _admission = admit(principal.user_id)?;
+        let _admission = admit_artwork(principal.user_id)?;
         let context = access_context(&principal, &headers)?;
         let scope = key_scope(&context);
         let crypto = state

@@ -84,28 +84,29 @@ impl ControlLeaseRepository {
         let now = database_now(&self.pool).await?;
         let expires_at = now
             + chrono::Duration::from_std(self.ttl).map_err(|_| ControlLeaseError::InvalidState)?;
+        let now = now.to_rfc3339();
         let owner = owner_instance_id.to_string();
         let row: Option<LeaseRow> = sqlx::query_as(
             "UPDATE live_control_server_leases
              SET fencing_token = CASE
-                     WHEN owner_instance_id = $1 AND expires_at > CURRENT_TIMESTAMP
+                     WHEN owner_instance_id = $1 AND expires_at > $2
                      THEN fencing_token
                      ELSE fencing_token + 1
                  END,
-                 owner_instance_id = $2,
+                 owner_instance_id = $3,
                  acquired_at = CASE
-                     WHEN owner_instance_id = $3 AND expires_at > CURRENT_TIMESTAMP
+                     WHEN owner_instance_id = $4 AND expires_at > $5
                      THEN acquired_at
-                     ELSE CURRENT_TIMESTAMP
+                     ELSE $6
                  END,
-                 heartbeat_at = CURRENT_TIMESTAMP,
-                 expires_at = $4
-             WHERE lease_name = $5
-               AND fencing_token < $6
+                 heartbeat_at = $7,
+                 expires_at = $8
+             WHERE lease_name = $9
+               AND fencing_token < $10
                AND (
                    owner_instance_id IS NULL
-                   OR owner_instance_id = $7
-                   OR expires_at <= CURRENT_TIMESTAMP
+                   OR owner_instance_id = $11
+                   OR expires_at <= $12
                )
              RETURNING
                  COALESCE(CAST(owner_instance_id AS TEXT), '') AS owner_instance_id,
@@ -115,12 +116,17 @@ impl ControlLeaseRepository {
                  COALESCE(CAST(expires_at AS TEXT), '') AS expires_at",
         )
         .bind(&owner)
+        .bind(&now)
         .bind(&owner)
         .bind(&owner)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
         .bind(expires_at.to_rfc3339())
         .bind(LIVE_CONTROL_LEASE_NAME)
         .bind(i64::MAX)
         .bind(&owner)
+        .bind(&now)
         .fetch_optional(&self.pool)
         .await?;
         if let Some(row) = row {
@@ -144,14 +150,15 @@ impl ControlLeaseRepository {
         let now = database_now(&self.pool).await?;
         let expires_at = now
             + chrono::Duration::from_std(self.ttl).map_err(|_| ControlLeaseError::InvalidState)?;
+        let now = now.to_rfc3339();
         let row: Option<LeaseRow> = sqlx::query_as(
             "UPDATE live_control_server_leases
-             SET heartbeat_at = CURRENT_TIMESTAMP,
-                 expires_at = $1
-             WHERE lease_name = $2
-               AND owner_instance_id = $3
-               AND fencing_token = $4
-               AND expires_at > CURRENT_TIMESTAMP
+             SET heartbeat_at = $1,
+                 expires_at = $2
+             WHERE lease_name = $3
+               AND owner_instance_id = $4
+               AND fencing_token = $5
+               AND expires_at > $6
              RETURNING
                  COALESCE(CAST(owner_instance_id AS TEXT), '') AS owner_instance_id,
                  fencing_token,
@@ -159,10 +166,12 @@ impl ControlLeaseRepository {
                  COALESCE(CAST(heartbeat_at AS TEXT), '') AS heartbeat_at,
                  COALESCE(CAST(expires_at AS TEXT), '') AS expires_at",
         )
+        .bind(&now)
         .bind(expires_at.to_rfc3339())
         .bind(LIVE_CONTROL_LEASE_NAME)
         .bind(lease.owner_instance_id.to_string())
         .bind(lease.fencing_token)
+        .bind(&now)
         .fetch_optional(&self.pool)
         .await?;
         row.map(LeaseRow::into_active).transpose()
@@ -358,14 +367,25 @@ mod tests {
                 .await?
         );
 
+        let same_day_expiry = database_now(&database.pool).await? - chrono::Duration::seconds(1);
         sqlx::query(
             "UPDATE live_control_server_leases
-             SET expires_at = '2000-01-01T00:00:00Z'
-             WHERE lease_name = $1",
+             SET expires_at = $1
+             WHERE lease_name = $2",
         )
+        .bind(same_day_expiry.to_rfc3339())
         .bind(LIVE_CONTROL_LEASE_NAME)
         .execute(&database.pool)
         .await?;
+        let persisted_expiry: String = sqlx::query_scalar(
+            "SELECT CAST(expires_at AS TEXT)
+             FROM live_control_server_leases
+             WHERE lease_name = $1",
+        )
+        .bind(LIVE_CONTROL_LEASE_NAME)
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(persisted_expiry.contains('T'));
         let takeover = repository.acquire(second_owner).await?;
         assert_eq!(takeover.fencing_token, 2);
         assert!(repository.renew(&renewed).await?.is_none());
