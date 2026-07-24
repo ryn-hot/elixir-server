@@ -13,9 +13,10 @@ use sha2::Sha256;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::live::config::is_public_egress_ip;
+use crate::live_egress_common::is_public_egress_ip;
 
-const CONTROL_VERSION: &str = "elixir-live-egress-v1";
+pub(crate) const CONTROL_VERSION: &str = "elixir-live-egress-v2";
+pub(crate) const WORKER_CONTROL_VERSION_LABEL: &str = "org.elixir.live-egress.control-version";
 const MAX_CLOCK_SKEW_SECONDS: i64 = 30;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]

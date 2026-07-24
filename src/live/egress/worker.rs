@@ -19,7 +19,7 @@ use futures_util::stream;
 use reqwest::{Client, Url, redirect::Policy};
 use tokio::{net::TcpListener, sync::Mutex, time};
 
-use crate::live::config::is_public_egress_ip;
+use crate::live_egress_common::is_public_egress_ip;
 
 use super::control::{
     ControlKeys, ControlProtocolError, ControlSecretDocument, FetchControlRequest,

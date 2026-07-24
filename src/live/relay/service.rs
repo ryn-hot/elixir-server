@@ -925,9 +925,6 @@ impl LiveRelayService {
         client_range: Option<&str>,
     ) -> Result<LiveRelayPayload, LiveRelayError> {
         let metric_kind = resource_metric_kind(descriptor.kind());
-        if descriptor.kind() == HlsResourceKind::EncryptionKey && client_range.is_some() {
-            return Err(LiveRelayError::RangeRejected);
-        }
         let (upstream_range, client_requested_range) = authorized_range(&descriptor, client_range)?;
         let policy = self.load_policy(relay, descriptor.url(), true).await?;
         let mut safe_headers = SafeRequestHeaders::new();
@@ -1257,7 +1254,7 @@ fn validate_manifest_content_type(headers: &HeaderMap, url: &Url) -> Result<(), 
 }
 
 fn validate_resource_content_type(
-    kind: HlsResourceKind,
+    _kind: HlsResourceKind,
     headers: &HeaderMap,
 ) -> Result<(), LiveRelayError> {
     let Some(value) = headers
@@ -1275,14 +1272,8 @@ fn validate_resource_content_type(
     ) {
         return Err(LiveRelayError::ContentTypeRejected);
     }
-    if kind == HlsResourceKind::EncryptionKey
-        && !matches!(
-            value.as_str(),
-            "application/octet-stream" | "binary/octet-stream"
-        )
-    {
-        return Err(LiveRelayError::ContentTypeRejected);
-    }
+    // AES-128 key endpoints are frequently mislabeled by CDNs. The relay
+    // validates their body separately as exactly 16 bytes.
     Ok(())
 }
 
@@ -1291,6 +1282,11 @@ fn authorized_range(
     client_range: Option<&str>,
 ) -> Result<(Option<String>, bool), LiveRelayError> {
     let client_range = client_range.map(validate_range).transpose()?;
+    if descriptor.kind() == HlsResourceKind::EncryptionKey {
+        // Players commonly range-probe HLS keys. Always fetch the complete,
+        // bounded 16-byte key so a partial probe cannot break decryption.
+        return Ok((None, false));
+    }
     if let Some(range) = descriptor.byte_range() {
         let start = range.offset.ok_or(LiveRelayError::RangeRejected)?;
         let end = start
@@ -1502,6 +1498,47 @@ mod tests {
         assert_eq!(
             validate_resource_status(StatusCode::PARTIAL_CONTENT, None, false),
             Err(LiveRelayError::UpstreamStatus)
+        );
+    }
+
+    #[test]
+    fn hls_aes128_key_ranges_are_validated_and_normalized_to_a_complete_fetch() {
+        let descriptor = HlsResourceDescriptor::new_for_relay_root(
+            Url::parse("https://keys.example.test/live.key").expect("valid key URL"),
+            HlsResourceKind::EncryptionKey,
+        );
+
+        assert_eq!(authorized_range(&descriptor, None), Ok((None, false)));
+        assert_eq!(
+            authorized_range(&descriptor, Some("bytes=0-")),
+            Ok((None, false))
+        );
+        assert_eq!(
+            authorized_range(&descriptor, Some("bytes=0-15")),
+            Ok((None, false))
+        );
+        assert_eq!(
+            authorized_range(&descriptor, Some("items=0-15")),
+            Err(LiveRelayError::RangeRejected)
+        );
+    }
+
+    #[test]
+    fn hls_aes128_keys_accept_mislabeled_binary_content_but_reject_error_payloads() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            "application/vnd.apple.mpegurl".parse().unwrap(),
+        );
+        assert_eq!(
+            validate_resource_content_type(HlsResourceKind::EncryptionKey, &headers),
+            Ok(())
+        );
+
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        assert_eq!(
+            validate_resource_content_type(HlsResourceKind::EncryptionKey, &headers),
+            Err(LiveRelayError::ContentTypeRejected)
         );
     }
 

@@ -6623,6 +6623,105 @@ async fn candidate_provider_status_summary_distinguishes_runtime_readiness() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn live_provider_status_summary_reports_startup_as_progress_until_driver_ready() -> Result<()>
+{
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let store = ExtensionStore::new(&db_pool);
+    seed_live_provider_summary_case(&store, "elixir.live.pending", "Pending Live", None, None)
+        .await?;
+    seed_live_provider_summary_case(
+        &store,
+        "elixir.live.transport",
+        "Transport Live",
+        Some(ProviderHealthState::Unknown),
+        Some(ProviderReadinessPhase::TransportReady),
+    )
+    .await?;
+    seed_live_provider_summary_case(
+        &store,
+        "elixir.live.bootstrap",
+        "Bootstrap Live",
+        Some(ProviderHealthState::Healthy),
+        Some(ProviderReadinessPhase::BootstrapReady),
+    )
+    .await?;
+    seed_live_provider_summary_case(
+        &store,
+        "elixir.live.ready",
+        "Ready Live",
+        Some(ProviderHealthState::Healthy),
+        Some(ProviderReadinessPhase::DriverReady),
+    )
+    .await?;
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        payload.get("needsAttentionCount").and_then(Value::as_u64),
+        Some(0)
+    );
+    let items = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("summary items");
+    let status_for = |extension_id: &str| -> (&str, &str, &str) {
+        let item = items
+            .iter()
+            .find(|item| item.get("extensionId").and_then(Value::as_str) == Some(extension_id))
+            .expect("Live summary item");
+        (
+            item.get("severity")
+                .and_then(Value::as_str)
+                .expect("severity"),
+            item.get("statusCode")
+                .and_then(Value::as_str)
+                .expect("status code"),
+            item.get("label").and_then(Value::as_str).expect("label"),
+        )
+    };
+
+    assert_eq!(
+        status_for("elixir.live.pending"),
+        ("progress", "provider_registration_pending", "Starting up")
+    );
+    assert_eq!(
+        status_for("elixir.live.transport"),
+        ("progress", "runtime_starting", "Connecting")
+    );
+    assert_eq!(
+        status_for("elixir.live.bootstrap"),
+        ("progress", "bootstrap_in_progress", "Finishing setup")
+    );
+    assert_eq!(status_for("elixir.live.ready"), ("ready", "ready", "Ready"));
+
+    Ok(())
+}
+
 async fn seed_candidate_provider_summary_case(
     store: &ExtensionStore<'_>,
     extension_id: &str,
@@ -6704,6 +6803,123 @@ async fn seed_candidate_provider_summary_case(
                 "scheme": "http",
                 "host": "elx-source",
                 "port": 8097,
+                "base_path": "/",
+                "network": "elixir_net"
+            })),
+            health_state: provider_health,
+        })
+        .await?;
+    if let Some(readiness_phase) = readiness_phase {
+        store
+            .upsert_provider_readiness(provider_id, readiness_phase, None)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn seed_live_provider_summary_case(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+    name: &str,
+    provider_health: Option<ProviderHealthState>,
+    readiness_phase: Option<ProviderReadinessPhase>,
+) -> Result<()> {
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: extension_id.to_string(),
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            kind: ExtensionKind::Module,
+            publisher_name: None,
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: json!({
+                "id": extension_id,
+                "version": "0.1.0",
+                "kind": "module",
+                "name": name,
+                "permissions": [
+                    "live.catalog.read",
+                    "live.stream.resolve",
+                    "network.egress"
+                ],
+                "provides": [{
+                    "capability": "live.catalog_provider",
+                    "slot": "default",
+                    "cardinality": "many",
+                    "implementation": "fixture_live",
+                    "contract_version": 1,
+                    "scope": {
+                        "actions": ["catalog", "meta", "resolve"],
+                        "live_item_types": ["channel"],
+                        "stream_protocols": ["hls"],
+                        "requires_account": false,
+                        "required_fields": []
+                    },
+                    "endpoint": {
+                        "type": "http",
+                        "scheme": "http",
+                        "port": 8112,
+                        "base_path": "/"
+                    },
+                    "healthcheck": {
+                        "type": "http",
+                        "path": "/health"
+                    }
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "elixir/fixture-live:0.1.0",
+                    "network": "elixir_net",
+                    "service_name": "elx-fixture-live",
+                    "ports": [{"container": 8112, "host": 0}]
+                },
+                "networking": {
+                    "service_port": {
+                        "scheme": "http",
+                        "container_port": 8112
+                    }
+                }
+            }),
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    let Some(provider_health) = provider_health else {
+        return Ok(());
+    };
+
+    let provider_id = Uuid::new_v4();
+    store
+        .upsert_provider(&NewProvider {
+            provider_id,
+            instance_id,
+            capability: "live.catalog_provider".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::Many,
+            implementation: Some("fixture_live".to_string()),
+            scope_json: Some(json!({
+                "actions": ["catalog", "meta", "resolve"],
+                "live_item_types": ["channel"],
+                "stream_protocols": ["hls"],
+                "requires_account": false,
+                "required_fields": []
+            })),
+            endpoint_json: Some(json!({
+                "scheme": "http",
+                "host": "elx-fixture-live",
+                "port": 8112,
                 "base_path": "/",
                 "network": "elixir_net"
             })),

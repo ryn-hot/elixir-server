@@ -37,9 +37,9 @@ use crate::{
         RuntimeManager,
         model::{
             ContainerHandle, ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount,
-            ELIXIR_MANAGED_LABEL, EnvVar, OwnedDirectoryVolumeSpec, PortMapping,
-            PrivateFileVolumeSpec, VolumeMount, VolumeMountSourceKind,
-            apply_container_spec_fingerprint,
+            ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, EnvVar,
+            OwnedDirectoryVolumeSpec, PortMapping, PrivateFileVolumeSpec, VolumeMount,
+            VolumeMountSourceKind, apply_container_spec_fingerprint,
         },
     },
     secrets::SecretsManager,
@@ -47,7 +47,10 @@ use crate::{
 
 use super::{
     ProtectedEgressTransport,
-    control::{ControlKeys, ControlSecretDocument, WorkerReadinessConfig, readiness_ip_matches},
+    control::{
+        CONTROL_VERSION, ControlKeys, ControlSecretDocument, WORKER_CONTROL_VERSION_LABEL,
+        WorkerReadinessConfig, readiness_ip_matches,
+    },
     material::{
         GATEWAY_CONFIG_ROLE, OPENVPN_CONFIG_PATH, OPENVPN_CONFIG_ROOT, OPENVPN_PASSWORD_PATH,
         OPENVPN_PASSWORD_ROLE, OPENVPN_PASSWORD_ROOT, OPENVPN_USERNAME_PATH, OPENVPN_USERNAME_ROLE,
@@ -70,6 +73,7 @@ const POLICY_KIND_LABEL: &str = "elixir.live.egress.policy_kind";
 const RUNTIME_KIND_LABEL: &str = "elixir.live.egress.runtime_kind";
 const PORTS_LABEL: &str = "elixir.live.egress.exposed_ports";
 const FENCE_LABEL: &str = "elixir.live.control_fencing_token";
+const RUNTIME_OWNER_ID: &str = "elixir.live.egress";
 const WORKER_SECRET_PATH: &str = "/run/elixir-live-egress/control.json";
 const WORKER_SECRET_ROOT: &str = "/run/elixir-live-egress";
 const WORKER_UID: u32 = 65_532;
@@ -96,6 +100,8 @@ pub enum LiveEgressError {
     PolicyRepository(#[from] EgressPolicyRepositoryError),
     #[error("protected Live egress runtime failed closed")]
     Runtime,
+    #[error("protected Live egress worker is incompatible with this server")]
+    WorkerIncompatible,
     #[error("protected Live egress readiness proof failed")]
     Readiness,
     #[error("protected Live egress cleanup is incomplete")]
@@ -735,6 +741,7 @@ impl LiveEgressService {
         let worker_name = worker_name(session.id);
         let gateway_name = format!("{worker_name}-vpn");
         let result = async {
+            self.require_compatible_worker_image().await?;
             let gateway_material = self.prepare_profile_material(&profile).await?;
             if profile.kind == LiveEgressProfileKind::Warp {
                 self.runtime
@@ -749,7 +756,7 @@ impl LiveEgressService {
                         labels: warp_state_volume_labels(&profile),
                     })
                     .await
-                    .map_err(|_| LiveEgressError::Runtime)?;
+                    .map_err(|error| runtime_failure("warp_state_volume", error))?;
             }
             let permit = self
                 .capacity
@@ -781,7 +788,7 @@ impl LiveEgressService {
                     labels: control_volume_labels.clone(),
                 })
                 .await
-                .map_err(|_| LiveEgressError::Runtime)?;
+                .map_err(|error| runtime_failure("control_volume", error))?;
             for material in &gateway_material {
                 let staged_path = secret_dir.join(material.file_name);
                 write_private_file(&staged_path, material.contents())?;
@@ -802,7 +809,7 @@ impl LiveEgressService {
                         ),
                     })
                     .await
-                    .map_err(|_| LiveEgressError::Runtime)?;
+                    .map_err(|error| runtime_failure("gateway_material_volume", error))?;
             }
             remove_secret_dir(&secret_dir).await?;
             let topology = self.compile_topology(
@@ -879,6 +886,32 @@ impl LiveEgressService {
         }
     }
 
+    async fn require_compatible_worker_image(&self) -> Result<(), LiveEgressError> {
+        let labels = self
+            .runtime
+            .image_labels(&self.config.worker_image)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    worker_image = %self.config.worker_image,
+                    error = %error,
+                    "Live egress worker image metadata is unavailable"
+                );
+                LiveEgressError::WorkerIncompatible
+            })?;
+        let observed = labels.get(WORKER_CONTROL_VERSION_LABEL).map(String::as_str);
+        if !worker_image_is_compatible(&labels) {
+            tracing::error!(
+                worker_image = %self.config.worker_image,
+                expected_control_version = CONTROL_VERSION,
+                observed_control_version = observed.unwrap_or("missing"),
+                "Live egress worker image is incompatible with this server"
+            );
+            return Err(LiveEgressError::WorkerIncompatible);
+        }
+        Ok(())
+    }
+
     fn compile_topology(
         &self,
         session: &SessionRecord,
@@ -910,31 +943,39 @@ impl LiveEgressService {
         self.runtime
             .ensure_network(&gateway_spec.network)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?;
+            .map_err(|error| runtime_failure("network", error))?;
         let gateway = self
             .runtime
             .ensure_container(&gateway_spec)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?;
+            .map_err(|error| runtime_failure("gateway_create", error))?;
         self.runtime
             .start_container(&gateway)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?;
+            .map_err(|error| runtime_failure("gateway_start", error))?;
         wait_running(
             self.runtime.as_ref(),
             &gateway,
             Duration::from_secs(self.config.startup_timeout_seconds),
         )
         .await?;
+        if profile.kind == LiveEgressProfileKind::Warp {
+            wait_healthy(
+                self.runtime.as_ref(),
+                &gateway,
+                Duration::from_secs(self.config.startup_timeout_seconds),
+            )
+            .await?;
+        }
         let worker = self
             .runtime
             .ensure_container(&worker_spec)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?;
+            .map_err(|error| runtime_failure("worker_create", error))?;
         self.runtime
             .start_container(&worker)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?;
+            .map_err(|error| runtime_failure("worker_start", error))?;
         wait_running(
             self.runtime.as_ref(),
             &worker,
@@ -945,13 +986,13 @@ impl LiveEgressService {
             .runtime
             .describe_container_runtime_state(&worker.name)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?
+            .map_err(|error| runtime_failure("worker_inspect", error))?
             .ok_or(LiveEgressError::Runtime)?;
         let gateway_state = self
             .runtime
             .describe_container_runtime_state(&gateway.name)
             .await
-            .map_err(|_| LiveEgressError::Runtime)?
+            .map_err(|error| runtime_failure("gateway_inspect", error))?
             .ok_or(LiveEgressError::Runtime)?;
         verify_runtime_state(
             session,
@@ -1543,9 +1584,25 @@ fn egress_error_label(error: &LiveEgressError) -> &'static str {
         LiveEgressError::Database(_) => "database",
         LiveEgressError::PolicyRepository(_) => "policy_repository",
         LiveEgressError::Runtime => "runtime",
+        LiveEgressError::WorkerIncompatible => "worker_incompatible",
         LiveEgressError::Readiness => "readiness",
         LiveEgressError::Cleanup => "cleanup",
     }
+}
+
+fn runtime_failure(stage: &'static str, error: anyhow::Error) -> LiveEgressError {
+    tracing::error!(
+        stage,
+        error = %error,
+        "Live protected-egress runtime operation failed"
+    );
+    LiveEgressError::Runtime
+}
+
+fn worker_image_is_compatible(labels: &HashMap<String, String>) -> bool {
+    labels
+        .get(WORKER_CONTROL_VERSION_LABEL)
+        .is_some_and(|version| version == CONTROL_VERSION)
 }
 
 fn project_builtin_profile(projected: &ActiveLiveEgressProfile) -> LiveEgressProfileConfig {
@@ -1649,6 +1706,11 @@ fn compile_live_topology(
 ) -> Result<crate::network::gateway::CompiledGatewayTopology, LiveEgressError> {
     let mut labels = HashMap::new();
     labels.insert(ELIXIR_MANAGED_LABEL.to_string(), "true".to_string());
+    labels.insert(
+        ELIXIR_EXTENSION_ID_LABEL.to_string(),
+        RUNTIME_OWNER_ID.to_string(),
+    );
+    labels.insert(ELIXIR_INSTANCE_ID_LABEL.to_string(), binding_id.to_string());
     labels.insert(ROLE_LABEL.to_string(), "worker".to_string());
     labels.insert(SESSION_LABEL.to_string(), session.id.to_string());
     labels.insert(BINDING_LABEL.to_string(), binding_id.to_string());
@@ -1980,6 +2042,44 @@ async fn wait_running(
     }
 }
 
+async fn wait_healthy(
+    runtime: &dyn RuntimeManager,
+    handle: &ContainerHandle,
+    timeout: Duration,
+) -> Result<(), LiveEgressError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let state = runtime
+            .inspect(handle)
+            .await
+            .map_err(|error| runtime_failure("gateway_health", error))?;
+        if !state.running {
+            tracing::error!(
+                container = handle.name,
+                status = state.status,
+                "Live protected-egress gateway stopped before becoming healthy"
+            );
+            return Err(LiveEgressError::Runtime);
+        }
+        if gateway_tunnel_is_ready(&state) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(
+                container = handle.name,
+                health = state.health.as_deref().unwrap_or("missing"),
+                "Live protected-egress gateway did not become healthy"
+            );
+            return Err(LiveEgressError::Readiness);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn gateway_tunnel_is_ready(state: &crate::runtime::model::ContainerState) -> bool {
+    state.running && state.health.as_deref() == Some("healthy")
+}
+
 fn protected_limits() -> UpstreamLimits {
     UpstreamLimits {
         connect_timeout: Duration::from_secs(5),
@@ -2118,6 +2218,40 @@ mod tests {
     use crate::live::session::{DeliveryMode, SessionOwner, SessionProtocol, SessionState};
 
     use super::*;
+
+    #[test]
+    fn live_worker_image_requires_the_exact_control_protocol() {
+        let compatible = HashMap::from([(
+            WORKER_CONTROL_VERSION_LABEL.to_string(),
+            CONTROL_VERSION.to_string(),
+        )]);
+        assert!(worker_image_is_compatible(&compatible));
+
+        let stale = HashMap::from([(
+            WORKER_CONTROL_VERSION_LABEL.to_string(),
+            "elixir-live-egress-v1".to_string(),
+        )]);
+        assert!(!worker_image_is_compatible(&stale));
+        assert!(!worker_image_is_compatible(&HashMap::new()));
+    }
+
+    #[test]
+    fn warp_gateway_requires_docker_health_to_confirm_the_tunnel() {
+        let mut state = crate::runtime::model::ContainerState {
+            id: "gateway-id".to_string(),
+            name: "gateway".to_string(),
+            status: "running".to_string(),
+            running: true,
+            health: Some("starting".to_string()),
+        };
+        assert!(!gateway_tunnel_is_ready(&state));
+
+        state.health = Some("healthy".to_string());
+        assert!(gateway_tunnel_is_ready(&state));
+
+        state.running = false;
+        assert!(!gateway_tunnel_is_ready(&state));
+    }
 
     #[test]
     fn live_runtime_namespace_accepts_exact_gateway_identity() {
@@ -3073,6 +3207,18 @@ mod tests {
             Some(expected_binding_id.as_str())
         );
         for spec in [&gateway, &app] {
+            assert_eq!(
+                spec.labels
+                    .get(ELIXIR_EXTENSION_ID_LABEL)
+                    .map(String::as_str),
+                Some(RUNTIME_OWNER_ID)
+            );
+            assert_eq!(
+                spec.labels
+                    .get(ELIXIR_INSTANCE_ID_LABEL)
+                    .map(String::as_str),
+                Some(expected_binding_id.as_str())
+            );
             assert!(
                 spec.labels
                     .keys()

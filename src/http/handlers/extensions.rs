@@ -4370,6 +4370,13 @@ async fn summarize_module_extension(
     failed_bindings_by_consumer: &HashMap<Uuid, usize>,
     runtime_snapshot: &DockerRuntimeHealthSnapshot,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
+    let zero_config_provider = manifest
+        .map(is_zero_config_auto_instance_manifest)
+        .unwrap_or(false);
+    let zero_config_live_provider = manifest
+        .map(is_zero_config_live_provider_manifest)
+        .unwrap_or(false);
+
     if !extension.enabled {
         return with_module_auto_update_summary(
             store,
@@ -4387,6 +4394,21 @@ async fn summarize_module_extension(
     }
 
     if instances.is_empty() {
+        if zero_config_provider {
+            return with_module_auto_update_summary(
+                store,
+                extension,
+                progress_extension_status(
+                    extension,
+                    "instance_creation_pending",
+                    "Installing",
+                    "Elixir is creating the default extension instance automatically.",
+                    "open",
+                    "Open",
+                ),
+            )
+            .await;
+        }
         return with_module_auto_update_summary(
             store,
             extension,
@@ -4413,6 +4435,10 @@ async fn summarize_module_extension(
     let mut degraded_provider_count = 0usize;
     let mut transport_ready_count = 0usize;
     let mut bootstrap_ready_count = 0usize;
+    let mut live_provider_count = 0usize;
+    let mut live_transport_ready_count = 0usize;
+    let mut live_bootstrap_ready_count = 0usize;
+    let mut live_driver_ready_count = 0usize;
     let mut failed_binding_count = 0usize;
 
     for instance in instances {
@@ -4435,11 +4461,30 @@ async fn summarize_module_extension(
         if let Some(providers) = providers_by_instance.get(&instance.instance_id) {
             provider_count += providers.len();
             for provider in providers {
+                let is_live_provider = provider.capability == "live.catalog_provider";
+                if is_live_provider {
+                    live_provider_count += 1;
+                }
                 if let Some(readiness) = readiness_by_provider.get(&provider.provider_id) {
                     match readiness.readiness_phase {
-                        ProviderReadinessPhase::TransportReady => transport_ready_count += 1,
-                        ProviderReadinessPhase::BootstrapReady => bootstrap_ready_count += 1,
-                        ProviderReadinessPhase::Unknown | ProviderReadinessPhase::DriverReady => {}
+                        ProviderReadinessPhase::TransportReady => {
+                            transport_ready_count += 1;
+                            if is_live_provider {
+                                live_transport_ready_count += 1;
+                            }
+                        }
+                        ProviderReadinessPhase::BootstrapReady => {
+                            bootstrap_ready_count += 1;
+                            if is_live_provider {
+                                live_bootstrap_ready_count += 1;
+                            }
+                        }
+                        ProviderReadinessPhase::DriverReady => {
+                            if is_live_provider {
+                                live_driver_ready_count += 1;
+                            }
+                        }
+                        ProviderReadinessPhase::Unknown => {}
                     }
                 }
                 match provider.health_state {
@@ -4510,18 +4555,15 @@ async fn summarize_module_extension(
     }
 
     if provider_count == 0 {
-        if manifest
-            .map(is_zero_config_candidate_provider_manifest)
-            .unwrap_or(false)
-        {
+        if zero_config_provider {
             return with_module_auto_update_summary(
                 store,
                 extension,
-                attention_extension_status(
+                progress_extension_status(
                     extension,
                     "provider_registration_pending",
                     "Starting up",
-                    "Elixir created the default source instance and is registering its candidate provider automatically.",
+                    "Elixir created the default instance and is registering its provider automatically.",
                     "open",
                     "Open",
                 ),
@@ -4539,6 +4581,38 @@ async fn summarize_module_extension(
                 "finish_setup",
                 "Finish setup",
             ),
+        )
+        .await;
+    }
+
+    if zero_config_live_provider
+        && live_driver_ready_count < live_provider_count
+        && unhealthy_provider_count == 0
+        && degraded_provider_count == 0
+    {
+        let (code, title, description) = if live_bootstrap_ready_count > 0 {
+            (
+                "bootstrap_in_progress",
+                "Finishing setup",
+                "The Live provider is connected while Elixir finishes its managed setup.",
+            )
+        } else if live_transport_ready_count > 0 {
+            (
+                "runtime_starting",
+                "Connecting",
+                "The Live provider is reachable and Elixir is waiting for it to become ready.",
+            )
+        } else {
+            (
+                "provider_registration_pending",
+                "Starting service",
+                "Elixir is starting the Live provider and checking its connection.",
+            )
+        };
+        return with_module_auto_update_summary(
+            store,
+            extension,
+            progress_extension_status(extension, code, title, description, "open", "Open"),
         )
         .await;
     }
@@ -4586,7 +4660,7 @@ async fn summarize_module_extension(
         return with_module_auto_update_summary(
             store,
             extension,
-            attention_extension_status(extension, code, title, description, "open", "Open"),
+            progress_extension_status(extension, code, title, description, "open", "Open"),
         )
         .await;
     }
@@ -4695,7 +4769,7 @@ async fn summarize_module_extension(
     .await
 }
 
-fn is_zero_config_candidate_provider_manifest(manifest: &ExtensionManifest) -> bool {
+fn is_zero_config_auto_instance_manifest(manifest: &ExtensionManifest) -> bool {
     if manifest.kind != ExtensionKind::Module || manifest.runtime.is_none() {
         return false;
     }
@@ -4706,22 +4780,40 @@ fn is_zero_config_candidate_provider_manifest(manifest: &ExtensionManifest) -> b
         return false;
     }
     manifest.provides.iter().any(|provide| {
-        if provide.capability != "acquisition.candidate_provider" {
+        if !matches!(
+            provide.capability.as_str(),
+            "acquisition.candidate_provider" | "live.catalog_provider"
+        ) {
             return false;
         }
-        let Some(scope) = provide.scope.as_ref() else {
-            return true;
-        };
-        !scope.requires_account && scope.required_fields.is_empty()
+        provider_scope_is_zero_config(provide.scope.as_ref())
     })
+}
+
+fn is_zero_config_live_provider_manifest(manifest: &ExtensionManifest) -> bool {
+    is_zero_config_auto_instance_manifest(manifest)
+        && manifest.provides.iter().any(|provide| {
+            provide.capability == "live.catalog_provider"
+                && provider_scope_is_zero_config(provide.scope.as_ref())
+        })
+}
+
+fn provider_scope_is_zero_config(
+    scope: Option<&crate::extensions::manifest::ManifestProviderScope>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    !scope.requires_account && scope.required_fields.is_empty()
 }
 
 fn extension_status_sort_order(severity: &str) -> usize {
     match severity {
-        "attention" => 0,
-        "ready" => 1,
-        "disabled" => 2,
-        _ => 3,
+        "progress" => 0,
+        "attention" => 1,
+        "ready" => 2,
+        "disabled" => 3,
+        _ => 4,
     }
 }
 
@@ -4774,6 +4866,25 @@ fn attention_extension_status(
     extension_status_item(
         extension,
         "attention",
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
+}
+
+fn progress_extension_status(
+    extension: &Extension,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    extension_status_item(
+        extension,
+        "progress",
         status_code,
         label,
         description,

@@ -9,7 +9,7 @@ COPY vendor ./vendor
 COPY docs ./docs
 COPY extensions ./extensions
 COPY elixir-server ./elixir-server
-RUN cargo build --locked --release -p elixir-server --bin elixir-live-egress-worker \
+RUN cargo build --locked --release -p elixir-live-egress-worker \
     && strip /src/target/release/elixir-live-egress-worker
 
 FROM ${RUNTIME_IMAGE}
@@ -21,7 +21,8 @@ LABEL org.opencontainers.image.title="Elixir Live egress worker" \
       org.opencontainers.image.description="Session-isolated authenticated upstream worker for protected Live playback" \
       org.opencontainers.image.vendor="Elixir" \
       org.opencontainers.image.base.name="${RUNTIME_IMAGE}" \
-      org.elixir.build.rust-image="${RUST_IMAGE}"
+      org.elixir.build.rust-image="${RUST_IMAGE}" \
+      org.elixir.live-egress.control-version="elixir-live-egress-v2"
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 

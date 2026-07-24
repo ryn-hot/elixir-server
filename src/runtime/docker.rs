@@ -1644,6 +1644,10 @@ impl DockerRuntimeManager {
 
 #[async_trait::async_trait]
 impl RuntimeManager for DockerRuntimeManager {
+    async fn image_labels(&self, image: &str) -> Result<HashMap<String, String>> {
+        Ok(self.inspect_image_metadata(image).await?.labels)
+    }
+
     async fn ensure_network(&self, name: &str) -> Result<()> {
         let inspect_args = vec![
             "network".to_string(),

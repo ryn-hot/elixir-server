@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -65,6 +68,9 @@ pub fn deployment_id_for_storage_root(storage_root: &str) -> String {
 
 #[async_trait]
 pub trait RuntimeManager: Send + Sync {
+    async fn image_labels(&self, _image: &str) -> anyhow::Result<HashMap<String, String>> {
+        anyhow::bail!("runtime does not support image metadata")
+    }
     async fn ensure_network(&self, name: &str) -> anyhow::Result<()>;
     async fn ensure_container(&self, spec: &ContainerSpec) -> anyhow::Result<ContainerHandle>;
     async fn create_private_file_volume(
