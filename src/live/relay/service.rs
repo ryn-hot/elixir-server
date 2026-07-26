@@ -1,4 +1,9 @@
-use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::http::{
     HeaderMap, StatusCode,
@@ -14,7 +19,7 @@ use uuid::Uuid;
 
 use crate::live::{
     config::LiveRelayLimits,
-    contract::{CredentialAuthority, SensitiveString, SourceDescriptor, StreamProtocol},
+    contract::{SensitiveString, SourceDescriptor, StreamProtocol},
     egress::{LiveEgressError, LiveEgressService},
     provider::LiveProviderClient,
     session::{
@@ -22,9 +27,10 @@ use crate::live::{
         StoredSessionDescriptor,
     },
     upstream::{
-        CredentialSet, DestinationPolicy, DestinationRule, FetchRequest, LocalDestinationDenylist,
-        NetworkScope, PrivateLanGate, SafeRequestHeaders, SystemDnsResolver, UpstreamError,
-        UpstreamFetcher, UpstreamLimits, UpstreamMethod, UpstreamResponse,
+        CredentialSet, DestinationPolicy, DestinationRule, FetchRequest, HostGatewayDnsResolver,
+        LocalDestinationDenylist, NetworkScope, PrivateLanGate, SafeRequestHeaders,
+        SystemDnsResolver, UpstreamError, UpstreamFetcher, UpstreamLimits, UpstreamMethod,
+        UpstreamResponse,
     },
 };
 
@@ -143,10 +149,6 @@ impl Authority {
         })
     }
 
-    fn from_credential(value: &CredentialAuthority) -> Result<Self, LiveRelayError> {
-        Self::from_parts(&value.scheme, &value.host, value.port)
-    }
-
     fn from_parts(scheme: &str, host: &str, port: u16) -> Result<Self, LiveRelayError> {
         let scheme = match scheme {
             "http" => Scheme::Http,
@@ -174,7 +176,6 @@ struct RelaySession {
     protocol: SessionProtocol,
     source: Arc<SourceDescriptor>,
     root_url: Url,
-    allowed_authorities: Vec<Authority>,
     credentials: Arc<CredentialSet>,
     fetcher: Arc<UpstreamFetcher>,
     resources: Mutex<HlsResourceMap>,
@@ -193,7 +194,6 @@ impl fmt::Debug for RelaySession {
             .field("hard_expires_at", &self.hard_expires_at)
             .field("protocol", &self.protocol)
             .field("source", &"[REDACTED]")
-            .field("allowed_authority_count", &self.allowed_authorities.len())
             .finish()
     }
 }
@@ -213,7 +213,9 @@ impl RelaySession {
             return matches!(url.scheme(), "http" | "https");
         }
         Authority::from_url(url).is_ok_and(|authority| {
-            self.allowed_authorities.contains(&authority) || policy_authorities.contains(&authority)
+            Authority::from_url(&self.root_url)
+                .is_ok_and(|root_authority| authority == root_authority)
+                || policy_authorities.contains(&authority)
         })
     }
 }
@@ -232,7 +234,6 @@ pub(crate) struct LiveRemuxSource {
     protocol: SessionProtocol,
     source: Arc<SourceDescriptor>,
     root_url: Url,
-    allowed_authorities: Vec<Authority>,
     credentials: Arc<CredentialSet>,
     fetcher: Arc<UpstreamFetcher>,
 }
@@ -310,7 +311,7 @@ impl LiveRelayService {
         let resolver = SystemDnsResolver::new(Duration::from_secs(5))
             .map_err(|_| LiveRelayBuildError::Resolver)?;
         let fetcher = UpstreamFetcher::new(
-            Arc::new(resolver),
+            Arc::new(HostGatewayDnsResolver::new(Arc::new(resolver))),
             UpstreamLimits {
                 connect_timeout: Duration::from_secs(5),
                 header_timeout: Duration::from_secs(10),
@@ -323,11 +324,19 @@ impl LiveRelayService {
             },
         )
         .map_err(|_| LiveRelayBuildError::Fetcher)?;
-        let addresses = local_ip_address::list_afinet_netifas()
+        let mut addresses = local_ip_address::list_afinet_netifas()
             .map_err(|_| LiveRelayBuildError::LocalDenylist)?
             .into_iter()
             .map(|(_, address)| address)
             .collect::<Vec<IpAddr>>();
+        for loopback in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            if !addresses.contains(&loopback) {
+                addresses.push(loopback);
+            }
+        }
         let local_denylist = LocalDestinationDenylist::new(addresses, Vec::new())
             .map_err(|_| LiveRelayBuildError::LocalDenylist)?;
         Self::with_fetcher(
@@ -391,7 +400,7 @@ impl LiveRelayService {
         let resolver = SystemDnsResolver::new(Duration::from_secs(5))
             .map_err(|_| LiveRelayBuildError::Resolver)?;
         let fetcher = UpstreamFetcher::new(
-            Arc::new(resolver),
+            Arc::new(HostGatewayDnsResolver::new(Arc::new(resolver))),
             UpstreamLimits {
                 connect_timeout: Duration::from_secs(5),
                 header_timeout: Duration::from_secs(10),
@@ -429,7 +438,11 @@ impl LiveRelayService {
             false,
             fetcher,
             None,
-            LocalDestinationDenylist::empty(),
+            LocalDestinationDenylist::new(
+                vec![IpAddr::V4(Ipv4Addr::new(192, 168, 255, 254))],
+                Vec::new(),
+            )
+            .expect("valid test local destination denylist"),
             true,
         )
     }
@@ -442,7 +455,11 @@ impl LiveRelayService {
         &self,
         session: &SessionRecord,
         stored: &StoredSessionDescriptor,
+        private_network: bool,
     ) -> Result<Arc<UpstreamFetcher>, LiveRelayError> {
+        if private_network {
+            return Ok(self.fetcher.clone());
+        }
         let policy = stored
             .egress
             .to_effective()
@@ -518,16 +535,10 @@ impl LiveRelayService {
         }
         let root_url =
             Url::parse(source.url.expose()).map_err(|_| LiveRelayError::DescriptorInvalid)?;
-        let mut allowed_authorities = vec![Authority::from_url(&root_url)?];
-        for authority in &source.credential_authorities {
-            let authority = Authority::from_credential(authority)?;
-            if !allowed_authorities.contains(&authority) {
-                allowed_authorities.push(authority);
-            }
-        }
+        Authority::from_url(&root_url)?;
         let credentials = CredentialSet::from_descriptor(&source)
             .map_err(|_| LiveRelayError::CredentialsRejected)?;
-        let fetcher = self.fetcher_for(session, &stored)?;
+        let fetcher = self.fetcher_for(session, &stored, source.private_network)?;
         let resources = HlsResourceMap::new(
             session.id,
             session.control_fencing_token,
@@ -542,7 +553,6 @@ impl LiveRelayService {
             protocol: session.protocol,
             source: Arc::new(source),
             root_url,
-            allowed_authorities,
             credentials: Arc::new(credentials),
             fetcher,
             resources: Mutex::new(resources),
@@ -643,16 +653,10 @@ impl LiveRelayService {
         if !matches!(root_url.scheme(), "http" | "https") {
             return Err(LiveRelayError::ProtocolUnsupported);
         }
-        let mut allowed_authorities = vec![Authority::from_url(&root_url)?];
-        for authority in &source.credential_authorities {
-            let authority = Authority::from_credential(authority)?;
-            if !allowed_authorities.contains(&authority) {
-                allowed_authorities.push(authority);
-            }
-        }
+        Authority::from_url(&root_url)?;
         let credentials = CredentialSet::from_descriptor(&source)
             .map_err(|_| LiveRelayError::CredentialsRejected)?;
-        let fetcher = self.fetcher_for(session, &stored)?;
+        let fetcher = self.fetcher_for(session, &stored, source.private_network)?;
         Ok(Arc::new(LiveRemuxSource {
             session_id: session.id,
             owner: session.owner,
@@ -662,7 +666,6 @@ impl LiveRelayService {
             protocol: session.protocol,
             source: Arc::new(source),
             root_url,
-            allowed_authorities,
             credentials: Arc::new(credentials),
             fetcher,
         }))
@@ -693,7 +696,6 @@ impl LiveRelayService {
                 source.owner,
                 &source.source,
                 &source.root_url,
-                &source.allowed_authorities,
                 target,
                 discovered,
             )
@@ -1007,7 +1009,6 @@ impl LiveRelayService {
             relay.owner,
             &relay.source,
             &relay.root_url,
-            &relay.allowed_authorities,
             target,
             allow_discovered_target,
         )
@@ -1019,7 +1020,6 @@ impl LiveRelayService {
         owner: SessionOwner,
         source: &SourceDescriptor,
         root_url: &Url,
-        allowed_authorities: &[Authority],
         target: &Url,
         allow_discovered_target: bool,
     ) -> Result<LoadedPolicy, LiveRelayError> {
@@ -1035,12 +1035,13 @@ impl LiveRelayService {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| LiveRelayError::Unavailable)?;
-        if rows.len() > MAX_POLICY_ROWS || (rows.is_empty() && source.private_network) {
+        if rows.len() > MAX_POLICY_ROWS || (source.private_network && rows.len() == MAX_POLICY_ROWS)
+        {
             return Err(LiveRelayError::PolicyRejected);
         }
-        let mut rules = Vec::with_capacity(rows.len() + usize::from(allow_discovered_target));
+        let mut rules = Vec::with_capacity(rows.len() + usize::from(source.private_network));
         let mut authorities = Vec::new();
-        let mut owner_private_rule = false;
+        let mut destination_authorized = false;
         for row in rows {
             if row
                 .try_get::<i64, _>("allow_fetch")
@@ -1069,7 +1070,7 @@ impl LiveRelayService {
             let scope = match network_scope.as_str() {
                 "public" => NetworkScope::Public,
                 "private_lan" => {
-                    owner_private_rule = true;
+                    destination_authorized = true;
                     NetworkScope::PrivateLan
                 }
                 _ => return Err(LiveRelayError::PolicyRejected),
@@ -1085,26 +1086,22 @@ impl LiveRelayService {
             }
             rules.push(rule);
         }
-        if allow_discovered_target && source.private_network {
+        if source.private_network {
+            let root_authority = Authority::from_url(root_url)?;
             let target_authority = Authority::from_url(target)?;
-            if !allowed_authorities.contains(&target_authority)
-                && !authorities.contains(&target_authority)
-            {
+            if target_authority == root_authority {
+                let host = root_url.host_str().ok_or(LiveRelayError::PolicyRejected)?;
+                let port = root_url
+                    .port_or_known_default()
+                    .ok_or(LiveRelayError::PolicyRejected)?;
+                rules.push(
+                    DestinationRule::for_private_provider_authority(root_url.scheme(), host, port)
+                        .map_err(|_| LiveRelayError::PolicyRejected)?,
+                );
+                destination_authorized = true;
+            } else if !allow_discovered_target || !authorities.contains(&target_authority) {
                 return Err(LiveRelayError::PolicyRejected);
             }
-            let host = target.host_str().ok_or(LiveRelayError::PolicyRejected)?;
-            let port = target
-                .port_or_known_default()
-                .ok_or(LiveRelayError::PolicyRejected)?;
-            let scope = if source.private_network {
-                NetworkScope::PrivateLan
-            } else {
-                NetworkScope::Public
-            };
-            rules.push(
-                DestinationRule::new(target.scheme(), host, port, target.path(), scope, true)
-                    .map_err(|_| LiveRelayError::PolicyRejected)?,
-            );
         }
         let provider_private_permission = if source.private_network {
             self.provider_client
@@ -1120,7 +1117,7 @@ impl LiveRelayService {
             server_enabled: self.allow_private_lan_sources,
             provider_permission: provider_private_permission,
             descriptor_requested: source.private_network,
-            owner_rule: owner_private_rule,
+            destination_authorized,
         };
         let allow_http = target.scheme() == "http" || root_url.scheme() == "http";
         let policy = if source.private_network {

@@ -26,9 +26,9 @@ use crate::live::contract::{
 
 use super::{
     BlockedNetwork, CredentialSet, DestinationPolicy, DestinationRule, DirectEgressConnector,
-    DnsResolver, FetchRequest, LocalDestinationDenylist, NetworkScope, PrivateLanGate,
-    SafeRequestHeaders, UpstreamErrorCode, UpstreamFetcher, UpstreamLimits, UpstreamMethod,
-    error::Result,
+    DnsResolver, FetchRequest, HostGatewayDnsResolver, LocalDestinationDenylist, NetworkScope,
+    PrivateLanGate, SafeRequestHeaders, UpstreamErrorCode, UpstreamFetcher, UpstreamLimits,
+    UpstreamMethod, error::Result,
 };
 
 struct SequenceResolver {
@@ -74,6 +74,22 @@ impl DnsResolver for SequenceResolver {
                 .cloned()
                 .ok_or_else(|| UpstreamErrorCode::DnsEmpty.into())
         }
+    }
+}
+
+struct FailingResolver {
+    code: UpstreamErrorCode,
+}
+
+#[async_trait]
+impl DnsResolver for FailingResolver {
+    async fn resolve(
+        &self,
+        _host: &str,
+        _port: u16,
+        _cancellation: &CancellationToken,
+    ) -> Result<Vec<IpAddr>> {
+        Err(self.code.into())
     }
 }
 
@@ -367,7 +383,7 @@ fn r10_private_lan_requires_all_four_independent_approvals() {
         server_enabled: true,
         provider_permission: true,
         descriptor_requested: true,
-        owner_rule: true,
+        destination_authorized: true,
     };
     assert_eq!(
         DestinationPolicy::new(
@@ -386,7 +402,7 @@ fn r10_private_lan_requires_all_four_independent_approvals() {
             0 => gate.server_enabled = false,
             1 => gate.provider_permission = false,
             2 => gate.descriptor_requested = false,
-            _ => gate.owner_rule = false,
+            _ => gate.destination_authorized = false,
         }
         let policy = DestinationPolicy::new(
             vec![private_rule.clone()],
@@ -435,6 +451,194 @@ fn r10_private_lan_requires_all_four_independent_approvals() {
             UpstreamErrorCode::AddressForbidden
         );
     }
+}
+
+#[test]
+fn private_provider_authority_is_scoped_and_keeps_infrastructure_destinations_blocked() {
+    let gateway_address: IpAddr = "192.168.65.2".parse().unwrap();
+    let policy = DestinationPolicy::new(
+        vec![
+            DestinationRule::for_private_provider_authority("http", "host.docker.internal", 8090)
+                .unwrap(),
+        ],
+        PrivateLanGate {
+            server_enabled: true,
+            provider_permission: true,
+            descriptor_requested: true,
+            destination_authorized: true,
+        },
+        true,
+        LocalDestinationDenylist::new(vec![gateway_address], Vec::new()).unwrap(),
+    )
+    .unwrap();
+
+    for path in ["/live/account/channel.ts", "/hls/child/playlist.m3u8"] {
+        let target = policy
+            .validate_initial(&format!("http://host.docker.internal:8090{path}"))
+            .unwrap();
+        assert!(policy.resolve_target(target, vec![gateway_address]).is_ok());
+    }
+
+    assert_eq!(
+        policy
+            .validate_initial("http://host.docker.internal:8091/live")
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::HostForbidden
+    );
+    assert_eq!(
+        policy
+            .validate_initial("http://other.private.invalid:8090/live")
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::DestinationForbidden
+    );
+
+    let loopback_target = policy
+        .validate_initial("http://host.docker.internal:8090/live")
+        .unwrap();
+    assert!(
+        policy
+            .resolve_target(loopback_target, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .is_ok()
+    );
+
+    for forbidden in [
+        "169.254.169.254".parse().unwrap(),
+        "fe80::1".parse().unwrap(),
+    ] {
+        let target = policy
+            .validate_initial("http://host.docker.internal:8090/live")
+            .unwrap();
+        assert_eq!(
+            policy
+                .resolve_target(target, vec![forbidden])
+                .unwrap_err()
+                .code(),
+            UpstreamErrorCode::AddressForbidden
+        );
+    }
+
+    let literal_loopback_policy = DestinationPolicy::new(
+        vec![DestinationRule::for_private_provider_authority("http", "127.0.0.1", 8090).unwrap()],
+        PrivateLanGate {
+            server_enabled: true,
+            provider_permission: true,
+            descriptor_requested: true,
+            destination_authorized: true,
+        },
+        true,
+        LocalDestinationDenylist::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Vec::new()).unwrap(),
+    )
+    .unwrap();
+    let literal_loopback = literal_loopback_policy
+        .validate_initial("http://127.0.0.1:8090/live")
+        .unwrap();
+    assert_eq!(
+        literal_loopback_policy
+            .resolve_target(literal_loopback, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::AddressForbidden
+    );
+
+    for host in [
+        "localhost",
+        "metadata.google.internal",
+        "metadata.aws.internal",
+        "kubernetes.default.svc",
+    ] {
+        assert_eq!(
+            DestinationRule::for_private_provider_authority("http", host, 8090)
+                .unwrap_err()
+                .code(),
+            UpstreamErrorCode::HostForbidden
+        );
+    }
+}
+
+#[tokio::test]
+async fn docker_host_gateway_falls_back_only_for_dns_resolution_failures() {
+    let resolver = HostGatewayDnsResolver::new(Arc::new(FailingResolver {
+        code: UpstreamErrorCode::DnsFailed,
+    }));
+    assert_eq!(
+        resolver
+            .resolve("host.docker.internal", 8090, &CancellationToken::new())
+            .await
+            .unwrap(),
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+    );
+    assert_eq!(
+        resolver
+            .resolve("media.example.invalid", 443, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::DnsFailed
+    );
+
+    let cancelled = HostGatewayDnsResolver::new(Arc::new(FailingResolver {
+        code: UpstreamErrorCode::Cancelled,
+    }));
+    assert_eq!(
+        cancelled
+            .resolve("host.docker.internal", 8090, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .code(),
+        UpstreamErrorCode::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn authorized_docker_host_gateway_fetches_through_the_host_loopback_fallback() -> AnyResult<()>
+{
+    let app = Router::new().route(
+        "/live/channel.ts",
+        get(|| async {
+            (
+                [(reqwest::header::CONTENT_TYPE, "video/mp2t")],
+                vec![0x47_u8; 188 * 4],
+            )
+        }),
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let policy = DestinationPolicy::new(
+        vec![DestinationRule::for_private_provider_authority(
+            "http",
+            "host.docker.internal",
+            port,
+        )?],
+        PrivateLanGate {
+            server_enabled: true,
+            provider_permission: true,
+            descriptor_requested: true,
+            destination_authorized: true,
+        },
+        true,
+        LocalDestinationDenylist::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Vec::new())?,
+    )?;
+    let resolver = HostGatewayDnsResolver::new(Arc::new(FailingResolver {
+        code: UpstreamErrorCode::DnsFailed,
+    }));
+    let fetcher = UpstreamFetcher::new(Arc::new(resolver), test_limits())?;
+    let response = fetcher
+        .fetch(request(
+            format!("http://host.docker.internal:{port}/live/channel.ts"),
+            policy,
+        ))
+        .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.collect().await?.as_bytes(), vec![0x47_u8; 188 * 4]);
+    server.abort();
+    let _ = server.await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -885,7 +1089,7 @@ async fn r10_adversarial_dns_fixture_profiles_cross_the_production_resolver_cont
             server_enabled: true,
             provider_permission: true,
             descriptor_requested: true,
-            owner_rule: true,
+            destination_authorized: true,
         },
         false,
         test_local_denylist(),

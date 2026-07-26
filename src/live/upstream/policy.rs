@@ -107,7 +107,7 @@ pub struct PrivateLanGate {
     pub server_enabled: bool,
     pub provider_permission: bool,
     pub descriptor_requested: bool,
-    pub owner_rule: bool,
+    pub destination_authorized: bool,
 }
 
 impl PrivateLanGate {
@@ -115,7 +115,7 @@ impl PrivateLanGate {
         self.server_enabled
             && self.provider_permission
             && self.descriptor_requested
-            && self.owner_rule
+            && self.destination_authorized
     }
 }
 
@@ -127,6 +127,8 @@ pub struct DestinationRule {
     exact_path: String,
     network_scope: NetworkScope,
     allow_fetch: bool,
+    authority_wide: bool,
+    allow_local_destination: bool,
 }
 
 impl fmt::Debug for DestinationRule {
@@ -136,6 +138,8 @@ impl fmt::Debug for DestinationRule {
             .field("destination", &"<redacted>")
             .field("network_scope", &self.network_scope)
             .field("allow_fetch", &self.allow_fetch)
+            .field("authority_wide", &self.authority_wide)
+            .field("allow_local_destination", &self.allow_local_destination)
             .finish()
     }
 }
@@ -167,15 +171,53 @@ impl DestinationRule {
             exact_path: exact_path.to_string(),
             network_scope,
             allow_fetch,
+            authority_wide: false,
+            allow_local_destination: false,
         })
+    }
+
+    pub(crate) fn for_private_provider_authority(
+        scheme: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<Self> {
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(UpstreamErrorCode::SchemeForbidden.into());
+        }
+        let host = normalize_host(host)?;
+        if hard_forbidden_hostname(&host) {
+            return Err(UpstreamErrorCode::HostForbidden.into());
+        }
+        if port == 0 {
+            return Err(UpstreamErrorCode::PortForbidden.into());
+        }
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            exact_path: "/".to_string(),
+            network_scope: NetworkScope::PrivateLan,
+            allow_fetch: true,
+            authority_wide: true,
+            allow_local_destination: true,
+        })
+    }
+
+    fn same_authority(&self, target: &ValidatedUrl) -> bool {
+        self.scheme == target.scheme && self.host == target.host && self.port == target.port
     }
 
     fn matches(&self, target: &ValidatedUrl) -> bool {
         self.allow_fetch
-            && self.scheme == target.scheme
-            && self.host == target.host
-            && self.port == target.port
-            && self.exact_path == target.url.path()
+            && self.same_authority(target)
+            && (self.authority_wide || self.exact_path == target.url.path())
+    }
+
+    fn permits_private_gateway_hostname(&self, target: &ValidatedUrl) -> bool {
+        self.allow_local_destination
+            && self.network_scope == NetworkScope::PrivateLan
+            && self.same_authority(target)
     }
 }
 
@@ -308,9 +350,6 @@ impl DestinationPolicy {
         }
         let raw_host = url.host_str().ok_or(UpstreamErrorCode::HostForbidden)?;
         let host = normalize_host(raw_host)?;
-        if forbidden_hostname(&host) {
-            return Err(UpstreamErrorCode::HostForbidden.into());
-        }
         let port = url
             .port_or_known_default()
             .ok_or(UpstreamErrorCode::PortForbidden)?;
@@ -320,7 +359,15 @@ impl DestinationPolicy {
             host,
             port,
         };
-        if !self.allow_public_discovery && !self.rules.iter().any(|rule| rule.matches(&candidate)) {
+        let matching_rule = self.rules.iter().find(|rule| rule.matches(&candidate));
+        if hard_forbidden_hostname(&candidate.host)
+            || (private_gateway_hostname(&candidate.host)
+                && !matching_rule
+                    .is_some_and(|rule| rule.permits_private_gateway_hostname(&candidate)))
+        {
+            return Err(UpstreamErrorCode::HostForbidden.into());
+        }
+        if !self.allow_public_discovery && matching_rule.is_none() {
             return Err(UpstreamErrorCode::DestinationForbidden.into());
         }
         Ok(candidate)
@@ -338,12 +385,27 @@ impl DestinationPolicy {
         for address in addresses {
             unique.insert(address);
         }
+        let matching_rule = self.rules.iter().find(|rule| rule.matches(&target));
+        let authorized_local_destination = matching_rule.is_some_and(|rule| {
+            rule.allow_local_destination
+                && rule.network_scope == NetworkScope::PrivateLan
+                && self.private_lan.permits()
+        });
         let mut scope = None;
         for address in &unique {
-            if self.local_denylist.contains(*address) {
+            if self.local_denylist.contains(*address) && !authorized_local_destination {
                 return Err(UpstreamErrorCode::AddressForbidden.into());
             }
             let current = classify(*address);
+            let current = if current == AddressClass::Forbidden
+                && address.is_loopback()
+                && private_gateway_hostname(&target.host)
+                && authorized_local_destination
+            {
+                AddressClass::PrivateLan
+            } else {
+                current
+            };
             #[cfg(test)]
             let current = if self.allow_fixture_loopback && address.is_loopback() {
                 AddressClass::FixtureLoopback
@@ -358,10 +420,7 @@ impl DestinationPolicy {
             }
             scope = Some(current);
         }
-        let expected = self
-            .rules
-            .iter()
-            .find(|rule| rule.matches(&target))
+        let expected = matching_rule
             .map(|rule| rule.network_scope)
             .or_else(|| self.allow_public_discovery.then_some(NetworkScope::Public))
             .ok_or(UpstreamErrorCode::DestinationForbidden)?;
@@ -551,17 +610,17 @@ fn normalize_host_lossy(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn forbidden_hostname(host: &str) -> bool {
+fn hard_forbidden_hostname(host: &str) -> bool {
     host == "localhost"
         || host.ends_with(".localhost")
         || matches!(
             host,
-            "host.docker.internal"
-                | "gateway.docker.internal"
-                | "metadata.google.internal"
-                | "metadata.aws.internal"
-                | "kubernetes.default.svc"
+            "metadata.google.internal" | "metadata.aws.internal" | "kubernetes.default.svc"
         )
+}
+
+fn private_gateway_hostname(host: &str) -> bool {
+    matches!(host, "host.docker.internal" | "gateway.docker.internal")
 }
 
 fn valid_exact_path(path: &str) -> bool {

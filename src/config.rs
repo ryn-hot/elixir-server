@@ -379,7 +379,8 @@ fn apply_live_product_defaults(
         .set_default("live.playback_enabled", default_true())?
         .set_default("live.client_direct_enabled", default_true())?
         .set_default("live.relay_enabled", default_true())?
-        .set_default("live.remux_enabled", default_true())?)
+        .set_default("live.remux_enabled", default_true())?
+        .set_default("live.allow_private_lan_sources", default_true())?)
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1579,7 +1580,7 @@ mod tests {
         assert!(!settings.live.low_latency_hls_enabled);
         assert!(!settings.live.rtmp_remux_enabled);
         assert!(!settings.live.srt_remux_enabled);
-        assert!(!settings.live.allow_private_lan_sources);
+        assert!(settings.live.allow_private_lan_sources);
         settings.live.validate()?;
         Ok(())
     }

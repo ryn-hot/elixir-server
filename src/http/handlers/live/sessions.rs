@@ -1669,7 +1669,11 @@ async fn admit_delivery_runtime(
         .egress
         .to_effective()
         .map_err(|_| contract_invalid())?;
-    if egress_policy.protected() {
+    let private_network = stored
+        .selected()
+        .ok_or_else(contract_invalid)?
+        .private_network;
+    if protected_egress_applies(&egress_policy, private_network) {
         if session.delivery_mode == DeliveryMode::ClientDirect {
             return Err(contract_invalid());
         }
@@ -1698,6 +1702,10 @@ async fn admit_delivery_runtime(
             .await
             .map_err(super::delivery::map_remux_error),
     }
+}
+
+fn protected_egress_applies(policy: &EffectiveEgressPolicy, private_network: bool) -> bool {
+    policy.protected() && !private_network
 }
 
 pub(super) async fn end_delivery_runtime(
@@ -1847,12 +1855,16 @@ async fn ensure_delivery_ready(
     actor: &ActorSnapshot,
     now: DateTime<Utc>,
 ) -> Result<SessionRecord, LiveHttpRejection> {
-    let protected = decrypt_descriptor(repository, &session)
-        .await?
+    let stored = decrypt_descriptor(repository, &session).await?;
+    let effective_egress = stored
         .egress
         .to_effective()
-        .map_err(|_| contract_invalid())?
-        .protected();
+        .map_err(|_| contract_invalid())?;
+    let private_network = stored
+        .selected()
+        .ok_or_else(contract_invalid)?
+        .private_network;
+    let protected = protected_egress_applies(&effective_egress, private_network);
     for _ in 0..3 {
         let next = match session.state {
             SessionState::Resolving => Some(SessionState::Planning),
@@ -1963,7 +1975,7 @@ async fn session_response(
         .egress
         .to_effective()
         .map_err(|_| contract_invalid())?;
-    let egress_outcome = if effective_egress.protected() {
+    let egress_outcome = if protected_egress_applies(&effective_egress, selected.private_network) {
         state
             .live
             .egress_service()
@@ -3216,6 +3228,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn private_provider_hops_bypass_protected_egress_without_changing_public_delivery() {
+        let policy = EffectiveEgressPolicy {
+            mode: EgressPolicyMode::RequireProtected,
+            policy_id: Some("warp".to_string()),
+            allow_fallback: false,
+            revision: 1,
+            source: EgressPolicySource::Session,
+        };
+
+        assert!(!protected_egress_applies(&policy, true));
+        assert!(protected_egress_applies(&policy, false));
+    }
+
     impl DirectOriginFixture {
         async fn start() -> Result<Self> {
             Self::start_with_transport(true).await
@@ -3401,27 +3427,31 @@ mod tests {
 
     impl DirectProviderFixture {
         async fn start() -> Result<Self> {
-            Self::start_with_origin(None, false, false, false, false).await
+            Self::start_with_origin(None, false, false, false, false, false).await
         }
 
         async fn start_for_origin(port: u16) -> Result<Self> {
-            Self::start_with_origin(Some(port), false, false, false, false).await
+            Self::start_with_origin(Some(port), false, false, false, false, false).await
         }
 
         async fn start_for_relay(port: u16) -> Result<Self> {
-            Self::start_with_origin(Some(port), true, false, false, false).await
+            Self::start_with_origin(Some(port), true, false, false, false, false).await
+        }
+
+        async fn start_for_private_relay(port: u16) -> Result<Self> {
+            Self::start_with_origin(Some(port), true, false, false, false, true).await
         }
 
         async fn start_for_relay_media(port: u16) -> Result<Self> {
-            Self::start_with_origin(Some(port), true, true, false, false).await
+            Self::start_with_origin(Some(port), true, true, false, false, false).await
         }
 
         async fn start_for_recovery(port: u16) -> Result<Self> {
-            Self::start_with_origin(Some(port), true, false, true, false).await
+            Self::start_with_origin(Some(port), true, false, true, false, false).await
         }
 
         async fn start_for_remux(port: u16) -> Result<Self> {
-            Self::start_with_origin(Some(port), false, false, false, true).await
+            Self::start_with_origin(Some(port), false, false, false, true, false).await
         }
 
         async fn start_with_origin(
@@ -3430,6 +3460,7 @@ mod tests {
             relay_media: bool,
             recovery: bool,
             remux_transport: bool,
+            private_network: bool,
         ) -> Result<Self> {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
             let port = listener.local_addr()?.port();
@@ -3532,6 +3563,11 @@ mod tests {
                         } else {
                             "public"
                         };
+                        let server_egress = if private_network {
+                            "required"
+                        } else {
+                            "not_required"
+                        };
                         let alternatives = if origin_port.is_some()
                             && !relay_origin
                             && !remux_transport
@@ -3586,8 +3622,8 @@ mod tests {
                                 "clientDisclosure": client_disclosure,
                                 "expiresAt": null,
                                 "refreshHandle": null,
-                                "serverEgress": "not_required",
-                                "privateNetwork": false,
+                                "serverEgress": server_egress,
+                                "privateNetwork": private_network,
                                 "drm": {"kind": "none"},
                                 "timeShift": time_shift,
                                 "media": {
@@ -5235,6 +5271,150 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(forbidden_after, forbidden_before);
+
+        fixture.stop().await;
+        origin.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_extension_relay_authorizes_its_root_authority_without_manual_rules()
+    -> Result<()> {
+        let origin = RelayOriginFixture::start().await?;
+        let fixture = DirectProviderFixture::start_for_private_relay(origin.port).await?;
+        let mut settings = settings();
+        settings.live.relay_enabled = true;
+        settings.live.allow_private_lan_sources = true;
+        let database = Database::connect(&settings.database).await?;
+        database.run_migrations().await?;
+        let pool = database.pool.clone();
+        let (_, provider_id) = seed_provider(&database, fixture.port, json!({})).await?;
+        let mut state = AppState::new(
+            settings.clone(),
+            database,
+            AuthService::new(settings.auth.clone())?,
+            ExtensionManager::new(),
+            MetadataService::new(settings.metadata.clone())?,
+            LinkerService::new(settings.classifier.clone())?,
+            ArtworkService::new(
+                settings.library.artwork_cache_dir.clone(),
+                settings.metadata.request_timeout_seconds,
+            )?,
+            SecretsManager::from_settings(&settings)?,
+        );
+        state.live = Arc::new(LiveService::new_for_test(
+            settings.live.clone(),
+            settings.environment,
+            pool.clone(),
+            state.secrets.clone(),
+        ));
+        state.live.initialize().await?;
+        let app = router(state.clone());
+
+        let (status, _, signup) = response_json(
+            request(
+                &app,
+                "POST",
+                "/api/v1/auth/signup",
+                &[],
+                Some(json!({
+                    "email": format!("private-relay-{}@example.invalid", Uuid::new_v4()),
+                    "password": "correct horse battery staple"
+                })),
+            )
+            .await?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let access = signup["access_token"].as_str().unwrap().to_string();
+        let home_id = Uuid::parse_str(signup["home_id"].as_str().unwrap())?;
+        let profile_id = Uuid::parse_str(signup["profile_id"].as_str().unwrap())?;
+        let authorization_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM profile_authorization_revisions WHERE profile_id = $1",
+        )
+        .bind(profile_id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        let codec = LivePublicKeyCodec::new(state.live.crypto().await.expect("Live crypto"));
+        let scope = LivePublicKeyScope {
+            home_id,
+            profile_id,
+            authorization_revision,
+        };
+        let now = Utc::now();
+        let item_key = codec.seal_item(provider_id, "private-relay-event", scope, now)?;
+        let stream_key =
+            codec.seal_stream(provider_id, "private-relay-event", "primary", scope, now)?;
+        let account_headers = [
+            ("authorization", format!("Bearer {access}")),
+            ("idempotency-key", "private-relay-create-0001".to_string()),
+        ];
+
+        let (status, _, created) = response_json(
+            request(
+                &app,
+                "POST",
+                "/api/v1/live/sessions",
+                &account_headers,
+                Some(json!({
+                    "providerId": provider_id,
+                    "itemKey": item_key,
+                    "streamOptionKey": stream_key,
+                    "client": {
+                        "platform": "macos",
+                        "player": "mpv",
+                        "protocols": ["hls"],
+                        "videoCodecs": ["h264"],
+                        "audioCodecs": ["aac"],
+                        "supportsRequestHeaders": true,
+                        "supportsCookies": true,
+                        "supportsLowLatencyHls": false,
+                        "supportsOriginTimeShift": true
+                    }
+                })),
+            )
+            .await?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED, "create body: {created}");
+        assert_eq!(created["deliveryMode"], "server_relay");
+        assert_eq!(created["decisionReason"], "private_network_requires_relay");
+        assert_eq!(created["egress"]["mode"], "server_default");
+
+        let session_token = created["sessionToken"].as_str().unwrap().to_string();
+        let root_route = created["playbackUrl"].as_str().unwrap();
+        let delivery_headers = [("authorization", format!("Bearer {session_token}"))];
+        let (status, _, root_body) = response_bytes(
+            request(&app, "GET", root_route, &delivery_headers, None).await?,
+            1024 * 1024,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let root_manifest = String::from_utf8(root_body)?;
+        let child_routes = relay_resource_routes(&root_manifest);
+        assert_eq!(child_routes.len(), 1, "rewritten root: {root_manifest}");
+
+        let (status, _, child_body) = response_bytes(
+            request(&app, "GET", &child_routes[0], &delivery_headers, None).await?,
+            1024 * 1024,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let child_manifest = String::from_utf8(child_body)?;
+        assert_eq!(
+            relay_resource_routes(&child_manifest).len(),
+            2,
+            "rewritten child: {child_manifest}"
+        );
+        let destination_rules: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM live_provider_destination_rules
+             WHERE home_id = $1 AND provider_id = $2",
+        )
+        .bind(home_id.to_string())
+        .bind(provider_id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(destination_rules, 0);
 
         fixture.stop().await;
         origin.stop().await;

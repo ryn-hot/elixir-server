@@ -20,7 +20,7 @@ pub use policy::{
     BlockedNetwork, DestinationPolicy, DestinationRule, LocalDestinationDenylist, NetworkScope,
     PrivateLanGate, ResponseOrigin,
 };
-pub use resolver::{DnsResolver, SystemDnsResolver};
+pub use resolver::{DnsResolver, HostGatewayDnsResolver, SystemDnsResolver};
 
 #[cfg(test)]
 mod tests;

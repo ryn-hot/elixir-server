@@ -419,10 +419,8 @@ fn evaluate_source(
     {
         return Err(PlannerRejectionCode::PrivateNetworkForbidden);
     }
-    if source.private_network && input.policy.protected_egress_mode != EgressPolicyMode::Off {
-        return Err(PlannerRejectionCode::ProtectedEgressUnavailable);
-    }
-    if input.policy.protected_egress_mode != EgressPolicyMode::Off
+    if !source.private_network
+        && input.policy.protected_egress_mode != EgressPolicyMode::Off
         && !input.policy.protected_egress_ready
     {
         return Err(PlannerRejectionCode::ProtectedEgressUnavailable);
@@ -880,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn p11_private_and_protected_egress_fail_closed() {
+    fn p11_private_sources_use_the_direct_lan_hop_under_protected_profiles() {
         let client = client();
         let mut policy = policy();
         let mut private = source(StreamProtocol::Hls, "https://10.0.0.10/live/main.m3u8");
@@ -901,16 +899,19 @@ mod tests {
         );
 
         policy.protected_egress_mode = EgressPolicyMode::RequireProtected;
+        policy.protected_egress_ready = false;
+        let required_private = plan(private, &policy, &client).unwrap();
+        assert_eq!(required_private.mode, DeliveryMode::ServerRelay);
+        assert_eq!(required_private.egress, Some(EgressMode::PrivateLan));
         assert_eq!(
-            plan(private, &policy, &client).unwrap_err().code,
-            PlannerRejectionCode::ProtectedEgressUnavailable
+            required_private.reason,
+            PlannerReason::PrivateNetworkRequiresRelay
         );
 
         let protected = source(
             StreamProtocol::Hls,
             "https://media.example.invalid/live/main.m3u8",
         );
-        policy.protected_egress_ready = false;
         assert_eq!(
             plan(protected.clone(), &policy, &client).unwrap_err().code,
             PlannerRejectionCode::ProtectedEgressUnavailable
