@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -83,6 +84,21 @@ const WARP_GID: u32 = 1_000;
 const PROJECTED_WIREGUARD_CONFIG_PATH: &str = "/run/elixir-live-egress/projected/wg0.conf";
 const PROJECTED_OPENVPN_CONFIG_PATH: &str = "/run/elixir-live-egress/projected/custom.conf";
 const PROJECTED_OPENVPN_AUTH_PATH: &str = "/run/elixir-live-egress/projected/auth.txt";
+const WARP_KILL_SWITCH_SCRIPT: &str = concat!(
+    "set -eu; ",
+    "nft delete table inet elixir_live_egress 2>/dev/null || true; ",
+    "nft add table inet elixir_live_egress; ",
+    "nft 'add chain inet elixir_live_egress output ",
+    "{ type filter hook output priority filter; policy drop; }'; ",
+    "nft add rule inet elixir_live_egress output oifname lo accept; ",
+    "nft add rule inet elixir_live_egress output oifname CloudflareWARP accept; ",
+    "nft add rule inet elixir_live_egress output meta skuid 0 accept; ",
+    "nft add rule inet elixir_live_egress output ip daddr 10.0.0.0/8 accept; ",
+    "nft add rule inet elixir_live_egress output ip daddr 100.64.0.0/10 accept; ",
+    "nft add rule inet elixir_live_egress output ip daddr 172.16.0.0/12 accept; ",
+    "nft add rule inet elixir_live_egress output ip daddr 192.168.0.0/16 accept; ",
+    "nft add rule inet elixir_live_egress output ip6 daddr fc00::/7 accept"
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveEgressError {
@@ -479,6 +495,24 @@ impl LiveEgressService {
     }
 
     pub async fn ensure_session(
+        self: &Arc<Self>,
+        session: &SessionRecord,
+        policy: &EffectiveEgressPolicy,
+        actor: &ActorSnapshot,
+    ) -> Result<Option<Arc<UpstreamFetcher>>, LiveEgressError> {
+        let service = Arc::clone(self);
+        let session = session.clone();
+        let policy = policy.clone();
+        let actor = actor.clone();
+        await_request_independent(async move {
+            service
+                .ensure_session_inner(&session, &policy, &actor)
+                .await
+        })
+        .await
+    }
+
+    async fn ensure_session_inner(
         &self,
         session: &SessionRecord,
         policy: &EffectiveEgressPolicy,
@@ -966,6 +1000,7 @@ impl LiveEgressService {
                 Duration::from_secs(self.config.startup_timeout_seconds),
             )
             .await?;
+            install_warp_kill_switch(self.runtime.as_ref(), &gateway).await?;
         }
         let worker = self
             .runtime
@@ -1469,6 +1504,20 @@ impl LiveEgressService {
     }
 }
 
+async fn await_request_independent<T, F>(operation: F) -> Result<T, LiveEgressError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, LiveEgressError>> + Send + 'static,
+{
+    tokio::spawn(operation).await.map_err(|error| {
+        tracing::error!(
+            error = %error,
+            "request-independent Live egress provisioning task failed"
+        );
+        LiveEgressError::Runtime
+    })?
+}
+
 type StartedBinding = (
     ContainerHandle,
     ContainerHandle,
@@ -1597,6 +1646,25 @@ fn runtime_failure(stage: &'static str, error: anyhow::Error) -> LiveEgressError
         "Live protected-egress runtime operation failed"
     );
     LiveEgressError::Runtime
+}
+
+async fn install_warp_kill_switch(
+    runtime: &dyn RuntimeManager,
+    gateway: &ContainerHandle,
+) -> Result<(), LiveEgressError> {
+    runtime
+        .exec_container_command(
+            gateway,
+            "0",
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                WARP_KILL_SWITCH_SCRIPT.to_string(),
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| runtime_failure("warp_kill_switch", error))
 }
 
 fn worker_image_is_compatible(labels: &HashMap<String, String>) -> bool {
@@ -2219,6 +2287,41 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn live_egress_provisioning_survives_request_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let completed = Arc::new(StdAtomicBool::new(false));
+        let completion = completed.clone();
+
+        let request = tokio::spawn(await_request_independent(async move {
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+            completion.store(true, StdOrdering::Release);
+            Ok(())
+        }));
+        started_rx.await.expect("provisioning task started");
+
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request was cancelled")
+                .is_cancelled()
+        );
+        finish_tx
+            .send(())
+            .expect("detached provisioning task still exists");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !completed.load(StdOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provisioning task completed after request cancellation");
+    }
+
     #[test]
     fn live_worker_image_requires_the_exact_control_protocol() {
         let compatible = HashMap::from([(
@@ -2251,6 +2354,32 @@ mod tests {
 
         state.running = false;
         assert!(!gateway_tunnel_is_ready(&state));
+    }
+
+    #[tokio::test]
+    async fn warp_gateway_installs_a_fail_closed_worker_kill_switch() {
+        let runtime = CleanupRuntime::default();
+        let gateway = ContainerHandle {
+            id: "gateway-id".to_string(),
+            name: "gateway".to_string(),
+        };
+
+        install_warp_kill_switch(&runtime, &gateway)
+            .await
+            .expect("install WARP kill switch");
+
+        let calls = runtime.exec_calls.lock().expect("exec call lock");
+        let (container, user, command) = calls.as_slice().first().expect("kill-switch command");
+        assert_eq!(container, "gateway");
+        assert_eq!(user, "0");
+        assert_eq!(command[0], "sh");
+        assert_eq!(command[1], "-c");
+        let script = &command[2];
+        assert!(script.contains("policy drop"));
+        assert!(script.contains("oifname CloudflareWARP accept"));
+        assert!(script.contains("meta skuid 0 accept"));
+        assert!(script.contains("ip daddr 192.168.0.0/16 accept"));
+        assert!(!script.contains("ct state established"));
     }
 
     #[test]
@@ -2420,6 +2549,7 @@ mod tests {
         stop_calls: std::sync::Mutex<Vec<String>>,
         remove_calls: std::sync::Mutex<Vec<String>>,
         volume_remove_calls: std::sync::Mutex<Vec<String>>,
+        exec_calls: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
         remove_fails: StdAtomicBool,
     }
 
@@ -2541,6 +2671,20 @@ mod tests {
 
         async fn start_container(&self, _handle: &ContainerHandle) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn exec_container_command(
+            &self,
+            handle: &ContainerHandle,
+            user: &str,
+            command: &[String],
+        ) -> anyhow::Result<String> {
+            self.exec_calls.lock().expect("exec call lock").push((
+                handle.name.clone(),
+                user.to_string(),
+                command.to_vec(),
+            ));
+            Ok(String::new())
         }
 
         async fn stop_container(&self, handle: &ContainerHandle) -> anyhow::Result<()> {

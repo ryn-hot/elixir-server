@@ -179,6 +179,9 @@ impl ExtensionManifest {
                 if env.value.is_some() && env.from_secret.is_some() {
                     bail!("runtime.env entry must not include both value and from_secret");
                 }
+                if env.optional && env.from_secret.is_none() {
+                    bail!("runtime.env optional=true requires from_secret");
+                }
                 if let Some(from_secret) = env.from_secret.as_ref() {
                     if from_secret.trim().is_empty() {
                         bail!("runtime.env from_secret must not be empty");
@@ -858,6 +861,8 @@ pub struct ManifestRuntimeEnv {
     pub value: Option<String>,
     #[serde(default)]
     pub from_secret: Option<String>,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 fn default_backup_retention() -> usize {
@@ -3066,6 +3071,58 @@ runtime:
         assert_eq!(
             egress.wireguard_config_secret.as_deref(),
             Some("instance:wg_config")
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_optional_secret_runtime_env() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Module
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: test
+runtime:
+  type: container
+  image: example/test:1
+  env:
+    - name: PREMIUM_URL
+      from_secret: instance:premium_url
+      optional: true
+"#;
+        let parsed = parse_manifest_yaml(yaml).expect("manifest should parse");
+        let env = &parsed.manifest.runtime.expect("runtime").env[0];
+        assert!(env.optional);
+        assert_eq!(env.from_secret.as_deref(), Some("instance:premium_url"));
+    }
+
+    #[test]
+    fn manifest_rejects_optional_literal_runtime_env() {
+        let yaml = r#"
+id: elixir.modules.test
+version: 1.0.0
+kind: module
+name: Test Module
+provides:
+  - capability: utility.test
+    slot: default
+    implementation: test
+runtime:
+  type: container
+  image: example/test:1
+  env:
+    - name: FEATURE_FLAG
+      value: enabled
+      optional: true
+"#;
+        let error = parse_manifest_yaml(yaml).expect_err("manifest should reject optional literal");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime.env optional=true requires from_secret")
         );
     }
 

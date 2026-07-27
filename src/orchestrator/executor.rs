@@ -5365,13 +5365,36 @@ async fn resolve_secret_value(
     from_secret: &str,
 ) -> Result<String> {
     let reference = parse_secret_reference(from_secret, instance_id)?;
-    let secret = store
+    resolve_secret_reference_value(store, secrets, &reference)
+        .await?
+        .ok_or_else(|| anyhow!("secret '{}' not found", reference.key))
+}
+
+async fn try_resolve_secret_value(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    from_secret: &str,
+) -> Result<Option<String>> {
+    let reference = parse_secret_reference(from_secret, instance_id)?;
+    resolve_secret_reference_value(store, secrets, &reference).await
+}
+
+async fn resolve_secret_reference_value(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    reference: &SecretReference,
+) -> Result<Option<String>> {
+    let Some(secret) = store
         .get_secret(reference.scope, reference.scope_id, &reference.key)
         .await?
-        .ok_or_else(|| anyhow!("secret '{}' not found", reference.key))?;
-    secrets
+    else {
+        return Ok(None);
+    };
+    let value = secrets
         .decrypt(&secret.value_encrypted)
-        .with_context(|| format!("decrypting secret '{}'", reference.key))
+        .with_context(|| format!("decrypting secret '{}'", reference.key))?;
+    Ok(Some(value))
 }
 
 fn render_openvpn_config(config: &str, has_auth_file: bool) -> String {
@@ -5467,18 +5490,31 @@ async fn resolve_runtime_env(
     let mut resolved = Vec::with_capacity(env.len());
     for env in env {
         let name = env.name.clone();
-        let value = match (env.value, env.from_secret) {
-            (Some(value), None) => value,
-            (None, Some(from_secret)) => {
+        let value = match (env.value, env.from_secret, env.optional) {
+            (Some(_), None, true) => {
+                bail!("runtime.env '{}' optional=true requires from_secret", name)
+            }
+            (Some(value), None, false) => value,
+            (None, Some(from_secret), true) => {
+                let Some(value) =
+                    try_resolve_secret_value(store, secrets, instance_id, &from_secret)
+                        .await
+                        .with_context(|| format!("resolving runtime.env '{name}'"))?
+                else {
+                    continue;
+                };
+                value
+            }
+            (None, Some(from_secret), false) => {
                 resolve_secret_value(store, secrets, instance_id, &from_secret)
                     .await
                     .with_context(|| format!("resolving runtime.env '{name}'"))?
             }
-            (Some(_), Some(_)) => bail!(
+            (Some(_), Some(_), _) => bail!(
                 "runtime.env '{}' must not define both value and from_secret",
                 name
             ),
-            (None, None) => bail!("runtime.env '{}' requires value or from_secret", name),
+            (None, None, _) => bail!("runtime.env '{}' requires value or from_secret", name),
         };
         resolved.push(EnvVar { name, value });
     }
@@ -7751,6 +7787,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
+                optional: false,
             }],
             egress: None,
             security: Default::default(),
@@ -7774,6 +7811,55 @@ mod tests {
             .find(|env| env.name == "API_KEY")
             .map(|env| env.value.clone());
         assert_eq!(env_value.as_deref(), Some("super-secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_env_optional_secret_is_omitted_until_configured() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+
+        insert_extension(&store, "ext.optional-secret", json!({})).await?;
+
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "ext.optional-secret".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+
+        let secrets = SecretsManager::from_key_bytes([5u8; 32], false);
+        let optional_env = || {
+            vec![ManifestRuntimeEnv {
+                name: "PREMIUM_URL".to_string(),
+                value: None,
+                from_secret: Some("instance:premium_url".to_string()),
+                optional: true,
+            }]
+        };
+
+        let missing = resolve_runtime_env(&store, &secrets, instance_id, optional_env()).await?;
+        assert!(missing.is_empty());
+
+        store
+            .upsert_secret(&NewSecret {
+                secret_id: Uuid::new_v4(),
+                scope: SecretScope::Instance,
+                scope_id: Some(instance_id),
+                key: "premium_url".to_string(),
+                value_encrypted: secrets.encrypt("https://premium.example/manifest.json")?,
+                rotatable: false,
+            })
+            .await?;
+
+        let configured = resolve_runtime_env(&store, &secrets, instance_id, optional_env()).await?;
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].name, "PREMIUM_URL");
+        assert_eq!(configured[0].value, "https://premium.example/manifest.json");
         Ok(())
     }
 
@@ -8000,6 +8086,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
+                optional: false,
             }],
             egress: None,
             security: Default::default(),
@@ -8074,6 +8161,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
+                optional: false,
             }],
             egress: None,
             security: Default::default(),
@@ -9420,11 +9508,13 @@ mod tests {
                     name: "NZBGET_USER".to_string(),
                     value: None,
                     from_secret: Some("instance:nzbget_username".to_string()),
+                    optional: false,
                 },
                 ManifestRuntimeEnv {
                     name: "NZBGET_PASS".to_string(),
                     value: None,
                     from_secret: Some("instance:nzbget_password".to_string()),
+                    optional: false,
                 },
             ],
             egress: None,

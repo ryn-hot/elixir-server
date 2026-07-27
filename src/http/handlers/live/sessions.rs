@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
@@ -1851,6 +1852,38 @@ async fn require_play_grant(
 async fn ensure_delivery_ready(
     state: &AppState,
     repository: &LiveSessionRepository,
+    session: SessionRecord,
+    actor: &ActorSnapshot,
+    now: DateTime<Utc>,
+) -> Result<SessionRecord, LiveHttpRejection> {
+    let state = state.clone();
+    let repository = repository.clone();
+    let actor = actor.clone();
+    await_request_independent_session_activation(async move {
+        ensure_delivery_ready_inner(&state, &repository, session, &actor, now).await
+    })
+    .await
+}
+
+async fn await_request_independent_session_activation<T, F>(
+    operation: F,
+) -> Result<T, LiveHttpRejection>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, LiveHttpRejection>> + Send + 'static,
+{
+    tokio::spawn(operation).await.map_err(|error| {
+        tracing::error!(
+            error = %error,
+            "request-independent Live session activation task failed"
+        );
+        internal_error()
+    })?
+}
+
+async fn ensure_delivery_ready_inner(
+    state: &AppState,
+    repository: &LiveSessionRepository,
     mut session: SessionRecord,
     actor: &ActorSnapshot,
     now: DateTime<Utc>,
@@ -3085,7 +3118,7 @@ mod tests {
         process::Command as StdCommand,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration as StdDuration, Instant},
     };
@@ -3133,6 +3166,32 @@ mod tests {
         secrets::SecretsManager,
         state::AppState,
     };
+
+    #[tokio::test]
+    async fn session_activation_survives_request_cancellation() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let operation_completed = completed.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let request = tokio::spawn(async move {
+            await_request_independent_session_activation(async move {
+                let _ = started_tx.send(());
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+                operation_completed.store(true, Ordering::SeqCst);
+                Ok::<(), LiveHttpRejection>(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("activation task started");
+        request.abort();
+        let _ = request.await;
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "dropping the HTTP request must not cancel session activation"
+        );
+    }
 
     #[tokio::test]
     async fn lpi2_session_provider_mapping_stops_on_account_required() {

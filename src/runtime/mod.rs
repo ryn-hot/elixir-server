@@ -101,6 +101,14 @@ pub trait RuntimeManager: Send + Sync {
     }
     async fn get_container_handle(&self, name: &str) -> anyhow::Result<Option<ContainerHandle>>;
     async fn start_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
+    async fn exec_container_command(
+        &self,
+        _handle: &ContainerHandle,
+        _user: &str,
+        _command: &[String],
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("runtime does not support container command execution")
+    }
     async fn stop_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
     async fn rename_container(
         &self,

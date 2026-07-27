@@ -31,7 +31,10 @@ pub fn required_secrets_from_runtime(runtime: &ManifestRuntime) -> Result<Vec<Re
     let mut required = Vec::new();
     for env in &runtime.env {
         if let Some(from_secret) = env.from_secret.as_ref() {
-            required.push(parse_required_secret(from_secret)?);
+            let secret = parse_required_secret(from_secret)?;
+            if !env.optional {
+                required.push(secret);
+            }
         }
     }
     if let Some(egress) = runtime.egress.as_ref() {
@@ -219,6 +222,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value: None,
                 from_secret: Some("instance:api_key".to_string()),
+                optional: false,
             }],
             egress: Some(ManifestRuntimeEgress {
                 mode: "wireguard".to_string(),
@@ -232,6 +236,35 @@ mod tests {
         let keys: Vec<_> = required.into_iter().map(|item| item.key).collect();
         assert!(keys.iter().any(|key| key == "api_key"));
         assert!(keys.iter().any(|key| key == "wg_config"));
+    }
+
+    #[test]
+    fn optional_runtime_env_secret_is_valid_but_not_required() {
+        let runtime = ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/test:1".to_string()),
+            network: None,
+            service_name: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            env: vec![ManifestRuntimeEnv {
+                name: "PREMIUM_URL".to_string(),
+                value: None,
+                from_secret: Some("instance:premium_url".to_string()),
+                optional: true,
+            }],
+            egress: None,
+            security: Default::default(),
+        };
+
+        let required = required_secrets_from_runtime(&runtime).expect("required secrets");
+        assert!(required.is_empty());
+
+        let mut malformed = runtime;
+        malformed.env[0].from_secret = Some("premium_url".to_string());
+        let error = required_secrets_from_runtime(&malformed)
+            .expect_err("optional secret references must still be valid");
+        assert!(error.to_string().contains("from_secret must be"));
     }
 
     #[test]

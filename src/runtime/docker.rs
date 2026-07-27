@@ -1981,6 +1981,31 @@ impl RuntimeManager for DockerRuntimeManager {
         Ok(())
     }
 
+    async fn exec_container_command(
+        &self,
+        handle: &ContainerHandle,
+        user: &str,
+        command: &[String],
+    ) -> Result<String> {
+        if user.trim().is_empty() {
+            bail!("container command user is required");
+        }
+        if command.is_empty() || command.iter().any(|value| value.is_empty()) {
+            bail!("container command is required");
+        }
+        let mut args = vec![
+            "exec".to_string(),
+            "--user".to_string(),
+            user.to_string(),
+            handle.id.clone(),
+        ];
+        args.extend(command.iter().cloned());
+        Ok(self
+            .run_capture_with_timeout(&args, Some(DOCKER_PROBE_COMMAND_TIMEOUT))
+            .await?
+            .stdout)
+    }
+
     async fn stop_container(&self, handle: &ContainerHandle) -> Result<()> {
         let args = vec!["stop".to_string(), handle.id.clone()];
         self.run_capture(&args).await?;

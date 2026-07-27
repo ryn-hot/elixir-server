@@ -612,6 +612,10 @@ pub(super) async fn write_owned_setting_value(
     setting: &ManifestControlOwnedSetting,
     raw_value: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    if clear_optional_secret_value_if_requested(store, context, setting, raw_value).await? {
+        return Ok(());
+    }
+
     let normalized = normalize_owned_setting_value(setting, raw_value)?;
     let storage_type = setting.storage.r#type.trim().to_ascii_lowercase();
     match storage_type.as_str() {
@@ -667,17 +671,37 @@ pub(super) async fn write_owned_setting_value(
     Ok(())
 }
 
+async fn clear_optional_secret_value_if_requested(
+    store: &ExtensionStore<'_>,
+    context: &ExtensionControlContext,
+    setting: &ManifestControlOwnedSetting,
+    raw_value: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let clear_requested = setting.secret
+        && !setting.required
+        && (raw_value.is_null()
+            || raw_value
+                .as_str()
+                .is_some_and(|value| value.trim().is_empty()));
+    if !clear_requested {
+        return Ok(false);
+    }
+
+    clear_owned_setting_value(store, context, setting).await?;
+    Ok(true)
+}
+
 async fn clear_owned_setting_value(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
     setting: &ManifestControlOwnedSetting,
 ) -> anyhow::Result<()> {
-    let instance = context
-        .selected_instance
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no extension instance is available"))?;
     match setting.storage.r#type.trim().to_ascii_lowercase().as_str() {
         "instance_setting" => {
+            let instance = context
+                .selected_instance
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no extension instance is available"))?;
             let current = store
                 .get_instance(instance.instance_id)
                 .await?
@@ -692,12 +716,28 @@ async fn clear_owned_setting_value(
                 .await?;
         }
         "instance_secret" => {
+            let instance = context
+                .selected_instance
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no extension instance is available"))?;
             for secret in store
                 .list_secrets(
                     Some(SecretScope::Instance),
                     Some(instance.instance_id),
                     Some(&setting.storage.key),
                 )
+                .await?
+            {
+                store.delete_secret(secret.secret_id).await?;
+            }
+        }
+        "global_secret" => {
+            let key = extension_control_setting_key(
+                &context.extension.extension_id,
+                &setting.storage.key,
+            );
+            for secret in store
+                .list_secrets(Some(SecretScope::Global), None, Some(&key))
                 .await?
             {
                 store.delete_secret(secret.secret_id).await?;
@@ -1032,6 +1072,149 @@ mod account_tests {
                 .get_secret(SecretScope::Instance, Some(instance_id), "unrelated_secret")
                 .await?
                 .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blank_optional_instance_secret_clears_the_saved_value() -> anyhow::Result<()> {
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:?cache=shared".to_string(),
+            max_connections: 1,
+            ..DatabaseConfig::default()
+        })
+        .await?;
+        database.run_migrations().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let manifest: ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "id": "fixture.live.optional-secret",
+            "version": "1.0.0",
+            "kind": "module",
+            "name": "Fixture Optional Secret",
+            "provides": [{
+                "capability": "live.catalog_provider",
+                "slot": "default",
+                "scope": {"requires_account": false}
+            }],
+            "control_surface": {
+                "adapter": "generic_v1",
+                "owned_settings": [{
+                    "id": "premiumManifestUrl",
+                    "label": "Premium manifest URL",
+                    "type": "text",
+                    "required": false,
+                    "secret": true,
+                    "ownership": "managed",
+                    "storage": {
+                        "type": "instance_secret",
+                        "key": "premium_manifest_url"
+                    }
+                }]
+            }
+        }))?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                kind: ExtensionKind::Module,
+                publisher_name: None,
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: serde_json::to_value(&manifest)?,
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: manifest.id.clone(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        for key in ["premium_manifest_url", "unrelated_secret"] {
+            store
+                .upsert_secret(&NewSecret {
+                    secret_id: Uuid::new_v4(),
+                    scope: SecretScope::Instance,
+                    scope_id: Some(instance_id),
+                    key: key.to_string(),
+                    value_encrypted: format!("encrypted-{key}"),
+                    rotatable: false,
+                })
+                .await?;
+        }
+
+        let extension = store.get_extension(&manifest.id).await?.expect("extension");
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let context = ExtensionControlContext {
+            extension,
+            manifest: manifest.clone(),
+            summary: ExtensionStatusSummaryItem {
+                extension_id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                kind: ExtensionKind::Module,
+                trust_level: ExtensionTrustLevel::Community,
+                enabled: true,
+                severity: "ready".to_string(),
+                status_code: "ready".to_string(),
+                label: "Ready".to_string(),
+                description: "Ready".to_string(),
+                primary_action: "open".to_string(),
+                primary_action_label: "Open".to_string(),
+                auto_update: None,
+                optional_addons: Vec::new(),
+            },
+            instances: vec![instance.clone()],
+            selected_instance: Some(instance),
+            providers: Vec::new(),
+            selected_provider: None,
+            control_binding: ExtensionControlBinding::GenericManifest,
+        };
+        let setting = &manifest
+            .control_surface
+            .as_ref()
+            .expect("control surface")
+            .owned_settings[0];
+
+        assert!(
+            clear_optional_secret_value_if_requested(
+                &store,
+                &context,
+                setting,
+                &serde_json::json!("  "),
+            )
+            .await?
+        );
+        assert!(
+            store
+                .get_secret(
+                    SecretScope::Instance,
+                    Some(instance_id),
+                    "premium_manifest_url",
+                )
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .get_secret(SecretScope::Instance, Some(instance_id), "unrelated_secret",)
+                .await?
+                .is_some()
+        );
+        assert!(
+            !clear_optional_secret_value_if_requested(
+                &store,
+                &context,
+                setting,
+                &serde_json::json!("https://premium.example/manifest.json"),
+            )
+            .await?
         );
         Ok(())
     }
