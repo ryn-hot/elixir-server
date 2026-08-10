@@ -689,7 +689,7 @@ mod tests {
     #[test]
     fn runtime_id_input_is_strict() {
         let base = AnimeInferenceProfileProbeConfig {
-            runtime_id: "linux-x86_64-cuda-cpu".to_string(),
+            runtime_id: "linux-x86_64-cuda".to_string(),
             manifest_path: "manifest.json".into(),
             model_path: "model.gguf".into(),
             runtime_artifact_path: "runtime.tar.gz".into(),
@@ -699,6 +699,81 @@ mod tests {
         let mut invalid = base;
         invalid.runtime_id = "linux x86_64 CUDA".to_string();
         assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn runtime_ids_match_release_and_qualification_slots() {
+        use super::super::{AnimeHostArch, AnimeHostOs};
+
+        let cases = [
+            (
+                AnimeHostOs::Macos,
+                AnimeHostArch::Aarch64,
+                AnimeRuntimeBackend::MetalCpu,
+                "macos-aarch64-metal-cpu",
+            ),
+            (
+                AnimeHostOs::Macos,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::MetalCpu,
+                "macos-x86_64-metal-cpu",
+            ),
+            (
+                AnimeHostOs::Windows,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::Cpu,
+                "windows-x86_64-cpu",
+            ),
+            (
+                AnimeHostOs::Windows,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::CudaCpu,
+                "windows-x86_64-cuda",
+            ),
+            (
+                AnimeHostOs::Windows,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::VulkanCpu,
+                "windows-x86_64-vulkan",
+            ),
+            (
+                AnimeHostOs::Linux,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::Cpu,
+                "linux-x86_64-cpu",
+            ),
+            (
+                AnimeHostOs::Linux,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::CudaCpu,
+                "linux-x86_64-cuda",
+            ),
+            (
+                AnimeHostOs::Linux,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::HipCpu,
+                "linux-x86_64-hip",
+            ),
+            (
+                AnimeHostOs::Linux,
+                AnimeHostArch::X86_64,
+                AnimeRuntimeBackend::VulkanCpu,
+                "linux-x86_64-vulkan",
+            ),
+            (
+                AnimeHostOs::Linux,
+                AnimeHostArch::Aarch64,
+                AnimeRuntimeBackend::Cpu,
+                "linux-aarch64-cpu",
+            ),
+        ];
+        for (os, arch, backend, expected) in cases {
+            let mut artifact = runtime(backend);
+            artifact.os = os;
+            artifact.arch = arch;
+            assert_eq!(runtime_id(&artifact), expected);
+            assert!(!runtime_id(&artifact).ends_with("-cuda-cpu"));
+        }
     }
 
     #[test]

@@ -52,6 +52,10 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 const V1_CONTEXT_TOKENS: u32 = 4_096;
 const V1_PARALLEL: u32 = 1;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(8);
+// Priming is an internal cold-start operation. User work falls back
+// deterministically while it runs, so the minimum Intel profile can use the
+// full cold-start envelope without weakening the eight-second request bound.
+const PRIME_DEADLINE: Duration = Duration::from_secs(15);
 const COLD_READINESS_DEADLINE: Duration = Duration::from_secs(15);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -869,7 +873,7 @@ impl LocalModelEngine {
             transition_worker_state(slot, LocalModelWorkerState::Inactive);
             return Err(error).context("local model prime deferred by resource admission");
         }
-        let prime_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
+        let prime_deadline = tokio::time::Instant::now() + PRIME_DEADLINE;
         let completion = monitor_inference_admission(
             self.inner.admission.as_ref(),
             inference_phase,
@@ -1020,6 +1024,7 @@ impl LocalModelEngine {
                 address,
                 &priming_chat_request,
                 &priming_request,
+                PRIME_DEADLINE,
                 "llama-server probe priming completion deadline exceeded",
             )
             .await?;
@@ -1046,6 +1051,7 @@ impl LocalModelEngine {
                 address,
                 &chat_request,
                 &request,
+                REQUEST_DEADLINE,
                 "llama-server probe completion deadline exceeded",
             )
             .await?;
@@ -1084,6 +1090,7 @@ impl LocalModelEngine {
         address: SocketAddr,
         chat_request: &Value,
         request: &AnimeMatchRequest,
+        completion_deadline: Duration,
         deadline_error: &'static str,
     ) -> Result<LocalModelCompletion> {
         if let Err(error) = self
@@ -1095,7 +1102,7 @@ impl LocalModelEngine {
             stop_worker(slot).await;
             return Err(error).context("local model probe deferred by resource admission");
         }
-        let request_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
+        let request_deadline = tokio::time::Instant::now() + completion_deadline;
         let completion = monitor_inference_admission(
             self.inner.admission.as_ref(),
             LocalModelAdmissionPhase::ProbeInference,
@@ -4670,6 +4677,10 @@ mod tests {
             ensure!(
                 REQUEST_DEADLINE == Duration::from_secs(8),
                 "native probe must exercise the qualified production deadline"
+            );
+            ensure!(
+                PRIME_DEADLINE == Duration::from_secs(15),
+                "native probe must keep priming inside the cold-start envelope"
             );
 
             let corpus: Value = serde_json::from_slice(include_bytes!(

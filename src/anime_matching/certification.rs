@@ -1078,11 +1078,18 @@ async fn prepare_runtime(
 }
 
 pub(crate) fn runtime_id(runtime: &AnimeRuntimeArtifactManifest) -> String {
+    let backend = match runtime.backend {
+        AnimeRuntimeBackend::MetalCpu => "metal-cpu",
+        AnimeRuntimeBackend::CudaCpu => "cuda",
+        AnimeRuntimeBackend::HipCpu => "hip",
+        AnimeRuntimeBackend::VulkanCpu => "vulkan",
+        AnimeRuntimeBackend::Cpu => "cpu",
+    };
     format!(
         "{}-{}-{}",
         runtime.os.as_str(),
         runtime.arch.as_str(),
-        runtime.backend.as_str().replace('_', "-")
+        backend
     )
 }
 
