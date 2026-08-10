@@ -912,7 +912,11 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
             MediaType::Anime,
             &acquisition_candidate_language_evidence(candidate),
         );
-        if acquisition_anime_deterministic_state(&plan) == DeterministicMatchState::Definitive
+        let deterministic_state = acquisition_anime_deterministic_state(&plan);
+        let definitively_matches_another_target = deterministic_state
+            == DeterministicMatchState::Definitive
+            && plan_definitively_excludes_wanted_targets(&input.request, &plan);
+        if deterministic_state == DeterministicMatchState::Definitive
             && plan_covers_only_wanted_targets(&input.request, &plan)
             && required_language_satisfied(&preference, &assessment)
             && !synthetic_stream_candidate_requires_manual_review(candidate)
@@ -923,7 +927,9 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
                 &assessment,
             ));
         }
-        if !required_language_is_hard_mismatch(&preference, &assessment) {
+        if !required_language_is_hard_mismatch(&preference, &assessment)
+            && !definitively_matches_another_target
+        {
             saw_partial_or_ambiguous |= !plan.entries.is_empty()
                 || plan.confidence == ReleaseConfidence::ReviewRequired
                 || plan.rejection_reasons.is_empty();
@@ -933,6 +939,24 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
         candidate_plans,
         saw_partial_or_ambiguous,
     })
+}
+
+fn plan_definitively_excludes_wanted_targets(
+    request: &AnimeMatchRequest,
+    plan: &AnimeFileCoveragePlan,
+) -> bool {
+    let wanted = request
+        .target
+        .wanted_target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    !wanted.is_empty()
+        && !plan.entries.is_empty()
+        && plan
+            .entries
+            .iter()
+            .all(|entry| !wanted.contains(entry.target_key.as_str()))
 }
 
 fn plan_covers_only_wanted_targets(
@@ -2897,6 +2921,78 @@ mod tests {
         assert_eq!(
             deterministic_union_state(&request, &overcomplete),
             DeterministicMatchState::Difficult
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn alm9_definitive_other_target_is_no_match_not_unresolved() -> Result<()> {
+        let candidate_title = "[SubsPlease] Tokyo Ghoul:re S03E01 [1080p]";
+        let mut scoring_context = scoring_context();
+        scoring_context.scoped_aliases.push(AnimeScopedAlias {
+            display: "Tokyo Ghoul:re".to_string(),
+            source: "fixture".to_string(),
+            language: Some("en".to_string()),
+            season_number: Some(3),
+            anilist_season_id: Some("100240".to_string()),
+        });
+        scoring_context.targets.push(AnimeCandidateTarget {
+            target_key: "S03E01".to_string(),
+            canonical_key: None,
+            title: "Place".to_string(),
+            season_number: Some(3),
+            anilist_season_id: Some("100240".to_string()),
+            episode_number: Some(1),
+            absolute_episode_number: Some(25),
+            tvdb_episode_id: None,
+            anidb_episode_id: None,
+        });
+
+        let mut request = request();
+        request.candidates.truncate(1);
+        request.candidates[0].title = candidate_title.to_string();
+        request.context = acquisition_match_context(
+            &request.target.canonical_title,
+            &scoring_context,
+            &request.target,
+        )?;
+        let candidate_key = request.candidates[0].candidate_key.clone();
+        let input = QualificationCaseInput {
+            request,
+            scoring_context,
+            acquisition_candidates: vec![AcquisitionCandidate {
+                id: None,
+                title: candidate_title.to_string(),
+                source: "fixture".to_string(),
+                source_kind: "torrent".to_string(),
+                info_hash: None,
+                file_index: None,
+                quality: None,
+                size_bytes: None,
+                seeders: None,
+                language: None,
+                cached_debrid: None,
+                rank: None,
+                score: None,
+                score_badges: Vec::new(),
+                files: Vec::new(),
+                supported_routes: Vec::new(),
+                default_route: None,
+                raw: None,
+            }],
+            route_context: QualificationRouteContext {
+                file_selection_supported_by_candidate_key: [(candidate_key, true)]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+
+        let baseline = deterministic_baseline(&input)?;
+        assert!(baseline.candidate_plans.iter().all(Option::is_none));
+        assert!(!baseline.saw_partial_or_ambiguous);
+        assert_eq!(
+            final_plan_for_resolution(&input.request, &baseline)?.disposition,
+            QualificationDisposition::NoMatch
         );
         Ok(())
     }
