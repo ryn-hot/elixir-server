@@ -14,7 +14,7 @@ use std::{
     process::{ExitStatus, Stdio},
     sync::{
         Arc, Mutex as StdMutex, RwLock as StdRwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -32,15 +32,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::metrics::{
-    ANIME_INFERENCE_EVENTS, ANIME_INFERENCE_OPERATION_DURATION, ANIME_INFERENCE_QUEUE_DEPTH,
-    ANIME_INFERENCE_RUNTIME_STATE, ANIME_INFERENCE_WORKER_RSS_BYTES,
+use crate::{
+    acquisition::release_resolution::{anime::parse_anime_release_title, models::AnimeEpisodeType},
+    metrics::{
+        ANIME_INFERENCE_EVENTS, ANIME_INFERENCE_OPERATION_DURATION, ANIME_INFERENCE_QUEUE_DEPTH,
+        ANIME_INFERENCE_RUNTIME_STATE, ANIME_INFERENCE_WORKER_RSS_BYTES,
+    },
 };
 
 use super::{
-    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile, AnimeMatchEngine,
-    AnimeMatchEngineOutput, AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance,
-    hardware::InferenceBackend,
+    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAliasKind, AnimeMatchAudioProfile,
+    AnimeMatchCandidate, AnimeMatchContextTarget, AnimeMatchEngine, AnimeMatchEngineOutput,
+    AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance, AnimeMatchSeasonContext,
+    anime_match_alias_equivalence_key, hardware::InferenceBackend, prime_request,
+    prime_response_passed, smoke_responses_passed,
 };
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -59,12 +64,12 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v4-semantic-bounded";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v5-compact-semantic";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const SYSTEM_PROMPT: &str = r#"Choose ordered exact anime release matches from the labeled request. Every match must satisfy title, season, seasonal or absolute episode, release kind, and audio. A listed alias names that exact season even without Sxx. Reject an explicit conflicting season, wrong episode, unrelated title, movie or non-episode for an episode target, or missing required audio evidence. Audio mode any permits unknown; prefer and prefer_dub do not reject solely for audio; require needs an accepted profile exactly evidenced; require_dub accepts only evidenced dual_audio or dubbed. Return only exact matches best-first and never pad. Return {"m":[mapping,...]}; mapping is [candidate index,[wanted indices],[candidate-local file indices]]. A candidate with one inventoried file may omit its path from the request; select its implicit file index 0. Fileless candidates select []. Preserve wanted and file order for packs and ranges. Empty m means none. JSON only."#;
+const SYSTEM_PROMPT: &str = r#"Match anime release candidates to wanted targets using title, season-scoped aliases, seasonal or absolute episode numbers, release kind, file evidence, and audio. Every mapping must satisfy all requested constraints. Reject conflicting season or episode, unrelated titles, specials or movies for episode targets, and missing required audio. Audio any allows unknown; prefer modes do not reject on audio; require accepts only listed profiles; require_dub needs dual_audio or dubbed. Return exact matches best-first as {"m":[[candidate index,[wanted indices],[file indices]],...]}. A single inventoried file is index 0 even when omitted. Fileless candidates use []. Preserve wanted and file order. No match is {"m":[]}. JSON only."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -139,6 +144,7 @@ pub struct LocalModelRuntimeProfile {
     pub context_tokens: u32,
     pub max_output_tokens: u32,
     pub threads: u32,
+    pub batch_threads: u32,
     pub gpu_layers: u32,
     pub kv_cache_type: String,
     pub peak_rss_bytes: u64,
@@ -185,6 +191,10 @@ impl LocalModelRuntimeProfile {
         ensure!(
             (1..=4).contains(&self.threads),
             "V1 worker thread count is outside 1..=4"
+        );
+        ensure!(
+            self.threads <= self.batch_threads && self.batch_threads <= 8,
+            "V1 worker batch thread count must be between generation threads and 8"
         );
         ensure!(
             self.gpu_layers <= 512,
@@ -263,6 +273,7 @@ async fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
 pub enum LocalModelAdmissionPhase {
     WorkerStart,
     ActivationWorkerStart,
+    ActivationInference,
     ProbeWorkerStart,
     ProbeInference,
     Inference,
@@ -453,6 +464,7 @@ struct ManagedWorker {
     _isolation: ProcessIsolation,
     address: SocketAddr,
     profile_fingerprint: String,
+    primed: bool,
     diagnostic_tail: Arc<WorkerDiagnosticTail>,
     diagnostic_task: tokio::task::JoinHandle<()>,
     #[cfg(unix)]
@@ -529,6 +541,8 @@ struct LocalModelInner {
     total_slots: Arc<Semaphore>,
     execution_slot: Arc<Semaphore>,
     background_warm_active: AtomicBool,
+    background_prime_requested: AtomicU64,
+    background_prime_completed: AtomicU64,
     restart_used: AtomicBool,
     publish_runtime_metrics: bool,
     snapshot_cache: Arc<StdRwLock<LocalModelSnapshot>>,
@@ -579,6 +593,8 @@ impl LocalModelEngine {
                 total_slots: Arc::new(Semaphore::new(QUEUE_AND_ACTIVE_CAPACITY)),
                 execution_slot: Arc::new(Semaphore::new(1)),
                 background_warm_active: AtomicBool::new(false),
+                background_prime_requested: AtomicU64::new(0),
+                background_prime_completed: AtomicU64::new(0),
                 restart_used: AtomicBool::new(false),
                 publish_runtime_metrics,
                 snapshot_cache,
@@ -721,25 +737,55 @@ impl LocalModelEngine {
         Ok(())
     }
 
-    pub async fn warm(&self) -> Result<()> {
-        self.warm_with_phase(LocalModelAdmissionPhase::WorkerStart)
-            .await
+    /// Start the selected worker and run one exact, production-shaped model
+    /// request. This is idempotent for the lifetime of a healthy worker.
+    pub async fn prime(&self) -> Result<()> {
+        let phases = if self.inner.publish_runtime_metrics {
+            (
+                LocalModelAdmissionPhase::WorkerStart,
+                LocalModelAdmissionPhase::Inference,
+            )
+        } else {
+            (
+                LocalModelAdmissionPhase::ProbeWorkerStart,
+                LocalModelAdmissionPhase::ProbeInference,
+            )
+        };
+        self.prime_with_phases(phases.0, phases.1).await
     }
 
-    /// Manager-owned warm used while ordinary inference is maintenance-gated
+    /// Manager-owned prime used while ordinary inference is maintenance-gated
     /// during an atomic bundle activation. It bypasses only that gate; the
     /// admission implementation still enforces playback and live memory.
-    pub async fn warm_for_activation(&self) -> Result<()> {
+    pub async fn prime_for_activation(&self) -> Result<()> {
         ensure!(
             self.inner.publish_runtime_metrics,
-            "activation warm requires the production local model engine"
+            "activation prime requires the production local model engine"
         );
-        self.warm_with_phase(LocalModelAdmissionPhase::ActivationWorkerStart)
-            .await
+        self.prime_with_phases(
+            LocalModelAdmissionPhase::ActivationWorkerStart,
+            LocalModelAdmissionPhase::ActivationInference,
+        )
+        .await
     }
 
-    async fn warm_with_phase(&self, phase: LocalModelAdmissionPhase) -> Result<()> {
-        let mut operation = MetricOperation::new("worker_warm");
+    /// Compatibility alias retained for internal release tooling. A warm is a
+    /// real model prime, never a readiness-only health check.
+    pub async fn warm(&self) -> Result<()> {
+        self.prime().await
+    }
+
+    /// Compatibility alias retained for tests and older manager call sites.
+    pub async fn warm_for_activation(&self) -> Result<()> {
+        self.prime_for_activation().await
+    }
+
+    async fn prime_with_phases(
+        &self,
+        worker_phase: LocalModelAdmissionPhase,
+        inference_phase: LocalModelAdmissionPhase,
+    ) -> Result<()> {
+        let mut operation = MetricOperation::new("worker_prime");
         ensure!(
             !self.inner.shutdown.is_cancelled(),
             "local model engine is shut down"
@@ -758,17 +804,139 @@ impl LocalModelEngine {
             .await
             .map_err(|_| anyhow!("local model engine is shut down"))?;
         let profile = self.active_profile().await?;
-        let deadline = tokio::time::Instant::now() + COLD_READINESS_DEADLINE;
+        let request = prime_request()?;
+        let chat_request = build_chat_request(&request, &profile)?;
         let mut slot = self.inner.worker.lock().await;
-        match timeout_at(deadline, self.ensure_ready(&profile, &mut slot, phase)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                stop_worker(&mut slot).await;
-                bail!("llama-server cold readiness deadline exceeded");
-            }
-        };
+        self.ensure_primed_locked(
+            &profile,
+            &mut slot,
+            worker_phase,
+            inference_phase,
+            &request,
+            &chat_request,
+        )
+        .await?;
         operation.succeed();
         Ok(())
+    }
+
+    async fn ensure_primed_locked(
+        &self,
+        profile: &LocalModelRuntimeProfile,
+        slot: &mut WorkerSlot,
+        worker_phase: LocalModelAdmissionPhase,
+        inference_phase: LocalModelAdmissionPhase,
+        request: &AnimeMatchRequest,
+        chat_request: &Value,
+    ) -> Result<SocketAddr> {
+        if slot.worker.as_ref().is_some_and(|worker| {
+            worker.profile_fingerprint == profile.profile_fingerprint && worker.primed
+        }) {
+            let deadline = tokio::time::Instant::now() + COLD_READINESS_DEADLINE;
+            return match timeout_at(deadline, self.ensure_ready(profile, slot, worker_phase)).await
+            {
+                Ok(result) => result.context("checking primed llama-server readiness"),
+                Err(_) => {
+                    let error = anyhow!("primed llama-server readiness deadline exceeded");
+                    abort_worker(slot).await;
+                    slot.last_error = Some(bounded_error(&error));
+                    transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+                    Err(error)
+                }
+            };
+        }
+
+        let readiness_deadline = tokio::time::Instant::now() + COLD_READINESS_DEADLINE;
+        let address = match timeout_at(
+            readiness_deadline,
+            self.ensure_ready(profile, slot, worker_phase),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let error = anyhow!("llama-server cold readiness deadline exceeded");
+                abort_worker(slot).await;
+                slot.last_error = Some(bounded_error(&error));
+                transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.inner.admission.admit(inference_phase, profile) {
+            abort_worker(slot).await;
+            slot.last_error = Some(bounded_error(&error));
+            transition_worker_state(slot, LocalModelWorkerState::Inactive);
+            return Err(error).context("local model prime deferred by resource admission");
+        }
+        let prime_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
+        let completion = monitor_inference_admission(
+            self.inner.admission.as_ref(),
+            inference_phase,
+            profile,
+            &self.inner.shutdown,
+            async {
+                let input_tokens =
+                    count_input_tokens(&self.inner.http, address, chat_request).await?;
+                enforce_context_gate(input_tokens, profile)?;
+                request_completion(
+                    &self.inner.http,
+                    address,
+                    chat_request,
+                    request,
+                    profile.max_output_tokens,
+                )
+                .await
+            },
+        );
+        let completion = match timeout_at(prime_deadline, completion).await {
+            Ok(AdmissionMonitored::Completed(result)) => result,
+            Ok(AdmissionMonitored::Rejected(error)) => {
+                abort_worker(slot).await;
+                slot.last_error = Some(bounded_error(&error));
+                transition_worker_state(slot, LocalModelWorkerState::Inactive);
+                return Err(error).context("local model prime admission was revoked");
+            }
+            Ok(AdmissionMonitored::Shutdown) => {
+                abort_worker(slot).await;
+                transition_worker_state(slot, LocalModelWorkerState::Inactive);
+                return Err(anyhow!("local model engine is shutting down"));
+            }
+            Err(_) => Err(anyhow!("llama-server prime deadline exceeded")),
+        };
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => {
+                // Dropping an HTTP future is not a protocol cancellation
+                // guarantee. Never leave a failed prime consuming resources.
+                abort_worker(slot).await;
+                slot.last_error = Some(bounded_error(&error));
+                transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+                return Err(error);
+            }
+        };
+        if !prime_response_passed(&completion.response) {
+            let error = anyhow!("llama-server prime returned the wrong mapping");
+            abort_worker(slot).await;
+            slot.last_error = Some(bounded_error(&error));
+            transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+            return Err(error);
+        }
+        let worker = slot
+            .worker
+            .as_mut()
+            .ok_or_else(|| anyhow!("llama-server worker disappeared after prime"))?;
+        ensure!(
+            worker.profile_fingerprint == profile.profile_fingerprint,
+            "llama-server profile changed during prime"
+        );
+        worker.primed = true;
+        slot.resident_rss_bytes = worker_rss_bytes(&worker.child).await;
+        slot.last_activity = Instant::now();
+        slot.last_error = None;
+        transition_worker_state(slot, LocalModelWorkerState::Ready);
+        inference_event("worker_prime", "success");
+        Ok(address)
     }
 
     /// Runs the real cold-load, template-aware token preflight, and constrained
@@ -855,6 +1023,16 @@ impl LocalModelEngine {
                 "llama-server probe priming completion deadline exceeded",
             )
             .await?;
+        if !prime_response_passed(&priming_completion.response) {
+            stop_worker(&mut slot).await;
+            bail!("llama-server probe prime returned the wrong mapping");
+        }
+        let primed_worker = slot
+            .worker
+            .as_mut()
+            .ok_or_else(|| anyhow!("llama-server worker disappeared after probe prime"))?;
+        primed_worker.primed = true;
+        transition_worker_state(&mut slot, LocalModelWorkerState::Ready);
         let rss_after_priming = match slot.worker.as_ref() {
             Some(worker) => worker_rss_bytes(&worker.child).await,
             None => None,
@@ -884,11 +1062,12 @@ impl LocalModelEngine {
             .max();
         slot.last_activity = Instant::now();
         transition_worker_state(&mut slot, LocalModelWorkerState::Ready);
-        self.mark_successful_completion();
         operation.succeed();
+        let smoke_match_passed =
+            smoke_responses_passed(&priming_completion.response, &completion.response);
         Ok(LocalModelProbeMeasurement {
             worker_ready: true,
-            smoke_match_passed: true,
+            smoke_match_passed,
             load_time_ms,
             warm_latency_ms,
             current_rss_bytes,
@@ -1125,13 +1304,26 @@ impl LocalModelEngine {
             .admit(LocalModelAdmissionPhase::ProbeInference, &profile)
             .context("local model contract smoke deferred by resource admission")?;
         let mut slot = self.inner.worker.lock().await;
-        let address = self
-            .ensure_ready(
+        let readiness_deadline = tokio::time::Instant::now() + COLD_READINESS_DEADLINE;
+        let address = match timeout_at(
+            readiness_deadline,
+            self.ensure_ready(
                 &profile,
                 &mut slot,
                 LocalModelAdmissionPhase::ProbeWorkerStart,
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let error = anyhow!("llama-server contract-smoke readiness deadline exceeded");
+                abort_worker(&mut slot).await;
+                slot.last_error = Some(bounded_error(&error));
+                transition_worker_state(&mut slot, LocalModelWorkerState::Unavailable);
+                return Err(error);
+            }
+        };
         let deadline = tokio::time::Instant::now() + COLD_READINESS_DEADLINE;
         let smoke = timeout_at(deadline, async {
             let mut tokenizations = Vec::with_capacity(tokenizer_inputs.len());
@@ -1172,7 +1364,12 @@ impl LocalModelEngine {
             None => None,
         };
         slot.last_activity = Instant::now();
-        transition_worker_state(&mut slot, LocalModelWorkerState::Ready);
+        let state = if slot.worker.as_ref().is_some_and(|worker| worker.primed) {
+            LocalModelWorkerState::Ready
+        } else {
+            LocalModelWorkerState::Starting
+        };
+        transition_worker_state(&mut slot, state);
         Ok(measurement)
     }
 
@@ -1216,7 +1413,23 @@ impl LocalModelEngine {
         operation.succeed();
     }
 
+    /// Request a coalesced background prime. Repeated triggers never spawn
+    /// competing workers, and a profile change that races an older task is
+    /// observed before that task exits.
+    pub(crate) fn request_background_prime(&self) {
+        self.schedule_background_warm();
+    }
+
     fn schedule_background_warm(&self) {
+        let _ = self.inner.background_prime_requested.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| Some(generation.saturating_add(1)),
+        );
+        self.start_background_prime_if_idle();
+    }
+
+    fn start_background_prime_if_idle(&self) {
         if self.inner.shutdown.is_cancelled()
             || self
                 .inner
@@ -1229,18 +1442,46 @@ impl LocalModelEngine {
         inference_event("background_warm", "scheduled");
         let engine = self.clone();
         tokio::spawn(async move {
-            let result = engine.warm().await;
-            if let Err(error) = result
-                && !engine.inner.shutdown.is_cancelled()
-            {
-                let mut slot = engine.inner.worker.lock().await;
-                slot.last_error = Some(bounded_error(&error));
-                transition_worker_state(&mut slot, LocalModelWorkerState::Unavailable);
+            loop {
+                let requested = engine
+                    .inner
+                    .background_prime_requested
+                    .load(Ordering::Acquire);
+                if let Err(error) = engine.prime().await
+                    && !engine.inner.shutdown.is_cancelled()
+                {
+                    tracing::debug!(error = %error, "background inference prime deferred");
+                }
+                engine
+                    .inner
+                    .background_prime_completed
+                    .store(requested, Ordering::Release);
+                if engine.inner.shutdown.is_cancelled()
+                    || engine
+                        .inner
+                        .background_prime_requested
+                        .load(Ordering::Acquire)
+                        == requested
+                {
+                    break;
+                }
             }
             engine
                 .inner
                 .background_warm_active
                 .store(false, Ordering::Release);
+            if !engine.inner.shutdown.is_cancelled()
+                && engine
+                    .inner
+                    .background_prime_completed
+                    .load(Ordering::Acquire)
+                    < engine
+                        .inner
+                        .background_prime_requested
+                        .load(Ordering::Acquire)
+            {
+                engine.start_background_prime_if_idle();
+            }
         });
     }
 
@@ -1339,10 +1580,13 @@ impl LocalModelEngine {
         if stale {
             stop_worker(slot).await;
         }
-        self.inner
-            .admission
-            .admit(admission_phase, profile)
-            .context("local model worker start deferred by resource admission")?;
+        if let Err(error) = self.inner.admission.admit(admission_phase, profile) {
+            stop_worker(slot).await;
+            slot.last_error = Some(bounded_error(&error));
+            transition_worker_state(slot, LocalModelWorkerState::Inactive);
+            inference_event("resource_admission", "deferred");
+            return Err(error).context("local model worker start deferred by resource admission");
+        }
         if let Some(worker) = slot.worker.as_mut() {
             match worker.child.try_wait() {
                 Ok(None) => {
@@ -1357,18 +1601,31 @@ impl LocalModelEngine {
                     match readiness {
                         AdmissionMonitored::Completed(Ok(address)) => {
                             slot.last_activity = Instant::now();
-                            transition_worker_state(slot, LocalModelWorkerState::Ready);
+                            let state = if slot.worker.as_ref().is_some_and(|worker| worker.primed)
+                            {
+                                LocalModelWorkerState::Ready
+                            } else {
+                                LocalModelWorkerState::Starting
+                            };
+                            transition_worker_state(slot, state);
                             return Ok(address);
                         }
-                        AdmissionMonitored::Completed(Err(error))
-                        | AdmissionMonitored::Rejected(error) => {
+                        AdmissionMonitored::Completed(Err(error)) => {
                             stop_worker(slot).await;
                             slot.last_error = Some(bounded_error(&error));
                             transition_worker_state(slot, LocalModelWorkerState::Unavailable);
                             return Err(error);
                         }
+                        AdmissionMonitored::Rejected(error) => {
+                            stop_worker(slot).await;
+                            slot.last_error = Some(bounded_error(&error));
+                            transition_worker_state(slot, LocalModelWorkerState::Inactive);
+                            return Err(error)
+                                .context("local model worker readiness admission was revoked");
+                        }
                         AdmissionMonitored::Shutdown => {
                             stop_worker(slot).await;
+                            transition_worker_state(slot, LocalModelWorkerState::Inactive);
                             bail!("local model engine is shutting down");
                         }
                     }
@@ -1391,7 +1648,8 @@ impl LocalModelEngine {
         }
 
         if let Err(error) = self.inner.admission.admit(admission_phase, profile) {
-            transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+            slot.last_error = Some(bounded_error(&error));
+            transition_worker_state(slot, LocalModelWorkerState::Inactive);
             inference_event("resource_admission", "deferred");
             return Err(error).context("local model worker start deferred by resource admission");
         }
@@ -1425,19 +1683,30 @@ impl LocalModelEngine {
             AdmissionMonitored::Completed(Ok(address)) => {
                 slot.last_activity = Instant::now();
                 slot.last_error = None;
-                transition_worker_state(slot, LocalModelWorkerState::Ready);
+                let state = if slot.worker.as_ref().is_some_and(|worker| worker.primed) {
+                    LocalModelWorkerState::Ready
+                } else {
+                    LocalModelWorkerState::Starting
+                };
+                transition_worker_state(slot, state);
                 load_operation.succeed();
                 Ok(address)
             }
-            AdmissionMonitored::Completed(Err(error)) | AdmissionMonitored::Rejected(error) => {
+            AdmissionMonitored::Completed(Err(error)) => {
                 stop_worker(slot).await;
                 slot.last_error = Some(bounded_error(&error));
                 transition_worker_state(slot, LocalModelWorkerState::Unavailable);
                 Err(error)
             }
+            AdmissionMonitored::Rejected(error) => {
+                stop_worker(slot).await;
+                slot.last_error = Some(bounded_error(&error));
+                transition_worker_state(slot, LocalModelWorkerState::Inactive);
+                Err(error).context("local model worker readiness admission was revoked")
+            }
             AdmissionMonitored::Shutdown => {
                 stop_worker(slot).await;
-                transition_worker_state(slot, LocalModelWorkerState::Unavailable);
+                transition_worker_state(slot, LocalModelWorkerState::Inactive);
                 bail!("local model engine is shutting down");
             }
         }
@@ -1470,7 +1739,8 @@ impl LocalModelEngine {
             .admission
             .admit(LocalModelAdmissionPhase::Inference, &initial_profile)
             .context("local model inference deferred by resource admission")?;
-        let deadline = tokio::time::Instant::now() + request_deadline;
+        let queue_started = tokio::time::Instant::now();
+        let queue_deadline = queue_started + request_deadline;
         let _total = self
             .inner
             .total_slots
@@ -1485,10 +1755,13 @@ impl LocalModelEngine {
             Err(TryAcquireError::Closed) => bail!("local model engine is shut down"),
             Err(TryAcquireError::NoPermits) => {
                 let _queued = QueueDepthGuard::new();
-                timeout_at(deadline, self.inner.execution_slot.clone().acquire_owned())
-                    .await
-                    .map_err(|_| anyhow!("local model queue deadline exceeded"))?
-                    .map_err(|_| anyhow!("local model engine is shut down"))?
+                timeout_at(
+                    queue_deadline,
+                    self.inner.execution_slot.clone().acquire_owned(),
+                )
+                .await
+                .map_err(|_| anyhow!("local model queue deadline exceeded"))?
+                .map_err(|_| anyhow!("local model engine is shut down"))?
             }
         };
         let profile = self.active_profile().await?;
@@ -1503,57 +1776,104 @@ impl LocalModelEngine {
         }
 
         let chat_request = build_chat_request(&request, &profile)?;
-        let mut restarted = false;
-        loop {
-            let attempt = tokio::select! {
-                _ = self.inner.shutdown.cancelled() => {
-                    return Err(anyhow!("local model engine is shutting down"));
+        let (ready, crashed) = self.primed_worker_status(&profile).await?;
+        if !ready {
+            if crashed {
+                if self.claim_restart() {
+                    inference_event("worker_restart", "scheduled");
+                    self.schedule_background_warm();
+                } else {
+                    inference_event("worker_restart", "exhausted");
                 }
-                attempt = timeout_at(
-                    deadline,
-                    self.infer_once_with_admission_monitor(&profile, &chat_request, &request),
-                ) => attempt,
-            };
-            match attempt {
-                Ok(Ok(completion)) => {
-                    self.mark_successful_completion();
-                    operation.succeed();
-                    return Ok((
-                        AnimeMatchEngineOutput {
-                            response: completion.response.clone(),
-                            runtime: Some(profile.provenance()),
-                        },
-                        completion,
-                    ));
+            } else if !self.inner.restart_used.load(Ordering::Acquire) {
+                self.schedule_background_warm();
+            } else {
+                inference_event("worker_restart", "exhausted");
+            }
+            bail!("local model worker is not primed; deterministic fallback required");
+        }
+
+        let attempt = tokio::select! {
+            _ = self.inner.shutdown.cancelled() => {
+                return Err(anyhow!("local model engine is shutting down"));
+            }
+            attempt = timeout_at(
+                queue_deadline,
+                self.infer_once_with_admission_monitor(&profile, &chat_request, &request),
+            ) => attempt,
+        };
+        match attempt {
+            Ok(Ok(completion)) => {
+                self.mark_successful_completion();
+                operation.succeed();
+                Ok((
+                    AnimeMatchEngineOutput {
+                        response: completion.response.clone(),
+                        runtime: Some(profile.provenance()),
+                    },
+                    completion,
+                ))
+            }
+            Ok(Err(error)) => {
+                if error.is::<InFlightAdmissionRejected>() {
+                    return Err(error)
+                        .context("local model inference cancelled for playback priority");
                 }
-                Ok(Err(error)) => {
-                    if error.is::<InFlightAdmissionRejected>() {
-                        return Err(error)
-                            .context("local model inference cancelled for playback priority");
-                    }
-                    let crashed = self.worker_exited().await;
-                    let restart_available = crashed && !restarted && self.claim_restart();
-                    if restart_available {
-                        restarted = true;
-                        inference_event("worker_restart", "attempted");
-                        continue;
-                    }
-                    if crashed {
+                if self.worker_exited().await {
+                    if self.claim_restart() {
+                        inference_event("worker_restart", "scheduled");
+                        self.schedule_background_warm();
+                    } else {
                         inference_event("worker_restart", "exhausted");
                     }
-                    return Err(error);
                 }
-                Err(_) => {
-                    // Cancelling the HTTP request is not a protocol-level
-                    // cancellation guarantee. Kill the worker before making a
-                    // replacement eligible so an over-deadline generation
-                    // cannot keep consuming playback resources.
-                    let mut slot = self.inner.worker.lock().await;
-                    abort_worker(&mut slot).await;
-                    drop(slot);
+                Err(error)
+            }
+            Err(_) => {
+                // Cancelling the HTTP request is not a protocol-level
+                // cancellation guarantee. Kill the worker before making a
+                // replacement eligible so an over-deadline generation cannot
+                // keep consuming playback resources.
+                let mut slot = self.inner.worker.lock().await;
+                abort_worker(&mut slot).await;
+                drop(slot);
+                if self.claim_restart() {
                     self.schedule_background_warm();
-                    return Err(anyhow!("local model request deadline exceeded"));
+                } else {
+                    inference_event("worker_restart", "exhausted");
                 }
+                Err(anyhow!("local model request deadline exceeded"))
+            }
+        }
+    }
+
+    async fn primed_worker_status(
+        &self,
+        profile: &LocalModelRuntimeProfile,
+    ) -> Result<(bool, bool)> {
+        let mut slot = self.inner.worker.lock().await;
+        let Some(worker) = slot.worker.as_mut() else {
+            return Ok((false, false));
+        };
+        if worker.profile_fingerprint != profile.profile_fingerprint {
+            stop_worker(&mut slot).await;
+            return Ok((false, false));
+        }
+        match worker.child.try_wait() {
+            Ok(None) => Ok((worker.primed, false)),
+            Ok(Some(status)) => {
+                slot.last_error = Some(unexpected_worker_exit(worker, &status));
+                slot.worker = None;
+                transition_worker_state(&mut slot, LocalModelWorkerState::Unavailable);
+                inference_event("worker_exit", "unexpected");
+                Ok((false, true))
+            }
+            Err(error) => {
+                slot.last_error = Some(format!("checking llama-server status: {error}"));
+                slot.worker = None;
+                transition_worker_state(&mut slot, LocalModelWorkerState::Unavailable);
+                inference_event("worker_status", "error");
+                Ok((false, true))
             }
         }
     }
@@ -1595,9 +1915,19 @@ impl LocalModelEngine {
         request: &AnimeMatchRequest,
     ) -> Result<LocalModelCompletion> {
         let mut slot = self.inner.worker.lock().await;
-        let address = self
-            .ensure_ready(profile, &mut slot, LocalModelAdmissionPhase::WorkerStart)
-            .await?;
+        let worker = slot
+            .worker
+            .as_mut()
+            .ok_or_else(|| anyhow!("local model worker is unavailable"))?;
+        ensure!(
+            worker.profile_fingerprint == profile.profile_fingerprint && worker.primed,
+            "local model worker is not primed"
+        );
+        ensure!(
+            worker.child.try_wait()?.is_none(),
+            "local model worker exited before inference"
+        );
+        let address = worker.address;
         let input_tokens = count_input_tokens(&self.inner.http, address, chat_request).await?;
         enforce_context_gate(input_tokens, profile)?;
         let response = request_completion(
@@ -1750,36 +2080,9 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
         .map(|season| {
             let mut compact_season = serde_json::Map::new();
             compact_season.insert("season".to_string(), json!(season.season_number));
-            let aliases = season
-                .aliases
-                .iter()
-                .filter(|alias| !alias.value.is_empty())
-                .map(|alias| alias.value.clone())
-                .collect::<Vec<_>>();
+            let aliases = compact_season_aliases(season, &request.target.canonical_title);
             insert_non_empty_strings(&mut compact_season, "aliases", &aliases);
-            let episodes = season
-                .targets
-                .iter()
-                .filter_map(|context_target| {
-                    let mut episode = serde_json::Map::new();
-                    if !context_target.title.is_empty() {
-                        episode.insert(
-                            "title".to_string(),
-                            Value::String(context_target.title.clone()),
-                        );
-                    }
-                    if let Some(number) = context_target.episode_number {
-                        episode.insert("episode".to_string(), json!(number));
-                    }
-                    if let Some(number) = context_target.absolute_episode_number {
-                        episode.insert("absolute".to_string(), json!(number));
-                    }
-                    if let Some(slot) = wanted_slots.get(context_target.target_key.as_str()) {
-                        episode.insert("wanted".to_string(), json!(slot));
-                    }
-                    (!episode.is_empty()).then_some(Value::Object(episode))
-                })
-                .collect::<Vec<_>>();
+            let episodes = compact_context_targets(season, &wanted_slots);
             if !episodes.is_empty() {
                 compact_season.insert("episodes".to_string(), Value::Array(episodes));
             }
@@ -1811,14 +2114,13 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
                             .files
                             .iter()
                             .enumerate()
-                            .map(|(file_index, file)| {
-                                json!({"index": file_index, "path": file.path})
-                            })
+                            .map(|(file_index, file)| compact_file(file_index, &file.path))
                             .collect(),
                     ),
                 );
             }
-            insert_non_empty_strings(&mut compact, "titles", &facts.title_candidates);
+            let semantic_titles = compact_candidate_titles(request, candidate);
+            insert_non_empty_strings(&mut compact, "titles", &semantic_titles);
             insert_non_empty_i32s(&mut compact, "seasons", &facts.season_numbers);
             insert_non_empty_i32s(&mut compact, "episodes", &facts.episode_numbers);
             insert_non_empty_i32s(&mut compact, "absolute", &facts.absolute_episode_numbers);
@@ -1829,16 +2131,244 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
                 compact.insert("batch".to_string(), Value::String(batch.clone()));
             }
             insert_non_empty_strings(&mut compact, "audio", &facts.audio_profiles);
-            insert_non_empty_strings(&mut compact, "languages", &facts.languages);
             Value::Object(compact)
         })
         .collect::<Vec<_>>();
 
     Ok(json!({
         "target": target,
-        "seasonContext": seasons,
+        "seasons": seasons,
         "candidates": candidates,
     }))
+}
+
+fn compact_season_aliases(season: &AnimeMatchSeasonContext, canonical_title: &str) -> Vec<String> {
+    let canonical_key = anime_match_alias_equivalence_key(canonical_title);
+    let mut seen = BTreeSet::new();
+    let mut aliases = Vec::new();
+    for alias in &season.aliases {
+        let value = alias.value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let key = anime_match_alias_equivalence_key(value);
+        if key.is_empty() {
+            continue;
+        }
+        // The canonical target is already present once. Only its generated
+        // duplicate is removable; generated season names and every sourced
+        // English, Romaji, native, or synonym alias retain season ownership.
+        if alias.kind == AnimeMatchAliasKind::Generated && key == canonical_key {
+            continue;
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        aliases.push(value.to_string());
+    }
+    aliases
+}
+
+fn compact_context_targets(
+    season: &AnimeMatchSeasonContext,
+    wanted_slots: &BTreeMap<&str, usize>,
+) -> Vec<Value> {
+    let wanted_indices = season
+        .targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| {
+            wanted_slots
+                .contains_key(target.target_key.as_str())
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if wanted_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut included = wanted_indices.iter().copied().collect::<BTreeSet<_>>();
+    for wanted_index in wanted_indices {
+        let wanted = &season.targets[wanted_index];
+        let coordinate_is_incomplete =
+            wanted.episode_number.is_none() || wanted.absolute_episode_number.is_none();
+        if coordinate_is_incomplete {
+            if wanted_index > 0 {
+                included.insert(wanted_index - 1);
+            }
+            if wanted_index + 1 < season.targets.len() {
+                included.insert(wanted_index + 1);
+            }
+        }
+        for (index, target) in season.targets.iter().enumerate() {
+            let seasonal_collision = wanted
+                .episode_number
+                .zip(target.episode_number)
+                .is_some_and(|(left, right)| left == right);
+            let absolute_collision = wanted
+                .absolute_episode_number
+                .zip(target.absolute_episode_number)
+                .is_some_and(|(left, right)| left == right);
+            if index != wanted_index && (seasonal_collision || absolute_collision) {
+                included.insert(index);
+            }
+        }
+    }
+
+    included
+        .into_iter()
+        .filter_map(|index| season.targets.get(index))
+        .filter_map(|target| compact_context_target(target, wanted_slots))
+        .collect()
+}
+
+fn compact_context_target(
+    target: &AnimeMatchContextTarget,
+    wanted_slots: &BTreeMap<&str, usize>,
+) -> Option<Value> {
+    let mut compact = serde_json::Map::new();
+    if !target.title.is_empty() {
+        compact.insert("title".to_string(), Value::String(target.title.clone()));
+    }
+    if let Some(number) = target.episode_number {
+        compact.insert("episode".to_string(), json!(number));
+    }
+    if let Some(number) = target.absolute_episode_number {
+        compact.insert("absolute".to_string(), json!(number));
+    }
+    if let Some(slot) = wanted_slots.get(target.target_key.as_str()) {
+        compact.insert("wanted".to_string(), json!(slot));
+    }
+    (!compact.is_empty()).then_some(Value::Object(compact))
+}
+
+fn compact_candidate_titles(
+    request: &AnimeMatchRequest,
+    candidate: &AnimeMatchCandidate,
+) -> Vec<String> {
+    let known_title_keys = std::iter::once(request.target.canonical_title.as_str())
+        .chain(
+            request
+                .context
+                .seasons
+                .iter()
+                .flat_map(|season| season.aliases.iter().map(|alias| alias.value.as_str())),
+        )
+        .map(anime_match_alias_equivalence_key)
+        .filter(|key| !key.is_empty())
+        .collect::<BTreeSet<_>>();
+    let raw_key = anime_match_alias_equivalence_key(&candidate.title);
+    let mut seen = BTreeSet::new();
+    let mut ranked = candidate
+        .parse_facts
+        .title_candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, title)| {
+            let title = title.trim();
+            let key = anime_match_alias_equivalence_key(title);
+            if title.is_empty() || key.is_empty() || key == raw_key || !seen.insert(key.clone()) {
+                return None;
+            }
+            let exact_context_title = known_title_keys.contains(&key);
+            let normalized_artifact = title
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+                && title
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic());
+            Some((
+                (
+                    !exact_context_title,
+                    normalized_artifact,
+                    title.chars().count(),
+                    index,
+                ),
+                title.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.0.cmp(&right.0));
+    let Some((_, primary)) = ranked.first() else {
+        return Vec::new();
+    };
+    let primary_is_japanese = contains_japanese_script(primary);
+    let mut selected = vec![primary.clone()];
+    if let Some((_, alternate)) = ranked.iter().skip(1).find(|(_, title)| {
+        contains_japanese_script(title) != primary_is_japanese
+            && known_title_keys.contains(&anime_match_alias_equivalence_key(title))
+    }) {
+        selected.push(alternate.clone());
+    }
+    selected
+}
+
+fn contains_japanese_script(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{3040}'..='\u{30ff}'
+                | '\u{31f0}'..='\u{31ff}'
+                | '\u{3400}'..='\u{4dbf}'
+                | '\u{4e00}'..='\u{9fff}'
+                | '\u{f900}'..='\u{faff}'
+        )
+    })
+}
+
+fn compact_file(index: usize, path: &str) -> Value {
+    let parsed = parse_anime_release_title(path);
+    let mut compact = serde_json::Map::new();
+    compact.insert("index".to_string(), json!(index));
+    if let Some(title) = parsed
+        .series_title
+        .as_ref()
+        .filter(|title| !title.is_empty())
+    {
+        compact.insert("title".to_string(), Value::String(title.clone()));
+    }
+    if let Some(season) = parsed.season_number {
+        compact.insert("season".to_string(), json!(season));
+    }
+    insert_non_empty_i32s(&mut compact, "episodes", &parsed.episode_numbers);
+    insert_non_empty_i32s(&mut compact, "absolute", &parsed.absolute_episode_numbers);
+    if parsed.episode_type != AnimeEpisodeType::Normal {
+        compact.insert(
+            "kind".to_string(),
+            Value::String(parsed.episode_type.as_str().to_string()),
+        );
+    }
+    if let Ok(batch) = serde_json::to_value(parsed.batch_kind)
+        && batch != Value::String("single".to_string())
+    {
+        compact.insert("batch".to_string(), batch);
+    }
+    let mut audio = parsed.audio_languages;
+    if parsed.quality.dual_audio {
+        audio.push("dual_audio".to_string());
+    }
+    audio.sort();
+    audio.dedup();
+    insert_non_empty_strings(&mut compact, "audio", &audio);
+
+    let components = path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() > 1 {
+        compact.insert(
+            "folder".to_string(),
+            Value::String(components[..components.len() - 1].join("/")),
+        );
+    }
+    let has_coordinate = parsed.season_number.is_some()
+        || !parsed.episode_numbers.is_empty()
+        || !parsed.absolute_episode_numbers.is_empty()
+        || parsed.episode_type != AnimeEpisodeType::Normal;
+    if parsed.series_title.is_none() || !has_coordinate {
+        compact.insert("name".to_string(), Value::String(path.to_string()));
+    }
+    Value::Object(compact)
 }
 
 fn insert_non_empty_strings(
@@ -2457,6 +2987,7 @@ async fn spawn_worker(profile: &LocalModelRuntimeProfile) -> Result<ManagedWorke
         child,
         address,
         profile_fingerprint: profile.profile_fingerprint.clone(),
+        primed: false,
         diagnostic_tail,
         diagnostic_task,
         #[cfg(unix)]
@@ -2531,6 +3062,8 @@ fn worker_args(profile: &LocalModelRuntimeProfile, port: u16) -> Vec<OsString> {
         OsString::from(V1_PARALLEL.to_string()),
         OsString::from("--threads"),
         OsString::from(profile.threads.to_string()),
+        OsString::from("--threads-batch"),
+        OsString::from(profile.batch_threads.to_string()),
         OsString::from("--n-gpu-layers"),
         OsString::from(profile.gpu_layers.to_string()),
         OsString::from("--cache-type-k"),
@@ -3050,6 +3583,10 @@ impl Drop for WindowsJobObject {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "local_model_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3057,6 +3594,7 @@ mod tests {
         AnimeMatchAlias, AnimeMatchAliasKind, AnimeMatchAudioPreference, AnimeMatchCandidate,
         AnimeMatchContext, AnimeMatchContextTarget, AnimeMatchFile, AnimeMatchMediaType,
         AnimeMatchParseFacts, AnimeMatchScope, AnimeMatchSeasonContext, AnimeMatchTarget,
+        smoke_requests,
     };
     use sha2::{Digest, Sha256};
 
@@ -3121,6 +3659,7 @@ mod tests {
             context_tokens: V1_CONTEXT_TOKENS,
             max_output_tokens: 256,
             threads: 4,
+            batch_threads: 4,
             gpu_layers: 0,
             kv_cache_type: "f16".to_string(),
             peak_rss_bytes: 2 * 1024 * 1024 * 1024,
@@ -3132,7 +3671,7 @@ mod tests {
     const ALM9_NATIVE_LLAMA_SERVER_ENV: &str = "ELIXIR_ALM9_LLAMA_SERVER_PATH";
     const ALM9_NATIVE_QWEN_MODEL_ENV: &str = "ELIXIR_ALM9_QWEN35_2B_Q4_K_M_PATH";
     const ALM9_NATIVE_LLAMA_SERVER_SHA256: &str =
-        "9e19505d26b2afe733c610a8f40e8b4bdde89718dd0668310106f7c18b8a4e05";
+        "11e02e3fd6c0ce1c770e79b8d9ccf5670a69d26c6252dfbfd55cb9caf22b95b7";
     const ALM9_NATIVE_QWEN_MODEL_SHA256: &str =
         "880c00b721b5a7c2f9358e1aa7c4b828477fe4da56dc9264bfbadc903a9dba30";
 
@@ -3170,6 +3709,7 @@ mod tests {
             context_tokens: V1_CONTEXT_TOKENS,
             max_output_tokens: 256,
             threads: 4,
+            batch_threads: 8,
             gpu_layers: 0,
             kv_cache_type: "f16".to_string(),
             peak_rss_bytes: 2 * 1024 * 1024 * 1024,
@@ -3334,6 +3874,12 @@ mod tests {
         let mut invalid = profile();
         invalid.gpu_layers = 1;
         assert!(invalid.validate_contract().is_err());
+        let mut invalid = profile();
+        invalid.batch_threads = invalid.threads - 1;
+        assert!(invalid.validate_contract().is_err());
+        let mut invalid = profile();
+        invalid.batch_threads = 9;
+        assert!(invalid.validate_contract().is_err());
     }
 
     #[test]
@@ -3343,7 +3889,7 @@ mod tests {
             .into_iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(args.len(), 22);
+        assert_eq!(args.len(), 24);
         assert_eq!(
             &args[0..5],
             ["--host", "127.0.0.1", "--port", "31337", "--model"]
@@ -3359,6 +3905,8 @@ mod tests {
                 "--parallel",
                 "1",
                 "--threads",
+                "4",
+                "--threads-batch",
                 "4",
                 "--n-gpu-layers",
                 "0",
@@ -3433,7 +3981,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v4-semantic-bounded"
+            "anime-match-v5-compact-semantic"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
@@ -3446,11 +3994,11 @@ mod tests {
         assert_eq!(compact.pointer("/target/scope"), Some(&json!("episode")));
         assert_eq!(compact.pointer("/target/audio/mode"), Some(&json!("any")));
         assert_eq!(
-            compact.pointer("/seasonContext/0/aliases"),
+            compact.pointer("/seasons/0/aliases"),
             Some(&json!(["Tokyo Ghoul Root A", "東京喰種√A"]))
         );
         assert_eq!(
-            compact.pointer("/seasonContext/0/episodes/0"),
+            compact.pointer("/seasons/0/episodes/0"),
             Some(&json!({
                 "title": "New Surge",
                 "episode": 1,
@@ -3460,7 +4008,11 @@ mod tests {
         );
         assert_eq!(
             compact.pointer("/candidates/0/files/0"),
-            Some(&json!({"index": 0, "path": "Tokyo Ghoul Root A - 01.mkv"}))
+            Some(&json!({
+                "index": 0,
+                "title": "Tokyo Ghoul Root A",
+                "absolute": [1],
+            }))
         );
         assert_eq!(compact.pointer("/candidates/0/index"), Some(&json!(0)));
         assert_eq!(
@@ -3491,15 +4043,15 @@ mod tests {
             .as_str()
             .expect("system prompt");
         for required_rule in [
-            "alias names that exact season even without Sxx",
+            "season-scoped aliases",
             "seasonal or absolute episode",
             "exact matches best-first",
-            "any permits unknown",
-            "prefer and prefer_dub do not reject solely for audio",
-            "require needs an accepted profile exactly evidenced",
-            "require_dub accepts only evidenced dual_audio or dubbed",
-            "one inventoried file may omit its path",
-            "Fileless candidates select []",
+            "Audio any allows unknown",
+            "prefer modes do not reject on audio",
+            "require accepts only listed profiles",
+            "require_dub needs dual_audio or dubbed",
+            "single inventoried file is index 0 even when omitted",
+            "Fileless candidates use []",
         ] {
             assert!(
                 prompt.contains(required_rule),
@@ -3551,11 +4103,198 @@ mod tests {
         assert_eq!(
             compact_pack.pointer("/candidates/0/files"),
             Some(&json!([
-                {"index": 0, "path": "Tokyo Ghoul Root A - 01.mkv"},
-                {"index": 1, "path": "Tokyo Ghoul Root A - 02.mkv"},
+                {"index": 0, "title": "Tokyo Ghoul Root A", "absolute": [1]},
+                {"index": 1, "title": "Tokyo Ghoul Root A", "absolute": [2]},
             ]))
         );
         assert!(compact_pack.pointer("/candidates/1/files").is_none());
+    }
+
+    #[test]
+    fn alm9_compact_aliases_preserve_season_ownership_and_sourced_canonical_aliases() {
+        let mut request = request();
+        let shared = AnimeMatchAlias {
+            value: "Shared Franchise Name".to_string(),
+            kind: AnimeMatchAliasKind::Synonym,
+            source: Some("anilist_synonym".to_string()),
+            language: Some("en".to_string()),
+        };
+        request.context.seasons[0].aliases.push(shared.clone());
+        request.context.seasons.insert(
+            0,
+            AnimeMatchSeasonContext {
+                season_number: 1,
+                anilist_id: "22319".to_string(),
+                aliases: vec![
+                    AnimeMatchAlias {
+                        value: "Tokyo Ghoul".to_string(),
+                        kind: AnimeMatchAliasKind::Generated,
+                        source: None,
+                        language: None,
+                    },
+                    AnimeMatchAlias {
+                        value: "Tokyo Ghoul".to_string(),
+                        kind: AnimeMatchAliasKind::English,
+                        source: Some("anilist_english".to_string()),
+                        language: Some("en".to_string()),
+                    },
+                    shared,
+                ],
+                targets: Vec::new(),
+            },
+        );
+
+        let compact = compact_request(&request).expect("season-owned aliases");
+        assert_eq!(
+            compact.pointer("/seasons/0/aliases"),
+            Some(&json!(["Tokyo Ghoul", "Shared Franchise Name"]))
+        );
+        assert_eq!(
+            compact.pointer("/seasons/1/aliases"),
+            Some(&json!([
+                "Tokyo Ghoul Root A",
+                "東京喰種√A",
+                "Shared Franchise Name",
+            ]))
+        );
+    }
+
+    #[test]
+    fn alm9_compact_context_keeps_missing_coordinate_anchors_and_collisions() {
+        let mut request = request();
+        request.context.seasons[0].targets = vec![
+            AnimeMatchContextTarget {
+                target_key: "S02E00".to_string(),
+                title: "Previous".to_string(),
+                season_number: Some(2),
+                episode_number: Some(0),
+                absolute_episode_number: Some(12),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            },
+            AnimeMatchContextTarget {
+                target_key: "S02E01".to_string(),
+                title: "Wanted".to_string(),
+                season_number: Some(2),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            },
+            AnimeMatchContextTarget {
+                target_key: "S02E02".to_string(),
+                title: "Next".to_string(),
+                season_number: Some(2),
+                episode_number: Some(2),
+                absolute_episode_number: Some(14),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            },
+            AnimeMatchContextTarget {
+                target_key: "collision".to_string(),
+                title: "Same Seasonal Coordinate".to_string(),
+                season_number: Some(2),
+                episode_number: Some(1),
+                absolute_episode_number: Some(101),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            },
+        ];
+
+        assert_eq!(
+            compact_request(&request)
+                .expect("anchored context")
+                .pointer("/seasons/0/episodes"),
+            Some(&json!([
+                {"title": "Previous", "episode": 0, "absolute": 12},
+                {"title": "Wanted", "episode": 1, "wanted": 0},
+                {"title": "Next", "episode": 2, "absolute": 14},
+                {"title": "Same Seasonal Coordinate", "episode": 1, "absolute": 101},
+            ]))
+        );
+    }
+
+    #[test]
+    fn alm9_compact_candidates_keep_raw_release_and_ignore_language_only_noise() {
+        let mut left = request();
+        left.candidates[0].parse_facts.title_candidates = vec!["Tokyo Ghoul Root A".to_string()];
+        left.candidates[0].parse_facts.episode_numbers = vec![1];
+        left.candidates[0].parse_facts.languages = vec!["ja".to_string()];
+        let mut right = left.clone();
+        right.candidates[0].parse_facts.languages =
+            vec!["en".to_string(), "ja".to_string(), "und".to_string()];
+
+        let compact_left = compact_request(&left).expect("left compact request");
+        let compact_right = compact_request(&right).expect("right compact request");
+        assert_eq!(compact_left, compact_right);
+        assert_eq!(
+            compact_left.pointer("/candidates/0/release"),
+            Some(&json!("Tokyo Ghoul Root A - 01"))
+        );
+        assert!(compact_left.pointer("/candidates/0/languages").is_none());
+    }
+
+    #[test]
+    fn alm9_compact_pack_files_preserve_order_cardinality_and_special_evidence() {
+        let mut request = multi_target_request();
+        request.candidates[0].files = (1..=10)
+            .map(|episode| AnimeMatchFile {
+                file_key: format!("episode-{episode}"),
+                path: format!("Tokyo Ghoul Root A - {episode:02}.mkv"),
+            })
+            .chain([
+                AnimeMatchFile {
+                    file_key: "special".to_string(),
+                    path: "Tokyo Ghoul Root A S00E01 Special.mkv".to_string(),
+                },
+                AnimeMatchFile {
+                    file_key: "supplement".to_string(),
+                    path: "Extras/Tokyo Ghoul Root A - NCOP.mkv".to_string(),
+                },
+            ])
+            .collect();
+
+        let compact = compact_request(&request).expect("12-file pack");
+        let files = compact
+            .pointer("/candidates/0/files")
+            .and_then(Value::as_array)
+            .expect("structured pack files");
+        assert_eq!(files.len(), 12);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file["index"].as_u64().expect("file index"))
+                .collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert_eq!(files[0]["absolute"], json!([1]));
+        assert_eq!(files[9]["absolute"], json!([10]));
+        assert_eq!(files[10]["season"], json!(0));
+        assert_eq!(files[10]["kind"], json!("special"));
+        assert_eq!(files[11]["folder"], json!("Extras"));
+        assert_eq!(files[11]["kind"], json!("credits"));
+    }
+
+    #[test]
+    fn alm9_compact_serialization_is_deterministic_and_indices_follow_current_order() {
+        let request = multi_target_request();
+        let first = serde_json::to_string(&compact_request(&request).expect("compact request"))
+            .expect("serialize compact request");
+        let second = serde_json::to_string(&compact_request(&request).expect("compact request"))
+            .expect("serialize compact request");
+        assert_eq!(first, second);
+
+        let mut permuted = request;
+        permuted.candidates.swap(0, 1);
+        let compact = compact_request(&permuted).expect("permuted request");
+        assert_eq!(compact["candidates"][0]["index"], json!(0));
+        assert_eq!(
+            compact["candidates"][0]["release"],
+            json!("Tokyo Ghoul Root A Episodes 1-2")
+        );
+        let decoded = decode_test_response(r#"{"m":[[0,[0],[]]]}"#, &permuted)
+            .expect("current candidate index");
+        assert_eq!(decoded.matches[0].candidate_key, "candidate-1");
     }
 
     #[test]
@@ -4006,6 +4745,10 @@ mod tests {
                 .activate_profile_for_probe(profile.clone())
                 .await
                 .context("activating native CPU release-probe profile")?;
+            engine
+                .prime()
+                .await
+                .context("priming native CPU release-probe worker")?;
 
             // Keep teardown outside the inference future so every ordinary
             // error path still gracefully stops and reaps the managed worker.
@@ -4070,6 +4813,78 @@ mod tests {
         });
     }
 
+    /// Release-maintenance latency diagnostic for the first request in the
+    /// frozen qualification corpus. Unlike the production protocol probe,
+    /// this allows the request to finish past the production deadline so a
+    /// timeout can be separated into prompt-evaluation and generation cost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the ALM-9 native artifacts and ELIXIR_ALM9_CORPUS_PATH"]
+    async fn alm9_native_qwen35_cpu_frozen_case_latency_diagnostic() {
+        let result = async {
+            let worker_path = alm9_native_release_path(ALM9_NATIVE_LLAMA_SERVER_ENV)?;
+            let model_path = alm9_native_release_path(ALM9_NATIVE_QWEN_MODEL_ENV)?;
+            let corpus_path = alm9_native_release_path("ELIXIR_ALM9_CORPUS_PATH")?;
+            ensure!(
+                alm9_native_sha256(&worker_path).await? == ALM9_NATIVE_LLAMA_SERVER_SHA256,
+                "native diagnostic worker bytes do not match pinned llama.cpp b9637"
+            );
+            ensure!(
+                alm9_native_sha256(&model_path).await? == ALM9_NATIVE_QWEN_MODEL_SHA256,
+                "native diagnostic model bytes do not match the official Qwen3.5-2B Q4_K_M artifact"
+            );
+            let corpus: Value = serde_json::from_slice(
+                &tokio::fs::read(&corpus_path)
+                    .await
+                    .with_context(|| format!("reading {}", corpus_path.display()))?,
+            )
+            .context("decoding frozen qualification corpus")?;
+            let case = corpus
+                .pointer("/cases/0")
+                .ok_or_else(|| anyhow!("qualification corpus has no first case"))?;
+            let case_id = case
+                .get("caseId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("first qualification case has no ID"))?;
+            let request: AnimeMatchRequest = serde_json::from_value(
+                case.pointer("/input/request")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("first qualification case has no request"))?,
+            )
+            .context("decoding first qualification request")?;
+            let profile = alm9_native_cpu_profile(worker_path, model_path);
+            let engine = LocalModelEngine::allow_all_for_probe()?;
+            engine.activate_profile_for_probe(profile).await?;
+            let prime_started = Instant::now();
+            engine
+                .prime()
+                .await
+                .context("running latency-diagnostic priming request")?;
+            let prime_elapsed_ms = duration_millis(prime_started.elapsed());
+            let measured = engine
+                .infer_measured_with_deadline(request, Duration::from_secs(60))
+                .await;
+            engine.shutdown().await;
+            let (_, completion) = measured.with_context(|| {
+                format!("running frozen qualification latency diagnostic {case_id}")
+            })?;
+            eprintln!(
+                "ALM9_PRIMING_LATENCY elapsed_ms={prime_elapsed_ms}",
+            );
+            eprintln!(
+                "ALM9_WARM_FROZEN_CASE_LATENCY case={case_id} prompt_tokens={:?} generated_tokens={:?} prompt_ms={:?} generation_ms={:?}",
+                completion.prompt_tokens,
+                completion.generated_tokens,
+                completion.prompt_time_ms,
+                completion.generation_time_ms,
+            );
+            Result::<()>::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            panic!("{error:#}");
+        }
+    }
+
     #[test]
     fn alm6_loopback_url_rejects_non_loopback_addresses() {
         assert!(loopback_url("127.0.0.1:8080".parse().unwrap(), "/health").is_ok());
@@ -4116,6 +4931,48 @@ mod tests {
             !engine.claim_restart(),
             "the new episode is still bounded to one restart"
         );
+    }
+
+    #[tokio::test]
+    async fn alm9_exhausted_restart_budget_cannot_be_bypassed_by_later_requests() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let worker_path = directory.path().join("llama-server");
+        let model_path = directory.path().join("model.gguf");
+        std::fs::write(&worker_path, b"fixture worker").expect("write worker fixture");
+        std::fs::write(&model_path, b"fixture model").expect("write model fixture");
+        let mut profile = profile();
+        profile.worker_path = worker_path;
+        profile.model_path = model_path;
+
+        let engine = LocalModelEngine::allow_all().expect("engine");
+        engine
+            .activate_profile_cold(profile)
+            .await
+            .expect("cold activation");
+        engine.inner.restart_used.store(true, Ordering::Release);
+        let requested = engine
+            .inner
+            .background_prime_requested
+            .load(Ordering::Acquire);
+
+        for _ in 0..3 {
+            let error = engine
+                .match_candidates(request())
+                .await
+                .expect_err("exhausted restart must use deterministic fallback");
+            assert!(error.to_string().contains("not primed"));
+        }
+        assert_eq!(
+            engine
+                .inner
+                .background_prime_requested
+                .load(Ordering::Acquire),
+            requested,
+            "a later request bypassed the exhausted restart budget"
+        );
+        assert!(!engine.inner.background_warm_active.load(Ordering::Acquire));
+        assert!(engine.snapshot().await.process_id.is_none());
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -4277,10 +5134,8 @@ server.serve_forever()
         profile.worker_path = worker_path;
         profile.model_path = model_path;
 
-        let priming_request = request();
-        let mut measured_request = request();
-        measured_request.request_id = "search-2".to_string();
-        measured_request.target.canonical_title = "Tokyo Ghoul Root A".to_string();
+        let [priming_request, measured_request] =
+            smoke_requests().expect("compiled hardware probe fixtures");
 
         let engine = LocalModelEngine::allow_all_for_probe().expect("probe engine");
         engine
@@ -4444,7 +5299,7 @@ server.serve_forever()
             "unexpected readiness failure: {error:#}"
         );
         let snapshot = engine.snapshot().await;
-        assert_eq!(snapshot.state, LocalModelWorkerState::Inactive);
+        assert_eq!(snapshot.state, LocalModelWorkerState::Unavailable);
         assert!(snapshot.process_id.is_none());
         engine.shutdown().await;
     }
@@ -4468,6 +5323,7 @@ import sys
 import time
 
 LIFECYCLE_PATH = __file__ + ".lifecycle"
+chat_calls = 0
 
 
 def record(event):
@@ -4499,6 +5355,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(404, b'{}')
 
     def do_POST(self):
+        global chat_calls
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
         if self.path == "/v1/chat/completions/input_tokens":
@@ -4507,9 +5364,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 b'{"object":"response.input_tokens","input_tokens":32}',
             )
         elif self.path == "/v1/chat/completions":
-            record("chat")
-            while True:
-                time.sleep(60)
+            chat_calls += 1
+            record(f"chat-{chat_calls}")
+            if chat_calls == 1:
+                self.reply(
+                    200,
+                    b'{"choices":[{"message":{"content":"{\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
+                )
+            else:
+                while True:
+                    time.sleep(60)
         else:
             self.reply(404, b'{}')
 
@@ -4608,7 +5472,7 @@ server.serve_forever()
             .expect("original worker start event");
         let original_chat = events
             .iter()
-            .position(|event| *event == format!("chat:{original_pid}"))
+            .position(|event| *event == format!("chat-2:{original_pid}"))
             .expect("original worker generation event");
         let replacement_started = events
             .iter()
@@ -4642,14 +5506,40 @@ server.serve_forever()
                 .expect("forced certification crash"),
             certification_pid
         );
-        let deadline_error = certification_engine
+        let crash_fallback = certification_engine
             .match_with_deadline_for_certification(request(), Duration::from_millis(1))
+            .await
+            .expect_err("a crashed worker must immediately use deterministic fallback");
+        assert!(
+            crash_fallback
+                .to_string()
+                .contains("local model worker is not primed")
+        );
+        let replacement_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = certification_engine.snapshot().await;
+            if snapshot.state == LocalModelWorkerState::Ready
+                && snapshot
+                    .process_id
+                    .is_some_and(|pid| pid != certification_pid)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < replacement_deadline,
+                "certification replacement was not primed: {snapshot:?}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        let deadline_error = certification_engine
+            .match_with_deadline_for_certification(request(), Duration::from_millis(100))
             .await
             .expect_err("real stalled replacement must hit certification deadline");
         assert!(
             deadline_error
                 .to_string()
-                .contains("local model request deadline exceeded")
+                .contains("local model request deadline exceeded"),
+            "unexpected replacement deadline failure: {deadline_error:#}"
         );
         certification_engine.shutdown().await;
     }

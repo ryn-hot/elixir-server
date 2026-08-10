@@ -13,7 +13,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -491,6 +491,10 @@ pub async fn run_anime_inference_qualification(
 
     let engine = LocalModelEngine::allow_all_for_probe()?;
     engine.activate_profile_for_probe(profile).await?;
+    engine
+        .prime()
+        .await
+        .context("priming exact qualification worker")?;
     let recording = RecordingEngine::new(Arc::new(engine.clone()));
     let service = AnimeMatchingService::with_engine(Arc::new(recording.clone()));
 
@@ -531,12 +535,19 @@ async fn run_cases(
 ) -> Result<Vec<QualificationCaseOutput>> {
     let base_seed = identity.candidate_order_seeds[0];
     let permutation_seed = identity.candidate_order_seeds[1];
-    let mut outputs =
-        Vec::with_capacity(selected_case_ids.map_or(corpus.cases.len(), BTreeSet::len));
+    let selected_count = selected_case_ids.map_or(corpus.cases.len(), BTreeSet::len);
+    let mut outputs = Vec::with_capacity(selected_count);
+    let mut selected_index = 0usize;
     for case in &corpus.cases {
         if selected_case_ids.is_some_and(|case_ids| !case_ids.contains(&case.case_id)) {
             continue;
         }
+        selected_index += 1;
+        let case_started = Instant::now();
+        eprintln!(
+            "ALM9_QUALIFICATION_CASE_START index={selected_index} total={selected_count} id={}",
+            case.case_id
+        );
         let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
             .with_context(|| format!("decoding input for qualification case {}", case.case_id))?;
         validate_case_input(case, &input)?;
@@ -610,6 +621,11 @@ async fn run_cases(
             stability_runs,
             failure_fallback_plans,
         });
+        eprintln!(
+            "ALM9_QUALIFICATION_CASE_COMPLETE index={selected_index} total={selected_count} id={} elapsedMs={}",
+            case.case_id,
+            u64::try_from(case_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        );
     }
     Ok(outputs)
 }
@@ -2080,6 +2096,7 @@ fn local_profile_from_qualification(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: u32::from(profile.cpu_thread_count),
+        batch_threads: u32::from(profile.batch_thread_count),
         gpu_layers: profile.gpu_layer_count,
         kv_cache_type: kv_cache_type.to_string(),
         peak_rss_bytes: profile.peak_rss_bytes,
@@ -2492,6 +2509,7 @@ mod tests {
             device_id: None,
             gpu_layer_count: 0,
             cpu_thread_count: 2,
+            batch_thread_count: 4,
             kv_cache_type: manifest.runtime_policy.kv_cache_type,
             load_time_ms: 1_000,
             warm_latency_ms: 100,

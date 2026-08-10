@@ -36,10 +36,11 @@ use super::bundle::{
 };
 
 pub const INFERENCE_HARDWARE_SCHEMA_VERSION: u32 = 1;
-pub const INFERENCE_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const INFERENCE_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 2;
 pub const MIN_AVAILABLE_SYSTEM_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MIN_DEVICE_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_INFERENCE_CPU_THREADS: u32 = 4;
+pub const MAX_INFERENCE_BATCH_THREADS: u32 = 8;
 pub const MAX_RUNTIME_PROFILE_CANDIDATES: usize = 8;
 pub const MAX_PROBE_DETAIL_BYTES: usize = 512;
 const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
@@ -243,6 +244,7 @@ pub struct InferenceRuntimeCandidate {
     pub device_key: Option<String>,
     pub gpu_layers: u32,
     pub cpu_threads: u32,
+    pub batch_threads: u32,
     pub required_device_reserve_bytes: u64,
 }
 
@@ -384,6 +386,7 @@ pub struct InferenceRuntimeProfile {
     pub device_key: Option<String>,
     pub gpu_layers: u32,
     pub cpu_threads: u32,
+    pub batch_threads: u32,
     pub kv_cache_type: String,
     pub outcome: InferenceEnvelopeOutcome,
     pub load_time_ms: u64,
@@ -747,6 +750,8 @@ pub fn bundle_runtime_profile_from_probe(
         gpu_layer_count: profile.gpu_layers,
         cpu_thread_count: u16::try_from(profile.cpu_threads)
             .map_err(|_| BundleRuntimeProfileBridgeError::InvalidProbeProfile)?,
+        batch_thread_count: u16::try_from(profile.batch_threads)
+            .map_err(|_| BundleRuntimeProfileBridgeError::InvalidProbeProfile)?,
         kv_cache_type,
         load_time_ms: profile.load_time_ms,
         warm_latency_ms: profile.warm_latency_ms,
@@ -1006,6 +1011,15 @@ pub fn recommended_cpu_threads(physical_cores: u32) -> u32 {
         .clamp(1, MAX_INFERENCE_CPU_THREADS)
 }
 
+/// Separates prompt-prefill parallelism from the generation thread count.
+/// Every value returned here is an explicit probe candidate; the runtime does
+/// not derive or silently override it later.
+pub fn optimized_batch_threads(physical_cores: u32, cpu_threads: u32) -> u32 {
+    physical_cores
+        .min(cpu_threads.saturating_mul(2))
+        .min(MAX_INFERENCE_BATCH_THREADS)
+}
+
 /// Produces the small, ordered probe set for one already-qualified model.
 /// Backends absent from release certification are never attempted.
 pub fn runtime_profile_candidates(
@@ -1022,6 +1036,8 @@ pub fn runtime_profile_candidates(
     }
 
     let cpu_threads = recommended_cpu_threads(inventory.cpu.physical_cores);
+    let optimized_cpu_batch_threads =
+        optimized_batch_threads(inventory.cpu.physical_cores, cpu_threads);
     let mut candidates = Vec::new();
     let backend_order = preferred_backend_order(inventory);
     for backend in backend_order {
@@ -1043,6 +1059,7 @@ pub fn runtime_profile_candidates(
                 device_key: Some(backend.llama_device_selector().to_string()),
                 gpu_layers: maximum_layers,
                 cpu_threads,
+                batch_threads: cpu_threads,
                 required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
             },
         );
@@ -1056,6 +1073,7 @@ pub fn runtime_profile_candidates(
                     device_key: Some(backend.llama_device_selector().to_string()),
                     gpu_layers: reduced_layers,
                     cpu_threads,
+                    batch_threads: cpu_threads,
                     required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
                 },
             );
@@ -1063,19 +1081,7 @@ pub fn runtime_profile_candidates(
     }
 
     if policy.certified_backends.contains(&InferenceBackend::Cpu) {
-        push_candidate(
-            &mut candidates,
-            InferenceRuntimeCandidate {
-                backend: InferenceBackend::Cpu,
-                device_class: InferenceDeviceClass::Cpu,
-                device_key: None,
-                gpu_layers: 0,
-                cpu_threads,
-                required_device_reserve_bytes: 0,
-            },
-        );
-        let reduced_threads = (cpu_threads / 2).max(1);
-        if reduced_threads < cpu_threads {
+        for batch_threads in [optimized_cpu_batch_threads, cpu_threads] {
             push_candidate(
                 &mut candidates,
                 InferenceRuntimeCandidate {
@@ -1083,10 +1089,30 @@ pub fn runtime_profile_candidates(
                     device_class: InferenceDeviceClass::Cpu,
                     device_key: None,
                     gpu_layers: 0,
-                    cpu_threads: reduced_threads,
+                    cpu_threads,
+                    batch_threads,
                     required_device_reserve_bytes: 0,
                 },
             );
+        }
+        let reduced_threads = (cpu_threads / 2).max(1);
+        if reduced_threads < cpu_threads {
+            let optimized_reduced_batch_threads =
+                optimized_batch_threads(inventory.cpu.physical_cores, reduced_threads);
+            for batch_threads in [optimized_reduced_batch_threads, reduced_threads] {
+                push_candidate(
+                    &mut candidates,
+                    InferenceRuntimeCandidate {
+                        backend: InferenceBackend::Cpu,
+                        device_class: InferenceDeviceClass::Cpu,
+                        device_key: None,
+                        gpu_layers: 0,
+                        cpu_threads: reduced_threads,
+                        batch_threads,
+                        required_device_reserve_bytes: 0,
+                    },
+                );
+            }
         }
     }
     candidates.truncate(MAX_RUNTIME_PROFILE_CANDIDATES);
@@ -1182,7 +1208,12 @@ fn runtime_candidate_is_well_formed(
     inventory: &InferenceHardwareInventory,
     candidate: &InferenceRuntimeCandidate,
 ) -> bool {
-    if !(1..=MAX_INFERENCE_CPU_THREADS).contains(&candidate.cpu_threads) {
+    if !(1..=MAX_INFERENCE_CPU_THREADS).contains(&candidate.cpu_threads)
+        || !(candidate.cpu_threads..=MAX_INFERENCE_BATCH_THREADS).contains(&candidate.batch_threads)
+        || (inventory.cpu.physical_cores > 0
+            && (candidate.cpu_threads > inventory.cpu.physical_cores
+                || candidate.batch_threads > inventory.cpu.physical_cores))
+    {
         return false;
     }
     match candidate.backend {
@@ -1353,7 +1384,8 @@ fn runtime_profile_from_probe(
         device_class: candidate.device_class,
         device_key: candidate.device_key.clone(),
         gpu_layers: candidate.gpu_layers,
-        cpu_threads: candidate.cpu_threads.min(MAX_INFERENCE_CPU_THREADS).max(1),
+        cpu_threads: candidate.cpu_threads,
+        batch_threads: candidate.batch_threads,
         kv_cache_type: bundle_kv_cache_name(identity.kv_cache_type).to_string(),
         outcome,
         load_time_ms: measurement.load_time_ms,
@@ -1378,6 +1410,7 @@ fn runtime_profile_is_well_formed(profile: &InferenceRuntimeProfile) -> bool {
     .all(|value| !value.trim().is_empty());
     let execution_is_valid = profile.peak_rss_bytes > 0
         && (1..=MAX_INFERENCE_CPU_THREADS).contains(&profile.cpu_threads)
+        && (profile.cpu_threads..=MAX_INFERENCE_BATCH_THREADS).contains(&profile.batch_threads)
         && matches!(profile.kv_cache_type.as_str(), "f16" | "q8_0")
         && match profile.backend {
             InferenceBackend::Cpu => {
@@ -3080,9 +3113,15 @@ mod tests {
                     candidate.backend,
                     candidate.gpu_layers,
                     candidate.cpu_threads,
+                    candidate.batch_threads,
                 ))
                 .collect::<Vec<_>>(),
-            vec![(InferenceBackend::Cpu, 0, 4), (InferenceBackend::Cpu, 0, 2),]
+            vec![
+                (InferenceBackend::Cpu, 0, 4, 8),
+                (InferenceBackend::Cpu, 0, 4, 4),
+                (InferenceBackend::Cpu, 0, 2, 4),
+                (InferenceBackend::Cpu, 0, 2, 2),
+            ]
         );
         assert!(runtime_device_memory(&inventory, InferenceBackend::Metal, Some("MTL0")).is_none());
     }
@@ -3116,9 +3155,15 @@ mod tests {
                     candidate.backend,
                     candidate.gpu_layers,
                     candidate.cpu_threads,
+                    candidate.batch_threads,
                 ))
                 .collect::<Vec<_>>(),
-            vec![(InferenceBackend::Cpu, 0, 4), (InferenceBackend::Cpu, 0, 2),]
+            vec![
+                (InferenceBackend::Cpu, 0, 4, 8),
+                (InferenceBackend::Cpu, 0, 4, 4),
+                (InferenceBackend::Cpu, 0, 2, 4),
+                (InferenceBackend::Cpu, 0, 2, 2),
+            ]
         );
     }
 
@@ -3238,6 +3283,13 @@ mod tests {
                 InferenceBackend::Vulkan,
                 InferenceBackend::Cpu
             ]
+        );
+        assert!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.backend != InferenceBackend::Cpu)
+                .all(|candidate| candidate.batch_threads == candidate.cpu_threads),
+            "accelerator candidates stay conservative until a distinct value is explicitly probed"
         );
     }
 
@@ -3370,11 +3422,15 @@ mod tests {
     }
 
     #[test]
-    fn alm6_cpu_threads_start_at_half_physical_and_never_exceed_four() {
+    fn alm6_cpu_and_batch_threads_are_bounded_explicit_probe_values() {
         assert_eq!(recommended_cpu_threads(1), 1);
         assert_eq!(recommended_cpu_threads(4), 2);
         assert_eq!(recommended_cpu_threads(8), 4);
         assert_eq!(recommended_cpu_threads(64), 4);
+        assert_eq!(optimized_batch_threads(1, 1), 1);
+        assert_eq!(optimized_batch_threads(4, 2), 4);
+        assert_eq!(optimized_batch_threads(6, 4), 6);
+        assert_eq!(optimized_batch_threads(64, 4), 8);
     }
 
     #[test]
@@ -3693,6 +3749,7 @@ mod tests {
             device_key: Some(InferenceBackend::Cuda.llama_device_selector().to_string()),
             gpu_layers: 24,
             cpu_threads: 4,
+            batch_threads: 4,
             required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
         };
         let cpu = InferenceRuntimeCandidate {
@@ -3701,6 +3758,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: 4,
+            batch_threads: 8,
             required_device_reserve_bytes: 0,
         };
         let mut rejected = passing_measurement();
@@ -3748,6 +3806,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: 4,
+            batch_threads: 8,
             required_device_reserve_bytes: 0,
         };
         let mut limits = InferenceProbeLimits::default();
@@ -3771,6 +3830,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: 4,
+            batch_threads: 8,
             required_device_reserve_bytes: 0,
         };
         let profile = runtime_profile_from_probe(
@@ -3844,6 +3904,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: 4,
+            batch_threads: 8,
             required_device_reserve_bytes: 0,
         };
         let mut profile = runtime_profile_from_probe(
@@ -4129,6 +4190,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: MAX_INFERENCE_CPU_THREADS + 1,
+            batch_threads: MAX_INFERENCE_CPU_THREADS + 1,
             required_device_reserve_bytes: 0,
         };
         let probe = FakeProbe::new(Vec::new());
@@ -4152,6 +4214,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alm6_batch_threads_must_cover_generation_and_fit_physical_cores() {
+        let inventory = inventory("linux", "x86_64", 4, gib(8), Vec::new());
+        for batch_threads in [3, 8, MAX_INFERENCE_BATCH_THREADS + 1] {
+            let invalid = InferenceRuntimeCandidate {
+                backend: InferenceBackend::Cpu,
+                device_class: InferenceDeviceClass::Cpu,
+                device_key: None,
+                gpu_layers: 0,
+                cpu_threads: 4,
+                batch_threads,
+                required_device_reserve_bytes: 0,
+            };
+            let selected = select_runtime_profile(
+                &inventory,
+                &identity(),
+                &[invalid],
+                &InferenceProbeLimits::default(),
+                &FakeProbe::new(Vec::new()),
+            )
+            .await;
+            assert_eq!(
+                selected.attempts[0].rejection,
+                Some(InferenceProbeRejection::InvalidCandidate),
+                "batch_threads={batch_threads} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn alm6_probe_rejects_missing_peak_rss_measurement() {
         let inventory = inventory("linux", "x86_64", 8, gib(8), Vec::new());
         let candidate = InferenceRuntimeCandidate {
@@ -4160,6 +4251,7 @@ mod tests {
             device_key: None,
             gpu_layers: 0,
             cpu_threads: 4,
+            batch_threads: 8,
             required_device_reserve_bytes: 0,
         };
         let mut measurement = passing_measurement();
@@ -4345,6 +4437,7 @@ mod tests {
             device_key: Some("CUDA0".to_string()),
             gpu_layers: 24,
             cpu_threads: 4,
+            batch_threads: 4,
             required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
         };
         let identity = RuntimeProfileIdentity {
@@ -4437,6 +4530,7 @@ mod tests {
                 device_key: Some("CUDA0".to_string()),
                 gpu_layers: 24,
                 cpu_threads: 4,
+                batch_threads: 4,
                 required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
             },
             &passing_measurement(),
@@ -4494,6 +4588,7 @@ mod tests {
                 device_key: Some("CUDA0".to_string()),
                 gpu_layers: 24,
                 cpu_threads: 4,
+                batch_threads: 4,
                 required_device_reserve_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
             },
             &passing_measurement(),

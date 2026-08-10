@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Notify, RwLock},
@@ -37,11 +37,10 @@ use crate::{
 };
 
 use super::{
-    ANIME_MATCH_PROMPT_REVISION, ANIME_MATCH_SCHEMA_VERSION, ActiveAnimeBundleDescriptor,
-    AnimeBundleCompatibilityPolicy, AnimeBundleStore, AnimeCandidateMatch, AnimeExecutionBackend,
-    AnimeInferenceBundleManifest, AnimeKvCacheType, AnimeMatchAudioProfile, AnimeMatchEngine,
-    AnimeMatchRequest, AnimeMatchResponse, AnimeMatchingService, AnimeRuntimeSelection,
-    InferenceBackend, InferenceEnvelopeProbe, InferenceHardwareInventory, InferenceModelEnvelope,
+    ANIME_MATCH_PROMPT_REVISION, ActiveAnimeBundleDescriptor, AnimeBundleCompatibilityPolicy,
+    AnimeBundleStore, AnimeExecutionBackend, AnimeInferenceBundleManifest, AnimeKvCacheType,
+    AnimeMatchEngine, AnimeMatchingService, AnimeRuntimeSelection, InferenceBackend,
+    InferenceEnvelopeProbe, InferenceHardwareInventory, InferenceModelEnvelope,
     InferenceProbeError, InferenceProbeLimits, InferenceProbeMeasurement,
     InferenceRuntimeCandidate, LocalModelAdmission, LocalModelAdmissionPhase, LocalModelEngine,
     LocalModelRuntimeProfile, LocalModelSamplingProfile, LocalModelSnapshot, LocalModelWorkerState,
@@ -52,7 +51,8 @@ use super::{
     collect_current_inference_memory, collect_inference_hardware_inventory,
     commit_accepted_anime_update, ensure_monotonic_anime_update, inference_hardware_fingerprint,
     load_accepted_anime_update, resolve_anime_runtime, runtime_device_memory,
-    runtime_profile_candidates, select_runtime_profile, verify_anime_bundle_envelope,
+    runtime_profile_candidates, select_runtime_profile, smoke_requests, smoke_responses_passed,
+    verify_anime_bundle_envelope,
 };
 
 const FIRST_PARTY_MANIFEST_URL: &str =
@@ -210,6 +210,7 @@ impl LocalModelAdmission for AnimeResourceAdmission {
         let manager_owned = matches!(
             phase,
             LocalModelAdmissionPhase::ActivationWorkerStart
+                | LocalModelAdmissionPhase::ActivationInference
                 | LocalModelAdmissionPhase::ProbeWorkerStart
                 | LocalModelAdmissionPhase::ProbeInference
         );
@@ -1390,7 +1391,7 @@ impl AnimeInferenceService {
             }
             result = async {
                 engine.activate_profile_cold(profile.clone()).await?;
-                engine.warm_for_activation().await
+                engine.prime_for_activation().await
             } => result,
         };
         if let Err(error) = activation {
@@ -1523,12 +1524,7 @@ impl AnimeInferenceService {
                 .map(|profile| profile.peak_rss_bytes)
                 .unwrap_or(u64::MAX);
             if self.admission.can_start(peak) {
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = engine.warm().await {
-                        tracing::debug!(error = %error, "background inference rewarm deferred");
-                    }
-                });
+                engine.request_background_prime();
             } else {
                 self.admission
                     .resource_suspended
@@ -1727,12 +1723,13 @@ fn local_profile_for_probe(
         "sha256:{:x}",
         Sha256::digest(
             format!(
-                "{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}",
                 manifest.bundle_version,
                 candidate.backend.as_str(),
                 candidate.device_key.as_deref().unwrap_or("cpu"),
                 candidate.gpu_layers,
-                candidate.cpu_threads
+                candidate.cpu_threads,
+                candidate.batch_threads
             )
             .as_bytes()
         )
@@ -1752,6 +1749,7 @@ fn local_profile_for_probe(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: candidate.cpu_threads,
+        batch_threads: candidate.batch_threads,
         gpu_layers: candidate.gpu_layers,
         kv_cache_type: kv_cache_name(manifest.runtime_policy.kv_cache_type).to_string(),
         peak_rss_bytes: manifest.model.size_bytes,
@@ -1818,6 +1816,7 @@ fn local_profile_from_active(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: u32::from(active.profile.cpu_thread_count),
+        batch_threads: u32::from(active.profile.batch_thread_count),
         gpu_layers: active.profile.gpu_layer_count,
         kv_cache_type: kv_cache_name(active.profile.kv_cache_type).to_string(),
         peak_rss_bytes: active.profile.peak_rss_bytes,
@@ -1872,6 +1871,9 @@ fn descriptor_matches_local_profile(
         && active.profile.worker_revision == profile.worker_revision
         && active.profile.profile_fingerprint == profile.profile_fingerprint
         && active.profile.execution_backend.as_str() == profile.backend
+        && u32::from(active.profile.cpu_thread_count) == profile.threads
+        && u32::from(active.profile.batch_thread_count) == profile.batch_threads
+        && active.profile.gpu_layer_count == profile.gpu_layers
 }
 
 fn runtime_probe_policy(
@@ -1944,84 +1946,6 @@ fn kv_cache_name(cache: AnimeKvCacheType) -> &'static str {
         AnimeKvCacheType::F16 => "f16",
         AnimeKvCacheType::Q8_0 => "q8_0",
     }
-}
-
-const PROFILE_PROBE_PRIMING_REQUEST_ID: &str = "alm9-hardware-tokyo-ghoul-s2e1";
-const PROFILE_PROBE_MEASURED_REQUEST_ID: &str = "alm9-hardware-cross-script-absolute";
-const PROFILE_PROBE_REQUEST_CORPUS_BYTES: &[u8] =
-    include_bytes!("fixtures/hardware-certification-requests.json");
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProfileProbeRequestCorpus {
-    schema_version: u32,
-    status: String,
-    requests: Vec<AnimeMatchRequest>,
-}
-
-/// Return two fixed, production-shaped requests used to admit a local runtime
-/// profile. The first populates a newly loaded worker's cache; the second is
-/// distinct, so only their shared production prefix is reusable and its
-/// measurement cannot pass through exact user-prompt reuse. Both remain part
-/// of the frozen physical-certification corpus.
-pub(crate) fn smoke_requests() -> Result<[AnimeMatchRequest; 2]> {
-    let corpus: ProfileProbeRequestCorpus =
-        serde_json::from_slice(PROFILE_PROBE_REQUEST_CORPUS_BYTES)
-            .context("decoding compiled profile-probe request corpus")?;
-    ensure!(
-        corpus.schema_version == 1 && corpus.status == "frozen",
-        "compiled profile-probe request corpus is not frozen schema v1"
-    );
-    let mut priming = None;
-    let mut measured = None;
-    for request in corpus.requests {
-        let slot = match request.request_id.as_str() {
-            PROFILE_PROBE_PRIMING_REQUEST_ID => &mut priming,
-            PROFILE_PROBE_MEASURED_REQUEST_ID => &mut measured,
-            _ => continue,
-        };
-        ensure!(
-            slot.is_none(),
-            "compiled profile-probe request is duplicated"
-        );
-        *slot = Some(request);
-    }
-    Ok([
-        priming.ok_or_else(|| anyhow!("compiled profile-probe priming request is missing"))?,
-        measured.ok_or_else(|| anyhow!("compiled profile-probe measured request is missing"))?,
-    ])
-}
-
-pub(crate) fn smoke_responses_passed(
-    priming_response: &AnimeMatchResponse,
-    response: &AnimeMatchResponse,
-) -> bool {
-    profile_probe_response_passed(PROFILE_PROBE_PRIMING_REQUEST_ID, priming_response)
-        && profile_probe_response_passed(PROFILE_PROBE_MEASURED_REQUEST_ID, response)
-}
-
-pub(crate) fn profile_probe_response_passed(
-    request_id: &str,
-    response: &AnimeMatchResponse,
-) -> bool {
-    profile_probe_expected_response(request_id).is_some_and(|expected| response == &expected)
-}
-
-fn profile_probe_expected_response(request_id: &str) -> Option<AnimeMatchResponse> {
-    let (target_key, audio_profile) = match request_id {
-        PROFILE_PROBE_PRIMING_REQUEST_ID => ("S02E01", AnimeMatchAudioProfile::DualAudio),
-        PROFILE_PROBE_MEASURED_REQUEST_ID => ("S01E13", AnimeMatchAudioProfile::Unknown),
-        _ => return None,
-    };
-    Some(AnimeMatchResponse {
-        schema_version: ANIME_MATCH_SCHEMA_VERSION,
-        matches: vec![AnimeCandidateMatch {
-            candidate_key: "candidate-0".to_string(),
-            matched_target_keys: vec![target_key.to_string()],
-            audio_profile,
-            selected_file_keys: Some(vec!["candidate-0-file-0".to_string()]),
-        }],
-    })
 }
 
 fn bundle_policy(environment: &RunEnvironment) -> Result<AnimeBundleCompatibilityPolicy> {
@@ -2118,8 +2042,7 @@ async fn await_task(task: tokio::task::JoinHandle<()>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anime_matching::{AnimeMatchAliasKind, AnimeMatchAudioPreferenceMode};
-
+    use crate::anime_matching::ANIME_MATCH_SCHEMA_VERSION;
     fn test_service(root: PathBuf) -> AnimeInferenceService {
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect_lazy("sqlite::memory:").expect("lazy test database");
@@ -2147,6 +2070,7 @@ mod tests {
             context_tokens: 4_096,
             max_output_tokens: 256,
             threads: 1,
+            batch_threads: 1,
             gpu_layers: 0,
             kv_cache_type: "f16".to_string(),
             peak_rss_bytes: 1,
@@ -2398,89 +2322,6 @@ mod tests {
             "polling requests must coalesce during offline retry backoff"
         );
         assert!(service.claim_scheduled_repair());
-    }
-
-    #[test]
-    fn alm9_profile_probe_fixture_is_production_shaped_and_reference_closed() {
-        let [priming, measured] = smoke_requests().expect("compiled profile-probe requests");
-        assert_ne!(priming.request_id, measured.request_id);
-        for request in [&priming, &measured] {
-            let encoded = serde_json::to_vec(request).unwrap();
-            assert!((1_800..4 * 1024).contains(&encoded.len()));
-            assert_eq!(request.candidates.len(), 4);
-            assert_eq!(request.candidates[0].candidate_key, "candidate-0");
-            assert_eq!(
-                request.candidates[0].files[0].file_key,
-                "candidate-0-file-0"
-            );
-        }
-
-        assert_eq!(priming.request_id, PROFILE_PROBE_PRIMING_REQUEST_ID);
-        assert_eq!(priming.target.wanted_target_keys, ["S02E01"]);
-        assert_eq!(
-            priming.target.audio_preference.mode,
-            AnimeMatchAudioPreferenceMode::RequireDub
-        );
-        assert_eq!(priming.target.absolute_episode_numbers, [13]);
-        assert_eq!(priming.context.seasons.len(), 1);
-        assert_eq!(priming.context.seasons[0].targets.len(), 2);
-        assert_eq!(
-            priming.context.seasons[0]
-                .aliases
-                .iter()
-                .map(|alias| alias.kind)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                AnimeMatchAliasKind::English,
-                AnimeMatchAliasKind::Romaji,
-                AnimeMatchAliasKind::Native,
-                AnimeMatchAliasKind::Generated,
-            ])
-        );
-        assert_eq!(measured.request_id, PROFILE_PROBE_MEASURED_REQUEST_ID);
-        assert_eq!(measured.target.wanted_target_keys, ["S01E13"]);
-        assert_eq!(
-            measured.target.audio_preference.mode,
-            AnimeMatchAudioPreferenceMode::Any
-        );
-        assert_eq!(measured.context.seasons[0].targets.len(), 3);
-        assert!(
-            measured.context.seasons[0]
-                .aliases
-                .iter()
-                .any(|alias| alias.kind == AnimeMatchAliasKind::Native)
-        );
-    }
-
-    #[test]
-    fn alm9_profile_probe_requires_both_complete_expected_mappings() {
-        let priming = profile_probe_expected_response(PROFILE_PROBE_PRIMING_REQUEST_ID).unwrap();
-        let measured = profile_probe_expected_response(PROFILE_PROBE_MEASURED_REQUEST_ID).unwrap();
-        assert!(smoke_responses_passed(&priming, &measured));
-        assert!(!profile_probe_response_passed("unknown", &priming));
-
-        let mut wrong_audio = priming.clone();
-        wrong_audio.matches[0].audio_profile = AnimeMatchAudioProfile::Subbed;
-        assert!(!smoke_responses_passed(&wrong_audio, &measured));
-
-        let mut missing_file = measured.clone();
-        missing_file.matches[0].selected_file_keys = None;
-        assert!(!smoke_responses_passed(&priming, &missing_file));
-
-        let mut duplicate_target = priming.clone();
-        duplicate_target.matches[0]
-            .matched_target_keys
-            .push("S02E01".to_string());
-        assert!(!smoke_responses_passed(&duplicate_target, &measured));
-
-        let mut extra_candidate = measured.clone();
-        extra_candidate.matches.push(AnimeCandidateMatch {
-            candidate_key: "candidate-2".to_string(),
-            matched_target_keys: vec!["S01E13".to_string()],
-            audio_profile: AnimeMatchAudioProfile::Subbed,
-            selected_file_keys: Some(vec!["candidate-2-file-0".to_string()]),
-        });
-        assert!(!smoke_responses_passed(&priming, &extra_candidate));
     }
 
     #[test]

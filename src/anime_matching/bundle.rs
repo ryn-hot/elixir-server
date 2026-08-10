@@ -32,7 +32,7 @@ use uuid::Uuid;
 pub const ANIME_BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const ANIME_INFERENCE_PROTOCOL_VERSION: u32 = 1;
 pub const ANIME_MATCHER_SCHEMA_VERSION: u32 = 1;
-pub const ANIME_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const ANIME_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_MARKER_SCHEMA_VERSION: u32 = 1;
 const PENDING_ACTIVATION_SCHEMA_VERSION: u32 = 1;
 const DESCRIPTOR_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -1207,6 +1207,7 @@ pub struct AnimeRuntimeProfile {
     pub device_id: Option<String>,
     pub gpu_layer_count: u32,
     pub cpu_thread_count: u16,
+    pub batch_thread_count: u16,
     pub kv_cache_type: AnimeKvCacheType,
     pub load_time_ms: u64,
     pub warm_latency_ms: u64,
@@ -1256,8 +1257,12 @@ impl AnimeRuntimeProfile {
         validate_component(&self.runtime_artifact_key, "profile.runtimeArtifactKey")?;
         validate_sha256(&self.host_fingerprint, "profile.hostFingerprint")?;
         ensure!(
-            (1..=256).contains(&self.cpu_thread_count),
-            "profile.cpuThreadCount must be between 1 and 256"
+            (1..=4).contains(&self.cpu_thread_count),
+            "profile.cpuThreadCount must be between 1 and 4"
+        );
+        ensure!(
+            self.batch_thread_count >= self.cpu_thread_count && self.batch_thread_count <= 8,
+            "profile.batchThreadCount must be between cpuThreadCount and 8"
         );
         match self.probe_result {
             AnimeRuntimeProbeResult::GpuBalanced => {
@@ -5591,6 +5596,7 @@ mod tests {
                 12
             },
             cpu_thread_count: 4,
+            batch_thread_count: 8,
             kv_cache_type: bundle.manifest.runtime_policy.kv_cache_type,
             load_time_ms: 100,
             warm_latency_ms: 200,
@@ -6759,8 +6765,27 @@ mod tests {
             &host(AnimeHostOs::Linux, AnimeHostArch::X86_64, None, &[]),
         )?;
         let mut profile = profile_for(&bundle, selection.preferred()).seal()?;
-        profile.cpu_thread_count += 1;
+        profile.batch_thread_count -= 1;
         assert!(profile.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn alm6_runtime_profile_rejects_unqualified_thread_envelopes() -> Result<()> {
+        let bundle = validated(complete_manifest());
+        let selection = resolve_anime_runtime(
+            &bundle,
+            &host(AnimeHostOs::Linux, AnimeHostArch::X86_64, None, &[]),
+        )?;
+        for (cpu_thread_count, batch_thread_count) in [(4, 3), (4, 9), (5, 5)] {
+            let mut profile = profile_for(&bundle, selection.preferred());
+            profile.cpu_thread_count = cpu_thread_count;
+            profile.batch_thread_count = batch_thread_count;
+            assert!(
+                profile.seal().is_err(),
+                "cpu={cpu_thread_count}, batch={batch_thread_count} must be rejected"
+            );
+        }
         Ok(())
     }
 

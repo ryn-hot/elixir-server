@@ -42,7 +42,7 @@ use super::{
 
 use super::{
     certification::{read_strict_json, runtime_id, verify_artifact},
-    inference::{smoke_requests, smoke_responses_passed},
+    prime::{smoke_requests, smoke_responses_passed},
 };
 
 #[derive(Debug, Clone)]
@@ -443,6 +443,7 @@ fn local_profile_for_probe(
         "deviceKey": candidate.device_key,
         "gpuLayers": candidate.gpu_layers,
         "cpuThreads": candidate.cpu_threads,
+        "batchThreads": candidate.batch_threads,
     });
     let profile_fingerprint = format!(
         "sha256:{:x}",
@@ -463,6 +464,7 @@ fn local_profile_for_probe(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: candidate.cpu_threads,
+        batch_threads: candidate.batch_threads,
         gpu_layers: candidate.gpu_layers,
         kv_cache_type: kv_cache_name(manifest.runtime_policy.kv_cache_type).to_string(),
         // This is only the admission estimate before the real probe replaces

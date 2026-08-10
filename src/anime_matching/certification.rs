@@ -66,7 +66,7 @@ use crate::{
     },
 };
 
-use super::inference::profile_probe_response_passed;
+use super::prime::profile_probe_response_passed;
 
 const OBSERVATION_SCHEMA_VERSION: u32 = 2;
 const REQUEST_CORPUS_SCHEMA_VERSION: u32 = 1;
@@ -471,9 +471,9 @@ pub async fn run_anime_inference_hardware_certification(
     let prepared = prepare_runtime(&config, bundle.manifest(), profile).await?;
     prepared
         .engine
-        .warm()
+        .prime()
         .await
-        .context("warming exact candidate worker")?;
+        .context("priming exact candidate worker")?;
     let initial_worker = ready_worker_pid(&prepared.engine).await?;
     let priming_request = requests.requests[0].clone();
     let priming_request_id = priming_request.request_id.clone();
@@ -1054,6 +1054,7 @@ async fn prepare_runtime(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: u32::from(profile.cpu_thread_count),
+        batch_threads: u32::from(profile.batch_thread_count),
         gpu_layers: profile.gpu_layer_count,
         kv_cache_type: match profile.kv_cache_type {
             AnimeKvCacheType::F16 => "f16",

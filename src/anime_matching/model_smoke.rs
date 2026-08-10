@@ -268,9 +268,9 @@ pub async fn run_anime_inference_model_smoke(config: AnimeInferenceModelSmokeCon
     let smoke_result = async {
         prepared
             .engine
-            .warm()
+            .prime()
             .await
-            .context("loading exact candidate model")?;
+            .context("loading and priming exact candidate model")?;
         let contract_measurement = prepared
             .engine
             .contract_smoke(&tokenizer_inputs, &template_messages)
@@ -923,6 +923,7 @@ async fn prepare_runtime(
         context_tokens: manifest.model.context_tokens,
         max_output_tokens: manifest.model.max_output_tokens,
         threads: u32::from(profile.cpu_thread_count),
+        batch_threads: u32::from(profile.batch_thread_count),
         gpu_layers: profile.gpu_layer_count,
         kv_cache_type: match profile.kv_cache_type {
             AnimeKvCacheType::F16 => "f16",
