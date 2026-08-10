@@ -12589,11 +12589,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm7_required_dub_is_enforced_after_a_valid_model_mapping() -> Result<()> {
+    async fn alm9_policy_invalid_second_mapping_rejects_the_entire_model_override() -> Result<()> {
         let database = setup_test_db().await?;
         let subscription = AcquisitionSubscription {
-            title: "Tokyo Ghoul".to_string(),
-            normalized_title: "tokyo ghoul".to_string(),
             source_provider_id: Some(Uuid::new_v4()),
             quality_profile: Some(json!({
                 "animeAudioPreference": {
@@ -12603,43 +12601,66 @@ mod tests {
             })),
             ..anime_subscription()
         };
-        let mut target = anime_episode_target(&subscription, 2, 1);
-        target.absolute_episode_number = Some(13);
-        let target = with_alm7_anime_context(
-            target,
-            "20606",
-            &["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
+        let target_one = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 1),
+            "100",
+            &["Example Title"],
         );
-        let mut subbed = candidate(
-            "Opaque.Release.Subbed.1080p",
+        let target_two = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 2),
+            "100",
+            &["Example Title"],
+        );
+        let targets = vec![target_one.clone(), target_two.clone()];
+        let mut deterministic = candidate(
+            "[SubsPlease] Example Title - 01 [1080p]",
             vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
             Some(true),
             Some(50),
         );
-        subbed.id = Some("subbed".to_string());
-        let mut dual = subbed.clone();
-        dual.id = Some("dual".to_string());
-        dual.title = "Opaque.Release.Dual.1080p".to_string();
-        dual.source = "magnet:?xt=urn:btih:alm7-required-dual".to_string();
+        deterministic.id = Some("deterministic-dual".to_string());
+        deterministic.language = Some("eng".to_string());
+        let mut unresolved = candidate(
+            "Opaque.Release.Subbed.1080p",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(40),
+        );
+        unresolved.id = Some("model-subbed".to_string());
         let response = candidate_search_response_for_test(
             subscription.source_provider_id.expect("provider id"),
-            "test.alm7.source",
+            "test.alm9.source",
             vec!["anime"],
-            vec![subbed, dual],
+            vec![deterministic, unresolved],
         );
+
+        let mut baseline_governor = empty_queue_governor();
+        let baseline = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &AnimeMatchingService::disabled(),
+            &subscription,
+            &response,
+            &target_one,
+            &targets,
+            &mut baseline_governor,
+        )
+        .await?;
+        assert_eq!(baseline.plans.len(), 1);
+        let expected = alm7_batch_canonical_snapshot(&baseline);
+
         let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
             schema_version: ANIME_MATCH_SCHEMA_VERSION,
             matches: vec![
                 AnimeCandidateMatch {
                     candidate_key: "candidate-0".to_string(),
-                    matched_target_keys: vec![target.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::Subbed,
+                    matched_target_keys: vec![target_one.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::DualAudio,
                     selected_file_keys: None,
                 },
                 AnimeCandidateMatch {
                     candidate_key: "candidate-1".to_string(),
-                    matched_target_keys: vec![target.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::DualAudio,
+                    matched_target_keys: vec![target_two.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::Subbed,
                     selected_file_keys: None,
                 },
             ],
@@ -12651,30 +12672,57 @@ mod tests {
             &AnimeMatchingService::with_engine(engine),
             &subscription,
             &response,
-            &target,
-            std::slice::from_ref(&target),
+            &target_one,
+            &targets,
             &mut governor,
         )
         .await?;
 
         assert_eq!(requests.lock().expect("request recorder poisoned").len(), 1);
+        assert_eq!(alm7_batch_canonical_snapshot(&batch), expected);
         assert_eq!(batch.plans.len(), 1);
         assert_eq!(
             batch.plans[0].selection.candidate.id.as_deref(),
-            Some("dual")
+            Some("deterministic-dual")
         );
         assert!(batch.review_candidates.is_empty());
+        assert!(batch.anime_retryable_unresolved);
         assert_eq!(
-            batch.plans[0]
-                .selection
-                .candidate
+            batch
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| (assist.result, assist.reason)),
+            Some((
+                AnimeMatchAssistResult::Fallback,
+                Some(AnimeMatchFallbackReason::CoverageValidationFailed)
+            ))
+        );
+        let retained_candidate = &batch.plans[0].selection.candidate;
+        assert_eq!(
+            retained_candidate
                 .raw
                 .as_ref()
-                .and_then(|raw| raw.pointer(
-                    "/serverEvidence/modelMapping/languagePolicy/requiredPreferenceSatisfied"
-                ))
-                .and_then(JsonValue::as_bool),
-            Some(true)
+                .and_then(|raw| raw.pointer("/serverEvidence/animeMatchAssist/source"))
+                .and_then(JsonValue::as_str),
+            Some("deterministic_fallback")
+        );
+        assert!(
+            retained_candidate
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/serverEvidence/modelMapping"))
+                .is_none(),
+            "the valid first mapping must not leak model provenance after the second fails policy"
+        );
+        assert_eq!(
+            batch.plans[0].covered_target_keys,
+            BTreeSet::from([target_one.target_key.clone()])
+        );
+        assert!(
+            !batch.plans[0]
+                .covered_target_keys
+                .contains(&target_two.target_key),
+            "the valid first mapping must not contribute partial model coverage"
         );
         Ok(())
     }

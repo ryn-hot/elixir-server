@@ -314,6 +314,7 @@ fn compile_blueprint(blueprint: CorpusBlueprint) -> Result<CompiledCorpus> {
     let mut case_ids = BTreeSet::new();
     let mut source_record_ids = BTreeSet::new();
     let mut compiled = Vec::with_capacity(blueprint.cases.len());
+    let mut case_errors = Vec::new();
     for source in blueprint.cases {
         ensure!(
             case_ids.insert(source.case_id.clone()),
@@ -325,7 +326,18 @@ fn compile_blueprint(blueprint: CorpusBlueprint) -> Result<CompiledCorpus> {
             "anime corpus blueprint repeats source record ID {}",
             source.provenance.source_record_id
         );
-        compiled.push(compile_case(source)?);
+        let case_id = source.case_id.clone();
+        match compile_case(source) {
+            Ok(case) => compiled.push(case),
+            Err(error) => case_errors.push(format!("{case_id}: {error:#}")),
+        }
+    }
+    if !case_errors.is_empty() {
+        bail!(
+            "anime corpus blueprint has {} invalid cases:\n{}",
+            case_errors.len(),
+            case_errors.join("\n")
+        );
     }
     compiled.sort_by_key(|item| set_order(&item.case.set));
     validate_composition(&compiled)?;
@@ -542,8 +554,9 @@ fn compile_case(source: BlueprintCase) -> Result<CompiledCase> {
     if expected_final_plan.disposition == QualificationDisposition::NoMatch {
         ensure!(
             deterministic_final_plan == expected_final_plan,
-            "case {} expected no_match is unreachable because model failure preserves a different deterministic baseline",
-            source.case_id
+            "case {} expected no_match is unreachable because model failure preserves deterministic baseline {:?}",
+            source.case_id,
+            deterministic_final_plan
         );
     }
     let deterministic_easy = deterministic_union_state(&input.request, &deterministic)
