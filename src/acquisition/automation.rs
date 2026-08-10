@@ -11,7 +11,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde_json::{Value as JsonValue, json};
 use tokio::time::MissedTickBehavior;
@@ -1893,6 +1893,10 @@ async fn build_anime_candidate_release_plans_with_matching(
                                     source_map,
                                 )?;
                                 let mut resolutions = deterministic.clone();
+                                ensure!(
+                                    !model_coverages.is_empty(),
+                                    "model response produced no acquisition coverage"
+                                );
                                 for (model_rank, model) in model_coverages.into_iter().enumerate() {
                                     let candidate = override_candidates
                                         .get(model.candidate_index)
@@ -1909,6 +1913,14 @@ async fn build_anime_candidate_release_plans_with_matching(
                                         model_rank,
                                         &override_subscription,
                                     )?;
+                                    ensure!(
+                                        anime_coverage_is_automatic(
+                                            &analysis,
+                                            candidate,
+                                            &override_subscription,
+                                        ),
+                                        "model mapping was rejected by automatic acquisition policy"
+                                    );
                                     let resolution_index = override_candidate_sources
                                         .get(model.candidate_index)
                                         .copied()
@@ -12376,7 +12388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm7_required_dub_rejects_deterministic_sub_only_candidate_without_review()
+    async fn alm7_required_dub_rejects_model_sub_only_candidate_without_false_match_provenance()
     -> Result<()> {
         let database = setup_test_db().await?;
         let subscription = AcquisitionSubscription {
@@ -12405,11 +12417,20 @@ mod tests {
                 Some(100),
             )],
         );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![AnimeCandidateMatch {
+                candidate_key: "candidate-0".to_string(),
+                matched_target_keys: vec![target.target_key.clone()],
+                audio_profile: AnimeMatchAudioProfile::Subbed,
+                selected_file_keys: None,
+            }],
+        });
         let mut governor = empty_queue_governor();
 
         let batch = build_anime_candidate_release_plans_with_matching(
             &database.pool,
-            &AnimeMatchingService::disabled(),
+            &AnimeMatchingService::with_engine(engine),
             &subscription,
             &response,
             &target,
@@ -12421,12 +12442,16 @@ mod tests {
         assert!(batch.plans.is_empty());
         assert!(batch.review_candidates.is_empty());
         assert!(batch.anime_retryable_unresolved);
+        assert_eq!(requests.lock().expect("request recorder poisoned").len(), 1);
         assert_eq!(
             batch
                 .anime_match_assist
                 .as_ref()
-                .map(|assist| assist.reason),
-            Some(Some(AnimeMatchFallbackReason::EngineUnavailable))
+                .map(|assist| (assist.result, assist.reason)),
+            Some((
+                AnimeMatchAssistResult::Fallback,
+                Some(AnimeMatchFallbackReason::CoverageValidationFailed)
+            ))
         );
         Ok(())
     }

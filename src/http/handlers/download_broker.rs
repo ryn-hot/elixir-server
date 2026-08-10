@@ -31,6 +31,7 @@ use crate::{
         reset_target_for_candidate_retry, update_target_state,
     },
     acquisition::{
+        language_policy::LanguagePreferenceAssessmentState,
         release_resolution::{
             anime::{
                 AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
@@ -3262,6 +3263,7 @@ struct QbittorrentCoverageRefinement {
     anime_model_audio_profile: Option<AnimeMatchAudioProfile>,
     anime_model_audio_policy: Option<Value>,
     automatic_retry: bool,
+    suppress_automatic_rediscovery: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3330,6 +3332,7 @@ async fn refine_and_apply_qbittorrent_file_policy(
                 anime_model_audio_profile: None,
                 anime_model_audio_policy: None,
                 automatic_retry: true,
+                suppress_automatic_rediscovery: false,
             };
             persist_anime_qbittorrent_retry(&state.db_pool, release, torrent_hash, &refinement)
                 .await?;
@@ -3359,6 +3362,7 @@ async fn refine_and_apply_qbittorrent_file_policy(
             anime_model_audio_profile: None,
             anime_model_audio_policy: None,
             automatic_retry: false,
+            suppress_automatic_rediscovery: false,
         };
         let decision = decide_qbittorrent_file_priority(release, &refinement, &files, &coverage);
         persist_qbittorrent_priority_decision(
@@ -3563,6 +3567,7 @@ async fn refine_tv_qbittorrent_coverage(
         anime_model_audio_profile: None,
         anime_model_audio_policy: None,
         automatic_retry: false,
+        suppress_automatic_rediscovery: false,
     })
 }
 
@@ -3599,16 +3604,19 @@ async fn refine_anime_qbittorrent_coverage(
         &candidate,
         &file_inputs,
     );
-    let deterministic_required_audio_satisfied = subscription
+    let (deterministic_required_audio_satisfied, deterministic_audio_hard_mismatch) = subscription
         .map(|subscription| {
-            assess_acquisition_anime_provider_file_audio(
+            let (assessment, satisfied) = assess_acquisition_anime_provider_file_audio(
                 subscription,
                 &acquisition_candidate,
                 &deterministic_plan.selected_file_keys,
+            );
+            (
+                satisfied,
+                !satisfied && assessment.state == LanguagePreferenceAssessmentState::Mismatch,
             )
-            .1
         })
-        .unwrap_or(true);
+        .unwrap_or((true, false));
 
     let deterministic_state = acquisition_anime_deterministic_state(&deterministic_plan);
     let deterministic_is_automatic =
@@ -3639,6 +3647,7 @@ async fn refine_anime_qbittorrent_coverage(
                 let override_context = context.clone();
                 let override_candidate = acquisition_candidate.clone();
                 let override_subscription = subscription.clone();
+                let override_targets = targets.to_vec();
                 let outcome = matching_service
                     .match_or_fallback(
                         AnimeDeterministicResult::difficult(deterministic_resolution),
@@ -3664,6 +3673,19 @@ async fn refine_anime_qbittorrent_coverage(
                                     &override_subscription,
                                     model.audio_profile,
                                 );
+                            if !required_audio_satisfied {
+                                bail!(
+                                    "qBittorrent anime model mapping did not satisfy the required audio policy"
+                                );
+                            }
+                            if !anime_qbittorrent_plan_is_automatic(
+                                &model.plan,
+                                &override_targets,
+                            ) {
+                                bail!(
+                                    "qBittorrent anime model mapping did not satisfy automatic coverage policy"
+                                );
+                            }
                             Ok(QbittorrentAnimeResolvedCoverage {
                                 plan: model.plan,
                                 model_audio: Some(QbittorrentAnimeModelAudioEvidence {
@@ -3775,6 +3797,7 @@ async fn refine_anime_qbittorrent_coverage(
         anime_model_audio_profile,
         anime_model_audio_policy,
         automatic_retry,
+        suppress_automatic_rediscovery: deterministic_audio_hard_mismatch,
     })
 }
 
@@ -3862,6 +3885,7 @@ async fn refine_movie_qbittorrent_coverage(
         anime_model_audio_profile: None,
         anime_model_audio_policy: None,
         automatic_retry: false,
+        suppress_automatic_rediscovery: false,
     })
 }
 
@@ -4196,6 +4220,7 @@ async fn persist_anime_qbittorrent_runtime_retry(
         anime_model_audio_profile: None,
         anime_model_audio_policy: None,
         automatic_retry: true,
+        suppress_automatic_rediscovery: false,
     };
     let reset = persist_anime_qbittorrent_retry_disposition(
         pool,
@@ -4576,10 +4601,11 @@ async fn mark_anime_qbittorrent_cleanup_completed(
 fn anime_qbittorrent_retry_suppresses_rediscovery(
     refinement: &QbittorrentCoverageRefinement,
 ) -> bool {
-    refinement
-        .anime_match_assist
-        .as_ref()
-        .is_some_and(|assist| assist.result != AnimeMatchAssistResult::Fallback)
+    refinement.suppress_automatic_rediscovery
+        || refinement
+            .anime_match_assist
+            .as_ref()
+            .is_some_and(|assist| assist.result != AnimeMatchAssistResult::Fallback)
 }
 
 async fn persist_qbittorrent_priority_decision(
@@ -9582,6 +9608,7 @@ mod tests {
             anime_model_audio_profile: None,
             anime_model_audio_policy: None,
             automatic_retry: true,
+            suppress_automatic_rediscovery: false,
         };
         persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &refinement).await?;
         let failed = get_release(&database.pool, release.release_id)
@@ -9703,6 +9730,7 @@ mod tests {
             anime_model_audio_profile: None,
             anime_model_audio_policy: None,
             automatic_retry: true,
+            suppress_automatic_rediscovery: false,
         };
         assert!(
             persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &refinement)
@@ -9987,40 +10015,23 @@ mod tests {
         .await?;
         assert_eq!(required_audio_engine.call_count(), 1);
         assert!(required_audio_refinement.automatic_retry);
-        assert_eq!(
-            required_audio_refinement.anime_model_audio_profile,
-            Some(AnimeMatchAudioProfile::JaAudioEnSubs)
-        );
-        assert_eq!(
-            required_audio_refinement
-                .anime_model_audio_policy
-                .as_ref()
-                .and_then(|policy| policy.get("state"))
-                .and_then(Value::as_str),
-            Some("mismatch")
-        );
-        assert_eq!(
-            required_audio_refinement
-                .anime_model_audio_policy
-                .as_ref()
-                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
-                .and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(required_audio_refinement.anime_model_audio_profile, None);
+        assert!(required_audio_refinement.anime_model_audio_policy.is_none());
         assert_eq!(
             required_audio_refinement
                 .anime_match_assist
                 .as_ref()
-                .map(|assist| (assist.source, assist.result)),
+                .map(|assist| (assist.source, assist.result, assist.reason)),
             Some((
-                AnimeMatchAssistSource::LocalModel,
-                AnimeMatchAssistResult::Matched
+                AnimeMatchAssistSource::DeterministicFallback,
+                AnimeMatchAssistResult::Fallback,
+                Some(AnimeMatchFallbackReason::CoverageValidationFailed)
             )),
-            "a structurally valid model match must still retry when required audio is absent"
+            "a model mapping rejected by required audio policy must report fallback"
         );
         assert!(
             anime_qbittorrent_retry_suppresses_rediscovery(&required_audio_refinement),
-            "a required-audio mismatch must move on from this release"
+            "a deterministic hard audio mismatch must move on to another release"
         );
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
         assert_eq!(
@@ -10157,7 +10168,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.get("modelAudioProfile"))
                 .and_then(Value::as_str),
-            Some("ja_audio_en_subs")
+            None
         );
         assert_eq!(
             updated_release
@@ -10165,7 +10176,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/modelAudioPolicy/requiredPreferenceSatisfied"))
                 .and_then(Value::as_bool),
-            Some(false)
+            None
         );
         let jobs = list_release_jobs(&database.pool, release.release_id).await?;
         assert_eq!(jobs[0].state, ReleaseJobState::Failed);

@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const ANIME_MATCH_SCHEMA_VERSION: u32 = 1;
-/// Matches the existing acquisition candidate-search batch limit.
-pub const ANIME_MATCH_MAX_CANDIDATES: usize = 25;
+/// Model-only batch bound qualified on the minimum Intel host. Acquisition
+/// may still search and resolve a larger deterministic candidate set; only
+/// the highest-ranked difficult candidates cross the local-model boundary.
+pub const ANIME_MATCH_MAX_CANDIDATES: usize = 6;
 /// Coarse, tokenizer-independent guard for the 4,096-token V1 worker envelope.
 /// ALM-6 also applies the bundle's exact tokenizer limit before inference.
 pub const ANIME_MATCH_MAX_REQUEST_BYTES: usize = 16 * 1024;

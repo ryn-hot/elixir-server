@@ -46,9 +46,11 @@ pub const MAX_PROBE_DETAIL_BYTES: usize = 512;
 const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const RESOURCE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-const PROBE_PRIME_ALLOWANCE: Duration = Duration::from_secs(15);
+const PROBE_LOAD_ALLOWANCE: Duration = Duration::from_secs(30);
+const PROBE_PRIME_ALLOWANCE: Duration = Duration::from_secs(30);
 const PROBE_REQUEST_ALLOWANCE: Duration = Duration::from_secs(8);
 const PROBE_FINALIZATION_ALLOWANCE: Duration = Duration::from_secs(10);
+const PROBE_SCHEDULER_JITTER_ALLOWANCE: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -326,14 +328,14 @@ impl Default for InferenceProbeLimits {
         Self {
             // The wrapper leaves room for cold readiness, internal priming,
             // one production-bounded request, post-probe inventory collection,
-            // and worker teardown. Round the exact 48-second sum upward so
+            // and worker teardown. Add a small scheduler-jitter allowance so
             // scheduler jitter cannot cancel cleanup.
-            per_candidate_timeout: Duration::from_secs(15)
+            per_candidate_timeout: PROBE_LOAD_ALLOWANCE
                 .saturating_add(PROBE_PRIME_ALLOWANCE)
                 .saturating_add(PROBE_REQUEST_ALLOWANCE)
                 .saturating_add(PROBE_FINALIZATION_ALLOWANCE)
-                .saturating_add(Duration::from_secs(4)),
-            maximum_load_time: Duration::from_secs(15),
+                .saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE),
+            maximum_load_time: PROBE_LOAD_ALLOWANCE,
             maximum_warm_latency: Duration::from_secs(5),
             maximum_worker_rss_bytes: FOUR_GIB,
             minimum_available_system_bytes: MIN_AVAILABLE_SYSTEM_MEMORY_BYTES,
@@ -3729,17 +3731,23 @@ mod tests {
     #[test]
     fn alm6_default_probe_wrapper_exceeds_phase_deadlines_and_cleanup() {
         let limits = InferenceProbeLimits::default();
-        assert_eq!(limits.maximum_load_time, Duration::from_secs(15));
-        assert_eq!(PROBE_PRIME_ALLOWANCE, Duration::from_secs(15));
+        assert_eq!(PROBE_LOAD_ALLOWANCE, Duration::from_secs(30));
+        assert_eq!(limits.maximum_load_time, PROBE_LOAD_ALLOWANCE);
+        assert_eq!(PROBE_PRIME_ALLOWANCE, Duration::from_secs(30));
         assert_eq!(PROBE_REQUEST_ALLOWANCE, Duration::from_secs(8));
+        assert_eq!(PROBE_FINALIZATION_ALLOWANCE, Duration::from_secs(10));
+        assert_eq!(PROBE_SCHEDULER_JITTER_ALLOWANCE, Duration::from_secs(4));
         assert_eq!(limits.maximum_warm_latency, Duration::from_secs(5));
-        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(52));
+        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(82));
         let required = limits
             .maximum_load_time
             .saturating_add(PROBE_PRIME_ALLOWANCE)
             .saturating_add(PROBE_REQUEST_ALLOWANCE)
             .saturating_add(PROBE_FINALIZATION_ALLOWANCE);
-        assert!(limits.per_candidate_timeout >= required);
+        assert_eq!(
+            limits.per_candidate_timeout,
+            required.saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE)
+        );
     }
 
     #[tokio::test]

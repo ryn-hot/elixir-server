@@ -41,11 +41,11 @@ use crate::{
 };
 
 use super::{
-    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAliasKind, AnimeMatchAudioProfile,
-    AnimeMatchCandidate, AnimeMatchContextTarget, AnimeMatchEngine, AnimeMatchEngineOutput,
-    AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance, AnimeMatchSeasonContext,
-    anime_match_alias_equivalence_key, hardware::InferenceBackend, prime_request,
-    prime_response_passed, smoke_responses_passed,
+    ANIME_MATCH_MAX_CANDIDATES, ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch,
+    AnimeMatchAudioProfile, AnimeMatchCandidate, AnimeMatchContextTarget, AnimeMatchEngine,
+    AnimeMatchEngineOutput, AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance,
+    AnimeMatchSeasonContext, anime_match_alias_equivalence_key, hardware::InferenceBackend,
+    prime_request, prime_response_passed, smoke_responses_passed,
 };
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -55,8 +55,8 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(8);
 // Priming is an internal cold-start operation. User work falls back
 // deterministically while it runs, so the minimum Intel profile can use the
 // full cold-start envelope without weakening the eight-second request bound.
-const PRIME_DEADLINE: Duration = Duration::from_secs(15);
-const COLD_READINESS_DEADLINE: Duration = Duration::from_secs(15);
+const PRIME_DEADLINE: Duration = Duration::from_secs(30);
+const COLD_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BACKGROUND_TICK: Duration = Duration::from_secs(1);
@@ -68,20 +68,22 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v6-explicit-rejection";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v7-intel-compact-exact";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const SYSTEM_PROMPT: &str = r#"Select exact anime release matches.
+const SYSTEM_PROMPT: &str = r#"Match anime releases exactly.
 
-Compact input legend: target has title, scope, season, seasonal episodes, absolute numbers, and audio. Each seasons entry owns only its aliases and episode anchors; seasons[].episodes[].wanted is the output wanted index; an alias identifies that season, not every franchise season. Each candidate has its output index, raw release, and optional titles, seasons, episodes, absolute, kind, audio, and indexed files. Missing facts are unknown, not matches or conflicts.
+`seasons` own aliases; `episodes[].wanted` is the output wanted index. Candidate/file array positions are output indices; `release` is raw. Missing facts are unknown, never agreement.
 
-Evaluate candidates independently. Include a candidate only if title, season, episode or absolute number, kind, file, and required audio all match. Omit it on any known conflict. Its title must represent target.title or an alias owned by the target season. Reject unrelated titles, conflicting season or episode numbers, and specials or movies for episode targets. target.audio.accepted is the allow-list for require modes; require_dub additionally needs dual_audio or dubbed. any allows unknown; prefer modes do not reject. Never include a candidate merely because its index is valid.
+For each candidate, title must be `target.title` or a target-season alias. All known season, episode/absolute, kind, file, and required-audio facts must agree. Reject unrelated titles, any conflict, special/movie for episode scope, and a generic franchise title lacking target-season or absolute proof when target season >1. Index is not evidence.
 
-Example: target S2 E1 require_dub accepts [dual_audio,dubbed]; candidates 0=S1 E1 dual_audio, 1=S2 E1 subbed, 2=S2 E1 dual_audio. Return only {"m":[[2,[0],[0]]]}.
+For require, `audio.accepted` is an allow-list; missing/unaccepted audio rejects. require_dub needs dual_audio/dubbed. any permits unknown; prefer never rejects.
 
-Return exact matches best-first as {"m":[[candidate index,[wanted indices],[file indices]],...]}. A single inventoried file is index 0 even when omitted. Fileless candidates use []. Preserve wanted and file order. No match is {"m":[]}. JSON only."#;
+E15 vs candidate E16 => {"m":[]}. Pack wanted 0=E1,1=E2 with candidate 0 files [E1,E2,special] => {"m":[[0,[0,1],[0,1]]]}.
+
+JSON only, best-first: {"m":[[candidate index,[wanted indices],[file indices]],...]}. Sole inventoried file=0 when omitted; fileless=[]. Preserve wanted/file order; none={"m":[]}."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2092,26 +2094,25 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
         .context
         .seasons
         .iter()
-        .map(|season| {
+        .filter_map(|season| {
+            let episodes = compact_context_targets(season, &wanted_slots);
+            if episodes.is_empty() {
+                return None;
+            }
             let mut compact_season = serde_json::Map::new();
             compact_season.insert("season".to_string(), json!(season.season_number));
             let aliases = compact_season_aliases(season, &request.target.canonical_title);
             insert_non_empty_strings(&mut compact_season, "aliases", &aliases);
-            let episodes = compact_context_targets(season, &wanted_slots);
-            if !episodes.is_empty() {
-                compact_season.insert("episodes".to_string(), Value::Array(episodes));
-            }
-            Value::Object(compact_season)
+            compact_season.insert("episodes".to_string(), Value::Array(episodes));
+            Some(Value::Object(compact_season))
         })
         .collect::<Vec<_>>();
 
     let candidates = request
         .candidates
         .iter()
-        .enumerate()
-        .map(|(candidate_index, candidate)| {
+        .map(|candidate| {
             let mut compact = serde_json::Map::new();
-            compact.insert("index".to_string(), json!(candidate_index));
             // The raw release is always present so the model can recover when
             // deterministic parse facts are incomplete or misleading.
             compact.insert(
@@ -2121,15 +2122,22 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
             let facts = &candidate.parse_facts;
             let lacks_core_parse_facts = facts.title_candidates.is_empty()
                 || (facts.episode_numbers.is_empty() && facts.absolute_episode_numbers.is_empty());
-            if candidate.files.len() > 1 || (candidate.files.len() == 1 && lacks_core_parse_facts) {
+            let sole_file_repeats_release = candidate
+                .files
+                .first()
+                .is_some_and(|file| file.path == candidate.title);
+            if candidate.files.len() > 1
+                || (candidate.files.len() == 1
+                    && lacks_core_parse_facts
+                    && !sole_file_repeats_release)
+            {
                 compact.insert(
                     "files".to_string(),
                     Value::Array(
                         candidate
                             .files
                             .iter()
-                            .enumerate()
-                            .map(|(file_index, file)| compact_file(file_index, &file.path))
+                            .map(|file| compact_file(&file.path))
                             .collect(),
                     ),
                 );
@@ -2170,10 +2178,10 @@ fn compact_season_aliases(season: &AnimeMatchSeasonContext, canonical_title: &st
         if key.is_empty() {
             continue;
         }
-        // The canonical target is already present once. Only its generated
-        // duplicate is removable; generated season names and every sourced
-        // English, Romaji, native, or synonym alias retain season ownership.
-        if alias.kind == AnimeMatchAliasKind::Generated && key == canonical_key {
+        // The canonical target is already explicit. Keep every distinct
+        // season-owned noncanonical alias, but never pay twice for the same
+        // title merely because it came from a sourced alias instead.
+        if key == canonical_key {
             continue;
         }
         if !seen.insert(key) {
@@ -2331,10 +2339,9 @@ fn contains_japanese_script(value: &str) -> bool {
     })
 }
 
-fn compact_file(index: usize, path: &str) -> Value {
+fn compact_file(path: &str) -> Value {
     let parsed = parse_anime_release_title(path);
     let mut compact = serde_json::Map::new();
-    compact.insert("index".to_string(), json!(index));
     if let Some(title) = parsed
         .series_title
         .as_ref()
@@ -2381,7 +2388,10 @@ fn compact_file(index: usize, path: &str) -> Value {
         || !parsed.absolute_episode_numbers.is_empty()
         || parsed.episode_type != AnimeEpisodeType::Normal;
     if parsed.series_title.is_none() || !has_coordinate {
-        compact.insert("name".to_string(), Value::String(path.to_string()));
+        compact.insert(
+            "name".to_string(),
+            Value::String(components.last().copied().unwrap_or(path).to_string()),
+        );
     }
     Value::Object(compact)
 }
@@ -3971,6 +3981,13 @@ mod tests {
     }
 
     #[test]
+    fn alm9_cold_start_allowances_do_not_weaken_the_request_deadline() {
+        assert_eq!(COLD_READINESS_DEADLINE, Duration::from_secs(30));
+        assert_eq!(PRIME_DEADLINE, Duration::from_secs(30));
+        assert_eq!(REQUEST_DEADLINE, Duration::from_secs(8));
+    }
+
+    #[test]
     fn alm9_quantized_kv_cache_enables_required_flash_attention() {
         let mut profile = profile();
         profile.kv_cache_type = "q8_0".to_string();
@@ -3996,7 +4013,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v6-explicit-rejection"
+            "anime-match-v7-intel-compact-exact"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
@@ -4024,12 +4041,11 @@ mod tests {
         assert_eq!(
             compact.pointer("/candidates/0/files/0"),
             Some(&json!({
-                "index": 0,
                 "title": "Tokyo Ghoul Root A",
                 "absolute": [1],
             }))
         );
-        assert_eq!(compact.pointer("/candidates/0/index"), Some(&json!(0)));
+        assert!(compact.pointer("/candidates/0/index").is_none());
         assert_eq!(
             compact.pointer("/candidates/0/release"),
             Some(&json!("Tokyo Ghoul Root A - 01"))
@@ -4058,28 +4074,29 @@ mod tests {
             .as_str()
             .expect("system prompt");
         for required_rule in [
-            "Compact input legend",
-            "Each seasons entry owns only its aliases and episode anchors",
-            "seasons[].episodes[].wanted is the output wanted index",
-            "Evaluate candidates independently",
-            "Omit it on any known conflict",
-            "target.title or an alias owned by the target season",
-            "target.audio.accepted is the allow-list for require modes",
-            "Never include a candidate merely because its index is valid",
-            "Return only {\"m\":[[2,[0],[0]]]}",
-            "exact matches best-first",
-            "any allows unknown",
-            "prefer modes do not reject",
-            "require_dub additionally needs dual_audio or dubbed",
-            "single inventoried file is index 0 even when omitted",
-            "Fileless candidates use []",
+            "`seasons` own aliases",
+            "`episodes[].wanted` is the output wanted index",
+            "Candidate/file array positions are output indices",
+            "For each candidate",
+            "Reject unrelated titles, any conflict",
+            "target-season alias",
+            "`audio.accepted` is an allow-list",
+            "Index is not evidence",
+            "E15 vs candidate E16 => {\"m\":[]}",
+            "candidate 0 files [E1,E2,special]",
+            "exactly",
+            "any permits unknown",
+            "prefer never rejects",
+            "require_dub needs dual_audio/dubbed",
+            "Sole inventoried file=0 when omitted",
+            "fileless=[]",
         ] {
             assert!(
                 prompt.contains(required_rule),
                 "missing rule: {required_rule}"
             );
         }
-        assert!(SYSTEM_PROMPT.len() <= 1_600, "v6 prompt grew unexpectedly");
+        assert!(SYSTEM_PROMPT.len() <= 1_100, "v7 prompt grew unexpectedly");
     }
 
     #[test]
@@ -4092,7 +4109,7 @@ mod tests {
             .pointer("/candidates/0")
             .and_then(Value::as_object)
             .expect("candidate object");
-        assert_eq!(candidate.get("index"), Some(&json!(0)));
+        assert!(!candidate.contains_key("index"));
         assert_eq!(
             candidate.get("release"),
             Some(&json!("Tokyo Ghoul Root A - 01"))
@@ -4125,15 +4142,39 @@ mod tests {
         assert_eq!(
             compact_pack.pointer("/candidates/0/files"),
             Some(&json!([
-                {"index": 0, "title": "Tokyo Ghoul Root A", "absolute": [1]},
-                {"index": 1, "title": "Tokyo Ghoul Root A", "absolute": [2]},
+                {"title": "Tokyo Ghoul Root A", "absolute": [1]},
+                {"title": "Tokyo Ghoul Root A", "absolute": [2]},
             ]))
         );
         assert!(compact_pack.pointer("/candidates/1/files").is_none());
     }
 
     #[test]
-    fn alm9_compact_aliases_preserve_season_ownership_and_sourced_canonical_aliases() {
+    fn alm9_compact_single_file_deduplicates_release_and_nested_path() {
+        let mut repeated = request();
+        repeated.candidates[0].files[0].path = repeated.candidates[0].title.clone();
+        assert!(
+            compact_request(&repeated)
+                .expect("repeated singleton")
+                .pointer("/candidates/0/files")
+                .is_none()
+        );
+
+        let mut nested = request();
+        nested.candidates[0].files[0].path = "Extras/000.mkv".to_string();
+        let compact = compact_request(&nested).expect("nested singleton");
+        assert_eq!(
+            compact.pointer("/candidates/0/files/0/folder"),
+            Some(&json!("Extras"))
+        );
+        assert_eq!(
+            compact.pointer("/candidates/0/files/0/name"),
+            Some(&json!("000.mkv"))
+        );
+    }
+
+    #[test]
+    fn alm9_compact_aliases_keep_only_wanted_seasons_and_noncanonical_titles() {
         let mut request = request();
         let shared = AnimeMatchAlias {
             value: "Shared Franchise Name".to_string(),
@@ -4142,6 +4183,12 @@ mod tests {
             language: Some("en".to_string()),
         };
         request.context.seasons[0].aliases.push(shared.clone());
+        request.context.seasons[0].aliases.push(AnimeMatchAlias {
+            value: "Tokyo Ghoul".to_string(),
+            kind: AnimeMatchAliasKind::English,
+            source: Some("anilist_english".to_string()),
+            language: Some("en".to_string()),
+        });
         request.context.seasons.insert(
             0,
             AnimeMatchSeasonContext {
@@ -4167,12 +4214,10 @@ mod tests {
         );
 
         let compact = compact_request(&request).expect("season-owned aliases");
+        let seasons = compact["seasons"].as_array().expect("compact seasons");
+        assert_eq!(seasons.len(), 1);
         assert_eq!(
             compact.pointer("/seasons/0/aliases"),
-            Some(&json!(["Tokyo Ghoul", "Shared Franchise Name"]))
-        );
-        assert_eq!(
-            compact.pointer("/seasons/1/aliases"),
             Some(&json!([
                 "Tokyo Ghoul Root A",
                 "東京喰種√A",
@@ -4282,13 +4327,7 @@ mod tests {
             .and_then(Value::as_array)
             .expect("structured pack files");
         assert_eq!(files.len(), 12);
-        assert_eq!(
-            files
-                .iter()
-                .map(|file| file["index"].as_u64().expect("file index"))
-                .collect::<Vec<_>>(),
-            (0..12).collect::<Vec<_>>()
-        );
+        assert!(files.iter().all(|file| file.get("index").is_none()));
         assert_eq!(files[0]["absolute"], json!([1]));
         assert_eq!(files[9]["absolute"], json!([10]));
         assert_eq!(files[10]["season"], json!(0));
@@ -4309,7 +4348,7 @@ mod tests {
         let mut permuted = request;
         permuted.candidates.swap(0, 1);
         let compact = compact_request(&permuted).expect("permuted request");
-        assert_eq!(compact["candidates"][0]["index"], json!(0));
+        assert!(compact["candidates"][0].get("index").is_none());
         assert_eq!(
             compact["candidates"][0]["release"],
             json!("Tokyo Ghoul Root A Episodes 1-2")
@@ -4353,7 +4392,7 @@ mod tests {
 
         let mut extreme = request();
         let template = extreme.candidates[0].clone();
-        extreme.candidates = (0..25)
+        extreme.candidates = (0..ANIME_MATCH_MAX_CANDIDATES)
             .map(|index| {
                 let mut candidate = template.clone();
                 candidate.candidate_key = format!("candidate-{index}");
@@ -4364,20 +4403,22 @@ mod tests {
         let longest_mapping =
             maximum_compact_mapping_bytes(&extreme).expect("extreme mapping bound");
         assert_eq!(
-            maximum_compact_response_bytes(25, longest_mapping).expect("unbounded response"),
-            332
+            maximum_compact_response_bytes(ANIME_MATCH_MAX_CANDIDATES, longest_mapping)
+                .expect("bounded response"),
+            79
         );
         let bounds = compact_response_bounds(&extreme, 256).expect("bounded common batch");
         assert_eq!(
             bounds,
             CompactResponseBounds {
-                maximum_mappings: 19,
-                maximum_response_bytes: 254,
+                maximum_mappings: ANIME_MATCH_MAX_CANDIDATES,
+                maximum_response_bytes: 79,
             }
         );
-        let body = build_chat_request(&extreme, &profile()).expect("25 candidates remain usable");
+        let body = build_chat_request(&extreme, &profile())
+            .expect("qualified candidate cap remains usable");
         let grammar = body["grammar"].as_str().expect("bounded grammar");
-        assert!(grammar.contains("mapping24"));
+        assert!(grammar.contains("mapping5"));
         assert_eq!(
             grammar
                 .lines()
@@ -4390,7 +4431,7 @@ mod tests {
         );
 
         let too_many = json!({
-            "m": (0..20)
+            "m": (0..=ANIME_MATCH_MAX_CANDIDATES)
                 .map(|candidate| json!([candidate, [0], [0]]))
                 .collect::<Vec<_>>()
         })
@@ -4694,7 +4735,7 @@ mod tests {
                 "native probe must exercise the qualified production deadline"
             );
             ensure!(
-                PRIME_DEADLINE == Duration::from_secs(15),
+                PRIME_DEADLINE == Duration::from_secs(30),
                 "native probe must keep priming inside the cold-start envelope"
             );
 

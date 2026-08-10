@@ -31,13 +31,13 @@ use crate::{
             AcquisitionAnimeCandidateSource, AcquisitionAnimeFileSource,
             acquisition_anime_deterministic_state, acquisition_candidate_language_evidence,
             acquisition_candidate_parse_facts, acquisition_match_context,
-            acquisition_model_audio_profile_evidence,
+            acquisition_model_audio_profile_evidence, bind_exact_single_anime_provider_file,
             model_derived_anime_coverage_plans_with_selection_resolver,
             selectable_anime_media_file,
         },
         automation::synthetic_stream_candidate_requires_manual_review,
         language_policy::{
-            AcquisitionLanguagePreference, LanguagePreferenceAssessment,
+            AcquisitionLanguagePreference, CandidateLanguageEvidence, LanguagePreferenceAssessment,
             LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule, LanguagePreferenceMode,
             UnknownLanguagePolicy, assess_language_preference,
         },
@@ -862,13 +862,16 @@ fn accepted_model_resolution(
             MediaType::Anime,
             &acquisition_model_audio_profile_evidence(matched.audio_profile),
         );
-        resolution.saw_partial_or_ambiguous = true;
-        resolution.candidate_plans[source.candidate_index] =
-            (required_language_satisfied(preference, &assessment)
+        ensure!(
+            required_language_satisfied(preference, &assessment)
                 && !synthetic_stream_candidate_requires_manual_review(
                     &candidates[source.candidate_index],
-                ))
-            .then(|| candidate_plan_for_model_match(matched, &assessment));
+                ),
+            "model coverage did not satisfy the required audio and route policy"
+        );
+        resolution.saw_partial_or_ambiguous = true;
+        resolution.candidate_plans[source.candidate_index] =
+            Some(candidate_plan_for_model_match(matched, &assessment));
     }
     Ok(resolution)
 }
@@ -885,17 +888,24 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
             .ok_or_else(|| anyhow!("qualification candidate cardinality mismatch"))?;
         let candidate_input = anime_candidate_input(candidate);
         let files = qualification_release_files(request_candidate, candidate)?;
-        let plan = plan_anime_file_coverage_with_options(
+        let plan = bind_exact_single_anime_provider_file(
+            plan_anime_file_coverage_with_options(
+                &input.scoring_context,
+                &candidate_input,
+                &files,
+                AnimeCoverageOptions {
+                    file_selection_supported: *input
+                        .route_context
+                        .file_selection_supported_by_candidate_key
+                        .get(&request_candidate.candidate_key)
+                        .ok_or_else(|| {
+                            anyhow!("route context lacks candidate file-selection key")
+                        })?,
+                },
+            ),
             &input.scoring_context,
             &candidate_input,
             &files,
-            AnimeCoverageOptions {
-                file_selection_supported: *input
-                    .route_context
-                    .file_selection_supported_by_candidate_key
-                    .get(&request_candidate.candidate_key)
-                    .ok_or_else(|| anyhow!("route context lacks candidate file-selection key"))?,
-            },
         );
         let assessment = assess_language_preference(
             &preference,
@@ -903,6 +913,7 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
             &acquisition_candidate_language_evidence(candidate),
         );
         if acquisition_anime_deterministic_state(&plan) == DeterministicMatchState::Definitive
+            && plan_covers_only_wanted_targets(&input.request, &plan)
             && required_language_satisfied(&preference, &assessment)
             && !synthetic_stream_candidate_requires_manual_review(candidate)
         {
@@ -912,14 +923,38 @@ fn deterministic_baseline(input: &QualificationCaseInput) -> Result<Qualificatio
                 &assessment,
             ));
         }
-        saw_partial_or_ambiguous |= !plan.entries.is_empty()
-            || plan.confidence == ReleaseConfidence::ReviewRequired
-            || plan.rejection_reasons.is_empty();
+        if !required_language_is_hard_mismatch(&preference, &assessment) {
+            saw_partial_or_ambiguous |= !plan.entries.is_empty()
+                || plan.confidence == ReleaseConfidence::ReviewRequired
+                || plan.rejection_reasons.is_empty();
+        }
     }
     Ok(QualificationResolutionState {
         candidate_plans,
         saw_partial_or_ambiguous,
     })
+}
+
+fn plan_covers_only_wanted_targets(
+    request: &AnimeMatchRequest,
+    plan: &AnimeFileCoveragePlan,
+) -> bool {
+    let wanted = request
+        .target
+        .wanted_target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let planned = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    !wanted.is_empty()
+        && wanted.len() == request.target.wanted_target_keys.len()
+        && !planned.is_empty()
+        && planned.len() == plan.entries.len()
+        && planned.is_subset(&wanted)
 }
 
 fn candidate_plan_for_coverage(
@@ -1050,18 +1085,21 @@ fn deterministic_union_state(
     request: &AnimeMatchRequest,
     resolution: &QualificationResolutionState,
 ) -> DeterministicMatchState {
+    let wanted = request
+        .target
+        .wanted_target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let covered = resolution
         .candidate_plans
         .iter()
         .flatten()
         .flat_map(|plan| plan.target_keys.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
-    if !request.target.wanted_target_keys.is_empty()
-        && request
-            .target
-            .wanted_target_keys
-            .iter()
-            .all(|key| covered.contains(key.as_str()))
+    if !wanted.is_empty()
+        && wanted.len() == request.target.wanted_target_keys.len()
+        && wanted == covered
     {
         DeterministicMatchState::Definitive
     } else {
@@ -1124,6 +1162,14 @@ fn required_language_satisfied(
 ) -> bool {
     preference.mode != LanguagePreferenceMode::RequireReview
         || assessment.state == LanguagePreferenceAssessmentState::Match
+}
+
+fn required_language_is_hard_mismatch(
+    preference: &AcquisitionLanguagePreference,
+    assessment: &LanguagePreferenceAssessment,
+) -> bool {
+    preference.mode == LanguagePreferenceMode::RequireReview
+        && assessment.state == LanguagePreferenceAssessmentState::Mismatch
 }
 
 fn audio_eligibility(assessment: &LanguagePreferenceAssessment) -> QualificationAudioEligibility {
@@ -2845,6 +2891,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["candidate-0", "candidate-2"]
         );
+
+        let mut overcomplete = complete;
+        overcomplete.candidate_plans[1] = Some(candidate_plan("candidate-1", "S02E03"));
+        assert_eq!(
+            deterministic_union_state(&request, &overcomplete),
+            DeterministicMatchState::Difficult
+        );
         Ok(())
     }
 
@@ -3125,6 +3178,16 @@ mod tests {
         );
         assert!(required_language_satisfied(&preference, &dubbed));
         assert!(!required_language_satisfied(&preference, &subbed));
+        assert!(!required_language_is_hard_mismatch(&preference, &dubbed));
+        assert!(required_language_is_hard_mismatch(&preference, &subbed));
+
+        let unknown = assess_language_preference(
+            &preference,
+            MediaType::Anime,
+            &CandidateLanguageEvidence::default(),
+        );
+        assert!(!required_language_satisfied(&preference, &unknown));
+        assert!(!required_language_is_hard_mismatch(&preference, &unknown));
     }
 
     #[test]

@@ -30,8 +30,8 @@ use crate::{
         release_resolution::anime::AnimeCandidateScoringContext,
     },
     anime_matching::{
-        AnimeMatchBatchInput, AnimeMatchCandidateInput, AnimeMatchFileInput, AnimeMatchTarget,
-        AnimeMatchingService, DeterministicMatchState,
+        ANIME_MATCH_MAX_CANDIDATES, AnimeMatchBatchInput, AnimeMatchCandidateInput,
+        AnimeMatchFileInput, AnimeMatchTarget, AnimeMatchingService, DeterministicMatchState,
     },
     http::handlers::acquisition_sources::AcquisitionCandidate,
 };
@@ -48,8 +48,8 @@ const EXPECTED_FROZEN_ORIGIN_CASES: usize = 160;
 const EXPECTED_FROZEN_SLICE_CASES: usize = 40;
 const EXPECTED_STABILITY_PER_SLICE: usize = 6;
 const EXPECTED_COUNTERFACTUAL_PAIRS: usize = 80;
-const MIN_CANDIDATES: usize = 4;
-const MAX_CANDIDATES: usize = 12;
+const MIN_CANDIDATES: usize = ANIME_MATCH_MAX_CANDIDATES;
+const MAX_CANDIDATES: usize = ANIME_MATCH_MAX_CANDIDATES;
 const SHA256_PREFIX: &str = "sha256:";
 const FROZEN_SLICES: [&str; 8] = [
     "season_aliases",
@@ -539,6 +539,13 @@ fn compile_case(source: BlueprintCase) -> Result<CompiledCase> {
     let deterministic = deterministic_baseline(&input)
         .with_context(|| format!("running deterministic baseline for {}", source.case_id))?;
     let deterministic_final_plan = final_plan_for_resolution(&input.request, &deterministic)?;
+    if expected_final_plan.disposition == QualificationDisposition::NoMatch {
+        ensure!(
+            deterministic_final_plan == expected_final_plan,
+            "case {} expected no_match is unreachable because model failure preserves a different deterministic baseline",
+            source.case_id
+        );
+    }
     let deterministic_easy = deterministic_union_state(&input.request, &deterministic)
         == DeterministicMatchState::Definitive
         && deterministic_final_plan == expected_final_plan;
@@ -1561,8 +1568,12 @@ mod tests {
                     "[Group] Tokyo Ghoul Root A Batch",
                     &["Tokyo Ghoul Root A - 01.mkv", "Tokyo Ghoul Root A - 02.mkv"],
                 ),
+                candidate("[Group] Psycho-Pass - 01 [1080p].mkv", &[]),
+                candidate("[Group] Ajin - 01 [1080p].mkv", &[]),
             ],
-            route_file_selection_supported_by_candidate_index: vec![false, false, false, true],
+            route_file_selection_supported_by_candidate_index: vec![
+                false, false, false, true, false, false,
+            ],
             expected_final_plan: BlueprintExpectedFinalPlan {
                 disposition: QualificationDisposition::Matched,
                 candidate_plans: vec![BlueprintExpectedCandidatePlan {
@@ -1621,6 +1632,21 @@ mod tests {
         assert_eq!(plan.target_keys, vec!["tg-s2-e1"]);
         assert_eq!(plan.file_keys, vec!["candidate-3-file-0"]);
         Ok(())
+    }
+
+    #[test]
+    fn no_match_gold_must_equal_the_deterministic_fallback() {
+        let mut source = test_case();
+        source.expected_final_plan = BlueprintExpectedFinalPlan {
+            disposition: QualificationDisposition::NoMatch,
+            candidate_plans: Vec::new(),
+        };
+        let error = compile_case(source).expect_err("unreachable no-match gold");
+        assert!(
+            error
+                .to_string()
+                .contains("expected no_match is unreachable")
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::acquisition::{
         model_derived_anime_coverage_plans_with_file_selection_support,
     },
     episode_state::sync_library_episode_acquisition_state_for_target,
+    language_policy::LanguagePreferenceAssessmentState,
     release_resolution::{
         anime::{
             AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
@@ -7325,21 +7326,24 @@ async fn refine_anime_debrid_coverage(
     );
     let deterministic_plan =
         bind_exact_single_anime_provider_file(deterministic_plan, &context, &candidate, &files);
-    let deterministic_required_audio_satisfied = subscription
+    let (deterministic_required_audio_satisfied, deterministic_audio_hard_mismatch) = subscription
         .map(|subscription| {
             let candidate = acquisition_candidate_from_debrid_file_list(
                 release,
                 selected_candidate,
                 inspection,
             );
-            assess_acquisition_anime_provider_file_audio(
+            let (assessment, satisfied) = assess_acquisition_anime_provider_file_audio(
                 subscription,
                 &candidate,
                 &deterministic_plan.selected_file_keys,
+            );
+            (
+                satisfied,
+                !satisfied && assessment.state == LanguagePreferenceAssessmentState::Mismatch,
             )
-            .1
         })
-        .unwrap_or(true);
+        .unwrap_or((true, false));
     let deterministic_state = debrid_anime_deterministic_state(
         &deterministic_plan,
         &files,
@@ -7418,6 +7422,11 @@ async fn refine_anime_debrid_coverage(
                                     &subscription_for_model,
                                     model.audio_profile,
                                 );
+                            if !required_audio_satisfied {
+                                bail!(
+                                    "Debrid anime model mapping did not satisfy the required audio policy"
+                                );
+                            }
                             if !anime_plan_ready_for_automatic_selection(
                                 &model.plan,
                                 &files_for_validation,
@@ -7545,7 +7554,8 @@ async fn refine_anime_debrid_coverage(
             .or_else(|| candidate.get("request_scope_evidence"))
             .cloned()
     });
-    let suppress_automatic_rediscovery = anime_debrid_retry_suppresses_rediscovery(&match_assist);
+    let suppress_automatic_rediscovery = deterministic_audio_hard_mismatch
+        || anime_debrid_retry_suppresses_rediscovery(&match_assist);
     let mapping_diagnostics = sanitize_anime_automatic_resolution_evidence(json!(review_reasons));
     let coverage_plan = json!({
         "source": "debrid_provider_file_list",
@@ -26070,7 +26080,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/modelAudioProfile"))
                 .and_then(Value::as_str),
-            Some("subbed")
+            None
         );
         assert_eq!(
             refinement
@@ -26078,7 +26088,23 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/modelAudioAssessment/state"))
                 .and_then(Value::as_str),
-            Some("mismatch")
+            None
+        );
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/result"))
+                .and_then(Value::as_str),
+            Some("fallback")
+        );
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/reason"))
+                .and_then(Value::as_str),
+            Some("coverage_validation_failed")
         );
         assert_eq!(
             refinement
