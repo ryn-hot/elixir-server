@@ -648,10 +648,26 @@ fn normalized_profile(value: &str) -> String {
 }
 
 pub fn host_hardware_fingerprint(inventory: &HostHardwareInventory) -> String {
+    // Platform collectors retain their complete raw payload for diagnostics,
+    // but those payloads can contain volatile values such as macOS
+    // `_spdisplays_displayRegID`. Host identity must depend only on the stable,
+    // normalized GPU fields consumed by runtime selection.
+    let gpus = inventory
+        .gpus
+        .iter()
+        .map(|gpu| {
+            json!({
+                "vendor": gpu.vendor.as_deref(),
+                "model": gpu.model.as_deref(),
+                "device_id": gpu.device_id.as_deref(),
+                "driver_version": gpu.driver_version.as_deref(),
+            })
+        })
+        .collect::<Vec<_>>();
     let payload = json!({
         "schema_version": HARDWARE_READINESS_SCHEMA_VERSION,
         "os": inventory.os,
-        "gpus": inventory.gpus,
+        "gpus": gpus,
         "ffmpeg": {
             "path": inventory.ffmpeg.path,
             "version": inventory.ffmpeg.version,
@@ -2889,6 +2905,65 @@ mod tests {
             canonical_pci_vendor_device("PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000"),
             expected
         );
+    }
+
+    #[test]
+    fn host_fingerprint_ignores_raw_gpu_evidence_but_tracks_stable_identity() {
+        let mut inventory = fixture_inventory(
+            "macos",
+            Some(("amd", "AMD Radeon Pro 5500M")),
+            &["h264_videotoolbox"],
+            &["videotoolbox"],
+            &[],
+        );
+        inventory.gpus[0].raw = json!({
+            "_spdisplays_displayRegID": "4597526952",
+            "spdisplays_device-id": "0x7340",
+            "sppci_model": "AMD Radeon Pro 5500M",
+        });
+        let fingerprint = host_hardware_fingerprint(&inventory);
+
+        let mut raw_only_change = inventory.clone();
+        raw_only_change.gpus[0].raw = json!({
+            "_spdisplays_displayRegID": "4597526999",
+            "spdisplays_device-id": "0x7340",
+            "sppci_model": "AMD Radeon Pro 5500M",
+        });
+        assert_eq!(
+            host_hardware_fingerprint(&raw_only_change),
+            fingerprint,
+            "volatile raw platform evidence changed stable host identity"
+        );
+
+        let stable_identity_changes = [
+            {
+                let mut changed = inventory.clone();
+                changed.gpus[0].vendor = Some("intel".to_string());
+                changed
+            },
+            {
+                let mut changed = inventory.clone();
+                changed.gpus[0].model = Some("AMD Radeon Pro W5700X".to_string());
+                changed
+            },
+            {
+                let mut changed = inventory.clone();
+                changed.gpus[0].device_id = Some("0x7341".to_string());
+                changed
+            },
+            {
+                let mut changed = inventory.clone();
+                changed.gpus[0].driver_version = Some("552.00".to_string());
+                changed
+            },
+        ];
+        for changed in stable_identity_changes {
+            assert_ne!(
+                host_hardware_fingerprint(&changed),
+                fingerprint,
+                "stable normalized GPU identity change was not fingerprinted"
+            );
+        }
     }
 
     #[tokio::test]

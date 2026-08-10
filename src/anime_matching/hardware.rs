@@ -45,6 +45,7 @@ pub const MAX_PROBE_DETAIL_BYTES: usize = 512;
 const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const RESOURCE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const PROBE_REQUEST_ALLOWANCE: Duration = Duration::from_secs(8);
 const PROBE_FINALIZATION_ALLOWANCE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,10 +321,15 @@ pub struct InferenceProbeLimits {
 impl Default for InferenceProbeLimits {
     fn default() -> Self {
         Self {
-            // The wrapper must leave room for both accepted phase deadlines
-            // plus post-probe inventory collection and worker teardown.
-            per_candidate_timeout: Duration::from_secs(20)
-                .saturating_add(PROBE_FINALIZATION_ALLOWANCE),
+            // The wrapper leaves room for cold readiness, two production-
+            // bounded requests, post-probe inventory collection, and worker
+            // teardown. Round the exact 41-second sum upward so scheduler
+            // jitter cannot cancel cleanup.
+            per_candidate_timeout: Duration::from_secs(15)
+                .saturating_add(PROBE_REQUEST_ALLOWANCE)
+                .saturating_add(PROBE_REQUEST_ALLOWANCE)
+                .saturating_add(PROBE_FINALIZATION_ALLOWANCE)
+                .saturating_add(Duration::from_secs(4)),
             maximum_load_time: Duration::from_secs(15),
             maximum_warm_latency: Duration::from_secs(5),
             maximum_worker_rss_bytes: FOUR_GIB,
@@ -3660,9 +3666,14 @@ mod tests {
     #[test]
     fn alm6_default_probe_wrapper_exceeds_phase_deadlines_and_cleanup() {
         let limits = InferenceProbeLimits::default();
+        assert_eq!(limits.maximum_load_time, Duration::from_secs(15));
+        assert_eq!(PROBE_REQUEST_ALLOWANCE, Duration::from_secs(8));
+        assert_eq!(limits.maximum_warm_latency, Duration::from_secs(5));
+        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(45));
         let required = limits
             .maximum_load_time
-            .saturating_add(limits.maximum_warm_latency)
+            .saturating_add(PROBE_REQUEST_ALLOWANCE)
+            .saturating_add(PROBE_REQUEST_ALLOWANCE)
             .saturating_add(PROBE_FINALIZATION_ALLOWANCE);
         assert!(limits.per_candidate_timeout >= required);
     }

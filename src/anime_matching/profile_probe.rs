@@ -42,7 +42,7 @@ use super::{
 
 use super::{
     certification::{read_strict_json, runtime_id, verify_artifact},
-    inference::{smoke_request, smoke_response_passed},
+    inference::{smoke_requests, smoke_responses_passed},
 };
 
 #[derive(Debug, Clone)]
@@ -360,12 +360,12 @@ impl ReleaseEnvelopeProbe<'_> {
             self.inventory,
             candidate,
         )?;
-        let request = smoke_request()?;
+        let [priming_request, request] = smoke_requests()?;
         let engine = LocalModelEngine::allow_all_for_probe()?;
         engine.activate_profile_for_probe(profile).await?;
         *self.active_engine.lock().await = Some(engine.clone());
 
-        let measured = match engine.probe(request).await {
+        let measured = match engine.probe(priming_request, request).await {
             Ok(measured) => measured,
             Err(error) => {
                 engine.shutdown().await;
@@ -401,7 +401,7 @@ impl ReleaseEnvelopeProbe<'_> {
         Ok(InferenceProbeMeasurement {
             worker_ready: measured.worker_ready,
             smoke_match_passed: measured.smoke_match_passed
-                && smoke_response_passed(&measured.response),
+                && smoke_responses_passed(&measured.priming_response, &measured.response),
             load_time_ms: measured.load_time_ms,
             warm_latency_ms: measured.warm_latency_ms,
             peak_rss_bytes: measured.peak_rss_bytes.unwrap_or(0),

@@ -384,6 +384,7 @@ pub struct LocalModelProbeMeasurement {
     pub warm_latency_ms: u64,
     pub current_rss_bytes: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
+    pub priming_response: AnimeMatchResponse,
     pub response: AnimeMatchResponse,
 }
 
@@ -771,9 +772,18 @@ impl LocalModelEngine {
     }
 
     /// Runs the real cold-load, template-aware token preflight, and constrained
-    /// completion protocol for a hardware-envelope smoke fixture. Callers use a
-    /// disposable engine and compare `response` with the fixture expectation.
-    pub async fn probe(&self, request: AnimeMatchRequest) -> Result<LocalModelProbeMeasurement> {
+    /// completion protocol for two distinct hardware-envelope smoke fixtures.
+    /// The first request populates the newly loaded worker's cache.
+    /// `warm_latency_ms` measures the second, distinct request, so only their
+    /// shared production prefix is reusable and an exact cached user payload
+    /// cannot make an incapable profile pass.
+    /// Callers use a disposable engine and compare both responses with their
+    /// frozen fixture expectations.
+    pub async fn probe(
+        &self,
+        priming_request: AnimeMatchRequest,
+        request: AnimeMatchRequest,
+    ) -> Result<LocalModelProbeMeasurement> {
         let mut operation = MetricOperation::new("profile_probe");
         ensure!(
             !self.inner.publish_runtime_metrics,
@@ -797,8 +807,17 @@ impl LocalModelEngine {
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("local model engine is shut down"))?;
+        ensure!(
+            priming_request.request_id != request.request_id,
+            "hardware-envelope priming and measured requests must be distinct"
+        );
         let profile = self.active_profile().await?;
+        let priming_chat_request = build_chat_request(&priming_request, &profile)?;
         let chat_request = build_chat_request(&request, &profile)?;
+        ensure!(
+            priming_chat_request != chat_request,
+            "hardware-envelope priming and measured prompt bodies must be distinct"
+        );
         let mut slot = self.inner.worker.lock().await;
         stop_worker(&mut slot).await;
 
@@ -826,61 +845,43 @@ impl LocalModelEngine {
             None => None,
         };
 
-        if let Err(error) = self
-            .inner
-            .admission
-            .admit(LocalModelAdmissionPhase::ProbeInference, &profile)
-        {
-            inference_event("resource_admission", "deferred");
-            stop_worker(&mut slot).await;
-            return Err(error).context("local model probe deferred by resource admission");
-        }
+        let priming_completion = self
+            .probe_completion(
+                &profile,
+                &mut slot,
+                address,
+                &priming_chat_request,
+                &priming_request,
+                "llama-server probe priming completion deadline exceeded",
+            )
+            .await?;
+        let rss_after_priming = match slot.worker.as_ref() {
+            Some(worker) => worker_rss_bytes(&worker.child).await,
+            None => None,
+        };
+
         let warm_started = Instant::now();
-        let request_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
-        let completion = monitor_inference_admission(
-            self.inner.admission.as_ref(),
-            LocalModelAdmissionPhase::ProbeInference,
-            &profile,
-            &self.inner.shutdown,
-            async {
-                let input_tokens =
-                    count_input_tokens(&self.inner.http, address, &chat_request).await?;
-                enforce_context_gate(input_tokens, &profile)?;
-                request_completion(
-                    &self.inner.http,
-                    address,
-                    &chat_request,
-                    &request,
-                    profile.max_output_tokens,
-                )
-                .await
-            },
-        );
-        let monitored = match timeout_at(request_deadline, completion).await {
-            Ok(monitored) => monitored,
-            Err(_) => {
-                stop_worker(&mut slot).await;
-                bail!("llama-server probe completion deadline exceeded");
-            }
-        };
-        let completion = match monitored {
-            AdmissionMonitored::Completed(result) => result?,
-            AdmissionMonitored::Rejected(error) => {
-                stop_worker(&mut slot).await;
-                return Err(error).context("local model probe admission was revoked");
-            }
-            AdmissionMonitored::Shutdown => {
-                stop_worker(&mut slot).await;
-                bail!("local model engine is shutting down");
-            }
-        };
+        let completion = self
+            .probe_completion(
+                &profile,
+                &mut slot,
+                address,
+                &chat_request,
+                &request,
+                "llama-server probe completion deadline exceeded",
+            )
+            .await?;
         let warm_latency_ms = duration_millis(warm_started.elapsed());
         let current_rss_bytes = match slot.worker.as_ref() {
             Some(worker) => worker_rss_bytes(&worker.child).await,
             None => None,
         };
         slot.resident_rss_bytes = current_rss_bytes;
-        let peak_rss_bytes = rss_after_load.into_iter().chain(current_rss_bytes).max();
+        let peak_rss_bytes = rss_after_load
+            .into_iter()
+            .chain(rss_after_priming)
+            .chain(current_rss_bytes)
+            .max();
         slot.last_activity = Instant::now();
         transition_worker_state(&mut slot, LocalModelWorkerState::Ready);
         self.mark_successful_completion();
@@ -892,8 +893,67 @@ impl LocalModelEngine {
             warm_latency_ms,
             current_rss_bytes,
             peak_rss_bytes,
+            priming_response: priming_completion.response,
             response: completion.response,
         })
+    }
+
+    async fn probe_completion(
+        &self,
+        profile: &LocalModelRuntimeProfile,
+        slot: &mut WorkerSlot,
+        address: SocketAddr,
+        chat_request: &Value,
+        request: &AnimeMatchRequest,
+        deadline_error: &'static str,
+    ) -> Result<LocalModelCompletion> {
+        if let Err(error) = self
+            .inner
+            .admission
+            .admit(LocalModelAdmissionPhase::ProbeInference, profile)
+        {
+            inference_event("resource_admission", "deferred");
+            stop_worker(slot).await;
+            return Err(error).context("local model probe deferred by resource admission");
+        }
+        let request_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
+        let completion = monitor_inference_admission(
+            self.inner.admission.as_ref(),
+            LocalModelAdmissionPhase::ProbeInference,
+            profile,
+            &self.inner.shutdown,
+            async {
+                let input_tokens =
+                    count_input_tokens(&self.inner.http, address, chat_request).await?;
+                enforce_context_gate(input_tokens, profile)?;
+                request_completion(
+                    &self.inner.http,
+                    address,
+                    chat_request,
+                    request,
+                    profile.max_output_tokens,
+                )
+                .await
+            },
+        );
+        let monitored = match timeout_at(request_deadline, completion).await {
+            Ok(monitored) => monitored,
+            Err(_) => {
+                stop_worker(slot).await;
+                bail!(deadline_error);
+            }
+        };
+        match monitored {
+            AdmissionMonitored::Completed(result) => result,
+            AdmissionMonitored::Rejected(error) => {
+                stop_worker(slot).await;
+                Err(error).context("local model probe admission was revoked")
+            }
+            AdmissionMonitored::Shutdown => {
+                stop_worker(slot).await;
+                bail!("local model engine is shutting down");
+            }
+        }
     }
 
     /// Execute one request through the same queue, admission, deadline,
@@ -4085,11 +4145,216 @@ mod tests {
     async fn alm6_production_engine_cannot_run_manager_bypass_probe_phases() {
         let engine = LocalModelEngine::allow_all().expect("engine");
         let error = engine
-            .probe(request())
+            .probe(request(), request())
             .await
             .expect_err("production engine must reject probe API");
         assert!(error.to_string().contains("probe-only"));
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn alm9_probe_rejects_an_identical_priming_request_before_worker_start() {
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let worker_path = directory.path().join("llama-server");
+        let model_path = directory.path().join("model.gguf");
+        std::fs::write(&worker_path, b"fixture worker").expect("write worker fixture");
+        std::fs::write(&model_path, b"fixture model").expect("write model fixture");
+        let mut profile = profile();
+        profile.worker_path = worker_path;
+        profile.model_path = model_path;
+
+        let engine = LocalModelEngine::allow_all_for_probe().expect("probe engine");
+        engine
+            .activate_profile_for_probe(profile)
+            .await
+            .expect("activate probe profile");
+        let same_request = request();
+        let error = engine
+            .probe(same_request.clone(), same_request)
+            .await
+            .expect_err("identical priming input must not qualify a profile");
+        assert!(
+            error.to_string().contains("must be distinct"),
+            "unexpected identical-probe error: {error:#}"
+        );
+        assert!(
+            engine.snapshot().await.process_id.is_none(),
+            "identical probe input started a worker"
+        );
+        engine.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alm9_probe_primes_then_measures_a_distinct_request_on_one_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let worker_path = directory.path().join("llama-server");
+        let lifecycle_path = worker_path.with_extension("lifecycle");
+        let model_path = directory.path().join("model.gguf");
+        std::fs::write(
+            &worker_path,
+            br#"#!/usr/bin/env python3
+import http.server
+import os
+import signal
+import sys
+import time
+
+LIFECYCLE_PATH = __file__ + ".lifecycle"
+chat_calls = 0
+
+
+def record(event):
+    with open(LIFECYCLE_PATH, "a", encoding="utf-8") as lifecycle:
+        lifecycle.write(f"{event}:{os.getpid()}\n")
+        lifecycle.flush()
+        os.fsync(lifecycle.fileno())
+
+
+def stop(_signal, _frame):
+    record("stopped")
+    os._exit(0)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, status, body=b""):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.reply(200, b'{}')
+        else:
+            self.reply(404, b'{}')
+
+    def do_POST(self):
+        global chat_calls
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        if self.path == "/v1/chat/completions/input_tokens":
+            record("tokens")
+            self.reply(
+                200,
+                b'{"object":"response.input_tokens","input_tokens":32}',
+            )
+        elif self.path == "/v1/chat/completions":
+            chat_calls += 1
+            record(f"chat-{chat_calls}")
+            time.sleep(0.6 if chat_calls == 1 else 0.02)
+            self.reply(
+                200,
+                b'{"choices":[{"message":{"content":"{\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
+            )
+        else:
+            self.reply(404, b'{}')
+
+    def log_message(self, _format, *_arguments):
+        pass
+
+
+arguments = sys.argv
+host = arguments[arguments.index("--host") + 1]
+port = int(arguments[arguments.index("--port") + 1])
+signal.signal(signal.SIGTERM, stop)
+server = http.server.ThreadingHTTPServer((host, port), Handler)
+server.daemon_threads = True
+record("started")
+server.serve_forever()
+"#,
+        )
+        .expect("write worker fixture");
+        std::fs::set_permissions(&worker_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make worker executable");
+        std::fs::write(&model_path, b"fixture model").expect("write model fixture");
+        let mut profile = profile();
+        profile.worker_path = worker_path;
+        profile.model_path = model_path;
+
+        let priming_request = request();
+        let mut measured_request = request();
+        measured_request.request_id = "search-2".to_string();
+        measured_request.target.canonical_title = "Tokyo Ghoul Root A".to_string();
+
+        let engine = LocalModelEngine::allow_all_for_probe().expect("probe engine");
+        engine
+            .activate_profile_for_probe(profile)
+            .await
+            .expect("activate probe profile");
+        let probe_started = Instant::now();
+        let measurement = engine
+            .probe(priming_request, measured_request)
+            .await
+            .expect("two-request probe");
+        let probe_elapsed_ms = duration_millis(probe_started.elapsed());
+
+        assert!(measurement.worker_ready && measurement.smoke_match_passed);
+        assert_eq!(
+            measurement.priming_response.matches[0].candidate_key,
+            "candidate-0"
+        );
+        assert_eq!(measurement.response.matches[0].candidate_key, "candidate-0");
+        assert!(
+            measurement.warm_latency_ms + 400 < probe_elapsed_ms,
+            "priming delay leaked into measured warm latency: measurement={measurement:?}, total={probe_elapsed_ms}ms"
+        );
+        assert!(
+            measurement.warm_latency_ms >= 20,
+            "measured request delay was not observed: {measurement:?}"
+        );
+        let process_id = engine
+            .snapshot()
+            .await
+            .process_id
+            .expect("probe worker process ID");
+        let lifecycle = std::fs::read_to_string(&lifecycle_path).expect("probe lifecycle log");
+        let events = lifecycle.lines().collect::<Vec<_>>();
+        let expected_started = format!("started:{process_id}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_bytes() == expected_started.as_bytes())
+                .count(),
+            1,
+            "probe did not retain exactly one worker: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("tokens:"))
+                .count(),
+            2,
+            "probe did not run two token preflights: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("chat-"))
+                .count(),
+            2,
+            "probe did not run two completions: {events:?}"
+        );
+        engine.shutdown().await;
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.state, LocalModelWorkerState::Inactive);
+        assert!(snapshot.process_id.is_none());
+        assert!(snapshot.loopback_port.is_none());
+        let lifecycle = std::fs::read_to_string(&lifecycle_path).expect("probe lifecycle log");
+        let stopped = format!("stopped:{process_id}");
+        assert_eq!(
+            lifecycle
+                .lines()
+                .filter(|event| event.as_bytes() == stopped.as_bytes())
+                .count(),
+            1,
+            "probe worker was not stopped exactly once: {lifecycle:?}"
+        );
     }
 
     #[tokio::test]

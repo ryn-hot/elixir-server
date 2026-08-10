@@ -66,6 +66,8 @@ use crate::{
     },
 };
 
+use super::inference::profile_probe_response_passed;
+
 const OBSERVATION_SCHEMA_VERSION: u32 = 2;
 const REQUEST_CORPUS_SCHEMA_VERSION: u32 = 1;
 const IDLE_REQUESTS: usize = 10;
@@ -473,6 +475,21 @@ pub async fn run_anime_inference_hardware_certification(
         .await
         .context("warming exact candidate worker")?;
     let initial_worker = ready_worker_pid(&prepared.engine).await?;
+    let priming_request = requests.requests[0].clone();
+    let priming_request_id = priming_request.request_id.clone();
+    let priming = prepared
+        .engine
+        .benchmark_match(priming_request)
+        .await
+        .with_context(|| format!("priming warm inference with {priming_request_id}"))?;
+    ensure!(
+        profile_probe_response_passed(&priming_request_id, &priming.output.response),
+        "warm inference priming request returned the wrong mapping"
+    );
+    ensure!(
+        current_worker_pid(&prepared.engine).await == Some(initial_worker),
+        "warm inference priming replaced the packaged worker"
+    );
     let service = AnimeMatchingService::with_engine(Arc::new(prepared.engine.clone()));
 
     let api_client = api_client()?;
@@ -508,7 +525,7 @@ pub async fn run_anime_inference_hardware_certification(
     let mut prompt_time_ms = 0_u64;
     let mut generation_time_ms = 0_u64;
     for index in 0..IDLE_REQUESTS {
-        let request = requests.requests[index % requests.requests.len()].clone();
+        let request = requests.requests[(index + 1) % requests.requests.len()].clone();
         let measured = prepared.engine.benchmark_match(request).await?;
         idle_latencies.push(measured.elapsed_ms as f64);
         prompt_tokens = prompt_tokens.saturating_add(measured.prompt_tokens);
