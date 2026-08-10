@@ -1721,13 +1721,16 @@ mod tests {
                 source.request_id = format!("compiler-test-{index:03}");
                 source.provenance.source_record_id = format!("animetosho:{index}");
                 if invalid_indexes.contains(&index) {
-                    source.request.candidates.clear();
+                    source.acquisition_candidates.clear();
                 }
                 source
             })
             .collect();
 
-        let error = compile_blueprint(blueprint(cases)).expect_err("invalid cases must fail");
+        let error = match compile_blueprint(blueprint(cases)) {
+            Ok(_) => panic!("invalid cases must fail"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(message.contains("anime corpus blueprint has 2 invalid cases"));
         assert!(message.contains("frozen-season-017"));

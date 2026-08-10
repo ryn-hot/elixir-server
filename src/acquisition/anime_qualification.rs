@@ -1993,38 +1993,44 @@ fn local_profile_from_qualification(
 }
 
 fn compiled_matcher_contract_fingerprints() -> Result<(String, String, String)> {
+    matcher_contract_fingerprints(LOCAL_MODEL_CONTRACT_SOURCE)
+}
+
+fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String)> {
+    let normalized_source = source.replace("\r\n", "\n");
+    let source = normalized_source.as_str();
     let prompt = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "const SYSTEM_PROMPT: &str = r#\"",
         "\"#;",
         "system prompt",
     )?;
     let prompt_builder = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "fn build_chat_request(",
         "\nfn compact_response_grammar(",
         "prompt builder",
     )?;
     let response_schema = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "fn compact_response_grammar(",
         "\n#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct InputTokenResponse",
         "response schema",
     )?;
     let response_wire = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct CompactAnimeMatchResponse",
         "\nasync fn request_completion(",
         "response wire",
     )?;
     let response_decoder = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "fn decode_compact_response(",
         "\nfn finite_positive_millis(",
         "response decoder",
     )?;
     let sampling = source_between(
-        LOCAL_MODEL_CONTRACT_SOURCE,
+        source,
         "impl Default for LocalModelSamplingProfile {",
         "\nimpl LocalModelSamplingProfile {",
         "sampling profile",
@@ -2894,6 +2900,14 @@ mod tests {
             QUALIFICATION_REPORT_SCHEMA_VERSION
         );
         assert_eq!(lock["scorer"]["revision"], QUALIFICATION_SCORER_REVISION);
+        Ok(())
+    }
+
+    #[test]
+    fn alm9_contract_fingerprints_are_independent_of_checkout_line_endings() -> Result<()> {
+        let expected = matcher_contract_fingerprints(LOCAL_MODEL_CONTRACT_SOURCE)?;
+        let crlf_source = LOCAL_MODEL_CONTRACT_SOURCE.replace('\n', "\r\n");
+        assert_eq!(matcher_contract_fingerprints(&crlf_source)?, expected);
         Ok(())
     }
 
