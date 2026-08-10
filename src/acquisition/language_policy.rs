@@ -470,7 +470,14 @@ pub fn add_language_evidence_text(evidence: &mut CandidateLanguageEvidence, raw:
         evidence.audio.insert(language);
         return;
     }
-    for token in language_signal_tokens(trimmed) {
+    let signal_tokens = language_signal_tokens(trimmed);
+    if signal_tokens.windows(2).any(|tokens| {
+        matches!(tokens[0].to_ascii_lowercase().as_str(), "dual" | "multi")
+            && tokens[1].eq_ignore_ascii_case("audio")
+    }) {
+        evidence.profiles.insert("dual_audio".to_string());
+    }
+    for token in signal_tokens {
         if let Some(profile) = normalize_language_profile(&token) {
             evidence.profiles.insert(profile);
         }
@@ -499,7 +506,14 @@ pub fn add_subtitle_language_evidence_text(evidence: &mut CandidateLanguageEvide
         evidence.subtitles.insert(language);
         return;
     }
-    for token in language_signal_tokens(trimmed) {
+    let tokens = language_signal_tokens(trimmed);
+    if tokens
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case("multi") && pair[1].eq_ignore_ascii_case("audio"))
+    {
+        evidence.profiles.insert("dual_audio".to_string());
+    }
+    for token in tokens {
         if let Some(language) = normalize_language_value(&token) {
             evidence.subtitles.insert(language);
         }
@@ -827,7 +841,6 @@ fn anime_profile_matches(profile: &str, evidence: &CandidateLanguageEvidence) ->
         }
         "dual_audio" => {
             evidence.profiles.contains("dual_audio")
-                || evidence.audio.len() > 1
                 || (evidence.audio.contains("ja") && evidence.audio.contains("en"))
         }
         "en_audio" => evidence.audio.contains("en") || evidence.profiles.contains("dubbed"),
@@ -906,6 +919,61 @@ mod tests {
 
         assert_eq!(assessment.state, LanguagePreferenceAssessmentState::Match);
         assert!(assessment.score_delta > 0.0);
+    }
+
+    #[test]
+    fn alm9_noisy_release_tokens_do_not_manufacture_dual_audio() {
+        let preference = AcquisitionLanguagePreference {
+            mode: LanguagePreferenceMode::Prefer,
+            anime: LanguagePreferenceMediaRule {
+                profiles: vec!["dual_audio".to_string()],
+                ..LanguagePreferenceMediaRule::default()
+            },
+            ..AcquisitionLanguagePreference::default()
+        }
+        .normalized();
+        let mut noisy_english_dub = CandidateLanguageEvidence::default();
+        add_language_evidence_text(
+            &mut noisy_english_dub,
+            "[Yameii] Example Anime - 01 [English Dub] [CR WEB-DL]",
+        );
+
+        let noisy_assessment =
+            assess_language_preference(&preference, MediaType::Anime, &noisy_english_dub);
+
+        assert_eq!(
+            noisy_assessment.state,
+            LanguagePreferenceAssessmentState::Mismatch
+        );
+        assert!(noisy_assessment.matching_profiles.is_empty());
+
+        for release in [
+            "Example Anime - 01 [Dual Audio]",
+            "Example Anime - 01 [Multi Audio]",
+        ] {
+            let mut explicit_profile = CandidateLanguageEvidence::default();
+            add_language_evidence_text(&mut explicit_profile, release);
+
+            let assessment =
+                assess_language_preference(&preference, MediaType::Anime, &explicit_profile);
+
+            assert_eq!(
+                assessment.state,
+                LanguagePreferenceAssessmentState::Match,
+                "{release}"
+            );
+            assert_eq!(assessment.matching_profiles, vec!["dual_audio"]);
+        }
+
+        let mut explicit_japanese_and_english = CandidateLanguageEvidence::default();
+        add_language_evidence_text(&mut explicit_japanese_and_english, "Audio: JA + EN");
+        let assessment = assess_language_preference(
+            &preference,
+            MediaType::Anime,
+            &explicit_japanese_and_english,
+        );
+        assert_eq!(assessment.state, LanguagePreferenceAssessmentState::Match);
+        assert_eq!(assessment.matching_profiles, vec!["dual_audio"]);
     }
 
     #[test]

@@ -1695,6 +1695,8 @@ pub fn reconcile_anime_graph(
         alias.kind == AnimeAliasMatchKind::Exact
             && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
     });
+    let exact_scoped_alias_season_conflict =
+        exact_scoped_alias_conflicts_with_structured_season(context, parsed, alias_matches);
 
     let mut contradiction_reasons = Vec::new();
     let mut review_reasons = Vec::new();
@@ -1702,7 +1704,11 @@ pub fn reconcile_anime_graph(
     let mut outcome = AnimeReconciliationOutcome::Unexplainable;
     let mut target_matches = Vec::new();
 
-    if exact_scoped_alias_match && !alias_scoped_target_matches.is_empty() {
+    if exact_scoped_alias_season_conflict {
+        outcome = AnimeReconciliationOutcome::TrueContradiction;
+        contradiction_reasons.push("exact_scoped_alias_and_sxxeyy_season_disagree".to_string());
+        review_reasons.push("graph_reconciliation_true_contradiction".to_string());
+    } else if exact_scoped_alias_match && !alias_scoped_target_matches.is_empty() {
         outcome = AnimeReconciliationOutcome::Translation;
         target_matches = alias_scoped_target_matches.clone();
     } else if has_sonarr_structured_facts
@@ -2847,19 +2853,17 @@ fn match_targets_by_alias_scope(
         return Vec::new();
     }
 
+    let structured_sxxeyy_season = explicit_sxxeyy_season(parsed);
     let mut matches = Vec::new();
     for alias in scoped_matches {
         for target in &context.targets {
-            let season_matches = alias
-                .anilist_season_id
-                .as_ref()
-                .zip(target.anilist_season_id.as_ref())
-                .is_some_and(|(alias_id, target_id)| alias_id == target_id)
-                || alias
-                    .season_number
-                    .zip(target.season_number)
-                    .is_some_and(|(alias_season, target_season)| alias_season == target_season);
-            if !season_matches {
+            if !anime_alias_scope_matches_target(alias, target) {
+                continue;
+            }
+            if structured_sxxeyy_season
+                .zip(target.season_number)
+                .is_some_and(|(parsed_season, target_season)| parsed_season != target_season)
+            {
                 continue;
             }
             if !target
@@ -2879,6 +2883,56 @@ fn match_targets_by_alias_scope(
     }
 
     dedup_target_matches(matches)
+}
+
+fn exact_scoped_alias_conflicts_with_structured_season(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    alias_matches: &[AnimeAliasMatch],
+) -> bool {
+    let Some(structured_season) = explicit_sxxeyy_season(parsed) else {
+        return false;
+    };
+    let Some(alias) = alias_matches.first().filter(|alias| {
+        alias.kind == AnimeAliasMatchKind::Exact
+            && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
+    }) else {
+        return false;
+    };
+
+    let scoped_target_seasons = context
+        .targets
+        .iter()
+        .filter(|target| anime_alias_scope_matches_target(alias, target))
+        .filter_map(|target| target.season_number)
+        .collect::<BTreeSet<_>>();
+    if !scoped_target_seasons.is_empty() {
+        return !scoped_target_seasons.contains(&structured_season);
+    }
+
+    alias
+        .season_number
+        .is_some_and(|alias_season| alias_season != structured_season)
+}
+
+fn explicit_sxxeyy_season(parsed: &AnimeParsedRelease) -> Option<i32> {
+    parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
+        .map(|(season, _, _)| season)
+}
+
+fn anime_alias_scope_matches_target(
+    alias: &AnimeAliasMatch,
+    target: &AnimeCandidateTarget,
+) -> bool {
+    alias
+        .anilist_season_id
+        .as_ref()
+        .zip(target.anilist_season_id.as_ref())
+        .is_some_and(|(alias_id, target_id)| alias_id == target_id)
+        || alias
+            .season_number
+            .zip(target.season_number)
+            .is_some_and(|(alias_season, target_season)| alias_season == target_season)
 }
 
 fn anime_alias_scopes_agree(left: &AnimeAliasMatch, right: &AnimeAliasMatch) -> bool {
@@ -6608,6 +6662,63 @@ mod tests {
                 .and_then(|alias| alias.season_number),
             Some(2)
         );
+    }
+
+    #[test]
+    fn rr3_exact_scoped_alias_cannot_override_conflicting_sxxeyy_season() {
+        let score = score_anime_candidate(
+            &tokyo_ghoul_scoped_context(),
+            &rr3e_candidate("[SubsPlease] Tokyo Ghoul Root A S03E01 [1080p]"),
+        );
+
+        assert_eq!(score.parsed.sonarr_facts.season_number, Some(3));
+        assert_eq!(
+            score
+                .alias_matches
+                .first()
+                .and_then(|alias| alias.season_number),
+            Some(2)
+        );
+        assert!(
+            score.target_matches.is_empty(),
+            "a season-two alias must not turn explicit S03E01 into definitive coverage"
+        );
+        assert_eq!(
+            score.reconciliation.outcome,
+            AnimeReconciliationOutcome::TrueContradiction
+        );
+        assert!(
+            score
+                .reconciliation
+                .contradiction_reasons
+                .iter()
+                .any(|reason| reason == "exact_scoped_alias_and_sxxeyy_season_disagree")
+        );
+        assert_eq!(score.outcome, AnimeMatchOutcome::Rejected);
+        assert!(
+            score
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason == "no_graph_target_coverage")
+        );
+    }
+
+    #[test]
+    fn rr3_exact_scoped_alias_accepts_agreeing_sxxeyy_season() {
+        let score = score_anime_candidate(
+            &tokyo_ghoul_scoped_context(),
+            &rr3e_candidate("[SubsPlease] Tokyo Ghoul Root A S02E01 [1080p]"),
+        );
+
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(
+            score
+                .target_matches
+                .first()
+                .map(|target| target.target_key.as_str()),
+            Some("S02E01")
+        );
+        assert!(score.reconciliation.contradiction_reasons.is_empty());
     }
 
     #[test]

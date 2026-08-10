@@ -1614,6 +1614,50 @@ mod tests {
         }
     }
 
+    fn safe_no_match_case() -> BlueprintCase {
+        let mut source = test_case();
+        source.target.audio_preference = AnimeMatchAudioPreference {
+            mode: AnimeMatchAudioPreferenceMode::RequireDub,
+            languages: vec!["en".to_string()],
+            subtitle_languages: Vec::new(),
+            accepted_profiles: Vec::new(),
+        };
+        for candidate in &mut source.acquisition_candidates {
+            candidate.language = Some("subbed".to_string());
+        }
+        source.expected_final_plan = BlueprintExpectedFinalPlan {
+            disposition: QualificationDisposition::NoMatch,
+            candidate_plans: Vec::new(),
+        };
+        source
+    }
+
+    fn blueprint(cases: Vec<BlueprintCase>) -> CorpusBlueprint {
+        CorpusBlueprint {
+            schema_version: BLUEPRINT_SCHEMA_VERSION,
+            assembly: BlueprintIdentity {
+                id: "compiler-test-assembly".to_string(),
+            },
+            corpus: BlueprintIdentity {
+                id: "compiler-test-corpus".to_string(),
+            },
+            curator: BlueprintIdentity {
+                id: "compiler-test-curator".to_string(),
+            },
+            timestamps: BlueprintTimestamps {
+                created_at: "2026-08-10T12:00:00Z".to_string(),
+                rules_frozen_at: "2026-08-09T10:00:00Z".to_string(),
+                frozen_labels_first_exposed_at: "2026-08-09T11:00:00Z".to_string(),
+            },
+            frozen_set_withheld_until_rules_frozen: true,
+            representative_subset: BlueprintRepresentativeSubset {
+                id: "compiler-test-representative".to_string(),
+                case_ids: Vec::new(),
+            },
+            cases,
+        }
+    }
+
     #[test]
     fn compiler_uses_production_parser_and_opaque_keys() -> Result<()> {
         let compiled = compile_case(test_case())?;
@@ -1648,7 +1692,19 @@ mod tests {
     }
 
     #[test]
-    fn no_match_gold_must_equal_the_deterministic_fallback() {
+    fn no_match_gold_compiles_when_hard_conflicts_make_the_fallback_safe() -> Result<()> {
+        let compiled = compile_case(safe_no_match_case())?;
+        assert_eq!(
+            compiled.case.expected_final_plan.disposition,
+            QualificationDisposition::NoMatch
+        );
+        assert!(compiled.case.expected_final_plan.candidate_plans.is_empty());
+        assert!(!compiled.case.deterministic_easy);
+        Ok(())
+    }
+
+    #[test]
+    fn no_match_gold_rejects_a_deterministic_false_match() {
         let mut source = test_case();
         source.expected_final_plan = BlueprintExpectedFinalPlan {
             disposition: QualificationDisposition::NoMatch,
@@ -1660,6 +1716,32 @@ mod tests {
                 .to_string()
                 .contains("expected no_match is unreachable")
         );
+    }
+
+    #[test]
+    fn blueprint_compiler_reports_every_invalid_case_in_one_pass() {
+        let invalid_indexes = [17usize, 391usize];
+        let cases = (0..EXPECTED_TOTAL_CASES)
+            .map(|index| {
+                let mut source = test_case();
+                source.case_id = format!("frozen-season-{index:03}");
+                source.request_id = format!("compiler-test-{index:03}");
+                source.provenance.source_record_id = format!("animetosho:{index}");
+                if invalid_indexes.contains(&index) {
+                    source.expected_final_plan = BlueprintExpectedFinalPlan {
+                        disposition: QualificationDisposition::NoMatch,
+                        candidate_plans: Vec::new(),
+                    };
+                }
+                source
+            })
+            .collect();
+
+        let error = compile_blueprint(blueprint(cases)).expect_err("invalid cases must fail");
+        let message = error.to_string();
+        assert!(message.contains("anime corpus blueprint has 2 invalid cases"));
+        assert!(message.contains("frozen-season-017"));
+        assert!(message.contains("frozen-season-391"));
     }
 
     #[test]
