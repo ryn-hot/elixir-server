@@ -48,6 +48,7 @@ const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_GGUF_METADATA_ENTRIES: u64 = 1_000_000;
 const MAX_GGUF_ARRAY_ITEMS: u64 = 5_000_000;
 const MAX_GGUF_STRING_BYTES: u64 = 64 * 1024 * 1024;
+const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 const REQUIRED_SMOKES: [&str; 7] = [
     "gguf_metadata",
@@ -1243,7 +1244,7 @@ fn hash_regular_file(path: &Path, label: &str) -> Result<(String, u64)> {
     );
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = file_hash_buffer();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1252,6 +1253,10 @@ fn hash_regular_file(path: &Path, label: &str) -> Result<(String, u64)> {
         hasher.update(&buffer[..read]);
     }
     Ok((format!("sha256:{:x}", hasher.finalize()), metadata.len()))
+}
+
+fn file_hash_buffer() -> Vec<u8> {
+    vec![0_u8; FILE_HASH_BUFFER_BYTES]
 }
 
 fn read_regular_bytes(path: &Path, label: &str) -> Result<Vec<u8>> {
@@ -1328,6 +1333,16 @@ fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_hash_buffer_is_heap_backed() {
+        let buffer = file_hash_buffer();
+        assert_eq!(buffer.len(), FILE_HASH_BUFFER_BYTES);
+        assert_eq!(
+            std::mem::size_of_val(&buffer),
+            std::mem::size_of::<Vec<u8>>()
+        );
+    }
 
     #[test]
     fn compiled_contract_is_bound_to_the_source_lock() {

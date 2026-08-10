@@ -78,6 +78,7 @@ const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
 const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v2";
 const SHA256_PREFIX: &str = "sha256:";
+const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const LOCAL_MODEL_CONTRACT_SOURCE: &str = include_str!("../anime_matching/local_model.rs");
 const FAILURE_MODES: [&str; 4] = ["unavailable", "timeout", "invalid", "empty"];
 const PLAN_FIELDS: [(&str, PlanField); 5] = [
@@ -2210,7 +2211,7 @@ fn sha256_file(path: &Path, label: &str) -> Result<(String, u64)> {
         .with_context(|| format!("reading {label} metadata"))?;
     ensure!(metadata.is_file(), "{label} is not a regular file");
     let mut digest = Sha256::new();
-    let mut bytes = [0_u8; 1024 * 1024];
+    let mut bytes = file_hash_buffer();
     let mut size = 0_u64;
     loop {
         let read = file
@@ -2225,6 +2226,10 @@ fn sha256_file(path: &Path, label: &str) -> Result<(String, u64)> {
             .ok_or_else(|| anyhow!("{label} size overflow"))?;
     }
     Ok((format!("{SHA256_PREFIX}{:x}", digest.finalize()), size))
+}
+
+fn file_hash_buffer() -> Vec<u8> {
+    vec![0_u8; FILE_HASH_BUFFER_BYTES]
 }
 
 fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
@@ -2440,6 +2445,16 @@ mod tests {
         AnimeModelFormat, AnimeRuntimeArchiveFormat, AnimeRuntimePolicyManifest, AnimeThinkingMode,
     };
     use crate::http::handlers::acquisition_sources::AcquisitionCandidateFile;
+
+    #[test]
+    fn qualification_hash_buffer_is_heap_backed() {
+        let buffer = file_hash_buffer();
+        assert_eq!(buffer.len(), FILE_HASH_BUFFER_BYTES);
+        assert_eq!(
+            std::mem::size_of_val(&buffer),
+            std::mem::size_of::<Vec<u8>>()
+        );
+    }
 
     fn qualification_manifest() -> AnimeInferenceBundleManifest {
         AnimeInferenceBundleManifest {

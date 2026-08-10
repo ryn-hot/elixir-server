@@ -895,6 +895,7 @@ fn bundle_accelerator_order(os: AnimeHostOs) -> Vec<AnimeAcceleratorBackend> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LinuxContainerDeviceAccess {
     nvidia_zero: bool,
+    wsl_dxg: bool,
     drm_render: bool,
     kfd: bool,
 }
@@ -905,6 +906,10 @@ impl LinuxContainerDeviceAccess {
         {
             Self {
                 nvidia_zero: device_node_is_accessible(Path::new("/dev/nvidia0")),
+                // Docker Desktop exposes NVIDIA compute to Linux containers
+                // through WSL's DirectX GPU bridge instead of the native
+                // Linux /dev/nvidia* device family.
+                wsl_dxg: device_node_is_accessible(Path::new("/dev/dxg")),
                 drm_render: linux_render_node_is_accessible(),
                 kfd: device_node_is_accessible(Path::new("/dev/kfd")),
             }
@@ -925,7 +930,8 @@ fn device_backend_is_exposed_in_container(
     if os == AnimeHostOs::Linux {
         return match backend {
             AnimeAcceleratorBackend::Cuda => {
-                source == DeviceMemoryEvidenceSource::NvidiaSmi && linux_access.nvidia_zero
+                source == DeviceMemoryEvidenceSource::NvidiaSmi
+                    && (linux_access.nvidia_zero || linux_access.wsl_dxg)
             }
             AnimeAcceleratorBackend::Hip => linux_access.drm_render && linux_access.kfd,
             AnimeAcceleratorBackend::Vulkan => linux_access.drm_render,
@@ -4374,9 +4380,43 @@ mod tests {
         let none = LinuxContainerDeviceAccess::default();
         assert!(!device_backend_is_exposed_in_container(
             AnimeHostOs::Linux,
+            DeviceMemoryEvidenceSource::NvidiaSmi,
+            AnimeAcceleratorBackend::Cuda,
+            none,
+        ));
+        assert!(!device_backend_is_exposed_in_container(
+            AnimeHostOs::Linux,
             DeviceMemoryEvidenceSource::LinuxSysfs,
             AnimeAcceleratorBackend::Vulkan,
             none,
+        ));
+
+        let native_cuda = LinuxContainerDeviceAccess {
+            nvidia_zero: true,
+            ..LinuxContainerDeviceAccess::default()
+        };
+        assert!(device_backend_is_exposed_in_container(
+            AnimeHostOs::Linux,
+            DeviceMemoryEvidenceSource::NvidiaSmi,
+            AnimeAcceleratorBackend::Cuda,
+            native_cuda,
+        ));
+
+        let wsl_cuda = LinuxContainerDeviceAccess {
+            wsl_dxg: true,
+            ..LinuxContainerDeviceAccess::default()
+        };
+        assert!(device_backend_is_exposed_in_container(
+            AnimeHostOs::Linux,
+            DeviceMemoryEvidenceSource::NvidiaSmi,
+            AnimeAcceleratorBackend::Cuda,
+            wsl_cuda,
+        ));
+        assert!(!device_backend_is_exposed_in_container(
+            AnimeHostOs::Linux,
+            DeviceMemoryEvidenceSource::LinuxSysfs,
+            AnimeAcceleratorBackend::Cuda,
+            wsl_cuda,
         ));
 
         let render_only = LinuxContainerDeviceAccess {

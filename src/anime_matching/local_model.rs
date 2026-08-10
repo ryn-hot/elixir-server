@@ -68,12 +68,20 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v5-compact-semantic";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v6-explicit-rejection";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const SYSTEM_PROMPT: &str = r#"Match anime release candidates to wanted targets using title, season-scoped aliases, seasonal or absolute episode numbers, release kind, file evidence, and audio. Every mapping must satisfy all requested constraints. Reject conflicting season or episode, unrelated titles, specials or movies for episode targets, and missing required audio. Audio any allows unknown; prefer modes do not reject on audio; require accepts only listed profiles; require_dub needs dual_audio or dubbed. Return exact matches best-first as {"m":[[candidate index,[wanted indices],[file indices]],...]}. A single inventoried file is index 0 even when omitted. Fileless candidates use []. Preserve wanted and file order. No match is {"m":[]}. JSON only."#;
+const SYSTEM_PROMPT: &str = r#"Select exact anime release matches.
+
+Compact input legend: target has title, scope, season, seasonal episodes, absolute numbers, and audio. Each seasons entry owns only its aliases and episode anchors; seasons[].episodes[].wanted is the output wanted index; an alias identifies that season, not every franchise season. Each candidate has its output index, raw release, and optional titles, seasons, episodes, absolute, kind, audio, and indexed files. Missing facts are unknown, not matches or conflicts.
+
+Evaluate candidates independently. Include a candidate only if title, season, episode or absolute number, kind, file, and required audio all match. Omit it on any known conflict. Its title must represent target.title or an alias owned by the target season. Reject unrelated titles, conflicting season or episode numbers, and specials or movies for episode targets. target.audio.accepted is the allow-list for require modes; require_dub additionally needs dual_audio or dubbed. any allows unknown; prefer modes do not reject. Never include a candidate merely because its index is valid.
+
+Example: target S2 E1 require_dub accepts [dual_audio,dubbed]; candidates 0=S1 E1 dual_audio, 1=S2 E1 subbed, 2=S2 E1 dual_audio. Return only {"m":[[2,[0],[0]]]}.
+
+Return exact matches best-first as {"m":[[candidate index,[wanted indices],[file indices]],...]}. A single inventoried file is index 0 even when omitted. Fileless candidates use []. Preserve wanted and file order. No match is {"m":[]}. JSON only."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -3988,7 +3996,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v5-compact-semantic"
+            "anime-match-v6-explicit-rejection"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
@@ -4050,13 +4058,19 @@ mod tests {
             .as_str()
             .expect("system prompt");
         for required_rule in [
-            "season-scoped aliases",
-            "seasonal or absolute episode",
+            "Compact input legend",
+            "Each seasons entry owns only its aliases and episode anchors",
+            "seasons[].episodes[].wanted is the output wanted index",
+            "Evaluate candidates independently",
+            "Omit it on any known conflict",
+            "target.title or an alias owned by the target season",
+            "target.audio.accepted is the allow-list for require modes",
+            "Never include a candidate merely because its index is valid",
+            "Return only {\"m\":[[2,[0],[0]]]}",
             "exact matches best-first",
-            "Audio any allows unknown",
-            "prefer modes do not reject on audio",
-            "require accepts only listed profiles",
-            "require_dub needs dual_audio or dubbed",
+            "any allows unknown",
+            "prefer modes do not reject",
+            "require_dub additionally needs dual_audio or dubbed",
             "single inventoried file is index 0 even when omitted",
             "Fileless candidates use []",
         ] {
@@ -4065,6 +4079,7 @@ mod tests {
                 "missing rule: {required_rule}"
             );
         }
+        assert!(SYSTEM_PROMPT.len() <= 1_600, "v6 prompt grew unexpectedly");
     }
 
     #[test]

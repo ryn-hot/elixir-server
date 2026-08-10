@@ -76,6 +76,7 @@ const STABILITY_REQUESTS: usize = 100;
 const API_BASELINE_REQUESTS: usize = 20;
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const API_RESPONSE_LIMIT: u64 = 256 * 1024;
+const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const PLAYBACK_BASELINE_RUNS: usize = 2;
 const PLAYBACK_BASELINE_SECONDS: f64 = 16.0;
 const PLAYBACK_COEXISTENCE_SECONDS: f64 = 900.0;
@@ -1939,7 +1940,7 @@ pub(crate) fn verify_artifact(
     );
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = file_hash_buffer();
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -1953,6 +1954,12 @@ pub(crate) fn verify_artifact(
         "{label} SHA-256 differs from manifest"
     );
     Ok(())
+}
+
+fn file_hash_buffer() -> Vec<u8> {
+    // A one-MiB array exhausts the default Windows executable stack before
+    // the release tools can hash their first artifact.
+    vec![0_u8; FILE_HASH_BUFFER_BYTES]
 }
 
 fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -2079,6 +2086,16 @@ impl<'de> Visitor<'de> for StrictJsonVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_hash_buffer_is_heap_backed() {
+        let buffer = file_hash_buffer();
+        assert_eq!(buffer.len(), FILE_HASH_BUFFER_BYTES);
+        assert_eq!(
+            std::mem::size_of_val(&buffer),
+            std::mem::size_of::<Vec<u8>>()
+        );
+    }
 
     #[test]
     fn bundled_hardware_request_corpus_is_strict_and_production_valid() -> Result<()> {
