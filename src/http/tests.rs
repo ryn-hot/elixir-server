@@ -3642,6 +3642,30 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
             .and_then(Value::as_str),
         Some("healthy")
     );
+    let anime_inference = json
+        .get("anime_inference")
+        .and_then(Value::as_object)
+        .expect("health exposes informational anime inference state");
+    assert_eq!(
+        anime_inference.get("state").and_then(Value::as_str),
+        Some("inactive")
+    );
+    assert_eq!(
+        anime_inference
+            .get("deterministicFallbackAvailable")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        anime_inference.get("workerState").and_then(Value::as_str),
+        Some("inactive")
+    );
+    assert!(anime_inference.get("backend").is_some_and(Value::is_null));
+    assert!(
+        anime_inference
+            .get("profileFingerprint")
+            .is_some_and(Value::is_null)
+    );
 
     let settings_response = app
         .clone()

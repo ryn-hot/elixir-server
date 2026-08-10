@@ -27,6 +27,7 @@ pub struct HealthResponse {
     mdns: MdnsHealth,
     wan: WanHealth,
     vpn: VpnHealth,
+    anime_inference: crate::anime_matching::AnimeInferenceSnapshot,
 }
 
 #[derive(Serialize)]
@@ -102,6 +103,7 @@ pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<He
     let mdns_status = check_mdns(&app_state);
     let wan_status = check_wan(&app_state).await;
     let vpn_status = check_vpn(&app_state);
+    let anime_inference = app_state.anime_inference.snapshot().await;
 
     Ok(Json(HealthResponse {
         status: "ok",
@@ -113,6 +115,7 @@ pub async fn healthcheck(State(app_state): State<AppState>) -> ApiResult<Json<He
         mdns: mdns_status,
         wan: wan_status,
         vpn: vpn_status,
+        anime_inference,
     }))
 }
 

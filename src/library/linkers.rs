@@ -1,12 +1,13 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
 use serde::de::Deserializer;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{config::ClassifierConfig, extensions::ExternalIds};
@@ -280,7 +281,7 @@ impl LinkerService {
         };
 
         let mut episodes = Vec::new();
-        for (_key, raw) in payload.episodes.unwrap_or_default() {
+        for (key, raw) in payload.episodes.unwrap_or_default() {
             let parsed: AniZipEpisode = serde_json::from_value(raw.clone()).unwrap_or_default();
             let title = select_title(parsed.title.as_ref());
             let episode_label = parsed
@@ -288,7 +289,11 @@ impl LinkerService {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_string);
+                .map(str::to_string)
+                .or_else(|| {
+                    let key = key.trim();
+                    (!key.is_empty()).then(|| key.to_string())
+                });
             let mainline_episode_number = parse_mainline_episode_label(episode_label.as_deref());
             episodes.push(AniZipEpisodeRecord {
                 season_number: parsed.season_number,
@@ -305,6 +310,7 @@ impl LinkerService {
                 raw,
             });
         }
+        episodes.sort_by(compare_anizip_episode_records);
         let with_season = episodes
             .iter()
             .filter(|ep| ep.season_number.is_some())
@@ -419,6 +425,34 @@ impl LinkerService {
     }
 }
 
+fn compare_anizip_episode_records(
+    left: &AniZipEpisodeRecord,
+    right: &AniZipEpisodeRecord,
+) -> Ordering {
+    compare_optional_none_last(left.season_number.as_ref(), right.season_number.as_ref())
+        .then_with(|| {
+            compare_optional_none_last(left.episode_number.as_ref(), right.episode_number.as_ref())
+        })
+        .then_with(|| {
+            compare_optional_none_last(
+                left.absolute_episode_number.as_ref(),
+                right.absolute_episode_number.as_ref(),
+            )
+        })
+        .then_with(|| {
+            compare_optional_none_last(left.episode_label.as_ref(), right.episode_label.as_ref())
+        })
+}
+
+fn compare_optional_none_last<T: Ord>(left: Option<&T>, right: Option<&T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn tvdb_entity_type_matches(value: &str, expected: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
     match expected {
@@ -483,7 +517,8 @@ pub struct TvdbEpisodeRecord {
     pub raw: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AniZipMapping {
     pub ids: ExternalIds,
     pub episodes: Vec<AniZipEpisodeRecord>,
@@ -491,7 +526,8 @@ pub struct AniZipMapping {
     pub titles: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AniZipEpisodeRecord {
     pub season_number: Option<i32>,
     pub episode_number: Option<i32>,
@@ -507,7 +543,8 @@ pub struct AniZipEpisodeRecord {
     pub raw: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AniZipImage {
     #[serde(rename = "coverType")]
     pub cover_type: Option<String>,
@@ -680,8 +717,8 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(match value {
-        Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v as i32),
-        Some(serde_json::Value::String(s)) => s.parse::<i32>().ok(),
+        Some(serde_json::Value::Number(n)) => n.as_i64().and_then(|v| i32::try_from(v).ok()),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<i32>().ok(),
         _ => None,
     })
 }
@@ -708,13 +745,23 @@ fn parse_mainline_episode_label(value: Option<&str>) -> Option<i32> {
 
 fn select_title(title_map: Option<&HashMap<String, String>>) -> Option<String> {
     let map = title_map?;
-    if let Some(en) = map.get("en") {
-        return Some(en.clone());
+    for key in ["en", "x-jat", "romaji", "ja", "x-jpn"] {
+        if let Some(title) = map
+            .get(key)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            return Some(title.to_string());
+        }
     }
-    if let Some(romaji) = map.get("x-jat") {
-        return Some(romaji.clone());
-    }
-    map.values().next().cloned()
+    map.iter()
+        .filter_map(|(key, title)| {
+            let title = title.trim();
+            (!title.is_empty()).then_some((key.as_str(), title))
+        })
+        .min_by(|left, right| left.0.cmp(right.0))
+        .map(|(_, title)| title.to_string())
 }
 
 #[cfg(test)]
@@ -793,6 +840,20 @@ mod tests {
                                 "absoluteEpisodeNumber": 1,
                                 "title": { "en": "I'm Luffy!" }
                             },
+                            "2": {
+                                "episode": "2",
+                                "seasonNumber": 1,
+                                "episodeNumber": 2,
+                                "absoluteEpisodeNumber": 2,
+                                "title": { "en": "The Great Swordsman Appears!" }
+                            },
+                            "13": {
+                                "episode": "13",
+                                "seasonNumber": 2,
+                                "episodeNumber": 1,
+                                "absoluteEpisodeNumber": 13,
+                                "title": { "en": "Second Season Premiere" }
+                            },
                             "9": {
                                 "episode": "9",
                                 "airdate": "2000-01-12",
@@ -803,9 +864,17 @@ mod tests {
                                 "airdate": "2000-05-03",
                                 "title": { "en": "Protect Baratie!" }
                             },
+                            "42": {
+                                "airdate": "2000-11-22",
+                                "title": { "en": "Key-Only Mainline Episode" }
+                            },
                             "S4": {
                                 "episode": "S4",
                                 "title": { "en": "Special: Adventure in the Ocean's Navel" }
+                            },
+                            "O27": {
+                                "episode": "O27",
+                                "title": { "en": "Opening 27" }
                             }
                         }
                     }))
@@ -858,6 +927,15 @@ mod tests {
             .context("ani.zip mapping")?;
 
         let _ = shutdown_tx.send(());
+        let ordered_labels = mapping
+            .episodes
+            .iter()
+            .filter_map(|episode| episode.episode_label.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_labels,
+            vec!["1", "2", "13", "9", "23", "42", "O27", "S4"]
+        );
         let episode_23 = mapping
             .episodes
             .iter()
@@ -878,6 +956,14 @@ mod tests {
         assert_eq!(episode_9.season_number, None);
         assert_eq!(episode_9.episode_number, None);
 
+        let key_only = mapping
+            .episodes
+            .iter()
+            .find(|episode| episode.episode_label.as_deref() == Some("42"))
+            .context("map-key episode label")?;
+        assert_eq!(key_only.mainline_episode_number, Some(42));
+        assert_eq!(key_only.absolute_episode_number, Some(42));
+
         let special = mapping
             .episodes
             .iter()
@@ -886,5 +972,28 @@ mod tests {
         assert_eq!(special.mainline_episode_number, None);
         assert_eq!(special.absolute_episode_number, None);
         Ok(())
+    }
+
+    #[test]
+    fn anizip_i32_fields_reject_out_of_range_numbers() -> Result<()> {
+        let parsed: AniZipEpisode = serde_json::from_value(json!({
+            "seasonNumber": 4_294_967_297_u64,
+            "episodeNumber": -4_294_967_297_i64,
+            "absoluteEpisodeNumber": 13
+        }))?;
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, None);
+        assert_eq!(parsed.absolute_episode_number, Some(13));
+        Ok(())
+    }
+
+    #[test]
+    fn anizip_title_fallback_is_deterministic_and_ignores_empty_values() {
+        let titles = HashMap::from([
+            ("zz".to_string(), "Last".to_string()),
+            ("aa".to_string(), "  First  ".to_string()),
+            ("en".to_string(), "   ".to_string()),
+        ]);
+        assert_eq!(select_title(Some(&titles)).as_deref(), Some("First"));
     }
 }

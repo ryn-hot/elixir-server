@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "status": "frozen",
+  "requests": [
+    {
+      "schemaVersion": 1,
+      "requestId": "alm9-hardware-tokyo-ghoul-s2e1",
+      "target": {
+        "mediaType": "anime",
+        "canonicalTitle": "Tokyo Ghoul",
+        "scope": "episode",
+        "wantedTargetKeys": ["S02E01"],
+        "seasonNumber": 2,
+        "episodeNumbers": [1],
+        "absoluteEpisodeNumbers": [13],
+        "audioPreference": {
+          "mode": "require_dub",
+          "languages": ["en"],
+          "acceptedProfiles": ["dual_audio", "dubbed"]
+        }
+      },
+      "context": {
+        "graphFingerprint": "alm9-hardware-tokyo-ghoul-v1",
+        "seasons": [
+          {
+            "seasonNumber": 2,
+            "anilistId": "27899",
+            "aliases": [
+              {"value": "Tokyo Ghoul Root A", "kind": "english", "source": "anizip_title", "language": "en"},
+              {"value": "Tokyo Ghoul √A", "kind": "romaji", "source": "anizip_title", "language": "x-jat"},
+              {"value": "東京喰種√A", "kind": "native", "source": "anilist_native", "language": "ja"},
+              {"value": "Tokyo Ghoul S02", "kind": "generated", "source": "generated_season_short"}
+            ],
+            "targets": [
+              {"targetKey": "S02E01", "title": "New Surge", "seasonNumber": 2, "episodeNumber": 1, "absoluteEpisodeNumber": 13},
+              {"targetKey": "S02E02", "title": "Dancing Flowers", "seasonNumber": 2, "episodeNumber": 2, "absoluteEpisodeNumber": 14}
+            ]
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "candidateKey": "candidate-0",
+          "title": "[Group] Tokyo Ghoul Root A - 01 [1080p] [Dual Audio]",
+          "files": [{"fileKey": "candidate-0-file-0", "path": "Tokyo Ghoul Root A - 01 [Dual Audio].mkv"}],
+          "parseFacts": {"titleCandidates": ["Tokyo Ghoul Root A"], "episodeNumbers": [1], "audioProfiles": ["dual_audio"], "languages": ["ja", "en"]}
+        },
+        {
+          "candidateKey": "candidate-1",
+          "title": "[Other] Tokyo Ghoul S01E01 [1080p] [Dual Audio]",
+          "files": [{"fileKey": "candidate-1-file-0", "path": "Tokyo Ghoul S01E01.mkv"}],
+          "parseFacts": {"titleCandidates": ["Tokyo Ghoul"], "seasonNumbers": [1], "episodeNumbers": [1], "audioProfiles": ["dual_audio"]}
+        },
+        {
+          "candidateKey": "candidate-2",
+          "title": "[Other] Tokyo Ghoul Root A - 01 [Subbed]",
+          "files": [{"fileKey": "candidate-2-file-0", "path": "Tokyo Ghoul Root A - 01 [Subbed].mkv"}],
+          "parseFacts": {"titleCandidates": ["Tokyo Ghoul Root A"], "episodeNumbers": [1], "audioProfiles": ["subbed"], "languages": ["ja"]}
+        },
+        {
+          "candidateKey": "candidate-3",
+          "title": "[Other] Tokyo Ghoul Re - 01 [Dual Audio]",
+          "files": [{"fileKey": "candidate-3-file-0", "path": "Tokyo Ghoul Re - 01.mkv"}],
+          "parseFacts": {"titleCandidates": ["Tokyo Ghoul Re"], "episodeNumbers": [1], "audioProfiles": ["dual_audio"]}
+        }
+      ]
+    },
+    {
+      "schemaVersion": 1,
+      "requestId": "alm9-hardware-cross-script-absolute",
+      "target": {
+        "mediaType": "anime",
+        "canonicalTitle": "Frieren: Beyond Journey's End",
+        "scope": "episode",
+        "wantedTargetKeys": ["S01E13"],
+        "seasonNumber": 1,
+        "episodeNumbers": [13],
+        "absoluteEpisodeNumbers": [13],
+        "audioPreference": {"mode": "any"}
+      },
+      "context": {
+        "graphFingerprint": "alm9-hardware-frieren-v1",
+        "seasons": [
+          {
+            "seasonNumber": 1,
+            "anilistId": "154587",
+            "aliases": [
+              {"value": "Frieren: Beyond Journey's End", "kind": "english", "source": "anilist_english", "language": "en"},
+              {"value": "Sousou no Frieren", "kind": "romaji", "source": "anilist_romaji", "language": "x-jat"},
+              {"value": "葬送のフリーレン", "kind": "native", "source": "anilist_native", "language": "ja"}
+            ],
+            "targets": [
+              {"targetKey": "S01E12", "title": "A Real Hero", "seasonNumber": 1, "episodeNumber": 12, "absoluteEpisodeNumber": 12},
+              {"targetKey": "S01E13", "title": "Aversion to One's Own Kind", "seasonNumber": 1, "episodeNumber": 13, "absoluteEpisodeNumber": 13},
+              {"targetKey": "S01E14", "title": "Privilege of the Young", "seasonNumber": 1, "episodeNumber": 14, "absoluteEpisodeNumber": 14}
+            ]
+          }
+        ]
+      },
+      "candidates": [
+        {"candidateKey": "candidate-0", "title": "[Group] Sousou no Frieren - 13 [1080p]", "files": [{"fileKey": "candidate-0-file-0", "path": "Sousou no Frieren - 13.mkv"}], "parseFacts": {"titleCandidates": ["Sousou no Frieren"], "episodeNumbers": [13]}},
+        {"candidateKey": "candidate-1", "title": "[Group] 葬送のフリーレン - 12 [1080p]", "files": [{"fileKey": "candidate-1-file-0", "path": "葬送のフリーレン - 12.mkv"}], "parseFacts": {"titleCandidates": ["葬送のフリーレン"], "episodeNumbers": [12]}},
+        {"candidateKey": "candidate-2", "title": "[Group] Frieren S01E14 [1080p]", "files": [{"fileKey": "candidate-2-file-0", "path": "Frieren S01E14.mkv"}], "parseFacts": {"titleCandidates": ["Frieren"], "seasonNumbers": [1], "episodeNumbers": [14]}},
+        {"candidateKey": "candidate-3", "title": "[Group] Frieren Movie [1080p]", "files": [{"fileKey": "candidate-3-file-0", "path": "Frieren Movie.mkv"}], "parseFacts": {"titleCandidates": ["Frieren"], "releaseKind": "movie"}}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "bundleVersion": "2026.08.1",
+  "protocolVersion": 1,
+  "matcherSchemaVersion": 1,
+  "minimumServerVersion": "0.1.0",
+  "workerRevision": "llama-cpp-b9637",
+  "model": {
+    "id": "qwen3-4b-instruct-2507",
+    "revision": "elixir-q4km-r1",
+    "upstreamModelId": "Qwen/Qwen3-4B-Instruct-2507",
+    "upstreamRevision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "license": "Apache-2.0",
+    "format": "gguf",
+    "quantization": "Q4_K_M",
+    "transformerLayers": 36,
+    "contextTokens": 4096,
+    "maxOutputTokens": 256,
+    "thinkingMode": "non_thinking_only",
+    "chatTemplateRevision": "qwen3-2507-elixir-v1",
+    "conversionToolRevision": "aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3",
+    "qualificationReportFingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "url": "https://releases.example/model.gguf",
+    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sizeBytes": 5
+  },
+  "runtimePolicy": {
+    "samplingProfileRevision": "anime-match-v1",
+    "parallel": 1,
+    "kvCacheType": "f16",
+    "idleUnloadSeconds": 300
+  },
+  "runtimes": [
+    {
+      "os": "macos",
+      "arch": "x86_64",
+      "backend": "metal_cpu",
+      "priority": 10,
+      "revision": "llama-cpp-b9637-macos-x86_64",
+      "minimumOsVersion": "13.0",
+      "requiredCpuFeatures": [],
+      "minimumDeviceMemoryBytes": 0,
+      "archiveFormat": "raw",
+      "entrypoint": "llama-server",
+      "packagedDependencies": [],
+      "url": "https://releases.example/llama-server",
+      "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sizeBytes": 3,
+      "installedSizeBytes": 3
+    }
+  ]
+}

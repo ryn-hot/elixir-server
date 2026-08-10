@@ -47,10 +47,9 @@ use crate::{
     },
     artwork::ArtworkService,
     db::models::MediaType,
-    extensions::store::ExtensionStore,
     library::{
-        AcquisitionLibraryImport, AcquisitionLibraryImportFile, AcquisitionLibraryImportFileResult,
-        AcquisitionLibraryTargetScaffold, LinkerService,
+        AcquisitionLibraryImport, AcquisitionLibraryImportAuthority, AcquisitionLibraryImportFile,
+        AcquisitionLibraryImportFileResult, AcquisitionLibraryTargetScaffold, LinkerService,
         ingest_acquisition_library_import_with_metadata, scaffold_acquisition_library_targets,
     },
     media::ffprobe,
@@ -1045,14 +1044,6 @@ async fn finalize_import_run_inner(
         request,
     )
     .await?;
-    ExtensionStore::new(pool)
-        .upsert_acquisition_media_ownership(
-            import_result.media_item_id,
-            subscription.subscription_id,
-            candidate.release.source_provider_id,
-            Some(&candidate.release.source_extension_id),
-        )
-        .await?;
     scaffold_subscription_targets_into_library(
         pool,
         services.artwork,
@@ -2488,7 +2479,7 @@ fn json_bool_path(value: Option<&JsonValue>, path: &[&str]) -> Option<bool> {
 
 fn build_library_import_request(
     subscription: &AcquisitionSubscription,
-    _release: &AcquisitionRelease,
+    release: &AcquisitionRelease,
     files: Vec<AcquisitionLibraryImportFile>,
 ) -> Result<AcquisitionLibraryImport> {
     let media_type = subscription.media_type;
@@ -2500,6 +2491,11 @@ fn build_library_import_request(
         title: subscription.title.clone(),
         year: subscription.year,
         external_ids: subscription.external_ids.clone().unwrap_or_default(),
+        authority: Some(AcquisitionLibraryImportAuthority {
+            subscription_id: subscription.subscription_id,
+            source_provider_id: release.source_provider_id,
+            source_extension_id: Some(release.source_extension_id.clone()),
+        }),
         files: files
             .into_iter()
             .map(|mut file| {
@@ -3981,7 +3977,8 @@ mod tests {
         download_broker::{
             DEBRID_DEFAULT_LOGICAL_ID, DEFAULT_ROUTE_OWNER_ID, TORRENT_DEFAULT_LOGICAL_ID,
         },
-        extensions::ExternalIds,
+        extensions::{ExternalIds, FileDescriptor, MediaFileCandidate, MediaIdentity},
+        library::run_full_scan_with_metadata_and_linkers,
     };
     use tempfile::tempdir;
 
@@ -4514,7 +4511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquisition_import_persists_media_ownership() -> Result<()> {
+    async fn alm8_acquisition_import_publishes_authority_with_the_library_link() -> Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("Show.S01E01.mkv");
         let fixture = setup_completed_release(
@@ -5542,6 +5539,48 @@ mod tests {
         assert_eq!(media_files, 1);
         assert_eq!(episode_files, 2);
         assert_eq!(distinct_media_files, 1);
+
+        run_full_scan_with_metadata_and_linkers(
+            &database.pool,
+            None,
+            None,
+            None,
+            None,
+            vec![MediaFileCandidate {
+                identity: MediaIdentity {
+                    r#type: MediaType::Series,
+                    external_ids: ExternalIds::default(),
+                    title: "Noisy Double Show Release".to_string(),
+                    year: None,
+                    season: Some(1),
+                    episode: Some(1),
+                },
+                files: vec![FileDescriptor {
+                    path: path.to_string_lossy().to_string(),
+                    size_bytes: Some(6),
+                    hash: None,
+                    container: Some("mkv".to_string()),
+                    video_codec: None,
+                    audio_codec: None,
+                }],
+                extension_metadata: HashMap::new(),
+                source_config_id: None,
+            }],
+            false,
+            true,
+            false,
+        )
+        .await?;
+
+        let linked_episode_numbers: Vec<i64> = sqlx::query_scalar(
+            "SELECT e.episode_number
+             FROM episode_files ef
+             JOIN episodes e ON e.id = ef.episode_id
+             ORDER BY e.episode_number",
+        )
+        .fetch_all(&database.pool)
+        .await?;
+        assert_eq!(linked_episode_numbers, vec![1, 2]);
         Ok(())
     }
 

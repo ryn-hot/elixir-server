@@ -18,6 +18,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
 use tokio::task::JoinSet;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::{
@@ -63,6 +64,7 @@ const CANDIDATE_PROVIDER_TIMEOUT_SECONDS: u64 = 30;
 const STREAM_CANDIDATE_DEFAULT_LIMIT: u32 = 25;
 const STREAM_CANDIDATE_MAX_LIMIT: u32 = 100;
 const STREAM_CANDIDATE_MAX_TARGETS: usize = 100;
+const CANDIDATE_SEARCH_MAX_TITLE_VARIANTS: usize = 6;
 const STREAM_CANDIDATE_MAX_TITLE_VARIANTS: usize = 32;
 const STREAM_CANDIDATE_PROVIDER_RESPONSE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const STREAM_CANDIDATE_MAX_BYTES: usize = 256 * 1024;
@@ -108,6 +110,8 @@ pub struct CandidateSearchRequest {
     pub year: Option<i32>,
     #[serde(default)]
     pub external_ids: Option<ExternalIds>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub titles: Vec<TitleVariant>,
     #[serde(default)]
     pub target: Option<CandidateSearchTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,7 +190,7 @@ pub struct StreamCandidateSearchRequest {
     #[serde(default)]
     pub external_ids: Option<ExternalIds>,
     #[serde(default)]
-    pub titles: Vec<StreamTitleVariant>,
+    pub titles: Vec<TitleVariant>,
     #[serde(default)]
     pub targets: Vec<StreamSearchTarget>,
     #[serde(default)]
@@ -197,10 +201,12 @@ pub struct StreamCandidateSearchRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StreamTitleVariant {
+pub struct TitleVariant {
     pub value: String,
     pub kind: String,
 }
+
+pub type StreamTitleVariant = TitleVariant;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -773,7 +779,16 @@ fn normalize_candidate_search_request(
 ) -> Result<CandidateSearchRequest> {
     validate_candidate_search_request(&request)?;
     request.media_type = request.media_type.trim().to_string();
-    request.title = request.title.trim().to_string();
+    request.title = request
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    request.titles = normalize_title_variants(
+        &request.title,
+        request.titles,
+        CANDIDATE_SEARCH_MAX_TITLE_VARIANTS,
+    );
     request.preferences.allowed_qualities =
         normalize_string_list(request.preferences.allowed_qualities);
     request.preferences.required_languages =
@@ -795,7 +810,11 @@ fn normalize_stream_candidate_search_request(
     mut request: StreamCandidateSearchRequest,
 ) -> Result<StreamCandidateSearchRequest> {
     request.media_type = request.media_type.trim().to_string();
-    request.title = request.title.trim().to_string();
+    request.title = request
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if request.media_type.is_empty() {
         bail!("mediaType is required");
     }
@@ -815,7 +834,11 @@ fn normalize_stream_candidate_search_request(
         );
     }
     request.limit = Some(stream_candidate_effective_limit(request.limit));
-    request.titles = normalize_stream_title_variants(&request.title, request.titles);
+    request.titles = normalize_title_variants(
+        &request.title,
+        request.titles,
+        STREAM_CANDIDATE_MAX_TITLE_VARIANTS,
+    );
     request.targets = request
         .targets
         .into_iter()
@@ -869,29 +892,30 @@ fn normalize_language_preference_hints(values: Vec<String>) -> Vec<String> {
     out
 }
 
-fn normalize_stream_title_variants(
+fn normalize_title_variants(
     canonical_title: &str,
-    titles: Vec<StreamTitleVariant>,
-) -> Vec<StreamTitleVariant> {
+    titles: Vec<TitleVariant>,
+    limit: usize,
+) -> Vec<TitleVariant> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    push_stream_title_variant(&mut out, &mut seen, canonical_title, "canonical");
+    push_title_variant(&mut out, &mut seen, canonical_title, "canonical");
     for title in titles {
-        if out.len() >= STREAM_CANDIDATE_MAX_TITLE_VARIANTS {
+        if out.len() >= limit {
             break;
         }
-        push_stream_title_variant(&mut out, &mut seen, &title.value, &title.kind);
+        push_title_variant(&mut out, &mut seen, &title.value, &title.kind);
     }
     out
 }
 
-fn push_stream_title_variant(
-    out: &mut Vec<StreamTitleVariant>,
+fn push_title_variant(
+    out: &mut Vec<TitleVariant>,
     seen: &mut BTreeSet<String>,
     value: &str,
     kind: &str,
 ) {
-    let value = value.trim();
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if value.is_empty() {
         return;
     }
@@ -899,14 +923,13 @@ fn push_stream_title_variant(
         let trimmed = kind.trim();
         if trimmed.is_empty() { "alias" } else { trimmed }
     };
-    let key = format!(
-        "{}\u{1f}{}",
-        value.to_ascii_lowercase(),
-        kind.to_ascii_lowercase()
-    );
+    let key = value
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
     if seen.insert(key) {
-        out.push(StreamTitleVariant {
-            value: value.to_string(),
+        out.push(TitleVariant {
+            value,
             kind: kind.to_string(),
         });
     }
@@ -5773,11 +5796,81 @@ mod tests {
                 imdb: Some("tt1234567".to_string()),
                 ..Default::default()
             }),
+            titles: Vec::new(),
             target: None,
             search_intent: None,
             preferences: CandidateSearchPreferences::default(),
             limit,
         }
+    }
+
+    #[test]
+    fn alm3_candidate_title_variants_are_additive_normalized_and_capped() -> Result<()> {
+        let legacy: CandidateSearchRequest = serde_json::from_value(json!({
+            "mediaType": "anime",
+            "title": "Tokyo Ghoul"
+        }))?;
+        assert!(legacy.titles.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)?
+                .as_object()
+                .is_some_and(|value| !value.contains_key("titles"))
+        );
+
+        let mut request = legacy;
+        request.title = "  Tokyo   Ghoul  ".to_string();
+        request.titles = vec![
+            TitleVariant {
+                value: "tokyo ghoul".to_string(),
+                kind: "duplicate".to_string(),
+            },
+            TitleVariant {
+                value: "Ｔｏｋｙｏ　Ｇｈｏｕｌ".to_string(),
+                kind: "unicode_duplicate".to_string(),
+            },
+            TitleVariant {
+                value: "Tokyo Ghoul Root A".to_string(),
+                kind: "season".to_string(),
+            },
+            TitleVariant {
+                value: "Tokyo  Ghoul √A".to_string(),
+                kind: "romaji".to_string(),
+            },
+            TitleVariant {
+                value: "東京喰種トーキョーグール√A".to_string(),
+                kind: "native".to_string(),
+            },
+            TitleVariant {
+                value: "Tokyo Ghoul Season 2".to_string(),
+                kind: "generated".to_string(),
+            },
+            TitleVariant {
+                value: "Tokyo Ghoul S02".to_string(),
+                kind: " ".to_string(),
+            },
+            TitleVariant {
+                value: "Tokyo Ghoul Second Season".to_string(),
+                kind: "overflow".to_string(),
+            },
+        ];
+
+        let normalized = normalize_candidate_search_request(request)?;
+        assert_eq!(normalized.title, "Tokyo Ghoul");
+        assert_eq!(normalized.titles.len(), CANDIDATE_SEARCH_MAX_TITLE_VARIANTS);
+        assert_eq!(normalized.titles[0].value, "Tokyo Ghoul");
+        assert_eq!(normalized.titles[0].kind, "canonical");
+        assert_eq!(normalized.titles[2].value, "Tokyo Ghoul √A");
+        assert_eq!(normalized.titles[5].kind, "alias");
+        assert!(
+            normalized
+                .titles
+                .iter()
+                .all(|title| title.value != "Tokyo Ghoul Second Season")
+        );
+        let serialized = serde_json::to_value(&normalized)?;
+        assert_eq!(serialized["titles"][1]["value"], "Tokyo Ghoul Root A");
+        assert_eq!(serialized["titles"][5]["kind"], "alias");
+        Ok(())
     }
 
     fn test_language_preference(
@@ -7622,6 +7715,7 @@ mod tests {
                 imdb: Some("tt1234567".to_string()),
                 ..Default::default()
             }),
+            titles: Vec::new(),
             target: None,
             search_intent: None,
             preferences: CandidateSearchPreferences::default(),
@@ -7655,7 +7749,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_provider_invocation_sends_only_public_instance_settings() -> Result<()> {
+    async fn alm3_candidate_provider_invocation_sends_only_public_instance_settings() -> Result<()>
+    {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
         let captured = Arc::new(Mutex::new(None::<Value>));
@@ -7792,6 +7887,16 @@ mod tests {
                 imdb: Some("tt1234567".to_string()),
                 ..Default::default()
             }),
+            titles: vec![
+                TitleVariant {
+                    value: "Example".to_string(),
+                    kind: "canonical".to_string(),
+                },
+                TitleVariant {
+                    value: "Example Alternate".to_string(),
+                    kind: "alias".to_string(),
+                },
+            ],
             target: None,
             search_intent: None,
             preferences: CandidateSearchPreferences::default(),
@@ -7812,6 +7917,13 @@ mod tests {
             .expect("capture lock")
             .clone()
             .expect("captured invocation");
+        assert_eq!(payload["schemaVersion"], 1);
+        assert_eq!(payload["request"]["title"], "Example");
+        assert_eq!(payload["request"]["titles"][0]["value"], "Example");
+        assert_eq!(
+            payload["request"]["titles"][1]["value"],
+            "Example Alternate"
+        );
         assert_eq!(
             payload
                 .pointer("/provider/config/baseUrl")

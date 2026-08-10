@@ -496,6 +496,13 @@ impl PlaybackJobManager {
         self.startup_queue_len.load(Ordering::Relaxed)
     }
 
+    /// A cheap admission signal for optional background workloads. Playback
+    /// always wins over local inference; callers should defer or unload their
+    /// worker while a stream is starting or a managed playback job is active.
+    pub fn has_latency_sensitive_work(&self) -> bool {
+        self.startup_queue_len() > 0 || !self.jobs.is_empty()
+    }
+
     pub async fn start(
         &self,
         mut plan: PlaybackJobPlan,

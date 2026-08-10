@@ -1374,6 +1374,14 @@ async fn collect_gpu_report() -> HostGpuReport {
     }
 }
 
+/// Recollects the exact host identity fields used by a playback certification
+/// report so sibling release gates can prove that they ran on the same
+/// physical OS/GPU/driver identity instead of merely trusting copied report
+/// fields.
+pub(crate) async fn collect_certification_host_identity() -> (HostOsReport, HostGpuReport) {
+    tokio::join!(collect_os_report(), collect_gpu_report())
+}
+
 fn gpu_identity_from_windows_cim(value: &Value) -> GpuIdentity {
     let controllers = value_array_or_single(value);
     let selected = controllers
@@ -2106,7 +2114,10 @@ fn current_run_id() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn artifact_tree_digest(artifact_dir: &Path, report: &CertificationReport) -> Result<String> {
+pub(crate) fn artifact_tree_digest(
+    artifact_dir: &Path,
+    report: &CertificationReport,
+) -> Result<String> {
     let mut digest = Sha256::new();
     let mut clone = report.clone();
     clone.artifact_digest = None;

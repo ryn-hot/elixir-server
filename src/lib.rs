@@ -1,4 +1,5 @@
 pub mod acquisition;
+pub mod anime_matching;
 pub mod artwork;
 pub mod auth;
 pub mod authz;

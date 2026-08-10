@@ -31,7 +31,7 @@ use crate::{
             upsert_subscription_targets, validate_new_targets,
         },
     },
-    db::models::ProviderHealthState,
+    db::models::{MediaType, ProviderHealthState},
     download_broker::{
         DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID,
     },
@@ -621,8 +621,17 @@ pub async fn submit_acquisition_target_candidate(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(candidate.clone()),
+        request_scope_evidence: Some(json!({
+            "requestMode": subscription.request_mode.as_str(),
+            "requestScope": subscription.request_scope.as_str(),
+            "targetCount": 1,
+            "targetIds": [target.target_id.to_string()],
+            "targetKeys": [target.target_key.clone()]
+        })),
         selected_stream_candidate: None,
         release_fingerprint: Some(candidate_fingerprint.clone()),
+        defer_anime_debrid_refinement: subscription.media_type == MediaType::Anime
+            && route_logical_id == DEBRID_DEFAULT_LOGICAL_ID,
     };
 
     let mut state_reason = format!("Submitted through '{}'.", route_logical_id);

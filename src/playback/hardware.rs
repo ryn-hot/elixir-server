@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{AnyPool, Row};
-use tokio::{process::Command, time::timeout};
+use tokio::{process::Command, sync::Mutex, time::timeout};
 use uuid::Uuid;
 
 use crate::metrics;
@@ -223,6 +224,48 @@ pub struct HostHardwareInventory {
     pub os: HostOsInventory,
     pub gpus: Vec<HostGpuInventory>,
     pub ffmpeg: FfmpegHardwareInventory,
+}
+
+/// Process-local, serialized host-inventory cache shared by playback and local
+/// inference startup. Collection invokes multiple platform tools, so callers
+/// must not independently rediscover the same immutable boot-time facts.
+#[derive(Clone, Default)]
+pub struct SharedHostHardwareInventory {
+    inner: Arc<Mutex<Option<HostHardwareInventory>>>,
+}
+
+impl SharedHostHardwareInventory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached inventory or performs exactly one serialized
+    /// collection. The lock is intentionally held across collection so racing
+    /// startup consumers cannot duplicate the expensive probes.
+    pub async fn get_or_collect(&self) -> HostHardwareInventory {
+        self.get_or_collect_with(collect_host_hardware_inventory)
+            .await
+    }
+
+    /// Invalidates the boot-time snapshot after an explicit hardware/runtime
+    /// refresh. The next consumer performs one new collection.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
+
+    async fn get_or_collect_with<F, Fut>(&self, collect: F) -> HostHardwareInventory
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = HostHardwareInventory>,
+    {
+        let mut cached = self.inner.lock().await;
+        if let Some(inventory) = cached.as_ref() {
+            return inventory.clone();
+        }
+        let inventory = collect().await;
+        *cached = Some(inventory.clone());
+        inventory
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -926,8 +969,22 @@ pub async fn load_or_detect_hardware_capabilities(
     if config.preference == HardwarePreference::Off {
         return Ok(HardwareCapabilities::software_only());
     }
-
     let inventory = collect_host_hardware_inventory().await;
+    load_or_detect_hardware_capabilities_for_inventory(pool, config, inventory).await
+}
+
+/// Cached-readiness path for callers that already obtained the process-shared
+/// host inventory. This keeps inference and playback startup on one physical
+/// inventory/fingerprint without changing readiness persistence semantics.
+pub async fn load_or_detect_hardware_capabilities_for_inventory(
+    pool: &AnyPool,
+    config: &HardwareDetectionConfig,
+    inventory: HostHardwareInventory,
+) -> Result<HardwareCapabilities> {
+    if config.preference == HardwarePreference::Off {
+        return Ok(HardwareCapabilities::software_only());
+    }
+
     let host_fingerprint = host_hardware_fingerprint(&inventory);
     mark_hardware_readiness_stale_except(pool, &host_fingerprint).await?;
     let cached = load_current_hardware_readiness_records(pool, &host_fingerprint).await?;
@@ -1856,7 +1913,11 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn collect_gpu_inventory() -> Vec<HostGpuInventory> {
-    let mut gpus = Vec::new();
+    // `nvidia-smi` has the best NVIDIA driver/runtime view, but it only sees
+    // NVIDIA adapters.  Always collect the platform inventory as well so a
+    // hybrid Intel/AMD + NVIDIA host cannot be misclassified as a single-GPU
+    // machine by inference backend selection.
+    let mut nvidia_gpus = Vec::new();
     if let Ok(output) = run_command_text(
         "nvidia-smi",
         &[
@@ -1873,7 +1934,7 @@ async fn collect_gpu_inventory() -> Vec<HostGpuInventory> {
             .filter(|line| !line.is_empty())
         {
             let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
-            gpus.push(HostGpuInventory {
+            nvidia_gpus.push(HostGpuInventory {
                 vendor: Some("nvidia".to_string()),
                 model: parts.first().map(|value| (*value).to_string()),
                 driver_version: parts.get(1).map(|value| (*value).to_string()),
@@ -1883,14 +1944,155 @@ async fn collect_gpu_inventory() -> Vec<HostGpuInventory> {
         }
     }
 
-    if gpus.is_empty() && cfg!(windows) {
-        collect_windows_gpu_inventory(&mut gpus).await;
-    } else if gpus.is_empty() && cfg!(target_os = "linux") {
-        collect_linux_gpu_inventory(&mut gpus).await;
-    } else if gpus.is_empty() && cfg!(target_os = "macos") {
-        collect_macos_gpu_inventory(&mut gpus).await;
+    let mut platform_gpus = Vec::new();
+    if cfg!(windows) {
+        collect_windows_gpu_inventory(&mut platform_gpus).await;
+    } else if cfg!(target_os = "linux") {
+        collect_linux_gpu_inventory(&mut platform_gpus).await;
+    } else if cfg!(target_os = "macos") {
+        collect_macos_gpu_inventory(&mut platform_gpus).await;
     }
-    gpus
+
+    merge_gpu_inventory(nvidia_gpus, platform_gpus)
+}
+
+/// Merges the NVIDIA runtime inventory with the OS inventory without changing
+/// `nvidia-smi` ordering. CUDA backend ordinals follow that ordering, while the
+/// appended platform-only adapters preserve the complete physical topology
+/// needed to make fail-closed Metal/Vulkan decisions.
+fn merge_gpu_inventory(
+    nvidia_gpus: Vec<HostGpuInventory>,
+    platform_gpus: Vec<HostGpuInventory>,
+) -> Vec<HostGpuInventory> {
+    let mut merged = nvidia_gpus;
+    let mut matched_runtime_rows = vec![false; merged.len()];
+
+    for platform_gpu in platform_gpus {
+        let duplicate = merged.iter().enumerate().find_map(|(index, runtime_gpu)| {
+            (!matched_runtime_rows[index] && gpu_inventory_rows_match(runtime_gpu, &platform_gpu))
+                .then_some(index)
+        });
+
+        if let Some(index) = duplicate {
+            matched_runtime_rows[index] = true;
+            merge_gpu_inventory_evidence(&mut merged[index], platform_gpu);
+        } else {
+            merged.push(platform_gpu);
+            matched_runtime_rows.push(true);
+        }
+    }
+
+    merged
+}
+
+fn gpu_inventory_rows_match(left: &HostGpuInventory, right: &HostGpuInventory) -> bool {
+    let Some(left_vendor) = left.vendor.as_deref().map(normalize_gpu_text) else {
+        return false;
+    };
+    let Some(right_vendor) = right.vendor.as_deref().map(normalize_gpu_text) else {
+        return false;
+    };
+    if left_vendor != right_vendor {
+        return false;
+    }
+
+    let left_device = left
+        .device_id
+        .as_deref()
+        .and_then(canonical_pci_vendor_device);
+    let right_device = right
+        .device_id
+        .as_deref()
+        .and_then(canonical_pci_vendor_device);
+    match (left_device, right_device) {
+        (Some(left_device), Some(right_device)) => return left_device == right_device,
+        (Some(_), None) | (None, Some(_)) => {}
+        (None, None) => {}
+    }
+
+    let left_model = left.model.as_deref().map(normalize_gpu_text);
+    let right_model = right.model.as_deref().map(normalize_gpu_text);
+    matches!((left_model, right_model), (Some(left), Some(right)) if !left.is_empty() && left == right)
+}
+
+fn merge_gpu_inventory_evidence(
+    runtime_gpu: &mut HostGpuInventory,
+    platform_gpu: HostGpuInventory,
+) {
+    if runtime_gpu.vendor.is_none() {
+        runtime_gpu.vendor = platform_gpu.vendor.clone();
+    }
+    if runtime_gpu.model.is_none() {
+        runtime_gpu.model = platform_gpu.model.clone();
+    }
+    if runtime_gpu.driver_version.is_none() {
+        runtime_gpu.driver_version = platform_gpu.driver_version.clone();
+    }
+    if runtime_gpu.device_id.is_none() {
+        runtime_gpu.device_id = platform_gpu.device_id.clone();
+    }
+    runtime_gpu.raw = json!({
+        "nvidia_smi": runtime_gpu.raw.clone(),
+        "platform": platform_gpu.raw,
+    });
+}
+
+fn normalize_gpu_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Normalizes the common PCI identifier representations emitted by
+/// nvidia-smi (`0x268410DE`), lspci (`10de:2684`), and Windows PNP IDs
+/// (`VEN_10DE&DEV_2684`) into `vendor:device`.
+fn canonical_pci_vendor_device(value: &str) -> Option<String> {
+    let lowered = value.to_ascii_lowercase();
+    if let (Some(vendor), Some(device)) = (
+        pci_marker_value(&lowered, "ven_"),
+        pci_marker_value(&lowered, "dev_"),
+    ) {
+        return Some(format!("{vendor}:{device}"));
+    }
+
+    for token in lowered.split(|character: char| character.is_ascii_whitespace()) {
+        let token = token
+            .trim_matches(|character: char| !character.is_ascii_hexdigit() && character != ':');
+        let mut parts = token.split(':');
+        let vendor = parts.next();
+        let device = parts.next();
+        if parts.next().is_none()
+            && vendor.is_some_and(is_pci_word)
+            && device.is_some_and(is_pci_word)
+        {
+            return Some(format!("{}:{}", vendor.unwrap(), device.unwrap()));
+        }
+    }
+
+    let compact = lowered
+        .strip_prefix("0x")
+        .unwrap_or(&lowered)
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if compact.len() == 8 {
+        let (device, vendor) = compact.split_at(4);
+        if matches!(vendor, "10de" | "1002" | "1022" | "8086") {
+            return Some(format!("{vendor}:{device}"));
+        }
+    }
+    None
+}
+
+fn pci_marker_value<'a>(value: &'a str, marker: &str) -> Option<&'a str> {
+    let start = value.find(marker)? + marker.len();
+    value.get(start..start + 4).filter(|word| is_pci_word(word))
+}
+
+fn is_pci_word(value: &str) -> bool {
+    value.len() == 4 && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 async fn collect_windows_gpu_inventory(gpus: &mut Vec<HostGpuInventory>) {
@@ -2615,6 +2817,80 @@ mod tests {
         assert_eq!(shell_quote("we'ird"), "'we'\"'\"'ird'");
     }
 
+    #[test]
+    fn alm6_gpu_inventory_merge_retains_hybrid_adapters() {
+        let runtime = vec![HostGpuInventory {
+            vendor: Some("nvidia".to_string()),
+            model: Some("NVIDIA GeForce RTX 4070".to_string()),
+            device_id: Some("0x278610DE".to_string()),
+            driver_version: Some("555.99".to_string()),
+            raw: json!({"source": "nvidia-smi"}),
+        }];
+        let platform = vec![
+            HostGpuInventory {
+                vendor: Some("intel".to_string()),
+                model: Some("Intel UHD Graphics 770".to_string()),
+                device_id: Some("8086:4680".to_string()),
+                driver_version: Some("platform-intel".to_string()),
+                raw: json!({"source": "platform"}),
+            },
+            HostGpuInventory {
+                vendor: Some("nvidia".to_string()),
+                model: Some("NVIDIA GeForce RTX 4070".to_string()),
+                device_id: Some("10de:2786".to_string()),
+                driver_version: Some("platform-nvidia".to_string()),
+                raw: json!({"source": "platform"}),
+            },
+        ];
+
+        let merged = merge_gpu_inventory(runtime, platform);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].vendor.as_deref(), Some("nvidia"));
+        assert_eq!(merged[0].driver_version.as_deref(), Some("555.99"));
+        assert_eq!(merged[1].vendor.as_deref(), Some("intel"));
+        assert!(merged[0].raw.get("nvidia_smi").is_some());
+        assert!(merged[0].raw.get("platform").is_some());
+    }
+
+    #[test]
+    fn alm6_gpu_inventory_merge_pairs_identical_nvidia_rows_one_to_one() {
+        let runtime = (0..2)
+            .map(|index| HostGpuInventory {
+                vendor: Some("nvidia".to_string()),
+                model: Some("NVIDIA RTX A4000".to_string()),
+                device_id: Some("0x24B010DE".to_string()),
+                driver_version: Some("560.1".to_string()),
+                raw: json!({"runtime_index": index}),
+            })
+            .collect();
+        let platform = (0..2)
+            .map(|index| HostGpuInventory {
+                vendor: Some("nvidia".to_string()),
+                model: Some("NVIDIA RTX A4000".to_string()),
+                device_id: Some("PCI\\VEN_10DE&DEV_24B0".to_string()),
+                driver_version: Some("platform".to_string()),
+                raw: json!({"platform_index": index}),
+            })
+            .collect();
+
+        let merged = merge_gpu_inventory(runtime, platform);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|gpu| gpu.raw.get("platform").is_some()));
+    }
+
+    #[test]
+    fn alm6_pci_device_ids_normalize_across_inventory_sources() {
+        let expected = Some("10de:2684".to_string());
+        assert_eq!(canonical_pci_vendor_device("0x268410DE"), expected);
+        assert_eq!(canonical_pci_vendor_device("[10de:2684]"), expected);
+        assert_eq!(
+            canonical_pci_vendor_device("PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000"),
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn unavailable_provider_matrix_never_marks_decode_supported() {
         let hwaccels = parse_hwaccels("Hardware acceleration methods:\ncuda\n");
@@ -2647,6 +2923,46 @@ mod tests {
                 .iter()
                 .all(|probe| probe.status == HardwareReadinessStatus::DriverRuntimeIncompatible)
         );
+    }
+
+    #[tokio::test]
+    async fn shared_host_inventory_serializes_collection_and_can_invalidate() {
+        let cache = SharedHostHardwareInventory::new();
+        let expected = fixture_inventory("linux", None, &[], &[], &[]);
+        let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let cache = cache.clone();
+            let expected = expected.clone();
+            let collections = collections.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_collect_with(|| async move {
+                        collections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        expected
+                    })
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.expect("inventory cache task"), expected);
+        }
+        assert_eq!(collections.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        cache.invalidate().await;
+        let refreshed = cache
+            .get_or_collect_with(|| {
+                let expected = expected.clone();
+                let collections = collections.clone();
+                async move {
+                    collections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    expected
+                }
+            })
+            .await;
+        assert_eq!(refreshed, expected);
+        assert_eq!(collections.load(std::sync::atomic::Ordering::Acquire), 2);
     }
 
     #[tokio::test]

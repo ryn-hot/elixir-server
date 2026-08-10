@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    path::Path,
     time::Duration,
 };
 #[cfg(test)]
@@ -15,29 +16,35 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde_json::{Value as JsonValue, json};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::{
+    acquisition::anime_matching::{
+        acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
+        assess_acquisition_anime_candidate_audio, assess_acquisition_anime_model_audio_profile,
+        model_derived_anime_coverage_plans,
+    },
     acquisition::audit::{
         EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_ROUTE_FALLBACK, NewAcquisitionAuditEvent,
         record_acquisition_audit_event,
     },
+    acquisition::episode_state::sync_library_episode_acquisition_state_for_target,
     acquisition::language_policy::language_preference_from_quality_profile,
     acquisition::release_resolution::{
         anime::{
-            ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput, AnimeCandidateScore,
-            AnimeCandidateScoringContext, AnimeCandidateTarget, AnimeCoverageOptions,
-            AnimeFileCoveragePlan, AnimeMetadataGraphInput, AnimeReleaseFileInput,
-            AnimeScopedAlias, AnimeSeasonMapping, anime_parser_diagnostics,
-            build_anime_metadata_graph, infer_anizip_season_number,
+            AnimeCandidateInput, AnimeCandidateScore, AnimeCandidateScoringContext,
+            AnimeCandidateTarget, AnimeCoverageOptions, AnimeFileCoveragePlan,
+            AnimeMetadataGraphInput, AnimeReleaseFileInput, AnimeScopedAlias, AnimeSeasonMapping,
+            anime_parser_diagnostics, build_anime_metadata_graph, infer_anizip_season_number,
             plan_anime_file_coverage_with_options, score_anime_candidate,
         },
         fingerprint::candidate_release_fingerprint,
         models::{
-            AcquisitionReleaseState, NewAcquisitionAnimeCandidateParse,
-            NewAcquisitionAnimeGraphSnapshot, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
-            NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
-            ReleaseCoverageState, ReleaseJobState, ReleaseKind, ReleaseResolverKind,
+            AcquisitionReleaseState, NewAcquisitionAnimeGraphSnapshot, NewAcquisitionRelease,
+            NewAcquisitionReleaseCoverage, NewAcquisitionReleaseFile, NewAcquisitionReleaseJob,
+            ReleaseConfidence, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
+            ReleaseResolverKind,
         },
         movie::{
             MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieCandidateInput, MovieCoveragePlan,
@@ -54,9 +61,8 @@ use crate::{
             count_active_release_jobs, count_active_release_jobs_by_route,
             count_active_release_jobs_by_subscription,
             count_active_release_jobs_by_subscription_route, count_stale_active_release_jobs,
-            get_release_by_fingerprint, list_release_coverage, upsert_anime_candidate_parse,
-            upsert_anime_graph_snapshot, upsert_release, upsert_release_coverage,
-            upsert_release_file, upsert_release_job,
+            get_release_by_fingerprint, list_release_coverage, upsert_anime_graph_snapshot,
+            upsert_release, upsert_release_coverage, upsert_release_file, upsert_release_job,
         },
         tv::{
             TV_SONARR_STYLE_RESOLVER_VERSION, TvCoverageOptions, TvCoveragePlan,
@@ -78,6 +84,11 @@ use crate::{
         list_subscription_targets, list_subscriptions, record_metadata_refresh,
         reset_target_for_candidate_retry, start_subscription_tracking_if_initial_download_complete,
         update_subscription_external_ids, update_target_state, upsert_subscription_targets,
+    },
+    anime_matching::{
+        ANIME_MATCH_MAX_CANDIDATES, AnimeDeterministicResult, AnimeMatchAssistProvenance,
+        AnimeMatchAssistResult, AnimeMatchAudioProfile, AnimeMatchFallbackReason,
+        AnimeMatchingService, DeterministicMatchState,
     },
     db::models::{MediaType, ProviderHealthState},
     debrid::{
@@ -101,7 +112,7 @@ use crate::{
                 CandidateScoreBadge, CandidateSearchIntent, CandidateSearchPreferences,
                 CandidateSearchRequest, CandidateSearchResponse, CandidateSearchTarget,
                 StreamCandidateSearchRequest, StreamSearchPreferences, StreamSearchTarget,
-                StreamTitleVariant, acquisition_candidate_tracker_count,
+                TitleVariant, acquisition_candidate_tracker_count,
                 search_candidate_suite_with_store, search_candidates_with_store,
                 search_stream_candidate_suite_with_store, stream_delivery_resolution_score,
                 stream_delivery_type_score, stream_target_confidence_score,
@@ -132,6 +143,8 @@ const SEARCH_BATCH_LIMIT: i64 = 20;
 const FALLBACK_BATCH_LIMIT: i64 = 50;
 const COMPLETION_RECONCILIATION_BATCH_LIMIT: i64 = 50;
 const DEFAULT_CANDIDATE_LIMIT: u32 = 25;
+const SEARCH_TITLE_VARIANT_LIMIT: usize = 6;
+const STREAM_SEARCH_TITLE_VARIANT_LIMIT: usize = 32;
 const DEFAULT_GLOBAL_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_SUBSCRIPTION_DEBRID_RELEASE_JOB_CAP: i64 = 1;
 const DEFAULT_GLOBAL_TORRENT_RELEASE_JOB_CAP: i64 = 5;
@@ -171,7 +184,8 @@ struct CandidateSubmission {
 #[derive(Debug, Clone)]
 struct ExistingReleaseReuse {
     download_id: String,
-    selected_provider_id: Option<Uuid>,
+    selected_route_logical_id: String,
+    selected_provider_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +452,8 @@ struct CandidateReleasePlanBatch {
     plans: Vec<CandidateReleasePlan>,
     review_candidates: Vec<CandidateReviewPlan>,
     capacity_block: Option<QueueCapacityBlock>,
+    anime_match_assist: Option<AnimeMatchAssistProvenance>,
+    anime_retryable_unresolved: bool,
     candidate_count: usize,
     policy_rejected_count: usize,
     preference_rejected_count: usize,
@@ -1139,30 +1155,10 @@ async fn search_due_targets(state: &AppState) -> Result<()> {
         if let Err(err) =
             search_and_submit_group(state, subscription, &group, now, &mut governor).await
         {
-            let next_after = next_candidate_retry_after(subscription, &group.representative, now);
-            let retry_targets = if group.targets.is_empty() {
-                vec![group.representative.clone()]
-            } else {
-                group.targets.clone()
-            };
-            update_group_targets_for_retry(
-                state,
-                subscription,
-                &retry_targets,
-                AcquisitionTargetStateUpdate {
-                    state: AcquisitionTargetState::Pending,
-                    state_reason: Some(format!("Candidate automation failed: {err}")),
-                    next_search_after: Some(next_after),
-                    increment_search_attempts: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
             warn!(
                 target_id = %group.representative.target_id,
                 subscription_id = %group.representative.subscription_id,
-                next_after = %next_after,
-                "candidate automation failed: {err}"
+                "candidate automation target claim or exact backoff failed: {err}"
             );
         }
     }
@@ -1281,63 +1277,109 @@ async fn search_and_submit_group(
     now: DateTime<Utc>,
     governor: &mut QueueGovernor,
 ) -> Result<()> {
-    let target = &group.representative;
-    let Some(target) = get_target(&state.db_pool, target.target_id).await? else {
-        return Ok(());
-    };
-    if !matches!(
-        target.state,
-        AcquisitionTargetState::Pending
-            | AcquisitionTargetState::Searching
-            | AcquisitionTargetState::Blocked
-    ) {
-        return Ok(());
-    }
-    let searching_targets = if group.targets.is_empty() {
-        vec![target.clone()]
+    let candidate_targets = if group.targets.is_empty() {
+        vec![group.representative.clone()]
     } else {
         group.targets.clone()
     };
-    for grouped_target in &searching_targets {
-        if matches!(
-            grouped_target.state,
-            AcquisitionTargetState::Pending
-                | AcquisitionTargetState::Searching
-                | AcquisitionTargetState::Blocked
-        ) {
-            update_target_state(
-                &state.db_pool,
-                grouped_target.target_id,
-                AcquisitionTargetStateUpdate {
-                    state: AcquisitionTargetState::Searching,
-                    state_reason: Some("Searching acquisition source provider.".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+    let claim_timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let mut searching_targets = Vec::with_capacity(candidate_targets.len());
+    for grouped_target in &candidate_targets {
+        match claim_unowned_target_for_candidate_search(
+            state,
+            subscription.subscription_id,
+            grouped_target,
+            &claim_timestamp,
+        )
+        .await
+        {
+            Ok(Some(claimed)) => searching_targets.push(claimed),
+            Ok(None) => {}
+            Err(err) => {
+                if let Some(first_claimed) = searching_targets.first() {
+                    let next_after = next_candidate_retry_after(subscription, first_claimed, now);
+                    retry_claimed_group_targets_after_automation_error(
+                        state,
+                        subscription.subscription_id,
+                        &searching_targets,
+                        &format!("Candidate automation failed while claiming its group: {err}"),
+                        next_after,
+                    )
+                    .await?;
+                }
+                return Err(err);
+            }
         }
     }
-    record_scheduler_search_audit_event(state, subscription, group, &target).await?;
-
-    let mut request =
-        candidate_search_request_for_group(subscription, &target, group.search_intent.clone());
-    let response = if subscription_uses_extension_suite(subscription) {
-        request.provider_id = None;
-        search_extension_suite_candidates_for_group(state, subscription, group, &target, request)
-            .await?
-    } else {
-        search_candidates_with_store(&state.db_pool, request).await?
+    let Some(target) = searching_targets
+        .iter()
+        .find(|target| target.target_id == group.representative.target_id)
+        .cloned()
+        .or_else(|| searching_targets.first().cloned())
+    else {
+        return Ok(());
     };
-    process_candidate_search_response_for_group(
-        state,
-        subscription,
-        group,
-        &response,
-        &target,
-        now,
-        governor,
-    )
-    .await
+    let search_intent = group.search_intent.as_ref().map(|intent| {
+        search_intent_for_targets_with_retry_bucket(&searching_targets, intent.retry_bucket.clone())
+    });
+    let claimed_group = TargetSearchGroup {
+        group_key: group.group_key.clone(),
+        representative: target.clone(),
+        targets: searching_targets.clone(),
+        search_intent: search_intent.clone(),
+    };
+    let result = async {
+        record_scheduler_search_audit_event(state, subscription, &claimed_group, &target).await?;
+
+        let mut request = candidate_search_request_for_group(
+            subscription,
+            &target,
+            &searching_targets,
+            search_intent,
+        );
+        let response = if subscription_uses_extension_suite(subscription) {
+            request.provider_id = None;
+            search_extension_suite_candidates_for_group(
+                state,
+                subscription,
+                &claimed_group,
+                &target,
+                request,
+            )
+            .await?
+        } else {
+            search_candidates_with_store(&state.db_pool, request).await?
+        };
+        process_candidate_search_response_for_group(
+            state,
+            subscription,
+            &claimed_group,
+            &response,
+            &target,
+            now,
+            governor,
+        )
+        .await
+    }
+    .await;
+    if let Err(err) = result {
+        let next_after = next_candidate_retry_after(subscription, &target, now);
+        retry_claimed_group_targets_after_automation_error(
+            state,
+            subscription.subscription_id,
+            &searching_targets,
+            &format!("Candidate automation failed: {err}"),
+            next_after,
+        )
+        .await?;
+        warn!(
+            target_id = %target.target_id,
+            subscription_id = %subscription.subscription_id,
+            next_after = %next_after,
+            "candidate automation failed after exact target claim: {err}"
+        );
+    }
+    Ok(())
 }
 
 async fn search_extension_suite_candidates_for_group(
@@ -1430,7 +1472,7 @@ async fn process_candidate_search_response_for_group(
             defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
             return Ok(());
         }
-        if !batch.review_candidates.is_empty() {
+        if subscription.media_type != MediaType::Anime && !batch.review_candidates.is_empty() {
             persist_group_manual_review_candidates(
                 state,
                 subscription,
@@ -1444,7 +1486,9 @@ async fn process_candidate_search_response_for_group(
             return Ok(());
         }
         let state_reason = no_matching_candidates_reason(&batch, group, response);
-        if should_mark_no_candidate_group_terminal(subscription, target) {
+        if !batch.anime_retryable_unresolved
+            && should_mark_no_candidate_group_terminal(subscription, target)
+        {
             update_group_targets_terminal_no_results(
                 state,
                 &grouped_targets,
@@ -1478,6 +1522,10 @@ async fn process_candidate_search_response_for_group(
         return Ok(());
     }
 
+    let selected_covered_target_ids = selected_plans
+        .iter()
+        .flat_map(|plan| plan.covered_target_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
     for plan in selected_plans {
         debug!(
             target_id = %target.target_id,
@@ -1509,8 +1557,40 @@ async fn process_candidate_search_response_for_group(
             CandidateSubmitOutcome::Submitted => {}
             CandidateSubmitOutcome::CapacityBlocked(block) => {
                 defer_group_for_queue_capacity(state, subscription, group, block, now).await?;
-                break;
+                return Ok(());
             }
+        }
+    }
+    if batch.anime_retryable_unresolved {
+        let unresolved_targets = grouped_targets
+            .iter()
+            .filter(|target| !selected_covered_target_ids.contains(&target.target_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unresolved_targets.is_empty() {
+            update_group_targets_for_retry(
+                state,
+                subscription,
+                &unresolved_targets,
+                AcquisitionTargetStateUpdate {
+                    state: AcquisitionTargetState::Pending,
+                    state_reason: Some(
+                        "Elixir skipped unresolved anime candidates and will retry automatically."
+                            .to_string(),
+                    ),
+                    selected_provider_id: persisted_source_provider_id(
+                        response.provider.provider_id,
+                    ),
+                    next_search_after: Some(next_candidate_retry_after(
+                        subscription,
+                        &unresolved_targets[0],
+                        now,
+                    )),
+                    increment_search_attempts: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1524,6 +1604,32 @@ async fn build_candidate_release_plans(
     grouped_targets: &[AcquisitionTarget],
     governor: &mut QueueGovernor,
 ) -> Result<CandidateReleasePlanBatch> {
+    if subscription.media_type == MediaType::Anime {
+        let matching_service = state.anime_inference.matching_service();
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &matching_service,
+            subscription,
+            response,
+            representative,
+            grouped_targets,
+            governor,
+        )
+        .await?;
+        if batch.anime_match_assist.as_ref().is_some_and(|assist| {
+            matches!(
+                assist.reason,
+                Some(
+                    AnimeMatchFallbackReason::EngineUnavailable
+                        | AnimeMatchFallbackReason::EngineError
+                )
+            )
+        }) {
+            state.anime_inference.request_runtime_repair();
+        }
+        return Ok(batch);
+    }
+
     let mut batch = CandidateReleasePlanBatch::default();
     for candidate in &response.candidates {
         let source_context = candidate_source_context(candidate, response);
@@ -1607,25 +1713,29 @@ async fn build_candidate_release_plans(
             }
         };
         match route_selection {
-            Ok(route_logical_id) => batch.plans.push(CandidateReleasePlan {
-                provider_id: source_context.provider.provider_id,
-                source_extension_id: source_context.provider.extension_id.clone(),
-                provider_warnings: source_context.warnings.clone(),
-                route_logical_id,
-                fingerprint,
-                selection: coverage.selection,
-                release_kind: coverage.release_kind,
-                resolver_kind: coverage.resolver_kind,
-                resolver_version: coverage.resolver_version,
-                confidence: coverage.confidence,
-                covered_target_ids: coverage.covered_target_ids,
-                covered_target_keys: coverage.covered_target_keys,
-                overfetch_count: coverage.overfetch_count,
-                request_scope_evidence: Some(request_scope_resolution_evidence(
+            Ok(route_logical_id) => {
+                let request_scope_evidence = request_scope_resolution_evidence_for_coverage(
                     subscription,
                     grouped_targets,
-                )),
-            }),
+                    &coverage.covered_target_ids,
+                );
+                batch.plans.push(CandidateReleasePlan {
+                    provider_id: source_context.provider.provider_id,
+                    source_extension_id: source_context.provider.extension_id.clone(),
+                    provider_warnings: source_context.warnings.clone(),
+                    route_logical_id,
+                    fingerprint,
+                    selection: coverage.selection,
+                    release_kind: coverage.release_kind,
+                    resolver_kind: coverage.resolver_kind,
+                    resolver_version: coverage.resolver_version,
+                    confidence: coverage.confidence,
+                    covered_target_ids: coverage.covered_target_ids,
+                    covered_target_keys: coverage.covered_target_keys,
+                    overfetch_count: coverage.overfetch_count,
+                    request_scope_evidence: Some(request_scope_evidence),
+                })
+            }
             Err(block) => {
                 batch.capacity_block.get_or_insert(block);
             }
@@ -1638,6 +1748,309 @@ async fn build_candidate_release_plans(
         compare_review_candidate_plans(right, left, subscription.route_policy)
     });
     Ok(batch)
+}
+
+#[derive(Debug, Clone)]
+struct AnimeCandidatePlanningInput {
+    candidate: AcquisitionCandidate,
+    source_context: CandidateSourceContext,
+    fingerprint: String,
+    deterministic_coverage: Option<CandidateCoverageAnalysis>,
+}
+
+async fn build_anime_candidate_release_plans_with_matching(
+    pool: &sqlx::AnyPool,
+    matching_service: &AnimeMatchingService,
+    subscription: &AcquisitionSubscription,
+    response: &CandidateSearchResponse,
+    representative: &AcquisitionTarget,
+    grouped_targets: &[AcquisitionTarget],
+    governor: &mut QueueGovernor,
+) -> Result<CandidateReleasePlanBatch> {
+    debug_assert_eq!(subscription.media_type, MediaType::Anime);
+    let targets = if grouped_targets.is_empty() {
+        vec![representative.clone()]
+    } else {
+        grouped_targets.to_vec()
+    };
+    let mut batch = CandidateReleasePlanBatch::default();
+    let mut eligible = Vec::new();
+
+    for candidate in &response.candidates {
+        let source_context = candidate_source_context(candidate, response);
+        batch.candidate_count += 1;
+        if !candidate_allowed_by_policy(candidate, subscription.route_policy) {
+            batch.policy_rejected_count += 1;
+            continue;
+        }
+        if !candidate_allowed_by_subscription_preferences(candidate, subscription) {
+            batch.preference_rejected_count += 1;
+            continue;
+        }
+        if !candidate_has_available_route_for_policy(
+            candidate,
+            &source_context.route_options,
+            subscription.route_policy,
+        ) {
+            batch.route_unavailable_count += 1;
+            continue;
+        }
+        let fingerprint =
+            candidate_release_fingerprint(candidate, Some(source_context.provider.provider_id));
+        if release_fingerprint_already_claimed(
+            pool,
+            &source_context.provider.extension_id,
+            &fingerprint,
+        )
+        .await?
+        {
+            batch.already_claimed_count += 1;
+            continue;
+        }
+        eligible.push(AnimeCandidatePlanningInput {
+            candidate: candidate.clone(),
+            source_context,
+            fingerprint,
+            deterministic_coverage: analyze_anime_candidate_coverage(
+                subscription,
+                representative,
+                &targets,
+                candidate,
+            ),
+        });
+    }
+
+    if eligible.is_empty() {
+        return Ok(batch);
+    }
+
+    let wanted_target_ids = targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    let deterministic_covered_target_ids = eligible
+        .iter()
+        .filter_map(|item| {
+            let coverage = item.deterministic_coverage.as_ref()?;
+            anime_coverage_is_automatic(coverage, &item.candidate, subscription).then_some(coverage)
+        })
+        .flat_map(|coverage| coverage.covered_target_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let deterministic_is_definitive = !wanted_target_ids.is_empty()
+        && wanted_target_ids
+            .iter()
+            .all(|target_id| deterministic_covered_target_ids.contains(target_id));
+    let mut resolved_coverages = eligible
+        .iter()
+        .map(|item| item.deterministic_coverage.clone())
+        .collect::<Vec<_>>();
+
+    if !deterministic_is_definitive {
+        batch.anime_retryable_unresolved = true;
+        let context = anime_candidate_scoring_context(subscription, representative, &targets);
+        let model_candidate_sources = eligible
+            .iter()
+            .enumerate()
+            .map(|(index, _)| index)
+            .take(ANIME_MATCH_MAX_CANDIDATES)
+            .collect::<Vec<_>>();
+        let candidates = model_candidate_sources
+            .iter()
+            .map(|index| eligible[*index].candidate.clone())
+            .collect::<Vec<_>>();
+        if let Some(context) = context {
+            match acquisition_anime_match_batch_input(
+                format!(
+                    "acquisition:{}:{}",
+                    subscription.subscription_id, representative.target_id
+                ),
+                subscription,
+                &targets,
+                &context,
+                &candidates,
+            ) {
+                Ok(input) => {
+                    let override_context = context.clone();
+                    let override_candidates = candidates.clone();
+                    let override_targets = targets.clone();
+                    let override_candidate_sources = model_candidate_sources.clone();
+                    let override_subscription = subscription.clone();
+                    let route_policy = subscription.route_policy;
+                    let outcome = matching_service
+                        .match_or_fallback(
+                            AnimeDeterministicResult {
+                                value: resolved_coverages,
+                                state: DeterministicMatchState::Difficult,
+                            },
+                            input,
+                            move |deterministic, request, matches, source_map| {
+                                let model_coverages = model_derived_anime_coverage_plans(
+                                    request,
+                                    &override_context,
+                                    &override_candidates,
+                                    route_policy,
+                                    matches,
+                                    source_map,
+                                )?;
+                                let mut resolutions = deterministic.clone();
+                                for (model_rank, model) in model_coverages.into_iter().enumerate() {
+                                    let candidate = override_candidates
+                                        .get(model.candidate_index)
+                                        .ok_or_else(|| {
+                                            anyhow!(
+                                                "model coverage candidate index is out of bounds"
+                                            )
+                                        })?;
+                                    let analysis = model_anime_candidate_coverage_analysis(
+                                        candidate,
+                                        &override_targets,
+                                        model.plan,
+                                        model.audio_profile,
+                                        model_rank,
+                                        &override_subscription,
+                                    )?;
+                                    let resolution_index = override_candidate_sources
+                                        .get(model.candidate_index)
+                                        .copied()
+                                        .ok_or_else(|| {
+                                            anyhow!("model candidate source index is out of bounds")
+                                        })?;
+                                    resolutions[resolution_index] = Some(analysis);
+                                }
+                                Ok(resolutions)
+                            },
+                        )
+                        .await;
+                    let used_model = outcome.provenance.result == AnimeMatchAssistResult::Matched;
+                    let provenance = outcome.provenance.clone();
+                    resolved_coverages = outcome.value;
+                    if used_model {
+                        for coverage in resolved_coverages.iter_mut().flatten().filter(|coverage| {
+                            coverage
+                                .selection
+                                .candidate
+                                .raw
+                                .as_ref()
+                                .and_then(|raw| raw.pointer("/serverEvidence/modelMapping"))
+                                .is_some()
+                        }) {
+                            attach_anime_match_assist_provenance(
+                                &mut coverage.selection.candidate,
+                                &provenance,
+                            );
+                        }
+                    } else {
+                        for coverage in resolved_coverages.iter_mut().flatten() {
+                            attach_anime_match_assist_provenance(
+                                &mut coverage.selection.candidate,
+                                &provenance,
+                            );
+                        }
+                        debug!(
+                            subscription_id = %subscription.subscription_id,
+                            target_id = %representative.target_id,
+                            reason = ?provenance.reason,
+                            detail = provenance.detail.as_deref().unwrap_or_default(),
+                            "local anime matching fell back to deterministic acquisition analysis"
+                        );
+                    }
+                    batch.anime_match_assist = Some(provenance);
+                }
+                Err(err) => {
+                    debug!(
+                        subscription_id = %subscription.subscription_id,
+                        target_id = %representative.target_id,
+                        error = %err,
+                        "anime acquisition context could not be adapted for local matching"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                subscription_id = %subscription.subscription_id,
+                target_id = %representative.target_id,
+                "anime acquisition has no canonical scoring context for local matching"
+            );
+        }
+    }
+
+    for (item, coverage) in eligible.into_iter().zip(resolved_coverages) {
+        let Some(coverage) = coverage else {
+            batch.resolver_rejected_count += 1;
+            continue;
+        };
+        if !anime_coverage_is_automatic(&coverage, &item.candidate, subscription) {
+            batch.resolver_rejected_count += 1;
+            continue;
+        }
+        let route_selection = match select_candidate_route_for_plan(
+            pool,
+            subscription,
+            &coverage.selection.candidate,
+            &item.source_context.route_options,
+            governor,
+        )
+        .await
+        {
+            Ok(selection) => selection,
+            Err(err) => {
+                debug!(
+                    candidate_title = item.candidate.title.as_str(),
+                    subscription_id = %subscription.subscription_id,
+                    "anime candidate route unavailable during ALM-7 planning: {err}"
+                );
+                batch.route_unavailable_count += 1;
+                continue;
+            }
+        };
+        match route_selection {
+            Ok(route_logical_id) => {
+                let request_scope_evidence = request_scope_resolution_evidence_for_coverage(
+                    subscription,
+                    &targets,
+                    &coverage.covered_target_ids,
+                );
+                batch.plans.push(CandidateReleasePlan {
+                    provider_id: item.source_context.provider.provider_id,
+                    source_extension_id: item.source_context.provider.extension_id.clone(),
+                    provider_warnings: item.source_context.warnings.clone(),
+                    route_logical_id,
+                    fingerprint: item.fingerprint,
+                    selection: coverage.selection,
+                    release_kind: coverage.release_kind,
+                    resolver_kind: coverage.resolver_kind,
+                    resolver_version: coverage.resolver_version,
+                    confidence: coverage.confidence,
+                    covered_target_ids: coverage.covered_target_ids,
+                    covered_target_keys: coverage.covered_target_keys,
+                    overfetch_count: coverage.overfetch_count,
+                    request_scope_evidence: Some(request_scope_evidence),
+                })
+            }
+            Err(block) => {
+                batch.capacity_block.get_or_insert(block);
+            }
+        }
+    }
+
+    batch
+        .plans
+        .sort_by(|left, right| compare_release_plans(right, left, subscription.route_policy));
+    Ok(batch)
+}
+
+fn anime_coverage_is_automatic(
+    coverage: &CandidateCoverageAnalysis,
+    original_candidate: &AcquisitionCandidate,
+    subscription: &AcquisitionSubscription,
+) -> bool {
+    let Some(plan) = coverage.selection.anime_coverage_plan.as_ref() else {
+        return false;
+    };
+    acquisition_anime_deterministic_state(plan) == DeterministicMatchState::Definitive
+        && !synthetic_stream_candidate_requires_manual_review(original_candidate)
+        && assess_acquisition_anime_candidate_audio(subscription, &coverage.selection.candidate).1
+        && !coverage.covered_target_ids.is_empty()
 }
 
 fn no_matching_candidates_reason(
@@ -1833,12 +2246,7 @@ fn build_manual_review_candidate_plan(
             candidate,
         )),
         MediaType::Series => Ok(Some(build_tv_manual_review_candidate(candidate, &targets)?)),
-        MediaType::Anime => Ok(Some(build_anime_manual_review_candidate(
-            subscription,
-            representative,
-            &targets,
-            candidate,
-        )?)),
+        MediaType::Anime => Ok(None),
     }
 }
 
@@ -1979,73 +2387,6 @@ fn build_tv_manual_review_candidate(
     })
 }
 
-fn build_anime_manual_review_candidate(
-    subscription: &AcquisitionSubscription,
-    representative: &AcquisitionTarget,
-    targets: &[AcquisitionTarget],
-    candidate: &AcquisitionCandidate,
-) -> Result<CandidateReviewPlan> {
-    let Some(context) = anime_candidate_scoring_context(subscription, representative, targets)
-    else {
-        return Ok(CandidateReviewPlan {
-            candidate: candidate.clone(),
-            release_kind: ReleaseKind::Unknown,
-            resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
-            resolver_version: ANIME_SHOKO_STYLE_RESOLVER_VERSION.to_string(),
-            confidence: ReleaseConfidence::ReviewRequired,
-            rejection_codes: vec!["missing_anime_graph_context".to_string()],
-            parsed_release: Some(json!({
-                "candidateTitle": candidate.title,
-                "reason": "anime metadata graph context was unavailable"
-            })),
-            score: candidate.score,
-            reason: "Anime candidate needs review because metadata graph context is unavailable."
-                .to_string(),
-        });
-    };
-    let input = anime_candidate_input(candidate);
-    let files = anime_release_file_inputs(candidate);
-    let plan = plan_anime_file_coverage_with_options(
-        &context,
-        &input,
-        &files,
-        anime_coverage_options_for_candidate(subscription.route_policy, candidate),
-    );
-    let mut rejection_codes = plan.rejection_reasons.clone();
-    rejection_codes.extend(plan.review_reasons.iter().cloned());
-    if plan.confidence == ReleaseConfidence::ReviewRequired {
-        rejection_codes.push("review_required_confidence".to_string());
-    }
-    if plan.confidence == ReleaseConfidence::Low {
-        rejection_codes.push("low_confidence".to_string());
-    }
-    if plan.entries.is_empty() {
-        rejection_codes.push("no_safe_target_coverage".to_string());
-    }
-    rejection_codes.sort();
-    rejection_codes.dedup();
-    let score = score_anime_candidate(&context, &input);
-    let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
-    let reason = manual_review_reason(&rejection_codes, "Anime");
-    Ok(CandidateReviewPlan {
-        candidate: candidate.clone(),
-        release_kind: plan.release_kind,
-        resolver_kind: plan.resolver_kind,
-        resolver_version: plan.resolver_version.clone(),
-        confidence: plan.confidence,
-        rejection_codes,
-        parsed_release: Some(json!({
-            "coveragePlan": plan,
-            "graphFingerprint": context.graph_fingerprint,
-            "aliasCount": context.aliases.len(),
-            "targetCount": context.targets.len(),
-            "diagnostics": diagnostics,
-        })),
-        score: Some(score.score),
-        reason,
-    })
-}
-
 fn manual_review_reason(rejection_codes: &[String], label: &str) -> String {
     if rejection_codes.is_empty() {
         return format!(
@@ -2130,6 +2471,19 @@ fn request_scope_resolution_evidence(
     evidence
 }
 
+fn request_scope_resolution_evidence_for_coverage(
+    subscription: &AcquisitionSubscription,
+    available_targets: &[AcquisitionTarget],
+    covered_target_ids: &BTreeSet<Uuid>,
+) -> JsonValue {
+    let covered_targets = available_targets
+        .iter()
+        .filter(|target| covered_target_ids.contains(&target.target_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    request_scope_resolution_evidence(subscription, &covered_targets)
+}
+
 fn source_selection_evidence_from_scope(scope: Option<&JsonValue>) -> Option<JsonValue> {
     let scope = scope?;
     let source_selection = scope
@@ -2201,6 +2555,53 @@ fn coverage_plan_with_request_scope(
     }
 }
 
+fn coverage_plan_with_submission_bookkeeping(mut plan: JsonValue, status: &str) -> JsonValue {
+    let evidence = json!({
+        "status": status,
+        "policyVersion": "acquisition-broker-bookkeeping-v1",
+        "updatedAt": Utc::now(),
+    });
+    match plan {
+        JsonValue::Object(ref mut object) => {
+            object.insert("submissionBookkeeping".to_string(), evidence);
+            plan
+        }
+        other => json!({
+            "coveragePlan": other,
+            "submissionBookkeeping": evidence,
+        }),
+    }
+}
+
+async fn mark_release_submission_bookkeeping_complete(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    coverage_plan: Option<JsonValue>,
+) -> Result<()> {
+    let coverage_plan = coverage_plan_with_submission_bookkeeping(
+        coverage_plan.unwrap_or_else(|| json!({})),
+        "complete",
+    );
+    let updated = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET coverage_plan_json = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2
+           AND state = 'submitted'",
+    )
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(release_id.to_string())
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "acquisition release {} lost its submitted bookkeeping ownership",
+            release_id
+        );
+    }
+    Ok(())
+}
+
 fn json_with_diagnostics(value: JsonValue, diagnostics: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(mut object) => {
@@ -2210,6 +2611,26 @@ fn json_with_diagnostics(value: JsonValue, diagnostics: JsonValue) -> JsonValue 
         other => json!({
             "value": other,
             "diagnostics": diagnostics,
+        }),
+    }
+}
+
+fn json_with_anime_match_assist(value: JsonValue, candidate: &AcquisitionCandidate) -> JsonValue {
+    let Some(assist) = candidate
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.pointer("/serverEvidence/animeMatchAssist"))
+    else {
+        return value;
+    };
+    match value {
+        JsonValue::Object(mut object) => {
+            object.insert("animeMatchAssist".to_string(), assist.clone());
+            JsonValue::Object(object)
+        }
+        other => json!({
+            "value": other,
+            "animeMatchAssist": assist,
         }),
     }
 }
@@ -2488,7 +2909,7 @@ fn route_decision_reason(route_policy: AcquisitionRoutePolicy, route_logical_id:
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CandidateCoverageAnalysis {
     selection: CandidateSelection,
     release_kind: ReleaseKind,
@@ -2567,6 +2988,133 @@ fn analyze_anime_candidate_coverage(
         covered_target_keys,
         overfetch_count: candidate_media_file_count(&candidate).saturating_sub(selected_files),
     })
+}
+
+fn model_anime_candidate_coverage_analysis(
+    candidate: &AcquisitionCandidate,
+    targets: &[AcquisitionTarget],
+    plan: AnimeFileCoveragePlan,
+    audio_profile: AnimeMatchAudioProfile,
+    model_rank: usize,
+    subscription: &AcquisitionSubscription,
+) -> Result<CandidateCoverageAnalysis> {
+    if acquisition_anime_deterministic_state(&plan) != DeterministicMatchState::Definitive {
+        bail!("model-derived anime coverage did not pass the automatic coverage gate");
+    }
+    let targets_by_key = targets
+        .iter()
+        .map(|target| (target.target_key.as_str(), target))
+        .collect::<HashMap<_, _>>();
+    let mut covered_target_ids = BTreeSet::new();
+    let mut covered_target_keys = BTreeSet::new();
+    for entry in &plan.entries {
+        let target = targets_by_key
+            .get(entry.target_key.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "model-derived anime coverage references unknown target '{}'",
+                    entry.target_key
+                )
+            })?;
+        covered_target_ids.insert(target.target_id);
+        covered_target_keys.insert(target.target_key.clone());
+    }
+    if covered_target_ids.is_empty() {
+        bail!("model-derived anime coverage contains no requested targets");
+    }
+
+    let mut matched_candidate = candidate.clone();
+    let (language_assessment, required_preference_satisfied) =
+        assess_acquisition_anime_model_audio_profile(subscription, audio_profile);
+    if language_assessment.score_delta != 0.0 {
+        matched_candidate.score = Some(
+            matched_candidate
+                .score
+                .filter(|score| score.is_finite())
+                .unwrap_or_default()
+                + language_assessment.score_delta,
+        );
+    }
+    matched_candidate.score_badges.push(CandidateScoreBadge {
+        label: "Local anime match".to_string(),
+        detail: Some(format!(
+            "model mapping rank {}; audio profile {:?}; language policy {}",
+            model_rank + 1,
+            audio_profile,
+            language_assessment.state.as_str(),
+        )),
+        score: Some(language_assessment.score_delta),
+    });
+    upsert_anime_match_server_evidence(
+        &mut matched_candidate,
+        "modelMapping",
+        json!({
+            "rank": model_rank,
+            "audioProfile": audio_profile,
+            "matchedTargetKeys": covered_target_keys,
+            "selectedFileKeys": plan.selected_file_keys,
+            "languagePolicy": {
+                "state": language_assessment.state.as_str(),
+                "scoreDelta": language_assessment.score_delta,
+                "matchingAudio": language_assessment.matching_audio,
+                "matchingSubtitles": language_assessment.matching_subtitles,
+                "matchingProfiles": language_assessment.matching_profiles,
+                "desiredAudio": language_assessment.desired_audio,
+                "desiredSubtitles": language_assessment.desired_subtitles,
+                "desiredProfiles": language_assessment.desired_profiles,
+                "evidenceAudio": language_assessment.evidence_audio,
+                "evidenceSubtitles": language_assessment.evidence_subtitles,
+                "evidenceProfiles": language_assessment.evidence_profiles,
+                "requiredPreferenceSatisfied": required_preference_satisfied,
+            },
+        }),
+    );
+    let selected_files = plan.selected_file_keys.len();
+    Ok(CandidateCoverageAnalysis {
+        selection: CandidateSelection {
+            candidate: matched_candidate,
+            anime_coverage_plan: Some(plan.clone()),
+            tv_coverage_plan: None,
+            movie_coverage_plan: None,
+        },
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+        covered_target_ids,
+        covered_target_keys,
+        overfetch_count: candidate_media_file_count(candidate).saturating_sub(selected_files),
+    })
+}
+
+fn attach_anime_match_assist_provenance(
+    candidate: &mut AcquisitionCandidate,
+    provenance: &AnimeMatchAssistProvenance,
+) {
+    upsert_anime_match_server_evidence(candidate, "animeMatchAssist", json!(provenance));
+}
+
+fn upsert_anime_match_server_evidence(
+    candidate: &mut AcquisitionCandidate,
+    key: &str,
+    value: JsonValue,
+) {
+    let mut raw = candidate.raw.take().unwrap_or_else(|| json!({}));
+    if !raw.is_object() {
+        raw = json!({ "providerRaw": raw });
+    }
+    let object = raw.as_object_mut().expect("object was constructed above");
+    let server_evidence = object
+        .entry("serverEvidence".to_string())
+        .or_insert_with(|| json!({}));
+    if !server_evidence.is_object() {
+        *server_evidence = json!({ "providerEvidence": server_evidence.take() });
+    }
+    server_evidence
+        .as_object_mut()
+        .expect("server evidence object was constructed above")
+        .insert(key.to_string(), value);
+    candidate.raw = Some(raw);
 }
 
 fn analyze_tv_candidate_coverage(
@@ -2901,6 +3449,7 @@ fn release_suppresses_automatic_rediscovery(
     release.coverage_plan.as_ref().is_some_and(|plan| {
         json_status(plan, &["retrySuppression", "status"]) == Some("rejected")
             || json_status(plan, &["manualReview", "status"]) == Some("rejected")
+            || json_status(plan, &["torrentCleanup", "status"]) == Some("pending")
             || json_bool(plan, &["retrySuppression", "suppressAutomaticRediscovery"]) == Some(true)
     })
 }
@@ -3009,7 +3558,19 @@ fn compare_release_plans(
 ) -> Ordering {
     release_plan_score_tuple(left, route_policy)
         .cmp(&release_plan_score_tuple(right, route_policy))
+        .then_with(|| anime_model_rank_score(left).cmp(&anime_model_rank_score(right)))
         .then_with(|| right.fingerprint.cmp(&left.fingerprint))
+}
+
+fn anime_model_rank_score(plan: &CandidateReleasePlan) -> i64 {
+    plan.selection
+        .candidate
+        .raw
+        .as_ref()
+        .and_then(|value| value.pointer("/serverEvidence/modelMapping/rank"))
+        .and_then(JsonValue::as_u64)
+        .map(|rank| i64::MAX.saturating_sub(i64::try_from(rank).unwrap_or(i64::MAX)))
+        .unwrap_or_default()
 }
 
 fn release_plan_score_tuple(
@@ -3450,6 +4011,13 @@ fn search_intent_for_targets(
     targets: &[AcquisitionTarget],
     retry_bucket: RetryBucket,
 ) -> CandidateSearchIntent {
+    search_intent_for_targets_with_retry_bucket(targets, Some(retry_bucket.as_str().to_string()))
+}
+
+fn search_intent_for_targets_with_retry_bucket(
+    targets: &[AcquisitionTarget],
+    retry_bucket: Option<String>,
+) -> CandidateSearchIntent {
     let season_number = common_season_number(targets);
     let mut sorted_targets = targets.iter().collect::<Vec<_>>();
     sorted_targets.sort_by_key(|target| {
@@ -3486,7 +4054,7 @@ fn search_intent_for_targets(
             .max(),
         target_count: u32::try_from(targets.len()).unwrap_or(u32::MAX),
         target_keys,
-        retry_bucket: Some(retry_bucket.as_str().to_string()),
+        retry_bucket,
     }
 }
 
@@ -3604,6 +4172,97 @@ async fn update_group_targets_for_retry(
         .await?;
     }
     Ok(())
+}
+
+async fn claim_unowned_target_for_candidate_search(
+    state: &AppState,
+    subscription_id: Uuid,
+    target: &AcquisitionTarget,
+    claim_timestamp: &str,
+) -> Result<Option<AcquisitionTarget>> {
+    if !matches!(
+        target.state,
+        AcquisitionTargetState::Pending
+            | AcquisitionTargetState::Searching
+            | AcquisitionTargetState::Blocked
+    ) {
+        return Ok(None);
+    }
+    let claimed = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = 'searching',
+             state_reason = 'Searching acquisition source provider.',
+             updated_at = $1
+         WHERE target_id = $2 AND subscription_id = $3 AND state = $4
+           AND download_id IS NULL",
+    )
+    .bind(claim_timestamp)
+    .bind(target.target_id.to_string())
+    .bind(subscription_id.to_string())
+    .bind(target.state.as_str())
+    .execute(&state.db_pool)
+    .await
+    .context("claiming an unowned acquisition target for candidate search")?;
+    if claimed.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let claimed = get_target(&state.db_pool, target.target_id).await?;
+    if let Some(target) = claimed.as_ref() {
+        sync_library_episode_acquisition_state_for_target(&state.db_pool, target).await?;
+    }
+    Ok(claimed)
+}
+
+async fn retry_claimed_group_targets_after_automation_error(
+    state: &AppState,
+    subscription_id: Uuid,
+    targets: &[AcquisitionTarget],
+    state_reason: &str,
+    next_search_after: DateTime<Utc>,
+) -> Result<usize> {
+    let first_target_id = targets.first().map(|target| target.target_id);
+    let next_search_after = next_search_after.format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut retried = 0_usize;
+    for target in targets {
+        let claim_timestamp = target
+            .updated_at
+            .format("%Y-%m-%d %H:%M:%S%.6f")
+            .to_string();
+        let increment_search_attempts = first_target_id == Some(target.target_id);
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_targets
+             SET state = 'pending', state_reason = $1, next_search_after = $2,
+                 search_attempts = search_attempts + $3,
+                 last_search_at = CASE
+                     WHEN $3 = 1 THEN CURRENT_TIMESTAMP ELSE last_search_at
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE target_id = $4 AND subscription_id = $5
+               AND state = 'searching' AND updated_at = $6
+               AND download_id IS NULL",
+        )
+        .bind(state_reason)
+        .bind(&next_search_after)
+        .bind(if increment_search_attempts {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(target.target_id.to_string())
+        .bind(subscription_id.to_string())
+        .bind(&claim_timestamp)
+        .execute(&state.db_pool)
+        .await
+        .context("retrying an unowned acquisition target after automation failure")?;
+        if updated.rows_affected() != 1 {
+            continue;
+        }
+        retried += 1;
+        if let Some(target) = get_target(&state.db_pool, target.target_id).await? {
+            sync_library_episode_acquisition_state_for_target(&state.db_pool, &target).await?;
+        }
+    }
+    Ok(retried)
 }
 
 async fn defer_group_for_queue_capacity(
@@ -4193,9 +4852,9 @@ async fn submit_selected_candidate(
             subscription,
             target,
             &submission,
-            &route_logical_id,
+            &reuse.selected_route_logical_id,
             Some(reuse.download_id),
-            reuse.selected_provider_id.unwrap_or(submission.provider_id),
+            reuse.selected_provider_id,
             None,
             "Reused existing pack-aware acquisition release.",
             &[],
@@ -5076,6 +5735,19 @@ fn debrid_release_context_for_submission(
     submission: &CandidateSubmission,
     route_attempts: &[RouteAttemptRecord],
 ) -> Result<DebridReleaseSubmitContext> {
+    let mut selected_candidate =
+        selected_candidate_provenance_with_route_attempts(submission, route_attempts)?;
+    if subscription.media_type == MediaType::Anime
+        && let Some(object) = selected_candidate.as_object_mut()
+    {
+        object.insert(
+            "submissionBookkeeping".to_string(),
+            json!({
+                "status": "pending",
+                "policyVersion": "acquisition-broker-bookkeeping-v1"
+            }),
+        );
+    }
     Ok(DebridReleaseSubmitContext {
         subscription_id: Some(subscription.subscription_id),
         source_provider_id: Some(submission.provider_id),
@@ -5089,10 +5761,7 @@ fn debrid_release_context_for_submission(
             Some(submission.provider_id),
         )),
         score: submission.candidate.score,
-        selected_candidate: Some(selected_candidate_provenance_with_route_attempts(
-            submission,
-            route_attempts,
-        )?),
+        selected_candidate: Some(selected_candidate),
     })
 }
 
@@ -5124,6 +5793,7 @@ async fn submit_candidate_to_route(
         media_type: Some(subscription.media_type),
         media_title: Some(subscription.title.clone()),
         selected_candidate: Some(submission.candidate.clone()),
+        request_scope_evidence: submission.request_scope_evidence.clone(),
         selected_stream_candidate: (route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID)
             .then(|| synthetic_stream_candidate_payload(&submission.candidate).cloned())
             .flatten(),
@@ -5131,6 +5801,8 @@ async fn submit_candidate_to_route(
             &submission.candidate,
             Some(submission.provider_id),
         )),
+        defer_anime_debrid_refinement: subscription.media_type == MediaType::Anime
+            && route_logical_id == DEBRID_DEFAULT_LOGICAL_ID,
     };
     submit_to_broker(
         state,
@@ -5198,18 +5870,33 @@ async fn existing_release_reuse(
     else {
         return Ok(None);
     };
-    if matches!(
+    if !matches!(
         release.state,
-        AcquisitionReleaseState::Failed | AcquisitionReleaseState::Cancelled
+        AcquisitionReleaseState::Staging
+            | AcquisitionReleaseState::Ready
+            | AcquisitionReleaseState::Submitted
+            | AcquisitionReleaseState::Downloading
+            | AcquisitionReleaseState::Materializing
     ) {
         return Ok(None);
     }
     let Some(download_id) = release.download_id else {
         return Ok(None);
     };
+    let Some(selected_route_logical_id) = release
+        .selected_route_logical_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(selected_provider_id) = release.selected_provider_id else {
+        return Ok(None);
+    };
     Ok(Some(ExistingReleaseReuse {
         download_id,
-        selected_provider_id: release.selected_provider_id,
+        selected_route_logical_id,
+        selected_provider_id,
     }))
 }
 
@@ -5309,6 +5996,13 @@ async fn persist_anime_release_submission(
         )
         .await;
     };
+    let selected_candidate_download_id = download_id.clone();
+    let download_id = download_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("anime submission did not return an exact download id")?
+        .to_string();
     let fingerprint =
         candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
     let targets = list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
@@ -5321,56 +6015,29 @@ async fn persist_anime_release_submission(
     let selected_candidate = selected_candidate_provenance_with_submission(
         submission,
         route_logical_id,
-        &download_id,
+        &selected_candidate_download_id,
         route_provider_id,
         route_provider_implementation,
         reason,
         route_attempts,
     )?;
-    let coverage_plan = match anime_scoring.as_ref() {
+    let base_coverage_plan = match anime_scoring.as_ref() {
         Some((context, score)) => json_with_diagnostics(
             serde_json::to_value(plan)?,
             anime_parser_diagnostics(context, score, Some(plan)),
         ),
         None => serde_json::to_value(plan)?,
     };
-    let release = upsert_release(
-        &state.db_pool,
-        NewAcquisitionRelease {
-            release_id: None,
-            subscription_id: Some(subscription.subscription_id),
-            source_provider_id: Some(submission.provider_id),
-            source_extension_id: submission.source_extension_id.clone(),
-            owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
-            media_type: target.media_type,
-            title: subscription.title.clone(),
-            release_title: submission.candidate.title.clone(),
-            source: submission.candidate.source.clone(),
-            source_kind: submission.candidate.source_kind.clone(),
-            info_hash: submission.candidate.info_hash.clone(),
-            fingerprint: fingerprint.clone(),
-            release_kind: plan.release_kind,
-            resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
-            resolver_version: plan.resolver_version.clone(),
-            confidence: plan.confidence,
-            score: submission.candidate.score,
-            selected_route_logical_id: Some(route_logical_id.to_string()),
-            selected_provider_id: Some(route_provider_id),
-            download_id: download_id.clone(),
-            remote_release_id: None,
-            state: AcquisitionReleaseState::Submitted,
-            state_reason: Some(format!(
-                "{reason} pack-aware coverage entries: {}",
-                plan.entries.len()
-            )),
-            selected_candidate: Some(selected_candidate.clone()),
-            coverage_plan: Some(coverage_plan_with_request_scope(
-                coverage_plan_with_route_attempt_ledger(coverage_plan, &selected_candidate),
-                submission.request_scope_evidence.as_ref(),
-            )),
-        },
-    )
-    .await?;
+    let base_coverage_plan =
+        json_with_anime_match_assist(base_coverage_plan, &submission.candidate);
+    let base_coverage_plan = coverage_plan_with_request_scope(
+        coverage_plan_with_route_attempt_ledger(base_coverage_plan, &selected_candidate),
+        submission.request_scope_evidence.as_ref(),
+    );
+    let pending_coverage_plan =
+        coverage_plan_with_submission_bookkeeping(base_coverage_plan.clone(), "pending");
+    let completed_coverage_plan =
+        coverage_plan_with_submission_bookkeeping(base_coverage_plan, "complete");
 
     let parsed = anime_scoring
         .as_ref()
@@ -5387,75 +6054,433 @@ async fn persist_anime_release_submission(
         ),
         None => serde_json::to_value(&parsed)?,
     };
-    upsert_anime_candidate_parse(
-        &state.db_pool,
-        NewAcquisitionAnimeCandidateParse {
-            candidate_parse_id: None,
-            release_id: release.release_id,
-            source_provider_id: Some(submission.provider_id),
-            source_candidate_id: submission.candidate.id.clone(),
-            release_title: submission.candidate.title.clone(),
-            normalized_title: parsed.normalized_title.clone(),
-            parsed: parsed_json,
-            confidence: plan.confidence,
-            review_reasons: json!(plan.review_reasons),
-        },
+    let parsed_json = json_with_anime_match_assist(parsed_json, &submission.candidate);
+
+    let targets_by_key = targets
+        .iter()
+        .cloned()
+        .map(|target| (target.target_key.clone(), target))
+        .collect::<HashMap<_, _>>();
+    let mut transaction = state.db_pool.begin().await?;
+    let proposed_release_id = Uuid::new_v4();
+    let inserted = sqlx::query::<sqlx::Any>(
+        "INSERT INTO acquisition_releases (
+            release_id, subscription_id, source_provider_id, source_extension_id, owner_id,
+            media_type, title, release_title, source, source_kind, info_hash, fingerprint,
+            release_kind, resolver_kind, resolver_version, confidence, score,
+            selected_route_logical_id, selected_provider_id, download_id, remote_release_id,
+            state, state_reason, selected_candidate_json, coverage_plan_json
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                   $15, $16, $17, $18, $19, $20, NULL, 'submitted', $21, $22, $23)
+         ON CONFLICT (owner_id, source_extension_id, fingerprint) DO NOTHING",
     )
+    .bind(proposed_release_id.to_string())
+    .bind(subscription.subscription_id.to_string())
+    .bind(submission.provider_id.to_string())
+    .bind(&submission.source_extension_id)
+    .bind(DEFAULT_ROUTE_OWNER_ID)
+    .bind(target.media_type.as_str())
+    .bind(&subscription.title)
+    .bind(&submission.candidate.title)
+    .bind(&submission.candidate.source)
+    .bind(&submission.candidate.source_kind)
+    .bind(submission.candidate.info_hash.as_deref())
+    .bind(&fingerprint)
+    .bind(plan.release_kind.as_str())
+    .bind(ReleaseResolverKind::AnimeShokoStyle.as_str())
+    .bind(&plan.resolver_version)
+    .bind(plan.confidence.as_str())
+    .bind(submission.candidate.score)
+    .bind(route_logical_id)
+    .bind(route_provider_id.to_string())
+    .bind(&download_id)
+    .bind(format!(
+        "{reason} pack-aware coverage entries: {}",
+        plan.entries.len()
+    ))
+    .bind(serde_json::to_string(&selected_candidate)?)
+    .bind(serde_json::to_string(&pending_coverage_plan)?)
+    .execute(&mut *transaction)
+    .await
+    .context("creating exact anime submission bookkeeping release")?;
+    let release_id = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT release_id
+         FROM acquisition_releases
+         WHERE owner_id = $1 AND source_extension_id = $2 AND fingerprint = $3",
+    )
+    .bind(DEFAULT_ROUTE_OWNER_ID)
+    .bind(&submission.source_extension_id)
+    .bind(&fingerprint)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("loading exact anime submission bookkeeping release")?;
+    let release_id = Uuid::parse_str(&release_id)
+        .context("anime submission bookkeeping release id is invalid")?;
+    let inserted_for_attempt = inserted.rows_affected() == 1;
+    let is_debrid = route_logical_id == DEBRID_DEFAULT_LOGICAL_ID;
+    let binds_unassigned_http_provider = route_logical_id == HTTP_STREAM_DEFAULT_LOGICAL_ID;
+    let ownership = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND subscription_id = $2
+           AND source_provider_id = $3
+           AND selected_route_logical_id = $4
+           AND (
+               selected_provider_id = $5
+               OR ($9 = 1 AND selected_provider_id IS NULL)
+           )
+           AND download_id = $6
+           AND state IN ('staging', 'submitted', 'ready', 'downloading', 'materializing')
+           AND (
+               $7 = 1
+               OR EXISTS (
+                   SELECT 1 FROM acquisition_release_jobs j
+                   WHERE j.release_id = acquisition_releases.release_id
+                     AND j.download_id = $6
+                     AND j.route_logical_id = $4
+                     AND (
+                         j.provider_id = $5
+                         OR ($9 = 1 AND j.provider_id IS NULL)
+                     )
+                     AND j.active = 1
+                     AND j.state IN ('staging', 'submitted', 'ready', 'downloading', 'materializing')
+                     AND (
+                         $8 = 0
+                         OR j.remote_release_id = acquisition_releases.remote_release_id
+                     )
+               )
+           )
+           AND (
+               $8 = 0
+               OR (
+                   COALESCE(remote_release_id, '') <> ''
+                   AND EXISTS (
+                       SELECT 1 FROM debrid_download_jobs d
+                       WHERE d.job_id = $6
+                         AND d.release_id = acquisition_releases.release_id
+                         AND d.provider_id = $5
+                         AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = acquisition_releases.remote_release_id
+                         AND d.status NOT IN ('failed', 'cancelled', 'paused', 'review_required')
+                         AND d.status <> 'completed'
+                         AND (
+                             d.status <> 'anime_retry_pending'
+                             OR acquisition_releases.state IN ('staging', 'submitted')
+                         )
+                   )
+               )
+           )",
+    )
+    .bind(release_id.to_string())
+    .bind(subscription.subscription_id.to_string())
+    .bind(submission.provider_id.to_string())
+    .bind(route_logical_id)
+    .bind(route_provider_id.to_string())
+    .bind(&download_id)
+    .bind(if inserted_for_attempt { 1_i64 } else { 0_i64 })
+    .bind(if is_debrid { 1_i64 } else { 0_i64 })
+    .bind(if binds_unassigned_http_provider {
+        1_i64
+    } else {
+        0_i64
+    })
+    .execute(&mut *transaction)
+    .await
+    .context("claiming exact anime post-submit bookkeeping attempt")?;
+    if ownership.rows_affected() != 1 {
+        transaction.rollback().await?;
+        bail!(
+            "anime submission bookkeeping lost ownership of download '{}' on route '{}'",
+            download_id,
+            route_logical_id
+        );
+    }
+    let (release_state, remote_release_id) = sqlx::query_as::<sqlx::Any, (String, Option<String>)>(
+        "SELECT state, remote_release_id
+             FROM acquisition_releases WHERE release_id = $1",
+    )
+    .bind(release_id.to_string())
+    .fetch_one(&mut *transaction)
+    .await
+    .context("loading locked anime submission ownership state")?;
+    let attachment_only = !matches!(release_state.as_str(), "staging" | "submitted");
+    let remote_release_identity = remote_release_id.as_deref().unwrap_or_default();
+
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET subscription_id = $1, source_provider_id = $2, source_extension_id = $3,
+             owner_id = $4, media_type = $5, title = $6, release_title = $7,
+             source = $8, source_kind = $9, info_hash = $10, fingerprint = $11,
+             release_kind = $12, resolver_kind = $13, resolver_version = $14,
+             confidence = $15, score = $16,
+             selected_provider_id = CASE
+                 WHEN $26 = 1 AND selected_provider_id IS NULL THEN $23
+                 ELSE selected_provider_id
+             END,
+             state = CASE WHEN $25 = 1 THEN state ELSE 'submitted' END,
+             state_reason = CASE WHEN $25 = 1 THEN state_reason ELSE $17 END,
+             selected_candidate_json = CASE
+                 WHEN $25 = 1 THEN selected_candidate_json ELSE $18
+             END,
+             coverage_plan_json = CASE
+                 WHEN $25 = 1 THEN coverage_plan_json ELSE $19
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $20
+           AND download_id = $21
+           AND selected_route_logical_id = $22
+           AND (
+               selected_provider_id = $23
+               OR ($26 = 1 AND selected_provider_id IS NULL)
+           )
+           AND COALESCE(remote_release_id, '') = $24
+           AND (
+               ($25 = 0 AND state IN ('staging', 'submitted'))
+               OR ($25 = 1 AND state IN ('ready', 'downloading', 'materializing'))
+           )",
+    )
+    .bind(subscription.subscription_id.to_string())
+    .bind(submission.provider_id.to_string())
+    .bind(&submission.source_extension_id)
+    .bind(DEFAULT_ROUTE_OWNER_ID)
+    .bind(target.media_type.as_str())
+    .bind(&subscription.title)
+    .bind(&submission.candidate.title)
+    .bind(&submission.candidate.source)
+    .bind(&submission.candidate.source_kind)
+    .bind(submission.candidate.info_hash.as_deref())
+    .bind(&fingerprint)
+    .bind(plan.release_kind.as_str())
+    .bind(ReleaseResolverKind::AnimeShokoStyle.as_str())
+    .bind(&plan.resolver_version)
+    .bind(plan.confidence.as_str())
+    .bind(submission.candidate.score)
+    .bind(format!(
+        "{reason} pack-aware coverage entries: {}",
+        plan.entries.len()
+    ))
+    .bind(serde_json::to_string(&selected_candidate)?)
+    .bind(serde_json::to_string(&pending_coverage_plan)?)
+    .bind(release_id.to_string())
+    .bind(&download_id)
+    .bind(route_logical_id)
+    .bind(route_provider_id.to_string())
+    .bind(remote_release_identity)
+    .bind(if attachment_only { 1_i64 } else { 0_i64 })
+    .bind(if binds_unassigned_http_provider {
+        1_i64
+    } else {
+        0_i64
+    })
+    .execute(&mut *transaction)
     .await?;
+    if release_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        bail!("anime submission bookkeeping release ownership changed during commit");
+    }
+
+    let source_candidate_id = submission.candidate.id.as_deref();
+    let existing_parse_id = if let Some(source_candidate_id) = source_candidate_id {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT candidate_parse_id FROM acquisition_anime_candidate_parses
+             WHERE release_id = $1 AND source_candidate_id = $2 LIMIT 1",
+        )
+        .bind(release_id.to_string())
+        .bind(source_candidate_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+    } else {
+        sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT candidate_parse_id FROM acquisition_anime_candidate_parses
+             WHERE release_id = $1 AND source_candidate_id IS NULL AND release_title = $2 LIMIT 1",
+        )
+        .bind(release_id.to_string())
+        .bind(&submission.candidate.title)
+        .fetch_optional(&mut *transaction)
+        .await?
+    };
+    let candidate_parse_id = existing_parse_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    if existing_parse_id.is_some() {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_anime_candidate_parses
+             SET source_provider_id = $1, source_candidate_id = $2, release_title = $3,
+                 normalized_title = $4, parsed_json = $5, confidence = $6,
+                 review_reasons_json = $7, updated_at = CURRENT_TIMESTAMP
+             WHERE candidate_parse_id = $8 AND release_id = $9",
+        )
+        .bind(submission.provider_id.to_string())
+        .bind(source_candidate_id)
+        .bind(&submission.candidate.title)
+        .bind(&parsed.normalized_title)
+        .bind(serde_json::to_string(&parsed_json)?)
+        .bind(plan.confidence.as_str())
+        .bind(serde_json::to_string(&json!(plan.review_reasons))?)
+        .bind(candidate_parse_id.to_string())
+        .bind(release_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_anime_candidate_parses (
+                candidate_parse_id, release_id, source_provider_id, source_candidate_id,
+                release_title, normalized_title, parsed_json, confidence, review_reasons_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(candidate_parse_id.to_string())
+        .bind(release_id.to_string())
+        .bind(submission.provider_id.to_string())
+        .bind(source_candidate_id)
+        .bind(&submission.candidate.title)
+        .bind(&parsed.normalized_title)
+        .bind(serde_json::to_string(&parsed_json)?)
+        .bind(plan.confidence.as_str())
+        .bind(serde_json::to_string(&json!(plan.review_reasons))?)
+        .execute(&mut *transaction)
+        .await?;
+    }
 
     let mut file_ids_by_key = HashMap::new();
     for file in anime_release_file_inputs(&submission.candidate) {
-        let parsed =
+        let parsed_file =
             crate::acquisition::release_resolution::anime::parse_anime_release_title(&file.path);
-        let release_file = upsert_release_file(
-            &state.db_pool,
-            NewAcquisitionReleaseFile {
-                release_file_id: None,
-                release_id: release.release_id,
-                file_index: file.file_index,
-                file_id: file.file_id.clone(),
-                provider_file_id: file.file_id.clone(),
-                path: file.path.clone(),
-                basename: None,
-                size_bytes: file.size_bytes,
-                selectable: file.selectable,
-                selected: None,
-                parsed_title: parsed.series_title.clone(),
-                parsed_season_number: parsed.season_number,
-                parsed_episode_number: parsed.episode_start_number,
-                parsed_episode_end_number: parsed.episode_end_number,
-                parsed_absolute_episode_number: parsed.absolute_episode_numbers.first().copied(),
-                parsed_absolute_episode_end_number: parsed.absolute_episode_numbers.last().copied(),
-                parsed_air_date: None,
-                parsed_quality: parsed.quality.resolution.clone(),
-                parsed_language: parsed
-                    .subtitle_languages
-                    .first()
-                    .cloned()
-                    .or_else(|| parsed.audio_languages.first().cloned()),
-                parsed_release_group: parsed.release_group.clone(),
-                parser_confidence: parsed.confidence,
-                parser_reason: (!parsed.review_reasons.is_empty())
-                    .then(|| parsed.review_reasons.join(",")),
-                raw: Some(json!({
-                    "fileKey": file.file_key.clone(),
-                    "parsed": parsed,
-                })),
-                provider_metadata: Some(json!({
-                    "fileKey": file.file_key.clone(),
-                    "fileId": file.file_id.clone(),
-                    "selectable": file.selectable,
-                })),
-            },
-        )
-        .await?;
-        file_ids_by_key.insert(file.file_key, release_file.release_file_id);
+        let existing_file_id = if let Some(provider_file_id) = file.file_id.as_deref() {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT release_file_id FROM acquisition_release_files
+                 WHERE release_id = $1 AND provider_file_id = $2 LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(provider_file_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else if let Some(file_index) = file.file_index {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT release_file_id FROM acquisition_release_files
+                 WHERE release_id = $1 AND file_index = $2 LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(file_index)
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT release_file_id FROM acquisition_release_files
+                 WHERE release_id = $1 AND path = $2 LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(file.path.trim())
+            .fetch_optional(&mut *transaction)
+            .await?
+        };
+        let release_file_id = existing_file_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        let basename = Path::new(&file.path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(file.path.as_str())
+            .to_string();
+        let parsed_language = parsed_file
+            .subtitle_languages
+            .first()
+            .cloned()
+            .or_else(|| parsed_file.audio_languages.first().cloned());
+        let parser_reason =
+            (!parsed_file.review_reasons.is_empty()).then(|| parsed_file.review_reasons.join(","));
+        let raw_json = serde_json::to_string(&json!({
+            "fileKey": file.file_key.clone(),
+            "parsed": parsed_file.clone(),
+        }))?;
+        let provider_metadata_json = serde_json::to_string(&json!({
+            "fileKey": file.file_key.clone(),
+            "fileId": file.file_id.clone(),
+            "selectable": file.selectable,
+        }))?;
+        if existing_file_id.is_some() {
+            if !attachment_only {
+                sqlx::query::<sqlx::Any>(
+                    "UPDATE acquisition_release_files
+                     SET file_index = $1, file_id = $2, provider_file_id = $3, path = $4,
+                         basename = $5, size_bytes = $6, selectable = $7, selected = NULL,
+                         parsed_title = $8, parsed_season_number = $9,
+                         parsed_episode_number = $10, parsed_episode_end_number = $11,
+                         parsed_absolute_episode_number = $12,
+                         parsed_absolute_episode_end_number = $13, parsed_air_date = NULL,
+                         parsed_quality = $14, parsed_language = $15, parsed_release_group = $16,
+                         parser_confidence = $17, parser_reason = $18, raw_json = $19,
+                         provider_metadata_json = $20, updated_at = CURRENT_TIMESTAMP
+                     WHERE release_file_id = $21 AND release_id = $22",
+                )
+                .bind(file.file_index)
+                .bind(file.file_id.as_deref())
+                .bind(file.file_id.as_deref())
+                .bind(file.path.trim())
+                .bind(&basename)
+                .bind(file.size_bytes)
+                .bind(if file.selectable { 1_i64 } else { 0_i64 })
+                .bind(parsed_file.series_title.as_deref())
+                .bind(parsed_file.season_number)
+                .bind(parsed_file.episode_start_number)
+                .bind(parsed_file.episode_end_number)
+                .bind(parsed_file.absolute_episode_numbers.first().copied())
+                .bind(parsed_file.absolute_episode_numbers.last().copied())
+                .bind(parsed_file.quality.resolution.as_deref())
+                .bind(parsed_language.as_deref())
+                .bind(parsed_file.release_group.as_deref())
+                .bind(parsed_file.confidence.as_str())
+                .bind(parser_reason.as_deref())
+                .bind(&raw_json)
+                .bind(&provider_metadata_json)
+                .bind(release_file_id.to_string())
+                .bind(release_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
+        } else {
+            sqlx::query::<sqlx::Any>(
+                "INSERT INTO acquisition_release_files (
+                    release_file_id, release_id, file_index, file_id, provider_file_id,
+                    path, basename, size_bytes, selectable, selected, parsed_title,
+                    parsed_season_number, parsed_episode_number, parsed_episode_end_number,
+                    parsed_absolute_episode_number, parsed_absolute_episode_end_number,
+                    parsed_air_date, parsed_quality, parsed_language, parsed_release_group,
+                    parser_confidence, parser_reason, raw_json, provider_metadata_json
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11, $12,
+                           $13, $14, $15, NULL, $16, $17, $18, $19, $20, $21, $22)",
+            )
+            .bind(release_file_id.to_string())
+            .bind(release_id.to_string())
+            .bind(file.file_index)
+            .bind(file.file_id.as_deref())
+            .bind(file.file_id.as_deref())
+            .bind(file.path.trim())
+            .bind(&basename)
+            .bind(file.size_bytes)
+            .bind(if file.selectable { 1_i64 } else { 0_i64 })
+            .bind(parsed_file.series_title.as_deref())
+            .bind(parsed_file.season_number)
+            .bind(parsed_file.episode_start_number)
+            .bind(parsed_file.episode_end_number)
+            .bind(parsed_file.absolute_episode_numbers.first().copied())
+            .bind(parsed_file.absolute_episode_numbers.last().copied())
+            .bind(parsed_file.quality.resolution.as_deref())
+            .bind(parsed_language.as_deref())
+            .bind(parsed_file.release_group.as_deref())
+            .bind(parsed_file.confidence.as_str())
+            .bind(parser_reason.as_deref())
+            .bind(&raw_json)
+            .bind(&provider_metadata_json)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        file_ids_by_key.insert(file.file_key, release_file_id);
     }
 
-    let targets_by_key = targets
-        .into_iter()
-        .map(|target| (target.target_key.clone(), target))
-        .collect::<HashMap<_, _>>();
     let mut submitted_target_ids = BTreeSet::new();
     for entry in &plan.entries {
         let Some(covered_target) = targets_by_key.get(&entry.target_key) else {
@@ -5464,78 +6489,275 @@ async fn persist_anime_release_submission(
         let release_file_id = entry
             .release_file_key
             .as_ref()
-            .and_then(|key| file_ids_by_key.get(key))
-            .copied();
-        upsert_release_coverage(
-            &state.db_pool,
-            NewAcquisitionReleaseCoverage {
-                coverage_id: None,
-                release_id: release.release_id,
-                release_file_id,
-                target_id: covered_target.target_id,
-                coverage_kind: entry.coverage_kind,
-                confidence: entry.confidence,
-                score: entry.score,
-                reason: Some(entry.reason.clone()),
-                state: ReleaseCoverageState::Submitted,
-                verified_by: Some("rr3f_file_list".to_string()),
-            },
-        )
-        .await?;
+            .map(|key| {
+                file_ids_by_key.get(key).copied().with_context(|| {
+                    format!("anime coverage references unavailable release file '{key}'")
+                })
+            })
+            .transpose()?;
+        let existing_coverage_id = if attachment_only {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT coverage_id FROM acquisition_release_coverage
+                 WHERE release_id = $1 AND target_id = $2 LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(covered_target.target_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else if let Some(release_file_id) = release_file_id {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT coverage_id FROM acquisition_release_coverage
+                 WHERE release_id = $1 AND target_id = $2 AND release_file_id = $3 LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(covered_target.target_id.to_string())
+            .bind(release_file_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else {
+            sqlx::query_scalar::<sqlx::Any, String>(
+                "SELECT coverage_id FROM acquisition_release_coverage
+                 WHERE release_id = $1 AND target_id = $2 AND release_file_id IS NULL LIMIT 1",
+            )
+            .bind(release_id.to_string())
+            .bind(covered_target.target_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+        };
+        let coverage_id = existing_coverage_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        if existing_coverage_id.is_some() {
+            if !attachment_only {
+                sqlx::query::<sqlx::Any>(
+                    "UPDATE acquisition_release_coverage
+                     SET release_file_id = $1, coverage_kind = $2, confidence = $3,
+                         score = $4, reason = $5, state = 'submitted',
+                         verified_by = 'rr3f_file_list', updated_at = CURRENT_TIMESTAMP
+                     WHERE coverage_id = $6 AND release_id = $7 AND target_id = $8",
+                )
+                .bind(release_file_id.map(|value| value.to_string()))
+                .bind(entry.coverage_kind.as_str())
+                .bind(entry.confidence.as_str())
+                .bind(entry.score)
+                .bind(&entry.reason)
+                .bind(coverage_id.to_string())
+                .bind(release_id.to_string())
+                .bind(covered_target.target_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
+        } else {
+            sqlx::query::<sqlx::Any>(
+                "INSERT INTO acquisition_release_coverage (
+                    coverage_id, release_id, release_file_id, target_id, coverage_kind,
+                    confidence, score, reason, state, verified_by
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'submitted', 'rr3f_file_list')",
+            )
+            .bind(coverage_id.to_string())
+            .bind(release_id.to_string())
+            .bind(release_file_id.map(|value| value.to_string()))
+            .bind(covered_target.target_id.to_string())
+            .bind(entry.coverage_kind.as_str())
+            .bind(entry.confidence.as_str())
+            .bind(entry.score)
+            .bind(&entry.reason)
+            .execute(&mut *transaction)
+            .await?;
+        }
         submitted_target_ids.insert(covered_target.target_id);
-        update_target_state(
-            &state.db_pool,
-            covered_target.target_id,
-            AcquisitionTargetStateUpdate {
-                state: AcquisitionTargetState::Submitted,
-                state_reason: Some(format!("{reason} {route_logical_id}")),
-                selected_provider_id: Some(submission.provider_id),
-                selected_route_logical_id: Some(route_logical_id.to_string()),
-                selected_candidate: Some(selected_candidate.clone()),
-                download_id: download_id.clone(),
-                next_search_after: None,
-                increment_search_attempts: covered_target.target_id == target.target_id,
-                ..Default::default()
-            },
-        )
-        .await?;
     }
-
     if submitted_target_ids.is_empty() {
-        mark_target_submitted(
-            state,
-            target,
-            submission,
-            route_logical_id,
-            download_id.clone(),
-            route_provider_id,
-            route_provider_implementation,
-            reason,
-            route_attempts,
+        submitted_target_ids.insert(target.target_id);
+    }
+    let selected_candidate_json = serde_json::to_string(&selected_candidate)?;
+    for target_id in &submitted_target_ids {
+        let increment_search_attempts = *target_id == target.target_id;
+        let target_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_targets
+             SET state = 'submitted', state_reason = $1, selected_provider_id = $2,
+                 selected_route_logical_id = $3, selected_candidate_json = $4,
+                 download_id = $5,
+                 search_attempts = search_attempts + $6,
+                 last_search_at = CASE WHEN $6 = 1 THEN CURRENT_TIMESTAMP ELSE last_search_at END,
+                 next_search_after = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE target_id = $7
+               AND subscription_id = $8
+               AND state NOT IN ('imported', 'excluded')
+               AND (
+                   (
+                       download_id IS NULL
+                       AND (
+                           selected_route_logical_id IS NULL
+                           OR (
+                               selected_route_logical_id = $3
+                               AND selected_provider_id = $2
+                           )
+                       )
+                   )
+                   OR (
+                       download_id = $5
+                       AND selected_route_logical_id = $3
+                       AND selected_provider_id = $2
+                   )
+               )
+               AND EXISTS (
+                   SELECT 1 FROM acquisition_releases r
+                   WHERE r.release_id = $9
+                     AND r.download_id = $5
+                     AND r.selected_route_logical_id = $3
+                     AND r.selected_provider_id = $10
+                     AND COALESCE(r.remote_release_id, '') = $11
+                     AND r.state NOT IN ('failed', 'cancelled')
+               )",
         )
+        .bind(format!("{reason} {route_logical_id}"))
+        .bind(submission.provider_id.to_string())
+        .bind(route_logical_id)
+        .bind(&selected_candidate_json)
+        .bind(&download_id)
+        .bind(if increment_search_attempts {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(target_id.to_string())
+        .bind(subscription.subscription_id.to_string())
+        .bind(release_id.to_string())
+        .bind(route_provider_id.to_string())
+        .bind(remote_release_identity)
+        .execute(&mut *transaction)
         .await?;
+        if target_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            bail!(
+                "anime submission bookkeeping lost target '{}' to a replacement attempt",
+                target_id
+            );
+        }
     }
 
-    upsert_release_job(
-        &state.db_pool,
-        NewAcquisitionReleaseJob {
-            release_job_id: None,
-            release_id: release.release_id,
-            route_logical_id: route_logical_id.to_string(),
-            provider_id: Some(route_provider_id),
-            download_id,
-            remote_release_id: None,
-            state: ReleaseJobState::Submitted,
-            state_reason: Some(reason.to_string()),
-            active: true,
-            started_at: Some(Utc::now()),
-            completed_at: None,
-        },
+    let existing_release_job_id = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT release_job_id FROM acquisition_release_jobs
+         WHERE release_id = $1 AND download_id = $2 LIMIT 1",
     )
+    .bind(release_id.to_string())
+    .bind(&download_id)
+    .fetch_optional(&mut *transaction)
     .await?;
-    let coverages = list_release_coverage(&state.db_pool, release.release_id).await?;
+    if let Some(release_job_id) = existing_release_job_id.as_deref() {
+        let release_job_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = CASE
+                     WHEN $9 = 0 AND state IN ('staging', 'submitted') THEN 'submitted'
+                     ELSE state
+                 END,
+                 state_reason = CASE
+                     WHEN $9 = 0 AND state IN ('staging', 'submitted') THEN $1
+                     ELSE state_reason
+                 END,
+                 provider_id = CASE
+                     WHEN $10 = 1 AND provider_id IS NULL THEN $6 ELSE provider_id
+                 END,
+                 started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                 completed_at = CASE
+                     WHEN $9 = 0 AND state IN ('staging', 'submitted') THEN NULL
+                     ELSE completed_at
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_job_id = $2 AND release_id = $3 AND download_id = $4
+               AND route_logical_id = $5
+               AND (provider_id = $6 OR ($10 = 1 AND provider_id IS NULL))
+               AND active = 1
+               AND state IN ('staging', 'submitted', 'ready', 'downloading', 'materializing')
+               AND ($7 = 0 OR remote_release_id = $8)",
+        )
+        .bind(reason)
+        .bind(release_job_id)
+        .bind(release_id.to_string())
+        .bind(&download_id)
+        .bind(route_logical_id)
+        .bind(route_provider_id.to_string())
+        .bind(if is_debrid { 1_i64 } else { 0_i64 })
+        .bind(remote_release_identity)
+        .bind(if attachment_only { 1_i64 } else { 0_i64 })
+        .bind(if binds_unassigned_http_provider {
+            1_i64
+        } else {
+            0_i64
+        })
+        .execute(&mut *transaction)
+        .await?;
+        if release_job_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            bail!("anime submission bookkeeping release job ownership changed during commit");
+        }
+    } else if inserted_for_attempt && !is_debrid {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_release_jobs (
+                release_job_id, release_id, route_logical_id, provider_id, download_id,
+                remote_release_id, state, state_reason, active, started_at, completed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'submitted', $7, 1, CURRENT_TIMESTAMP, NULL)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(release_id.to_string())
+        .bind(route_logical_id)
+        .bind(route_provider_id.to_string())
+        .bind(&download_id)
+        .bind(remote_release_id.as_deref())
+        .bind(reason)
+        .execute(&mut *transaction)
+        .await?;
+    } else {
+        transaction.rollback().await?;
+        bail!("anime submission bookkeeping exact release job disappeared during commit");
+    }
+
+    let completion = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET coverage_plan_json = CASE
+                 WHEN $8 = 1 THEN coverage_plan_json ELSE $1
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2 AND download_id = $3
+           AND selected_route_logical_id = $4 AND selected_provider_id = $5
+           AND COALESCE(remote_release_id, '') = $6
+           AND state IN ('staging', 'submitted', 'ready', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1 FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $3 AND j.route_logical_id = $4
+                 AND j.provider_id = $5
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'submitted', 'ready', 'downloading', 'materializing')
+                 AND ($7 = 0 OR j.remote_release_id = acquisition_releases.remote_release_id)
+           )",
+    )
+    .bind(serde_json::to_string(&completed_coverage_plan)?)
+    .bind(release_id.to_string())
+    .bind(&download_id)
+    .bind(route_logical_id)
+    .bind(route_provider_id.to_string())
+    .bind(remote_release_identity)
+    .bind(if is_debrid { 1_i64 } else { 0_i64 })
+    .bind(if attachment_only { 1_i64 } else { 0_i64 })
+    .execute(&mut *transaction)
+    .await?;
+    if completion.rows_affected() != 1 {
+        transaction.rollback().await?;
+        bail!("anime submission bookkeeping lost ownership before marker completion");
+    }
+    transaction.commit().await?;
+
+    for target_id in &submitted_target_ids {
+        if let Some(target) = get_target(&state.db_pool, *target_id).await? {
+            sync_library_episode_acquisition_state_for_target(&state.db_pool, &target).await?;
+        }
+    }
+    let coverages = list_release_coverage(&state.db_pool, release_id).await?;
     debug!(
-        release_id = %release.release_id,
+        release_id = %release_id,
         coverage = coverages.len(),
         "persisted RR-3F anime release coverage"
     );
@@ -5609,12 +6831,15 @@ async fn persist_tv_release_submission(
                 plan.entries.len()
             )),
             selected_candidate: Some(selected_candidate.clone()),
-            coverage_plan: Some(coverage_plan_with_request_scope(
-                coverage_plan_with_route_attempt_ledger(
-                    serde_json::to_value(plan)?,
-                    &selected_candidate,
+            coverage_plan: Some(coverage_plan_with_submission_bookkeeping(
+                coverage_plan_with_request_scope(
+                    coverage_plan_with_route_attempt_ledger(
+                        serde_json::to_value(plan)?,
+                        &selected_candidate,
+                    ),
+                    submission.request_scope_evidence.as_ref(),
                 ),
-                submission.request_scope_evidence.as_ref(),
+                "pending",
             )),
         },
     )
@@ -5745,6 +6970,12 @@ async fn persist_tv_release_submission(
         },
     )
     .await?;
+    mark_release_submission_bookkeeping_complete(
+        &state.db_pool,
+        release.release_id,
+        release.coverage_plan.clone(),
+    )
+    .await?;
     debug!(
         release_id = %release.release_id,
         coverage = plan.entries.len(),
@@ -5817,12 +7048,15 @@ async fn persist_movie_release_submission(
             state: AcquisitionReleaseState::Submitted,
             state_reason: Some(format!("{reason} Movie Radarr-style match.")),
             selected_candidate: Some(selected_candidate.clone()),
-            coverage_plan: Some(coverage_plan_with_request_scope(
-                coverage_plan_with_route_attempt_ledger(
-                    serde_json::to_value(plan)?,
-                    &selected_candidate,
+            coverage_plan: Some(coverage_plan_with_submission_bookkeeping(
+                coverage_plan_with_request_scope(
+                    coverage_plan_with_route_attempt_ledger(
+                        serde_json::to_value(plan)?,
+                        &selected_candidate,
+                    ),
+                    submission.request_scope_evidence.as_ref(),
                 ),
-                submission.request_scope_evidence.as_ref(),
+                "pending",
             )),
         },
     )
@@ -5930,6 +7164,12 @@ async fn persist_movie_release_submission(
             started_at: Some(Utc::now()),
             completed_at: None,
         },
+    )
+    .await?;
+    mark_release_submission_bookkeeping_complete(
+        &state.db_pool,
+        release.release_id,
+        release.coverage_plan.clone(),
     )
     .await?;
     debug!(
@@ -6694,6 +7934,7 @@ async fn resolve_tvdb_series_id(state: &AppState, ids: &ExternalIds) -> Result<O
 fn candidate_search_request_for_group(
     subscription: &AcquisitionSubscription,
     target: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
     search_intent: Option<CandidateSearchIntent>,
 ) -> CandidateSearchRequest {
     let external_ids = merged_target_external_ids(subscription.external_ids.clone(), target);
@@ -6702,9 +7943,16 @@ fn candidate_search_request_for_group(
             .selected_provider_id
             .or(subscription.source_provider_id),
         media_type: media_type_name(target.media_type).to_string(),
-        title: target.title.clone(),
+        title: subscription.title.clone(),
         year: subscription.year,
         external_ids: Some(external_ids),
+        titles: title_variants_for_group(
+            subscription,
+            target,
+            targets,
+            &subscription.title,
+            TitleVariantMode::ReleaseText,
+        ),
         target: Some(CandidateSearchTarget {
             target_key: Some(target.target_key.clone()),
             title: Some(target.title.clone()),
@@ -6798,7 +8046,13 @@ fn stream_candidate_search_request_for_group(
         title: request.title.clone(),
         year: request.year,
         external_ids: request.external_ids.clone(),
-        titles: stream_title_variants_for_group(subscription, representative, targets, request),
+        titles: title_variants_for_group(
+            subscription,
+            representative,
+            targets,
+            &request.title,
+            TitleVariantMode::Stream,
+        ),
         targets: stream_targets,
         preferences: stream_preferences_from_candidate_preferences(&request.preferences),
         limit: request.limit,
@@ -6835,116 +8089,450 @@ fn stream_preferences_from_candidate_preferences(
     }
 }
 
-fn stream_title_variants_for_group(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleVariantMode {
+    ReleaseText,
+    Stream,
+}
+
+#[derive(Debug, Clone)]
+struct RequestedTitleScope {
+    season_number: Option<i32>,
+    anilist_season_id: Option<String>,
+    season_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopedAliasClass {
+    English,
+    Romaji,
+    Native,
+    Other,
+    GeneratedOrdinal,
+    GeneratedShort,
+}
+
+fn title_variants_for_group(
     subscription: &AcquisitionSubscription,
     representative: &AcquisitionTarget,
     targets: &[AcquisitionTarget],
-    request: &CandidateSearchRequest,
-) -> Vec<StreamTitleVariant> {
+    canonical_title: &str,
+    mode: TitleVariantMode,
+) -> Vec<TitleVariant> {
+    let limit = match mode {
+        TitleVariantMode::ReleaseText => SEARCH_TITLE_VARIANT_LIMIT,
+        TitleVariantMode::Stream => STREAM_SEARCH_TITLE_VARIANT_LIMIT,
+    };
     let mut variants = Vec::new();
     let mut seen = BTreeSet::new();
-    push_stream_title_variant(&mut variants, &mut seen, &request.title, "request");
-    push_stream_title_variant(&mut variants, &mut seen, &subscription.title, "canonical");
+    push_title_variant(
+        &mut variants,
+        &mut seen,
+        canonical_title,
+        "canonical",
+        limit,
+    );
     if let Some(scope) = subscription.scope.as_ref() {
         if let Some(title) = scope
             .get("media")
             .and_then(|value| value.get("title"))
             .and_then(JsonValue::as_str)
         {
-            push_stream_title_variant(&mut variants, &mut seen, title, "scope");
+            push_title_variant(&mut variants, &mut seen, title, "scope", limit);
         }
-        push_stream_title_aliases(
-            &mut variants,
-            &mut seen,
-            scope.get("media").and_then(|value| value.get("aliases")),
-            "alias",
-        );
     }
-    let targets = if targets.is_empty() {
+
+    let grouped_targets = if targets.is_empty() {
         vec![representative]
     } else {
         targets.iter().collect()
     };
-    for target in targets {
-        push_stream_title_variant(&mut variants, &mut seen, &target.title, "target");
-        push_stream_title_aliases(
+
+    if mode == TitleVariantMode::Stream {
+        push_title_variant(
             &mut variants,
             &mut seen,
+            &representative.title,
+            "target",
+            limit,
+        );
+    }
+
+    let scopes = requested_title_scopes(&grouped_targets);
+    for scope in &scopes {
+        if let Some(title) = scope.season_title.as_deref() {
+            push_title_variant(&mut variants, &mut seen, title, "season", limit);
+        }
+    }
+
+    let mut scoped_aliases = BTreeMap::new();
+    for target in &grouped_targets {
+        insert_candidate_scoped_aliases_from_json_array(
+            &mut scoped_aliases,
+            target
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("scopedAliases"))
+                .or_else(|| {
+                    target
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value.get("scoped_aliases"))
+                }),
+        );
+    }
+    let scoped_aliases = scoped_aliases.into_values().collect::<Vec<_>>();
+    if subscription.media_type == MediaType::Anime && scoped_aliases.is_empty() {
+        for scope in &scopes {
+            if let Some(season) = scope.season_number.filter(|season| *season > 1) {
+                push_title_variant(
+                    &mut variants,
+                    &mut seen,
+                    &format!("{} Season {season}", canonical_title.trim()),
+                    "generated",
+                    limit,
+                );
+            }
+        }
+        for scope in &scopes {
+            if let Some(season) = scope.season_number.filter(|season| *season > 1) {
+                push_title_variant(
+                    &mut variants,
+                    &mut seen,
+                    &format!("{} S{season:02}", canonical_title.trim()),
+                    "generated",
+                    limit,
+                );
+            }
+        }
+    }
+    let metadata_class_order = [
+        ScopedAliasClass::English,
+        ScopedAliasClass::Romaji,
+        ScopedAliasClass::Native,
+        ScopedAliasClass::Other,
+    ];
+    let has_generated_ordinal = scopes.iter().any(|scope| {
+        scoped_aliases.iter().any(|alias| {
+            scoped_alias_class(alias) == ScopedAliasClass::GeneratedOrdinal
+                && scoped_alias_matches_scope(alias, scope)
+        })
+    });
+    let metadata_limit = if mode == TitleVariantMode::ReleaseText && has_generated_ordinal {
+        limit.saturating_sub(1)
+    } else {
+        limit
+    };
+    for class in metadata_class_order {
+        push_scoped_alias_class(
+            &mut variants,
+            &mut seen,
+            &scopes,
+            &scoped_aliases,
+            class,
+            metadata_limit,
+            if mode == TitleVariantMode::ReleaseText {
+                1
+            } else {
+                usize::MAX
+            },
+        );
+    }
+    push_scoped_alias_class(
+        &mut variants,
+        &mut seen,
+        &scopes,
+        &scoped_aliases,
+        ScopedAliasClass::GeneratedOrdinal,
+        limit,
+        if mode == TitleVariantMode::ReleaseText {
+            1
+        } else {
+            usize::MAX
+        },
+    );
+    if mode == TitleVariantMode::ReleaseText && variants.len() < limit {
+        for class in metadata_class_order {
+            push_scoped_alias_class(
+                &mut variants,
+                &mut seen,
+                &scopes,
+                &scoped_aliases,
+                class,
+                limit,
+                usize::MAX,
+            );
+        }
+    }
+    push_scoped_alias_class(
+        &mut variants,
+        &mut seen,
+        &scopes,
+        &scoped_aliases,
+        ScopedAliasClass::GeneratedShort,
+        limit,
+        usize::MAX,
+    );
+
+    let all_scoped_title_keys = scoped_aliases
+        .iter()
+        .map(|alias| title_variant_key(&alias.display))
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut unscoped_aliases = BTreeSet::new();
+    if let Some(scope) = subscription.scope.as_ref() {
+        insert_candidate_aliases_from_json_array(
+            &mut unscoped_aliases,
+            scope.get("media").and_then(|value| value.get("aliases")),
+        );
+    }
+    for target in &grouped_targets {
+        insert_candidate_aliases_from_json_array(
+            &mut unscoped_aliases,
             target
                 .metadata
                 .as_ref()
                 .and_then(|value| value.get("aliases")),
-            "alias",
-        );
-        push_stream_scoped_title_aliases(
-            &mut variants,
-            &mut seen,
-            target
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("scopedAliases")),
         );
     }
+    let has_episode_like_target = grouped_targets.iter().any(|target| {
+        target.season_number.is_some()
+            || target.episode_number.is_some()
+            || target.absolute_episode_number.is_some()
+    });
+    let unscoped_aliases_are_safe =
+        subscription.media_type != MediaType::Anime || !has_episode_like_target;
+    if unscoped_aliases_are_safe {
+        for alias in unscoped_aliases {
+            if !all_scoped_title_keys.contains(&title_variant_key(&alias)) {
+                push_title_variant(&mut variants, &mut seen, &alias, "alias", limit);
+            }
+        }
+    }
+
+    if mode == TitleVariantMode::Stream {
+        for target in grouped_targets {
+            push_title_variant(&mut variants, &mut seen, &target.title, "target", limit);
+        }
+    }
+
     variants
 }
 
-fn push_stream_title_variant(
-    variants: &mut Vec<StreamTitleVariant>,
+fn requested_title_scopes(targets: &[&AcquisitionTarget]) -> Vec<RequestedTitleScope> {
+    let mut scopes = Vec::<RequestedTitleScope>::new();
+    let mut indexes = BTreeMap::<String, usize>::new();
+    for target in targets {
+        let metadata = target.metadata.as_ref();
+        let season_number = target.season_number.filter(|value| *value > 0).or_else(|| {
+            metadata
+                .and_then(|value| value.get("anilistSeason"))
+                .or_else(|| metadata.and_then(|value| value.get("anilist_season")))
+                .and_then(|value| {
+                    value
+                        .get("seasonNumber")
+                        .or_else(|| value.get("season_number"))
+                })
+                .and_then(JsonValue::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .filter(|value| *value > 0)
+        });
+        let anilist_season_id =
+            metadata_string(metadata, &["anilistSeasonId", "anilist_season_id"]).or_else(|| {
+                metadata
+                    .and_then(|value| value.get("anilistSeason"))
+                    .or_else(|| metadata.and_then(|value| value.get("anilist_season")))
+                    .and_then(|value| value.get("anilistId").or_else(|| value.get("anilist_id")))
+                    .and_then(json_scalar_string)
+            });
+        let season_title = metadata
+            .and_then(|value| value.get("anilistSeason"))
+            .or_else(|| metadata.and_then(|value| value.get("anilist_season")))
+            .and_then(|value| value.get("title"))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if season_number.is_none() && anilist_season_id.is_none() && season_title.is_none() {
+            continue;
+        }
+        let key = format!(
+            "{}:{}",
+            season_number
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            anilist_season_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase(),
+        );
+        if let Some(index) = indexes.get(&key).copied() {
+            if scopes[index].season_title.is_none() {
+                scopes[index].season_title = season_title;
+            }
+        } else {
+            indexes.insert(key, scopes.len());
+            scopes.push(RequestedTitleScope {
+                season_number,
+                anilist_season_id,
+                season_title,
+            });
+        }
+    }
+    scopes
+}
+
+fn json_scalar_string(value: &JsonValue) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn push_scoped_alias_class(
+    variants: &mut Vec<TitleVariant>,
+    seen: &mut BTreeSet<String>,
+    scopes: &[RequestedTitleScope],
+    aliases: &[AnimeScopedAlias],
+    class: ScopedAliasClass,
+    limit: usize,
+    per_scope_limit: usize,
+) {
+    if variants.len() >= limit {
+        return;
+    }
+    let per_scope = scopes
+        .iter()
+        .map(|scope| {
+            aliases
+                .iter()
+                .filter(|alias| {
+                    scoped_alias_class(alias) == class && scoped_alias_matches_scope(alias, scope)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let max_aliases = per_scope
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or_default()
+        .min(per_scope_limit);
+    for alias_index in 0..max_aliases {
+        for aliases in &per_scope {
+            if let Some(alias) = aliases.get(alias_index) {
+                push_title_variant(
+                    variants,
+                    seen,
+                    &alias.display,
+                    scoped_alias_variant_kind(class),
+                    limit,
+                );
+                if variants.len() >= limit {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn scoped_alias_matches_scope(alias: &AnimeScopedAlias, scope: &RequestedTitleScope) -> bool {
+    let mut matched_dimension = false;
+    if let (Some(alias_season), Some(scope_season)) = (alias.season_number, scope.season_number) {
+        if alias_season != scope_season {
+            return false;
+        }
+        matched_dimension = true;
+    }
+    if let (Some(alias_id), Some(scope_id)) = (
+        alias.anilist_season_id.as_deref(),
+        scope.anilist_season_id.as_deref(),
+    ) {
+        if !alias_id.trim().eq_ignore_ascii_case(scope_id.trim()) {
+            return false;
+        }
+        matched_dimension = true;
+    }
+    matched_dimension
+}
+
+fn scoped_alias_class(alias: &AnimeScopedAlias) -> ScopedAliasClass {
+    let source = alias.source.trim().to_ascii_lowercase();
+    if source == "generated_season_ordinal" {
+        return ScopedAliasClass::GeneratedOrdinal;
+    }
+    if source.starts_with("generated_season") {
+        return ScopedAliasClass::GeneratedShort;
+    }
+    let language = alias
+        .language
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(language.as_str(), "en" | "eng" | "english") || language.starts_with("en-") {
+        return ScopedAliasClass::English;
+    }
+    if matches!(
+        language.as_str(),
+        "romaji" | "x-jat" | "ja-latn" | "jpn-latn"
+    ) {
+        return ScopedAliasClass::Romaji;
+    }
+    if matches!(language.as_str(), "ja" | "jpn" | "japanese" | "x-jpn")
+        || alias
+            .display
+            .chars()
+            .any(|character| !character.is_ascii() && character.is_alphanumeric())
+    {
+        return ScopedAliasClass::Native;
+    }
+    ScopedAliasClass::Other
+}
+
+fn scoped_alias_variant_kind(class: ScopedAliasClass) -> &'static str {
+    match class {
+        ScopedAliasClass::English => "alias_english",
+        ScopedAliasClass::Romaji => "alias_romaji",
+        ScopedAliasClass::Native => "alias_native",
+        ScopedAliasClass::Other => "scoped_alias",
+        ScopedAliasClass::GeneratedOrdinal | ScopedAliasClass::GeneratedShort => "generated",
+    }
+}
+
+fn push_title_variant(
+    variants: &mut Vec<TitleVariant>,
     seen: &mut BTreeSet<String>,
     value: &str,
     kind: &str,
+    limit: usize,
 ) {
-    let value = value.trim();
-    if value.is_empty() {
+    if variants.len() >= limit {
         return;
     }
-    let kind = if kind.trim().is_empty() {
-        "alias"
-    } else {
-        kind.trim()
-    };
-    let key = format!(
-        "{}\u{1f}{}",
-        value.to_ascii_lowercase(),
-        kind.to_ascii_lowercase()
-    );
-    if seen.insert(key) {
-        variants.push(StreamTitleVariant {
-            value: value.to_string(),
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let key = title_variant_key(&value);
+    if !value.is_empty() && seen.insert(key) {
+        variants.push(TitleVariant {
+            value,
             kind: kind.to_string(),
         });
     }
 }
 
-fn push_stream_title_aliases(
-    variants: &mut Vec<StreamTitleVariant>,
-    seen: &mut BTreeSet<String>,
-    value: Option<&JsonValue>,
-    kind: &str,
-) {
-    let Some(values) = value.and_then(JsonValue::as_array) else {
-        return;
-    };
-    for value in values {
-        if let Some(alias) = value.as_str() {
-            push_stream_title_variant(variants, seen, alias, kind);
-        }
-    }
-}
-
-fn push_stream_scoped_title_aliases(
-    variants: &mut Vec<StreamTitleVariant>,
-    seen: &mut BTreeSet<String>,
-    value: Option<&JsonValue>,
-) {
-    let Some(values) = value.and_then(JsonValue::as_array) else {
-        return;
-    };
-    for value in values {
-        if let Some(display) = value.get("display").and_then(JsonValue::as_str) {
-            push_stream_title_variant(variants, seen, display, "scoped_alias");
-        }
-    }
+fn title_variant_key(value: &str) -> String {
+    value
+        .nfkc()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn target_runtime_seconds(target: &AcquisitionTarget) -> Option<u32> {
@@ -7145,7 +8733,9 @@ fn synthetic_stream_candidate_payload(candidate: &AcquisitionCandidate) -> Optio
         .and_then(|raw| raw.pointer("/serverEvidence/streamCandidate"))
 }
 
-fn synthetic_stream_candidate_requires_manual_review(candidate: &AcquisitionCandidate) -> bool {
+pub(crate) fn synthetic_stream_candidate_requires_manual_review(
+    candidate: &AcquisitionCandidate,
+) -> bool {
     synthetic_stream_candidate_payload(candidate)
         .map(stream_target_confidence_score)
         .is_some_and(|score| score < 3)
@@ -7201,7 +8791,6 @@ fn anime_candidate_scoring_context(
         return None;
     }
 
-    let metadata = target.metadata.as_ref();
     let mut aliases = BTreeSet::new();
     let mut scoped_aliases = BTreeMap::<String, AnimeScopedAlias>::new();
     insert_candidate_alias(&mut aliases, &subscription.title);
@@ -7235,12 +8824,25 @@ fn anime_candidate_scoring_context(
             &mut scoped_aliases,
             item.metadata
                 .as_ref()
-                .and_then(|value| value.get("scopedAliases")),
+                .and_then(|value| value.get("scopedAliases"))
+                .or_else(|| {
+                    item.metadata
+                        .as_ref()
+                        .and_then(|value| value.get("scoped_aliases"))
+                }),
         );
     }
 
+    let graph_fingerprints = targets
+        .iter()
+        .filter_map(|target| metadata_string(target.metadata.as_ref(), &["graphFingerprint"]))
+        .collect::<BTreeSet<_>>();
+    let graph_fingerprint = (graph_fingerprints.len() == 1)
+        .then(|| graph_fingerprints.first().cloned())
+        .flatten();
+
     Some(AnimeCandidateScoringContext {
-        graph_fingerprint: metadata_string(metadata, &["graphFingerprint"]),
+        graph_fingerprint,
         aliases: aliases.into_iter().collect(),
         scoped_aliases: scoped_aliases.into_values().collect(),
         targets: targets
@@ -7849,7 +9451,7 @@ fn candidate_file_selection_supported(candidate: &AcquisitionCandidate) -> bool 
             .any(|file| file.selectable.unwrap_or(true))
 }
 
-fn anime_coverage_options_for_candidate(
+pub(crate) fn anime_coverage_options_for_candidate(
     route_policy: AcquisitionRoutePolicy,
     candidate: &AcquisitionCandidate,
 ) -> AnimeCoverageOptions {
@@ -7987,6 +9589,14 @@ fn selected_candidate_provenance_inner(
         }
         if let Some(plan) = submission.movie_coverage_plan.as_ref() {
             object.insert("movieCoveragePlan".to_string(), serde_json::to_value(plan)?);
+        }
+        if let Some(assist) = submission
+            .candidate
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.pointer("/serverEvidence/animeMatchAssist"))
+        {
+            object.insert("animeMatchAssist".to_string(), assist.clone());
         }
         if let Some(evidence) = submission.request_scope_evidence.as_ref() {
             object.insert("requestScopeEvidence".to_string(), evidence.clone());
@@ -8423,10 +10033,11 @@ mod tests {
     use super::*;
     use crate::acquisition::{
         audit::{
-            EVENT_ACQUISITION_SEARCH_SCHEDULED, count_acquisition_audit_events_for_subscription,
+            EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_REVIEW_CANDIDATE_CREATED,
+            count_acquisition_audit_events_for_subscription,
         },
-        release_resolution::store::list_release_jobs,
         release_resolution::store::{ReleaseListFilter, list_releases},
+        release_resolution::store::{list_release_files, list_release_jobs},
         subscriptions::{
             AcquisitionCompletionPolicy, AcquisitionMetadataPolicy, AcquisitionRequestMode,
             AcquisitionRequestScope, NewAcquisitionSubscription, NewAcquisitionTarget,
@@ -8437,6 +10048,10 @@ mod tests {
         AcquisitionCandidateFile, CandidateProviderSummary, normalize_acquisition_candidate,
     };
     use crate::{
+        anime_matching::{
+            ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioPreferenceMode,
+            AnimeMatchEngine, AnimeMatchRequest, AnimeMatchResponse,
+        },
         artwork::ArtworkService,
         auth::AuthService,
         config::Settings,
@@ -8456,6 +10071,7 @@ mod tests {
         },
         library::LinkerService,
     };
+    use async_trait::async_trait;
     use axum::{
         Json, Router,
         extract::{Path as AxumPath, Query, State},
@@ -8464,6 +10080,58 @@ mod tests {
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
     use tokio::{net::TcpListener, task::JoinHandle};
+
+    #[derive(Clone)]
+    struct RecordingAnimeMatchEngine {
+        requests: Arc<Mutex<Vec<AnimeMatchRequest>>>,
+        outcome: RecordingAnimeMatchOutcome,
+    }
+
+    #[derive(Clone)]
+    enum RecordingAnimeMatchOutcome {
+        Response(AnimeMatchResponse),
+        Error(&'static str),
+    }
+
+    impl RecordingAnimeMatchEngine {
+        fn response(
+            response: AnimeMatchResponse,
+        ) -> (Arc<Self>, Arc<Mutex<Vec<AnimeMatchRequest>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    requests: requests.clone(),
+                    outcome: RecordingAnimeMatchOutcome::Response(response),
+                }),
+                requests,
+            )
+        }
+
+        fn error(message: &'static str) -> (Arc<Self>, Arc<Mutex<Vec<AnimeMatchRequest>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    requests: requests.clone(),
+                    outcome: RecordingAnimeMatchOutcome::Error(message),
+                }),
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl AnimeMatchEngine for RecordingAnimeMatchEngine {
+        async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+            self.requests
+                .lock()
+                .expect("anime request recorder poisoned")
+                .push(request);
+            match &self.outcome {
+                RecordingAnimeMatchOutcome::Response(response) => Ok(response.clone()),
+                RecordingAnimeMatchOutcome::Error(message) => Err(anyhow!(*message)),
+            }
+        }
+    }
 
     async fn setup_test_db() -> Result<Database> {
         let config = DatabaseConfig {
@@ -8829,6 +10497,109 @@ mod tests {
         .fetch_optional(pool)
         .await?
         .is_some())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_test_debrid_submission_attempt(
+        pool: &sqlx::AnyPool,
+        subscription: &AcquisitionSubscription,
+        target: &AcquisitionTarget,
+        submission: &CandidateSubmission,
+        route_provider_id: Uuid,
+        download_id: Uuid,
+        remote_release_id: &str,
+        release_state: AcquisitionReleaseState,
+        release_job_state: ReleaseJobState,
+        release_job_active: bool,
+        debrid_job_status: &str,
+    ) -> Result<Uuid> {
+        let instance_id = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT instance_id FROM providers WHERE provider_id = $1",
+        )
+        .bind(route_provider_id.to_string())
+        .fetch_one(pool)
+        .await?;
+        let fingerprint =
+            candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id));
+        let release = upsert_release(
+            pool,
+            NewAcquisitionRelease {
+                release_id: None,
+                subscription_id: Some(subscription.subscription_id),
+                source_provider_id: Some(submission.provider_id),
+                source_extension_id: submission.source_extension_id.clone(),
+                owner_id: DEFAULT_ROUTE_OWNER_ID.to_string(),
+                media_type: target.media_type,
+                title: subscription.title.clone(),
+                release_title: submission.candidate.title.clone(),
+                source: submission.candidate.source.clone(),
+                source_kind: submission.candidate.source_kind.clone(),
+                info_hash: submission.candidate.info_hash.clone(),
+                fingerprint,
+                release_kind: ReleaseKind::Unknown,
+                resolver_kind: ReleaseResolverKind::Unresolved,
+                resolver_version: "alm7-test-debrid-broker-v1".to_string(),
+                confidence: ReleaseConfidence::Low,
+                score: submission.candidate.score,
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_provider_id: Some(route_provider_id),
+                download_id: Some(download_id.to_string()),
+                remote_release_id: Some(remote_release_id.to_string()),
+                state: release_state,
+                state_reason: Some("Debrid broker accepted the exact test attempt.".to_string()),
+                selected_candidate: Some(json!({
+                    "submissionBookkeeping": {
+                        "status": "pending",
+                        "policyVersion": "acquisition-broker-bookkeeping-v1"
+                    }
+                })),
+                coverage_plan: Some(json!({
+                    "source": "debrid_submission_test_fixture",
+                    "submissionBookkeeping": {
+                        "status": "pending",
+                        "policyVersion": "acquisition-broker-bookkeeping-v1"
+                    }
+                })),
+            },
+        )
+        .await?;
+        upsert_release_job(
+            pool,
+            NewAcquisitionReleaseJob {
+                release_job_id: None,
+                release_id: release.release_id,
+                route_logical_id: DEBRID_DEFAULT_LOGICAL_ID.to_string(),
+                provider_id: Some(route_provider_id),
+                download_id: Some(download_id.to_string()),
+                remote_release_id: Some(remote_release_id.to_string()),
+                state: release_job_state,
+                state_reason: Some("Debrid broker recorded the exact test job.".to_string()),
+                active: release_job_active,
+                started_at: Some(Utc::now()),
+                completed_at: (!release_job_active).then(Utc::now),
+            },
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO debrid_download_jobs (
+                job_id, provider_id, instance_id, owner_id, source, source_kind,
+                status, links_json, provider_implementation, remote_release_id,
+                remote_release_status, release_id
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, '[]', 'real_debrid', $8, $9, $10)",
+        )
+        .bind(download_id.to_string())
+        .bind(route_provider_id.to_string())
+        .bind(instance_id)
+        .bind(DEFAULT_ROUTE_OWNER_ID)
+        .bind(&submission.candidate.source)
+        .bind(&submission.candidate.source_kind)
+        .bind(debrid_job_status)
+        .bind(remote_release_id)
+        .bind(debrid_job_status)
+        .bind(release.release_id.to_string())
+        .execute(pool)
+        .await?;
+        Ok(release.release_id)
     }
 
     fn suite_response_from_direct_response_for_test(
@@ -10274,6 +12045,37 @@ mod tests {
         }
     }
 
+    fn with_alm7_anime_context(
+        mut target: AcquisitionTarget,
+        anilist_season_id: &str,
+        aliases: &[&str],
+    ) -> AcquisitionTarget {
+        let scoped_aliases = aliases
+            .iter()
+            .map(|alias| {
+                json!({
+                    "display": alias,
+                    "source": "alm7_fixture",
+                    "language": if alias.is_ascii() { "en" } else { "ja" },
+                    "seasonNumber": target.season_number,
+                    "anilistSeasonId": anilist_season_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        target.metadata = Some(json!({
+            "graphFingerprint": "alm7-automation-graph-v1",
+            "targetCanonicalKey": format!("anilist:{anilist_season_id}:{}", target.target_key),
+            "anilistSeasonId": anilist_season_id,
+            "aliases": aliases,
+            "scopedAliases": scoped_aliases,
+            "tvdbEpisodeId": format!("tvdb:{}", target.target_key),
+            "anidbEpisodeId": target
+                .absolute_episode_number
+                .map(|episode| format!("anidb:{episode}")),
+        }));
+        target
+    }
+
     fn movie_target(subscription: &AcquisitionSubscription) -> AcquisitionTarget {
         let now = Utc::now();
         AcquisitionTarget {
@@ -10517,6 +12319,1833 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alm7_definitive_anime_group_never_invokes_the_model() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(Uuid::new_v4()),
+            ..anime_subscription()
+        };
+        let target = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 1),
+            "100",
+            &["Example Title"],
+        );
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.alm7.source",
+            vec!["anime"],
+            vec![candidate(
+                "[SubsPlease] Example Title - 01 [1080p]",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: Vec::new(),
+        });
+        let service = AnimeMatchingService::with_engine(engine);
+        let mut governor = empty_queue_governor();
+
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &service,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.anime_match_assist.is_none());
+        assert!(!batch.anime_retryable_unresolved);
+        assert!(
+            requests
+                .lock()
+                .expect("request recorder poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            batch.plans[0].selection.candidate.title,
+            "[SubsPlease] Example Title - 01 [1080p]"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_required_dub_rejects_deterministic_sub_only_candidate_without_review()
+    -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(Uuid::new_v4()),
+            quality_profile: Some(json!({
+                "animeAudioPreference": {
+                    "mode": "require_dub_review",
+                    "language": "en"
+                }
+            })),
+            ..anime_subscription()
+        };
+        let target = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 1),
+            "100",
+            &["Example Title"],
+        );
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.alm7.source",
+            vec!["anime"],
+            vec![candidate(
+                "[SubsPlease] Example Title - 01 [1080p] [Subbed]",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let mut governor = empty_queue_governor();
+
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &AnimeMatchingService::disabled(),
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+
+        assert!(batch.plans.is_empty());
+        assert!(batch.review_candidates.is_empty());
+        assert!(batch.anime_retryable_unresolved);
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.reason),
+            Some(Some(AnimeMatchFallbackReason::EngineUnavailable))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_difficult_group_uses_one_scoped_request_and_audio_aware_ordering() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            title: "Tokyo Ghoul".to_string(),
+            normalized_title: "tokyo ghoul".to_string(),
+            source_provider_id: Some(Uuid::new_v4()),
+            quality_profile: Some(json!({
+                "animeAudioPreference": {
+                    "mode": "prefer_dub",
+                    "language": "en"
+                }
+            })),
+            ..anime_subscription()
+        };
+        let mut target = anime_episode_target(&subscription, 2, 1);
+        target.absolute_episode_number = Some(13);
+        target.title = "Tokyo Ghoul Root A".to_string();
+        let target = with_alm7_anime_context(
+            target,
+            "20606",
+            &["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
+        );
+        let mut dual = candidate(
+            "Mystery.Release.Alpha.1080p",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(50),
+        );
+        dual.id = Some("dual".to_string());
+        let mut subbed = dual.clone();
+        subbed.id = Some("subbed".to_string());
+        subbed.title = "Mystery.Release.Beta.1080p".to_string();
+        subbed.source = "magnet:?xt=urn:btih:alm7-subbed".to_string();
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.alm7.source",
+            vec!["anime"],
+            vec![dual, subbed],
+        );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![
+                AnimeCandidateMatch {
+                    candidate_key: "candidate-0".to_string(),
+                    matched_target_keys: vec![target.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::DualAudio,
+                    selected_file_keys: None,
+                },
+                AnimeCandidateMatch {
+                    candidate_key: "candidate-1".to_string(),
+                    matched_target_keys: vec![target.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::Subbed,
+                    selected_file_keys: None,
+                },
+            ],
+        });
+        let service = AnimeMatchingService::with_engine(engine);
+        let mut governor = empty_queue_governor();
+
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &service,
+            &subscription,
+            &response,
+            &target,
+            &[target.clone()],
+            &mut governor,
+        )
+        .await?;
+
+        let recorded = requests.lock().expect("request recorder poisoned");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].target.wanted_target_keys, vec!["S02E01"]);
+        assert_eq!(recorded[0].target.absolute_episode_numbers, vec![13]);
+        assert_eq!(
+            recorded[0].target.audio_preference.mode,
+            AnimeMatchAudioPreferenceMode::PreferDub
+        );
+        assert_eq!(
+            recorded[0].target.audio_preference.accepted_profiles,
+            vec!["dual_audio", "dubbed", "en_audio"]
+        );
+        assert_eq!(
+            recorded[0]
+                .candidates
+                .iter()
+                .map(|candidate| candidate.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Mystery.Release.Alpha.1080p", "Mystery.Release.Beta.1080p"]
+        );
+        assert!(
+            recorded[0].context.seasons[0]
+                .aliases
+                .iter()
+                .any(|alias| { alias.value == "Tokyo Ghoul √A" })
+        );
+        drop(recorded);
+
+        assert_eq!(batch.plans.len(), 2);
+        assert_eq!(
+            batch.plans[0].selection.candidate.id.as_deref(),
+            Some("dual")
+        );
+        assert_eq!(
+            batch.plans[0].covered_target_keys,
+            BTreeSet::from(["S02E01".to_string()])
+        );
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.result),
+            Some(AnimeMatchAssistResult::Matched)
+        );
+        assert_eq!(
+            batch.plans[0]
+                .selection
+                .candidate
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/serverEvidence/animeMatchAssist/source"))
+                .and_then(JsonValue::as_str),
+            Some("local_model")
+        );
+        assert!(
+            batch.plans[0].selection.candidate.score.unwrap_or_default()
+                > batch.plans[1].selection.candidate.score.unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_required_dub_is_enforced_after_a_valid_model_mapping() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            title: "Tokyo Ghoul".to_string(),
+            normalized_title: "tokyo ghoul".to_string(),
+            source_provider_id: Some(Uuid::new_v4()),
+            quality_profile: Some(json!({
+                "animeAudioPreference": {
+                    "mode": "require_dub_review",
+                    "language": "en"
+                }
+            })),
+            ..anime_subscription()
+        };
+        let mut target = anime_episode_target(&subscription, 2, 1);
+        target.absolute_episode_number = Some(13);
+        let target = with_alm7_anime_context(
+            target,
+            "20606",
+            &["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
+        );
+        let mut subbed = candidate(
+            "Opaque.Release.Subbed.1080p",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(50),
+        );
+        subbed.id = Some("subbed".to_string());
+        let mut dual = subbed.clone();
+        dual.id = Some("dual".to_string());
+        dual.title = "Opaque.Release.Dual.1080p".to_string();
+        dual.source = "magnet:?xt=urn:btih:alm7-required-dual".to_string();
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.alm7.source",
+            vec!["anime"],
+            vec![subbed, dual],
+        );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![
+                AnimeCandidateMatch {
+                    candidate_key: "candidate-0".to_string(),
+                    matched_target_keys: vec![target.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::Subbed,
+                    selected_file_keys: None,
+                },
+                AnimeCandidateMatch {
+                    candidate_key: "candidate-1".to_string(),
+                    matched_target_keys: vec![target.target_key.clone()],
+                    audio_profile: AnimeMatchAudioProfile::DualAudio,
+                    selected_file_keys: None,
+                },
+            ],
+        });
+        let mut governor = empty_queue_governor();
+
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &AnimeMatchingService::with_engine(engine),
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(requests.lock().expect("request recorder poisoned").len(), 1);
+        assert_eq!(batch.plans.len(), 1);
+        assert_eq!(
+            batch.plans[0].selection.candidate.id.as_deref(),
+            Some("dual")
+        );
+        assert!(batch.review_candidates.is_empty());
+        assert_eq!(
+            batch.plans[0]
+                .selection
+                .candidate
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.pointer(
+                    "/serverEvidence/modelMapping/languagePolicy/requiredPreferenceSatisfied"
+                ))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_model_match_persists_release_parser_coverage_job_and_target_provenance()
+    -> Result<()> {
+        let state = setup_test_state().await?;
+        let source_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            source_provider_id,
+            "test.alm7.model.source",
+            "ALM-7 Model Source",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "many",
+            "alm7_model_source",
+        )
+        .await?;
+        let route_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            route_provider_id,
+            "test.alm7.model.debrid",
+            "ALM-7 Model Debrid",
+            "debrid.resolver",
+            "many",
+            "real_debrid",
+        )
+        .await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Anime,
+                title: "Tokyo Ghoul".to_string(),
+                year: Some(2014),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("20606".to_string()),
+                    tvdb_series: Some("281249".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: None,
+                metadata_policy: None,
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(source_provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: Some(json!({
+                    "animeAudioPreference": {
+                        "mode": "prefer_dub",
+                        "language": "en"
+                    }
+                })),
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let mut target_input = new_anime_episode_target("Tokyo Ghoul Root A", 2, 1, 13);
+        target_input.metadata = Some(json!({
+            "graphFingerprint": "alm7-tokyo-ghoul-graph-v1",
+            "targetCanonicalKey": "anilist:20606:S02E01",
+            "anilistSeasonId": "20606",
+            "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
+            "scopedAliases": [
+                {
+                    "display": "Tokyo Ghoul Root A",
+                    "source": "anilist",
+                    "language": "en",
+                    "seasonNumber": 2,
+                    "anilistSeasonId": "20606"
+                },
+                {
+                    "display": "東京喰種√A",
+                    "source": "anilist",
+                    "language": "ja",
+                    "seasonNumber": 2,
+                    "anilistSeasonId": "20606"
+                }
+            ],
+            "tvdbEpisodeId": "tvdb:281249:S02E01",
+            "anidbEpisodeId": "anidb:13"
+        }));
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![target_input],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let mut opaque = candidate(
+            "Mystery.Release.Alpha.1080p",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        opaque.id = Some("alm7-model-selected".to_string());
+        let response = candidate_search_response_for_test(
+            source_provider_id,
+            "test.alm7.model.source",
+            vec!["anime"],
+            vec![opaque],
+        );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![AnimeCandidateMatch {
+                candidate_key: "candidate-0".to_string(),
+                matched_target_keys: vec![target.target_key.clone()],
+                audio_profile: AnimeMatchAudioProfile::DualAudio,
+                selected_file_keys: None,
+            }],
+        });
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &AnimeMatchingService::with_engine(engine),
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(requests.lock().expect("request recorder poisoned").len(), 1);
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.result),
+            Some(AnimeMatchAssistResult::Matched)
+        );
+
+        let group = TargetSearchGroup {
+            group_key: "alm7-model-success".to_string(),
+            representative: target.clone(),
+            targets: targets.clone(),
+            search_intent: None,
+        };
+        let plan = batch.plans.into_iter().next().expect("one model plan");
+        let route_logical_id = plan.route_logical_id.clone();
+        let dispatch = scheduler_dispatch_evidence(
+            &subscription,
+            &group,
+            &plan,
+            governor.capacity_snapshot(subscription.subscription_id, &route_logical_id),
+        );
+        let mut submission = plan.into_submission(dispatch);
+        submission.candidate.files = vec![AcquisitionCandidateFile {
+            file_id: Some("alm7-advanced-file".to_string()),
+            file_index: Some(1),
+            path: "Tokyo Ghoul Root A - 01 [1080p].mkv".to_string(),
+            size_bytes: Some(1_000_000),
+            selectable: Some(true),
+        }];
+        let download_id = Uuid::new_v4();
+        let download_id_string = download_id.to_string();
+        let remote_release_id = format!("alm7-remote-{download_id}");
+        let broker_release_id = seed_test_debrid_submission_attempt(
+            &state.db_pool,
+            &subscription,
+            &target,
+            &submission,
+            route_provider_id,
+            download_id,
+            &remote_release_id,
+            AcquisitionReleaseState::Staging,
+            ReleaseJobState::Staging,
+            true,
+            "queued",
+        )
+        .await?;
+        persist_anime_release_submission(
+            &state,
+            &subscription,
+            &target,
+            &submission,
+            &route_logical_id,
+            Some(download_id_string.clone()),
+            route_provider_id,
+            Some("real_debrid"),
+            "ALM-7 model-selected anime release.",
+            &[],
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: Some(AcquisitionReleaseState::Submitted),
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.release_id, broker_release_id);
+        assert_eq!(
+            release.download_id.as_deref(),
+            Some(download_id_string.as_str())
+        );
+        assert_eq!(
+            release.remote_release_id.as_deref(),
+            Some(remote_release_id.as_str())
+        );
+        assert_eq!(release.confidence, ReleaseConfidence::High);
+        assert_eq!(release.resolver_kind, ReleaseResolverKind::AnimeShokoStyle);
+        for persisted in [
+            release.coverage_plan.as_ref(),
+            release.selected_candidate.as_ref(),
+        ] {
+            let persisted = persisted.expect("model provenance persisted");
+            assert_eq!(
+                persisted
+                    .pointer("/animeMatchAssist/source")
+                    .and_then(JsonValue::as_str),
+                Some("local_model")
+            );
+            assert_eq!(
+                persisted
+                    .pointer("/animeMatchAssist/result")
+                    .and_then(JsonValue::as_str),
+                Some("matched")
+            );
+        }
+
+        let parsed_json = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT parsed_json
+             FROM acquisition_anime_candidate_parses
+             WHERE release_id = $1",
+        )
+        .bind(release.release_id.to_string())
+        .fetch_one(&state.db_pool)
+        .await?;
+        let parsed: JsonValue = serde_json::from_str(&parsed_json)?;
+        assert_eq!(
+            parsed
+                .pointer("/animeMatchAssist/source")
+                .and_then(JsonValue::as_str),
+            Some("local_model")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/animeMatchAssist/result")
+                .and_then(JsonValue::as_str),
+            Some("matched")
+        );
+
+        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].target_id, target.target_id);
+        assert_eq!(coverage[0].state, ReleaseCoverageState::Submitted);
+        let jobs = list_release_jobs(&state.db_pool, release.release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Submitted);
+        assert!(jobs[0].active);
+        assert_eq!(
+            jobs[0].download_id.as_deref(),
+            Some(download_id_string.as_str())
+        );
+        assert_eq!(
+            jobs[0].remote_release_id.as_deref(),
+            Some(remote_release_id.as_str())
+        );
+        let exact_worker_ownership = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*)
+             FROM acquisition_releases r
+             JOIN acquisition_release_jobs j ON j.release_id = r.release_id
+             JOIN debrid_download_jobs d ON d.release_id = r.release_id
+             WHERE r.release_id = $1
+               AND r.download_id = $2 AND j.download_id = $2 AND d.job_id = $2
+               AND r.selected_route_logical_id = $3 AND j.route_logical_id = $3
+               AND r.selected_provider_id = $4 AND j.provider_id = $4 AND d.provider_id = $4
+               AND r.remote_release_id = $5 AND j.remote_release_id = $5
+               AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = $5
+               AND j.active = 1",
+        )
+        .bind(release.release_id.to_string())
+        .bind(&download_id_string)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(route_provider_id.to_string())
+        .bind(&remote_release_id)
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert_eq!(exact_worker_ownership, 1);
+        let persisted_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(persisted_targets.len(), 1);
+        assert_eq!(
+            persisted_targets[0].state,
+            AcquisitionTargetState::Submitted
+        );
+        assert_eq!(
+            persisted_targets[0]
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.pointer("/animeMatchAssist/source"))
+                .and_then(JsonValue::as_str),
+            Some("local_model")
+        );
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = 'downloading', state_reason = 'advanced release sentinel',
+                 selected_candidate_json = $1, coverage_plan_json = $2
+             WHERE release_id = $3",
+        )
+        .bind(r#"{"runtimeSentinel":"selected-candidate"}"#)
+        .bind(r#"{"runtimeSentinel":"coverage-plan"}"#)
+        .bind(release.release_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+        let file_sentinel = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_files
+             SET selected = 1, raw_json = $1, provider_metadata_json = $2
+             WHERE release_id = $3",
+        )
+        .bind(r#"{"runtimeSentinel":"raw-file"}"#)
+        .bind(r#"{"runtimeSentinel":"provider-file"}"#)
+        .bind(release.release_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+        assert_eq!(file_sentinel.rows_affected(), 1);
+        let coverage_sentinel = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_coverage
+             SET state = 'selected', reason = 'advanced coverage sentinel',
+                 verified_by = 'advanced_runtime'
+             WHERE release_id = $1",
+        )
+        .bind(release.release_id.to_string())
+        .execute(&state.db_pool)
+        .await?;
+        assert_eq!(coverage_sentinel.rows_affected(), 1);
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = 'ready', state_reason = 'advanced job sentinel'
+             WHERE release_id = $1 AND download_id = $2",
+        )
+        .bind(release.release_id.to_string())
+        .bind(&download_id_string)
+        .execute(&state.db_pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs SET status = 'downloading' WHERE job_id = $1",
+        )
+        .bind(&download_id_string)
+        .execute(&state.db_pool)
+        .await?;
+        let reuse = existing_release_reuse(&state, &submission)
+            .await?
+            .expect("advanced release is reusable");
+        assert_eq!(reuse.download_id, download_id_string);
+        assert_eq!(reuse.selected_route_logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(reuse.selected_provider_id, route_provider_id);
+        persist_anime_release_submission(
+            &state,
+            &subscription,
+            &target,
+            &submission,
+            &reuse.selected_route_logical_id,
+            Some(reuse.download_id),
+            reuse.selected_provider_id,
+            Some("real_debrid"),
+            "Reused advanced ALM-7 release.",
+            &[],
+        )
+        .await?;
+        let preserved = get_release_by_fingerprint(
+            &state.db_pool,
+            DEFAULT_ROUTE_OWNER_ID,
+            &submission.source_extension_id,
+            &candidate_release_fingerprint(&submission.candidate, Some(submission.provider_id)),
+        )
+        .await?
+        .expect("preserved advanced release");
+        assert_eq!(preserved.state, AcquisitionReleaseState::Downloading);
+        assert_eq!(
+            preserved.state_reason.as_deref(),
+            Some("advanced release sentinel")
+        );
+        assert_eq!(
+            preserved.remote_release_id.as_deref(),
+            Some(remote_release_id.as_str())
+        );
+        assert_eq!(
+            preserved
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.get("runtimeSentinel"))
+                .and_then(JsonValue::as_str),
+            Some("selected-candidate")
+        );
+        assert_eq!(
+            preserved
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.get("runtimeSentinel"))
+                .and_then(JsonValue::as_str),
+            Some("coverage-plan")
+        );
+        let preserved_job = list_release_jobs(&state.db_pool, release.release_id).await?;
+        assert_eq!(preserved_job.len(), 1);
+        assert_eq!(preserved_job[0].state, ReleaseJobState::Ready);
+        assert_eq!(
+            preserved_job[0].state_reason.as_deref(),
+            Some("advanced job sentinel")
+        );
+        assert_eq!(
+            preserved_job[0].remote_release_id.as_deref(),
+            Some(remote_release_id.as_str())
+        );
+        let preserved_file = sqlx::query_as::<sqlx::Any, (i64, String, String)>(
+            "SELECT selected, raw_json, provider_metadata_json
+             FROM acquisition_release_files WHERE release_id = $1",
+        )
+        .bind(release.release_id.to_string())
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert_eq!(preserved_file.0, 1);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&preserved_file.1)?
+                .get("runtimeSentinel")
+                .and_then(JsonValue::as_str),
+            Some("raw-file")
+        );
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&preserved_file.2)?
+                .get("runtimeSentinel")
+                .and_then(JsonValue::as_str),
+            Some("provider-file")
+        );
+        let preserved_coverage = sqlx::query_as::<sqlx::Any, (String, String, String)>(
+            "SELECT state, reason, verified_by
+             FROM acquisition_release_coverage WHERE release_id = $1",
+        )
+        .bind(release.release_id.to_string())
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert_eq!(preserved_coverage.0, "selected");
+        assert_eq!(preserved_coverage.1, "advanced coverage sentinel");
+        assert_eq!(preserved_coverage.2, "advanced_runtime");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_complete_series_model_file_mapping_persists_exact_multi_season_bindings()
+    -> Result<()> {
+        let state = setup_test_state().await?;
+        let source_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            source_provider_id,
+            "test.alm7.series-pack.source",
+            "ALM-7 Series Pack Source",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "many",
+            "alm7_series_pack_source",
+        )
+        .await?;
+        let route_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            route_provider_id,
+            "test.alm7.series-pack.debrid",
+            "ALM-7 Series Pack Debrid",
+            "debrid.resolver",
+            "many",
+            "real_debrid",
+        )
+        .await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Anime,
+                title: "Example Anime".to_string(),
+                year: Some(2024),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("alm7-example-anime".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::Monitored),
+                request_scope: Some(AcquisitionRequestScope::Subscription),
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(source_provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+
+        let mut target_inputs = Vec::new();
+        for (absolute, (season, episode)) in
+            [(1, 1), (1, 2), (2, 1), (2, 2)].into_iter().enumerate()
+        {
+            let mut target = new_anime_episode_target(
+                "Example Anime",
+                season,
+                episode,
+                i32::try_from(absolute)? + 1,
+            );
+            let anilist_season_id = format!("alm7-example-anime-season-{season}");
+            target.metadata = Some(json!({
+                "graphFingerprint": "alm7-example-anime-complete-graph-v1",
+                "targetCanonicalKey": format!(
+                    "anilist:{anilist_season_id}:S{season:02}E{episode:02}"
+                ),
+                "anilistSeasonId": anilist_season_id,
+                "aliases": ["Example Anime", format!("Example Anime Season {season}")],
+                "scopedAliases": [{
+                    "display": format!("Example Anime Season {season}"),
+                    "source": "alm7_complete_series_fixture",
+                    "language": "en",
+                    "seasonNumber": season,
+                    "anilistSeasonId": format!("alm7-example-anime-season-{season}")
+                }],
+                "tvdbEpisodeId": format!("tvdb:example:S{season:02}E{episode:02}"),
+                "anidbEpisodeId": format!("anidb:{}", absolute + 1)
+            }));
+            target_inputs.push(target);
+        }
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            target_inputs,
+        )
+        .await?;
+        assert_eq!(targets.len(), 4);
+
+        let provider_file_ids = [
+            "provider-s01e01",
+            "provider-s01e02",
+            "provider-s02e01",
+            "provider-s02e02",
+        ];
+        let mut opaque = candidate(
+            "Mystery Payload Complete Series 1080p WEB-DL",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        opaque.id = Some("alm7-complete-series-model-selected".to_string());
+        opaque.source = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".to_string();
+        opaque.info_hash = Some("1111111111111111111111111111111111111111".to_string());
+        opaque.files = provider_file_ids
+            .iter()
+            .enumerate()
+            .map(|(index, provider_file_id)| AcquisitionCandidateFile {
+                file_id: Some((*provider_file_id).to_string()),
+                file_index: Some(index as i64 + 1),
+                path: format!("opaque-payload-{}.mkv", index + 1),
+                size_bytes: Some(1_000_000),
+                selectable: Some(true),
+            })
+            .collect();
+        let response = candidate_search_response_for_test(
+            source_provider_id,
+            "test.alm7.series-pack.source",
+            vec!["anime"],
+            vec![opaque],
+        );
+        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![AnimeCandidateMatch {
+                candidate_key: "candidate-0".to_string(),
+                matched_target_keys: targets
+                    .iter()
+                    .map(|target| target.target_key.clone())
+                    .collect(),
+                audio_profile: AnimeMatchAudioProfile::JaAudioEnSubs,
+                selected_file_keys: Some(
+                    (0..targets.len())
+                        .map(|index| format!("candidate-0-file-{index}"))
+                        .collect(),
+                ),
+            }],
+        });
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &AnimeMatchingService::with_engine(engine),
+            &subscription,
+            &response,
+            &targets[0],
+            &targets,
+            &mut governor,
+        )
+        .await?;
+
+        let recorded = requests.lock().expect("request recorder poisoned");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].target.wanted_target_keys.len(), targets.len());
+        assert_eq!(recorded[0].candidates.len(), 1);
+        assert_eq!(
+            recorded[0].candidates[0].files.len(),
+            provider_file_ids.len()
+        );
+        assert_eq!(
+            recorded[0].candidates[0]
+                .files
+                .iter()
+                .map(|file| file.file_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "candidate-0-file-0",
+                "candidate-0-file-1",
+                "candidate-0-file-2",
+                "candidate-0-file-3",
+            ]
+        );
+        drop(recorded);
+
+        assert_eq!(batch.plans.len(), 1);
+        assert!(batch.review_candidates.is_empty());
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.result),
+            Some(AnimeMatchAssistResult::Matched)
+        );
+        let plan = &batch.plans[0];
+        assert_eq!(plan.release_kind, ReleaseKind::SeriesPack);
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(plan.route_logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(plan.covered_target_ids.len(), targets.len());
+        let model_plan = plan
+            .selection
+            .anime_coverage_plan
+            .as_ref()
+            .context("complete-series model coverage plan")?;
+        assert_eq!(model_plan.entries.len(), targets.len());
+        let expected_file_by_target = targets
+            .iter()
+            .zip(provider_file_ids)
+            .map(|(target, provider_file_id)| {
+                (target.target_key.clone(), provider_file_id.to_string())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let model_file_by_target = model_plan
+            .entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry.target_key.clone(),
+                    entry
+                        .release_file_key
+                        .clone()
+                        .context("model entry must bind a real provider file key")?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(model_file_by_target, expected_file_by_target);
+
+        let group = TargetSearchGroup {
+            group_key: "alm7-complete-series-model-success".to_string(),
+            representative: targets[0].clone(),
+            targets: targets.clone(),
+            search_intent: None,
+        };
+        let plan = batch.plans.into_iter().next().expect("one model plan");
+        let route_logical_id = plan.route_logical_id.clone();
+        let dispatch = scheduler_dispatch_evidence(
+            &subscription,
+            &group,
+            &plan,
+            governor.capacity_snapshot(subscription.subscription_id, &route_logical_id),
+        );
+        let submission = plan.into_submission(dispatch);
+        let download_id = Uuid::new_v4();
+        let download_id_string = download_id.to_string();
+        let remote_release_id = format!("alm7-complete-series-remote-{download_id}");
+        let broker_release_id = seed_test_debrid_submission_attempt(
+            &state.db_pool,
+            &subscription,
+            &targets[0],
+            &submission,
+            route_provider_id,
+            download_id,
+            &remote_release_id,
+            AcquisitionReleaseState::Staging,
+            ReleaseJobState::Staging,
+            true,
+            "queued",
+        )
+        .await?;
+        persist_anime_release_submission(
+            &state,
+            &subscription,
+            &targets[0],
+            &submission,
+            &route_logical_id,
+            Some(download_id_string.clone()),
+            route_provider_id,
+            Some("real_debrid"),
+            "ALM-7 complete-series model-selected anime release.",
+            &[],
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(releases.len(), 1);
+        let release = &releases[0];
+        assert_eq!(release.release_id, broker_release_id);
+        assert_eq!(release.state, AcquisitionReleaseState::Submitted);
+        assert_eq!(release.release_kind, ReleaseKind::SeriesPack);
+        assert_eq!(release.source_provider_id, Some(source_provider_id));
+        assert_eq!(release.selected_provider_id, Some(route_provider_id));
+        assert_eq!(
+            release.selected_route_logical_id.as_deref(),
+            Some(DEBRID_DEFAULT_LOGICAL_ID)
+        );
+        assert_eq!(
+            release.download_id.as_deref(),
+            Some(download_id_string.as_str())
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/source"))
+                .and_then(JsonValue::as_str),
+            Some("local_model")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/requestScopeEvidence/targetCount"))
+                .and_then(JsonValue::as_u64),
+            Some(targets.len() as u64)
+        );
+        let persisted_scope = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.get("requestScopeEvidence"))
+            .context("persisted exact request scope")?;
+        assert_eq!(
+            persisted_scope
+                .get("targetIds")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>(),
+            targets
+                .iter()
+                .map(|target| target.target_id.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            persisted_scope
+                .get("targetKeys")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>(),
+            targets
+                .iter()
+                .map(|target| target.target_key.clone())
+                .collect::<BTreeSet<_>>()
+        );
+
+        let files = list_release_files(&state.db_pool, release.release_id).await?;
+        assert_eq!(files.len(), provider_file_ids.len());
+        let persisted_file_ids = files
+            .iter()
+            .map(|file| {
+                Ok((
+                    file.provider_file_id
+                        .clone()
+                        .context("persisted provider file id")?,
+                    file.release_file_id,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(
+            persisted_file_ids.keys().cloned().collect::<BTreeSet<_>>(),
+            provider_file_ids
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<BTreeSet<_>>()
+        );
+
+        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        assert_eq!(coverage.len(), targets.len());
+        for entry in &coverage {
+            let target = targets
+                .iter()
+                .find(|target| target.target_id == entry.target_id)
+                .context("coverage target must remain request scoped")?;
+            let provider_file_id = expected_file_by_target
+                .get(&target.target_key)
+                .context("expected provider file for target")?;
+            assert_eq!(
+                entry.release_file_id,
+                persisted_file_ids.get(provider_file_id).copied()
+            );
+            assert_eq!(entry.coverage_kind.as_str(), "series_pack");
+            assert_eq!(entry.state, ReleaseCoverageState::Submitted);
+            assert_eq!(entry.verified_by.as_deref(), Some("rr3f_file_list"));
+        }
+
+        let persisted_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(persisted_targets.len(), targets.len());
+        assert!(persisted_targets.iter().all(|target| {
+            target.state == AcquisitionTargetState::Submitted
+                && target.download_id.as_deref() == Some(download_id_string.as_str())
+                && target.selected_route_logical_id.as_deref() == Some(DEBRID_DEFAULT_LOGICAL_ID)
+        }));
+        let jobs = list_release_jobs(&state.db_pool, release.release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Submitted);
+        assert!(jobs[0].active);
+        assert_eq!(jobs[0].provider_id, Some(route_provider_id));
+        assert_eq!(jobs[0].route_logical_id, DEBRID_DEFAULT_LOGICAL_ID);
+        assert_eq!(
+            jobs[0].download_id.as_deref(),
+            Some(download_id_string.as_str())
+        );
+
+        assert!(
+            releases
+                .iter()
+                .all(|release| release.state != AcquisitionReleaseState::ReviewRequired)
+        );
+        assert!(coverage.iter().all(|entry| {
+            entry.state != ReleaseCoverageState::ReviewRequired
+                && !entry
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains("review")
+        }));
+        assert_eq!(
+            count_acquisition_audit_events_for_subscription(
+                &state.db_pool,
+                subscription.subscription_id,
+                EVENT_REVIEW_CANDIDATE_CREATED,
+            )
+            .await?,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_delayed_anime_bookkeeping_writer_cannot_mutate_replacement_attempt() -> Result<()>
+    {
+        let state = setup_test_state().await?;
+        let source_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            source_provider_id,
+            "test.alm7.delayed.source",
+            "ALM-7 Delayed Writer Source",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "many",
+            "alm7_delayed_source",
+        )
+        .await?;
+        let route_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            route_provider_id,
+            "test.alm7.delayed.debrid",
+            "ALM-7 Delayed Writer Debrid",
+            "debrid.resolver",
+            "many",
+            "real_debrid",
+        )
+        .await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Anime,
+                title: "Example Title".to_string(),
+                year: Some(2026),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("100".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: None,
+                metadata_policy: None,
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(source_provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let mut target_input = new_anime_episode_target("Example Title", 1, 1, 1);
+        target_input.metadata = Some(json!({
+            "graphFingerprint": "alm7-delayed-writer-graph-v1",
+            "targetCanonicalKey": "anilist:100:S01E01",
+            "anilistSeasonId": "100",
+            "aliases": ["Example Title"],
+            "scopedAliases": [{
+                "display": "Example Title",
+                "source": "anilist",
+                "language": "en",
+                "seasonNumber": 1,
+                "anilistSeasonId": "100"
+            }]
+        }));
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![target_input],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let claim_timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let claimed_target = claim_unowned_target_for_candidate_search(
+            &state,
+            subscription.subscription_id,
+            &target,
+            &claim_timestamp,
+        )
+        .await?
+        .expect("the unowned target should be claimed");
+        assert_eq!(claimed_target.state, AcquisitionTargetState::Searching);
+        assert_eq!(
+            claimed_target.state_reason.as_deref(),
+            Some("Searching acquisition source provider.")
+        );
+        let released_claim = retry_claimed_group_targets_after_automation_error(
+            &state,
+            subscription.subscription_id,
+            std::slice::from_ref(&claimed_target),
+            "ALM-7 exact search-claim fixture retry.",
+            Utc::now() + ChronoDuration::minutes(5),
+        )
+        .await?;
+        assert_eq!(released_claim, 1);
+        assert_eq!(
+            get_target(&state.db_pool, target.target_id)
+                .await?
+                .expect("released search claim target")
+                .state,
+            AcquisitionTargetState::Pending
+        );
+        let mut release_candidate = candidate(
+            "[SubsPlease] Example Title - 01 [1080p]",
+            vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+            Some(true),
+            Some(100),
+        );
+        release_candidate.id = Some("alm7-delayed-writer-candidate".to_string());
+        let response = candidate_search_response_for_test(
+            source_provider_id,
+            "test.alm7.delayed.source",
+            vec!["anime"],
+            vec![release_candidate],
+        );
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &AnimeMatchingService::disabled(),
+            &subscription,
+            &response,
+            &target,
+            std::slice::from_ref(&target),
+            &mut governor,
+        )
+        .await?;
+        assert_eq!(batch.plans.len(), 1);
+        let plan = batch.plans.into_iter().next().expect("one anime plan");
+        let submission = CandidateSubmission {
+            provider_id: plan.provider_id,
+            source_extension_id: plan.source_extension_id,
+            candidate: plan.selection.candidate,
+            provider_warnings: plan.provider_warnings,
+            anime_coverage_plan: plan.selection.anime_coverage_plan,
+            tv_coverage_plan: None,
+            movie_coverage_plan: None,
+            request_scope_evidence: plan.request_scope_evidence,
+            dispatch: None,
+            route_attempt_ledger: None,
+            route_attempts: Vec::new(),
+        };
+
+        let attempt_a = Uuid::new_v4();
+        let remote_a = format!("alm7-remote-a-{attempt_a}");
+        let release_id = seed_test_debrid_submission_attempt(
+            &state.db_pool,
+            &subscription,
+            &target,
+            &submission,
+            route_provider_id,
+            attempt_a,
+            &remote_a,
+            AcquisitionReleaseState::Staging,
+            ReleaseJobState::Staging,
+            true,
+            "queued",
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET active = 0, state = 'cancelled', completed_at = CURRENT_TIMESTAMP
+             WHERE release_id = $1 AND download_id = $2",
+        )
+        .bind(release_id.to_string())
+        .bind(attempt_a.to_string())
+        .execute(&state.db_pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs SET status = 'cancelled' WHERE job_id = $1",
+        )
+        .bind(attempt_a.to_string())
+        .execute(&state.db_pool)
+        .await?;
+
+        let attempt_b = Uuid::new_v4();
+        let attempt_b_string = attempt_b.to_string();
+        let remote_b = format!("alm7-remote-b-{attempt_b}");
+        let replacement_release_id = seed_test_debrid_submission_attempt(
+            &state.db_pool,
+            &subscription,
+            &target,
+            &submission,
+            route_provider_id,
+            attempt_b,
+            &remote_b,
+            AcquisitionReleaseState::Staging,
+            ReleaseJobState::Staging,
+            true,
+            "queued",
+        )
+        .await?;
+        assert_eq!(replacement_release_id, release_id);
+        update_target_state(
+            &state.db_pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("Replacement attempt B owns the target.".to_string()),
+                selected_provider_id: Some(source_provider_id),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: Some(json!({"attempt": "B"})),
+                download_id: Some(attempt_b_string.clone()),
+                next_search_after: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let stale_claim_timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let stale_search_claim = claim_unowned_target_for_candidate_search(
+            &state,
+            subscription.subscription_id,
+            &target,
+            &stale_claim_timestamp,
+        )
+        .await?;
+        assert!(
+            stale_search_claim.is_none(),
+            "a stale Pending group snapshot must not reclaim replacement-owned target B"
+        );
+
+        let delayed = persist_anime_release_submission(
+            &state,
+            &subscription,
+            &target,
+            &submission,
+            DEBRID_DEFAULT_LOGICAL_ID,
+            Some(attempt_a.to_string()),
+            route_provider_id,
+            Some("real_debrid"),
+            "Delayed attempt A writer.",
+            &[],
+        )
+        .await
+        .expect_err("replacement attempt B must reject delayed writer A");
+        assert!(delayed.to_string().contains("lost ownership"));
+        let retried = retry_claimed_group_targets_after_automation_error(
+            &state,
+            subscription.subscription_id,
+            std::slice::from_ref(&target),
+            &format!("Candidate automation failed: {delayed}"),
+            Utc::now() + ChronoDuration::minutes(5),
+        )
+        .await?;
+        assert_eq!(
+            retried, 0,
+            "the outer automation retry CAS must not reset replacement-owned target B"
+        );
+
+        let release = get_release_by_fingerprint(
+            &state.db_pool,
+            DEFAULT_ROUTE_OWNER_ID,
+            &submission.source_extension_id,
+            &candidate_release_fingerprint(&submission.candidate, Some(source_provider_id)),
+        )
+        .await?
+        .expect("replacement release");
+        assert_eq!(release.release_id, release_id);
+        assert_eq!(
+            release.download_id.as_deref(),
+            Some(attempt_b_string.as_str())
+        );
+        assert_eq!(
+            release.remote_release_id.as_deref(),
+            Some(remote_b.as_str())
+        );
+        assert_eq!(release.state, AcquisitionReleaseState::Staging);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|value| value.get("source"))
+                .and_then(JsonValue::as_str),
+            Some("debrid_submission_test_fixture")
+        );
+        let replacement_job = sqlx::query_as::<sqlx::Any, (String, String, i64)>(
+            "SELECT state, remote_release_id, active
+             FROM acquisition_release_jobs
+             WHERE release_id = $1 AND download_id = $2",
+        )
+        .bind(release_id.to_string())
+        .bind(&attempt_b_string)
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert_eq!(replacement_job.0, "staging");
+        assert_eq!(replacement_job.1, remote_b);
+        assert_eq!(replacement_job.2, 1);
+        let persisted_target = get_target(&state.db_pool, target.target_id)
+            .await?
+            .expect("replacement target");
+        assert_eq!(
+            persisted_target.download_id.as_deref(),
+            Some(attempt_b_string.as_str())
+        );
+        assert_eq!(
+            persisted_target
+                .selected_candidate
+                .as_ref()
+                .and_then(|value| value.get("attempt"))
+                .and_then(JsonValue::as_str),
+            Some("B")
+        );
+        for table in [
+            "acquisition_anime_candidate_parses",
+            "acquisition_release_files",
+            "acquisition_release_coverage",
+        ] {
+            let count = sqlx::query_scalar::<sqlx::Any, i64>(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE release_id = $1"
+            ))
+            .bind(release_id.to_string())
+            .fetch_one(&state.db_pool)
+            .await?;
+            assert_eq!(count, 0, "delayed writer mutated {table}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_model_timeout_persists_pending_retry_without_any_review_artifact() -> Result<()> {
+        let state = setup_test_state().await?;
+        let source_provider_id = Uuid::new_v4();
+        insert_test_provider_ref(
+            &state.db_pool,
+            source_provider_id,
+            "test.alm7.timeout.source",
+            "ALM-7 Timeout Source",
+            ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            "many",
+            "alm7_timeout_source",
+        )
+        .await?;
+        let subscription = create_subscription(
+            &state.db_pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Anime,
+                title: "Tokyo Ghoul".to_string(),
+                year: Some(2014),
+                external_ids: Some(ExternalIds {
+                    anilist: Some("20606".to_string()),
+                    ..Default::default()
+                }),
+                idempotency_key: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
+                scope: None,
+                metadata_policy: None,
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: Some(source_provider_id),
+                release_delay_seconds: Some(0),
+                quality_profile: None,
+                metadata_refresh_after: Some(Utc::now()),
+                candidate_search_after: Some(Utc::now()),
+            },
+        )
+        .await?;
+        let mut target_input = new_anime_episode_target("Tokyo Ghoul Root A", 2, 1, 13);
+        target_input.metadata = Some(json!({
+            "graphFingerprint": "alm7-timeout-tokyo-ghoul-graph-v1",
+            "targetCanonicalKey": "anilist:20606:S02E01",
+            "anilistSeasonId": "20606",
+            "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
+            "scopedAliases": [{
+                "display": "Tokyo Ghoul Root A",
+                "source": "anilist",
+                "language": "en",
+                "seasonNumber": 2,
+                "anilistSeasonId": "20606"
+            }]
+        }));
+        let targets = upsert_subscription_targets(
+            &state.db_pool,
+            subscription.subscription_id,
+            vec![target_input],
+        )
+        .await?;
+        let target = targets[0].clone();
+        let group = TargetSearchGroup {
+            group_key: "alm7-timeout-retry".to_string(),
+            representative: target.clone(),
+            targets: targets.clone(),
+            search_intent: None,
+        };
+        let response = candidate_search_response_for_test(
+            source_provider_id,
+            "test.alm7.timeout.source",
+            vec!["anime"],
+            vec![candidate(
+                "Mystery.Release.Without.Number.1080p",
+                vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                Some(true),
+                Some(100),
+            )],
+        );
+        let (engine, requests) =
+            RecordingAnimeMatchEngine::error("local model request deadline exceeded");
+        let mut governor = QueueGovernor::load(&state.db_pool).await?;
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &AnimeMatchingService::with_engine(engine),
+            &subscription,
+            &response,
+            &target,
+            &targets,
+            &mut governor,
+        )
+        .await?;
+
+        assert_eq!(requests.lock().expect("request recorder poisoned").len(), 1);
+        assert!(batch.plans.is_empty());
+        assert!(batch.review_candidates.is_empty());
+        assert!(batch.anime_retryable_unresolved);
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::EngineError)
+        );
+        let state_reason = no_matching_candidates_reason(&batch, &group, &response);
+        update_group_targets_for_retry(
+            &state,
+            &subscription,
+            &targets,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Pending,
+                state_reason: Some(state_reason),
+                selected_provider_id: Some(source_provider_id),
+                next_search_after: Some(next_candidate_retry_after(
+                    &subscription,
+                    &target,
+                    Utc::now(),
+                )),
+                increment_search_attempts: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let releases = list_releases(
+            &state.db_pool,
+            ReleaseListFilter {
+                subscription_id: Some(subscription.subscription_id),
+                state: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert!(releases.is_empty());
+        let review_coverage_count = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*)
+             FROM acquisition_release_coverage AS coverage
+             INNER JOIN acquisition_releases AS release
+                     ON release.release_id = coverage.release_id
+             WHERE release.subscription_id = $1
+               AND coverage.state = 'review_required'",
+        )
+        .bind(subscription.subscription_id.to_string())
+        .fetch_one(&state.db_pool)
+        .await?;
+        assert_eq!(review_coverage_count, 0);
+        assert_eq!(
+            count_acquisition_audit_events_for_subscription(
+                &state.db_pool,
+                subscription.subscription_id,
+                EVENT_REVIEW_CANDIDATE_CREATED,
+            )
+            .await?,
+            0
+        );
+
+        let persisted_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(persisted_targets.len(), 1);
+        let persisted = &persisted_targets[0];
+        assert_eq!(persisted.state, AcquisitionTargetState::Pending);
+        assert_eq!(persisted.search_attempts, 1);
+        assert!(persisted.next_search_after.is_some());
+        assert!(persisted.selected_candidate.is_none());
+        assert!(persisted.download_id.is_none());
+        let reason = persisted
+            .state_reason
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(reason.contains("could not safely match"));
+        assert!(!reason.contains("manual"));
+        assert!(!reason.contains("review"));
+        assert!(!reason.contains("awaiting"));
+        Ok(())
+    }
+
+    fn alm7_batch_canonical_snapshot(batch: &CandidateReleasePlanBatch) -> JsonValue {
+        json!(
+            batch
+                .plans
+                .iter()
+                .map(|plan| json!({
+                    "title": plan.selection.candidate.title,
+                    "source": plan.selection.candidate.source,
+                    "route": plan.route_logical_id,
+                    "releaseKind": plan.release_kind,
+                    "resolverKind": plan.resolver_kind,
+                    "resolverVersion": plan.resolver_version,
+                    "confidence": plan.confidence,
+                    "coveredTargetIds": plan.covered_target_ids,
+                    "coveredTargetKeys": plan.covered_target_keys,
+                    "selectedFileKeys": plan
+                        .selection
+                        .anime_coverage_plan
+                        .as_ref()
+                        .map(|coverage| coverage.selected_file_keys.clone())
+                        .unwrap_or_default(),
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[tokio::test]
+    async fn alm7_model_failures_preserve_the_exact_deterministic_group_baseline() -> Result<()> {
+        let database = setup_test_db().await?;
+        let subscription = AcquisitionSubscription {
+            source_provider_id: Some(Uuid::new_v4()),
+            ..anime_subscription()
+        };
+        let target_one = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 1),
+            "100",
+            &["Example Title"],
+        );
+        let target_two = with_alm7_anime_context(
+            anime_episode_target(&subscription, 1, 2),
+            "100",
+            &["Example Title"],
+        );
+        let targets = vec![target_one.clone(), target_two];
+        let response = candidate_search_response_for_test(
+            subscription.source_provider_id.expect("provider id"),
+            "test.alm7.source",
+            vec!["anime"],
+            vec![
+                candidate(
+                    "[SubsPlease] Example Title - 01 [1080p]",
+                    vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                    Some(true),
+                    Some(100),
+                ),
+                candidate(
+                    "Mystery.Release.Without.Number.1080p",
+                    vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
+                    Some(true),
+                    Some(90),
+                ),
+            ],
+        );
+
+        let mut disabled_governor = empty_queue_governor();
+        let disabled = build_anime_candidate_release_plans_with_matching(
+            &database.pool,
+            &AnimeMatchingService::disabled(),
+            &subscription,
+            &response,
+            &target_one,
+            &targets,
+            &mut disabled_governor,
+        )
+        .await?;
+        let expected = alm7_batch_canonical_snapshot(&disabled);
+        assert_eq!(disabled.plans.len(), 1);
+
+        let (error_engine, _) = RecordingAnimeMatchEngine::error("model deadline exceeded");
+        let (empty_engine, _) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: Vec::new(),
+        });
+        let (invalid_engine, _) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
+            schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            matches: vec![AnimeCandidateMatch {
+                candidate_key: "candidate-404".to_string(),
+                matched_target_keys: vec!["S01E02".to_string()],
+                audio_profile: AnimeMatchAudioProfile::Unknown,
+                selected_file_keys: None,
+            }],
+        });
+        let services = [
+            AnimeMatchingService::with_engine(error_engine),
+            AnimeMatchingService::with_engine(empty_engine),
+            AnimeMatchingService::with_engine(invalid_engine),
+        ];
+        let expected_reasons = [
+            AnimeMatchFallbackReason::EngineError,
+            AnimeMatchFallbackReason::EmptyModelMatches,
+            AnimeMatchFallbackReason::InvalidModelResponse,
+        ];
+        for (service, expected_reason) in services.into_iter().zip(expected_reasons) {
+            let mut governor = empty_queue_governor();
+            let actual = build_anime_candidate_release_plans_with_matching(
+                &database.pool,
+                &service,
+                &subscription,
+                &response,
+                &target_one,
+                &targets,
+                &mut governor,
+            )
+            .await?;
+            assert_eq!(alm7_batch_canonical_snapshot(&actual), expected);
+            assert!(actual.review_candidates.is_empty());
+            assert!(actual.anime_retryable_unresolved);
+            assert_eq!(
+                actual
+                    .anime_match_assist
+                    .as_ref()
+                    .and_then(|assist| assist.reason),
+                Some(expected_reason)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn te10b_due_provider_invocation_feeds_rr_decisions_for_required_media_shapes()
     -> Result<()> {
         let state = setup_test_state().await?;
@@ -10698,6 +14327,7 @@ mod tests {
             let request = candidate_search_request_for_group(
                 &fixture.subscription,
                 &target,
+                &fixture.targets,
                 fixture.search_intent.clone(),
             );
             let response =
@@ -10935,7 +14565,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amr1_anime_ambiguity_persists_manual_review_candidate() -> Result<()> {
+    async fn alm7_anime_ambiguity_retries_without_manual_review_or_terminal_exclusion() -> Result<()>
+    {
         let state = setup_test_state().await?;
         let provider_id = seed_te10b_candidate_provider(&state, 49153).await?;
         let subscription = create_subscription(
@@ -10950,11 +14581,11 @@ mod tests {
                     ..Default::default()
                 }),
                 idempotency_key: None,
-                request_mode: None,
-                request_scope: None,
+                request_mode: Some(AcquisitionRequestMode::OneShot),
+                request_scope: Some(AcquisitionRequestScope::Episode),
                 scope: None,
                 metadata_policy: None,
-                completion_policy: None,
+                completion_policy: Some(AcquisitionCompletionPolicy::TerminalSelectedTargets),
                 monitor_policy: Default::default(),
                 route_policy: AcquisitionRoutePolicy::DebridFirst,
                 source_provider_id: Some(provider_id),
@@ -10972,7 +14603,7 @@ mod tests {
         )
         .await?;
         let group = TargetSearchGroup {
-            group_key: "amr1-anime-review".to_string(),
+            group_key: "alm7-anime-retry".to_string(),
             representative: targets[0].clone(),
             targets: targets.clone(),
             search_intent: None,
@@ -11010,23 +14641,22 @@ mod tests {
             },
         )
         .await?;
-        assert_eq!(releases.len(), 1);
-        let release = &releases[0];
-        assert_eq!(release.source_provider_id, Some(provider_id));
-        assert_eq!(release.resolver_kind, ReleaseResolverKind::AnimeShokoStyle);
-        assert_eq!(release.selected_provider_id, None);
-        assert_eq!(release.download_id, None);
-        assert!(
-            release
-                .coverage_plan
-                .as_ref()
-                .and_then(|value| value.pointer("/resolverEvidence/rejectionCodes"))
-                .and_then(Value::as_array)
-                .is_some_and(|codes| !codes.is_empty())
-        );
-        let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
-        assert_eq!(coverage.len(), 1);
-        assert_eq!(coverage[0].state, ReleaseCoverageState::ReviewRequired);
+        assert!(releases.is_empty());
+        let updated_targets =
+            list_subscription_targets(&state.db_pool, subscription.subscription_id).await?;
+        assert_eq!(updated_targets.len(), 1);
+        assert_eq!(updated_targets[0].state, AcquisitionTargetState::Pending);
+        assert!(updated_targets[0].next_search_after.is_some());
+        assert_eq!(updated_targets[0].search_attempts, 1);
+        let reason = updated_targets[0]
+            .state_reason
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(reason.contains("could not safely match"));
+        assert!(!reason.contains("manual"));
+        assert!(!reason.contains("review"));
+        assert!(!reason.contains("awaiting"));
         Ok(())
     }
 
@@ -11646,6 +15276,7 @@ mod tests {
         let request = candidate_search_request_for_group(
             &subscription,
             &targets[0],
+            &targets,
             Some(search_intent_for_targets(&targets, RetryBucket::Cold)),
         );
         let serialized = serde_json::to_value(&request).expect("serialized request");
@@ -11676,6 +15307,241 @@ mod tests {
             json!(["S01E01", "S01E02", "S01E03"])
         );
         assert_eq!(serialized["searchIntent"]["retryBucket"], "cold");
+    }
+
+    #[test]
+    fn alm3_release_request_uses_canonical_title_and_only_requested_season_aliases() {
+        let mut subscription = anime_subscription();
+        subscription.title = "Tokyo Ghoul".to_string();
+        subscription.normalized_title = "tokyo ghoul".to_string();
+        subscription.scope = Some(json!({
+            "media": {
+                "title": "Ｔｏｋｙｏ　Ｇｈｏｕｌ",
+                "aliases": [
+                    "Tokyo Ghoul",
+                    "Tokyo Ghoul Root A",
+                    "Tokyo Ghoul:re",
+                    "東京喰種トーキョーグール√A"
+                ]
+            }
+        }));
+        let mut target = anime_episode_target(&subscription, 2, 1);
+        target.title = "New Surge".to_string();
+        target.absolute_episode_number = Some(13);
+        target.metadata = Some(json!({
+            "anilistSeasonId": "1002",
+            "anilistSeason": {
+                "seasonNumber": 2,
+                "anilistId": "1002",
+                "title": "Tokyo Ghoul Root A"
+            },
+            "aliases": [
+                "Tokyo Ghoul",
+                "Tokyo Ghoul Root A",
+                "Tokyo Ghoul:re",
+                "東京喰種トーキョーグール√A"
+            ],
+            "scopedAliases": [
+                { "display": "Tokyo Ghoul Root A", "source": "anilist_season_title", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul Root A", "source": "anizip_title", "language": "en", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul √A", "source": "anizip_title", "language": "x-jat", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "東京喰種トーキョーグール√A", "source": "anizip_title", "language": "ja", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul Season 2", "source": "generated_season_ordinal", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul S02", "source": "generated_season_short", "seasonNumber": 2, "anilistSeasonId": "1002" }
+            ]
+        }));
+
+        let request =
+            candidate_search_request_for_group(&subscription, &target, &[target.clone()], None);
+        let values = request
+            .titles
+            .iter()
+            .map(|title| title.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(request.title, "Tokyo Ghoul");
+        assert_eq!(
+            request
+                .target
+                .as_ref()
+                .and_then(|target| target.title.as_deref()),
+            Some("New Surge")
+        );
+        assert_eq!(values.first().copied(), Some("Tokyo Ghoul"));
+        assert!(values.contains(&"Tokyo Ghoul Root A"));
+        assert!(values.contains(&"Tokyo Ghoul √A"));
+        assert!(values.contains(&"東京喰種トーキョーグール√A"));
+        assert!(values.contains(&"Tokyo Ghoul Season 2"));
+        assert!(!values.contains(&"New Surge"));
+        assert!(!values.contains(&"Tokyo Ghoul:re"));
+        assert!(request.titles.len() <= SEARCH_TITLE_VARIANT_LIMIT);
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value.eq_ignore_ascii_case("Tokyo Ghoul"))
+                .count(),
+            1
+        );
+        let serialized = serde_json::to_value(&request).expect("serialized ALM-3 request");
+        assert!(serialized["titles"].is_array());
+        assert_eq!(serialized["target"]["title"], "New Surge");
+
+        let stream = stream_candidate_search_request_for_group(
+            &subscription,
+            &target,
+            &[target.clone()],
+            &request,
+        );
+        assert!(
+            stream
+                .titles
+                .iter()
+                .any(|title| title.value == "New Surge" && title.kind == "target")
+        );
+        assert!(
+            stream
+                .titles
+                .iter()
+                .all(|title| title.value != "Tokyo Ghoul:re")
+        );
+    }
+
+    #[test]
+    fn alm3_multi_season_release_variants_union_only_grouped_seasons() {
+        let mut subscription = anime_subscription();
+        subscription.title = "Tokyo Ghoul".to_string();
+        let mut season_two = anime_episode_target(&subscription, 2, 1);
+        season_two.title = "Episode 13".to_string();
+        season_two.metadata = Some(json!({
+            "anilistSeasonId": "1002",
+            "anilistSeason": { "seasonNumber": 2, "anilistId": "1002", "title": "Tokyo Ghoul Root A" },
+            "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul:re", "Tokyo Ghoul:re (2018)"],
+            "scopedAliases": [
+                { "display": "Tokyo Ghoul Root A", "source": "anilist_season_title", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul √A", "source": "anizip_title", "language": "x-jat", "seasonNumber": 2, "anilistSeasonId": "1002" },
+                { "display": "Tokyo Ghoul Season 2", "source": "generated_season_ordinal", "seasonNumber": 2, "anilistSeasonId": "1002" }
+            ]
+        }));
+        let mut season_three = anime_episode_target(&subscription, 3, 1);
+        season_three.title = "Episode 25".to_string();
+        season_three.metadata = Some(json!({
+            "anilistSeasonId": "1003",
+            "anilistSeason": { "seasonNumber": 3, "anilistId": "1003", "title": "Tokyo Ghoul:re" },
+            "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul:re", "Tokyo Ghoul:re (2018)"],
+            "scopedAliases": [
+                { "display": "Tokyo Ghoul:re", "source": "anilist_season_title", "seasonNumber": 3, "anilistSeasonId": "1003" },
+                { "display": "Tokyo Ghoul:re Part 1", "source": "anizip_title", "language": "x-jat", "seasonNumber": 3, "anilistSeasonId": "1003" },
+                { "display": "Tokyo Ghoul Season 3", "source": "generated_season_ordinal", "seasonNumber": 3, "anilistSeasonId": "1003" }
+            ]
+        }));
+        let targets = vec![season_two.clone(), season_three];
+
+        let request =
+            candidate_search_request_for_group(&subscription, &season_two, &targets, None);
+        let values = request
+            .titles
+            .iter()
+            .map(|title| title.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"Tokyo Ghoul Root A"));
+        assert!(values.contains(&"Tokyo Ghoul:re"));
+        assert!(values.contains(&"Tokyo Ghoul √A"));
+        assert!(values.contains(&"Tokyo Ghoul:re Part 1"));
+        assert!(values.contains(&"Tokyo Ghoul Season 2"));
+        assert!(!values.contains(&"Tokyo Ghoul:re (2018)"));
+        assert!(!values.contains(&"Episode 13"));
+        assert!(!values.contains(&"Episode 25"));
+        assert!(request.titles.len() <= SEARCH_TITLE_VARIANT_LIMIT);
+    }
+
+    #[test]
+    fn alm3_legacy_anime_metadata_uses_season_safe_generated_aliases() {
+        let mut subscription = anime_subscription();
+        subscription.title = "Tokyo Ghoul".to_string();
+        subscription.scope = Some(json!({
+            "media": {
+                "title": "Tokyo Ghoul",
+                "aliases": [
+                    "Tokyo Ghoul Root A",
+                    "Tokyo Ghoul:re",
+                    "Tokyo Ghoul:re (2018)"
+                ]
+            }
+        }));
+        let mut target = anime_episode_target(&subscription, 2, 1);
+        target.title = "New Surge".to_string();
+        target.metadata = Some(json!({
+            "aliases": [
+                "Tokyo Ghoul Root A",
+                "Tokyo Ghoul:re",
+                "Tokyo Ghoul:re (2018)"
+            ]
+        }));
+
+        let request =
+            candidate_search_request_for_group(&subscription, &target, &[target.clone()], None);
+        let values = request
+            .titles
+            .iter()
+            .map(|title| title.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(request.title, "Tokyo Ghoul");
+        assert_eq!(values.first().copied(), Some("Tokyo Ghoul"));
+        assert!(values.contains(&"Tokyo Ghoul Season 2"));
+        assert!(values.contains(&"Tokyo Ghoul S02"));
+        assert!(!values.contains(&"Tokyo Ghoul Root A"));
+        assert!(!values.contains(&"Tokyo Ghoul:re"));
+        assert!(!values.contains(&"Tokyo Ghoul:re (2018)"));
+        assert!(!values.contains(&"New Surge"));
+        assert!(request.titles.len() <= SEARCH_TITLE_VARIANT_LIMIT);
+    }
+
+    #[test]
+    fn alm3_legacy_absolute_only_anime_metadata_excludes_graph_wide_aliases() {
+        let mut subscription = anime_subscription();
+        subscription.title = "Tokyo Ghoul".to_string();
+        subscription.scope = Some(json!({
+            "media": {
+                "title": "Tokyo Ghoul",
+                "aliases": [
+                    "Tokyo Ghoul Root A",
+                    "Tokyo Ghoul:re",
+                    "Tokyo Ghoul:re (2018)"
+                ]
+            }
+        }));
+        let mut target = anime_episode_target(&subscription, 2, 1);
+        target.target_key = "A0013".to_string();
+        target.title = "New Surge".to_string();
+        target.season_number = None;
+        target.episode_number = None;
+        target.absolute_episode_number = Some(13);
+        target.metadata = Some(json!({
+            "aliases": [
+                "Tokyo Ghoul Root A",
+                "Tokyo Ghoul:re",
+                "Tokyo Ghoul:re (2018)"
+            ]
+        }));
+
+        let request =
+            candidate_search_request_for_group(&subscription, &target, &[target.clone()], None);
+        let values = request
+            .titles
+            .iter()
+            .map(|title| title.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec!["Tokyo Ghoul"]);
+        assert_eq!(
+            request
+                .target
+                .as_ref()
+                .and_then(|value| value.title.as_deref()),
+            Some("New Surge")
+        );
     }
 
     #[test]
@@ -14594,7 +18460,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rr3r_anime_pack_overfetch_without_safe_file_selection_goes_to_review() -> Result<()> {
+    async fn alm7_anime_pack_overfetch_without_safe_file_selection_retries_internally() -> Result<()>
+    {
         let state = setup_test_state().await?;
         let subscription = AcquisitionSubscription {
             request_mode: AcquisitionRequestMode::OneShot,
@@ -14602,7 +18469,20 @@ mod tests {
             source_provider_id: Some(Uuid::new_v4()),
             ..anime_subscription()
         };
-        let target = anime_episode_target(&subscription, 1, 1);
+        let mut target = anime_episode_target(&subscription, 1, 1);
+        target.metadata = Some(json!({
+            "graphFingerprint": "alm7-pack-overfetch-v1",
+            "targetCanonicalKey": "anilist:100:S01E01",
+            "anilistSeasonId": "100",
+            "aliases": ["Example Title"],
+            "scopedAliases": [{
+                "display": "Example Title",
+                "source": "anilist_english",
+                "language": "en",
+                "seasonNumber": 1,
+                "anilistSeasonId": "100"
+            }]
+        }));
         let candidate: AcquisitionCandidate = serde_json::from_value(json!({
             "title": "[SubsPlease] Example Title S01 Batch [1080p]",
             "source": "magnet:?xt=urn:btih:rr3runsafeanimepack",
@@ -14639,8 +18519,9 @@ mod tests {
         );
         let mut governor = QueueGovernor::load(&state.db_pool).await?;
 
-        let batch = build_candidate_release_plans(
-            &state,
+        let batch = build_anime_candidate_release_plans_with_matching(
+            &state.db_pool,
+            &AnimeMatchingService::disabled(),
             &subscription,
             &response,
             &target,
@@ -14650,18 +18531,20 @@ mod tests {
         .await?;
 
         assert!(batch.plans.is_empty());
-        assert_eq!(batch.review_candidates.len(), 1);
-        assert!(
-            batch.review_candidates[0]
-                .rejection_codes
-                .iter()
-                .any(|reason| reason == "pack_overfetch_without_safe_file_selection")
+        assert!(batch.review_candidates.is_empty());
+        assert!(batch.anime_retryable_unresolved);
+        assert_eq!(
+            batch
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::EngineUnavailable)
         );
         Ok(())
     }
 
     #[test]
-    fn rr3s_anime_manual_review_keeps_summary_clean_and_stores_diagnostics() -> Result<()> {
+    fn alm7_anime_never_constructs_a_manual_review_candidate() -> Result<()> {
         let subscription = AcquisitionSubscription {
             request_mode: AcquisitionRequestMode::OneShot,
             request_scope: AcquisitionRequestScope::Episode,
@@ -14697,42 +18580,13 @@ mod tests {
             ]
         }))?;
 
-        let plan = build_anime_manual_review_candidate(
+        let plan = build_manual_review_candidate_plan(
             &subscription,
             &target,
             &[target.clone()],
             &candidate,
         )?;
-
-        assert!(
-            plan.reason
-                .starts_with("Anime candidate needs manual review")
-        );
-        assert!(!plan.reason.contains("sonarrFacts"));
-        assert!(!plan.reason.contains("parserProvenance"));
-        assert!(
-            plan.rejection_codes
-                .iter()
-                .any(|reason| reason == "pack_overfetch_without_safe_file_selection")
-        );
-        let parsed_release = plan.parsed_release.expect("review parsed release evidence");
-        assert_eq!(
-            parsed_release
-                .pointer("/diagnostics/parserProvenance/sonarr/releaseKind")
-                .and_then(JsonValue::as_str),
-            Some("season_pack")
-        );
-        assert_eq!(
-            parsed_release
-                .pointer("/diagnostics/parserProvenance/coverage/requiresFileSelection")
-                .and_then(JsonValue::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            parsed_release.pointer("/parsed/sonarrFacts"),
-            None,
-            "manual review rows should not expose raw parser dumps at the top level"
-        );
+        assert!(plan.is_none());
         Ok(())
     }
 

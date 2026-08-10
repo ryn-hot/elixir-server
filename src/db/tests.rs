@@ -34,7 +34,7 @@ use crate::{
     },
     config::{AuthConfig, DatabaseConfig},
     db::{
-        Database, DatabaseDriver,
+        Database, DatabaseDriver, effective_pool_max_connections,
         models::{ExtensionKind, ExtensionTrustLevel, MediaType, SecretScope},
     },
     extensions::store::{
@@ -46,6 +46,19 @@ use crate::{
         PlaybackSupportDecision,
     },
 };
+
+#[test]
+fn alm8_postgres_pool_automatically_reserves_the_identity_coordinator_connection() {
+    assert_eq!(
+        effective_pool_max_connections(DatabaseDriver::Postgres, 1),
+        2
+    );
+    assert_eq!(
+        effective_pool_max_connections(DatabaseDriver::Postgres, 6),
+        6
+    );
+    assert_eq!(effective_pool_max_connections(DatabaseDriver::Sqlite, 1), 1);
+}
 
 fn migrator_through(version: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -412,6 +425,805 @@ async fn migrations_apply_and_basic_inserts() -> Result<()> {
         .await?;
     assert_eq!(count, 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn classifier_resolution_state_migration_is_internal_and_one_row_per_file() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+    let database = Database::connect(&config).await?;
+    migrator_through(56).run(&database.pool).await?;
+    let media_item_id = Uuid::new_v4();
+    let media_file_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO media_items (id, type, title) VALUES ($1, 'anime', 'Fixture')")
+        .bind(media_item_id.to_string())
+        .execute(&database.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_files (id, media_item_id, path, scan_state) \
+         VALUES ($1, $2, '/media/fixture.mkv', 'ok')",
+    )
+    .bind(media_file_id.to_string())
+    .bind(media_item_id.to_string())
+    .execute(&database.pool)
+    .await?;
+
+    migrator_through(57).run(&database.pool).await?;
+    sqlx::query(
+        "INSERT INTO classifier_resolution_state \
+         (media_file_id, disposition, confidence) VALUES ($1, 'unresolved', 0.4) \
+         ON CONFLICT(media_file_id) DO UPDATE SET \
+         disposition = excluded.disposition, confidence = excluded.confidence",
+    )
+    .bind(media_file_id.to_string())
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO classifier_resolution_state \
+         (media_file_id, disposition, confidence) VALUES ($1, 'applied', 0.95) \
+         ON CONFLICT(media_file_id) DO UPDATE SET \
+         disposition = excluded.disposition, confidence = excluded.confidence",
+    )
+    .bind(media_file_id.to_string())
+    .execute(&database.pool)
+    .await?;
+
+    let state: (i64, String, f64) = sqlx::query_as(
+        "SELECT COUNT(*), MIN(disposition), MAX(confidence) \
+         FROM classifier_resolution_state WHERE media_file_id = $1",
+    )
+    .bind(media_file_id.to_string())
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(state, (1, "applied".to_string(), 0.95));
+    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_queue")
+        .fetch_one(&database.pool)
+        .await?;
+    assert_eq!(review_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn anizip_mapping_cache_migration_is_versioned_and_upsertable() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+    let database = Database::connect(&config).await?;
+    migrator_through(57).run(&database.pool).await?;
+    migrator_through(58).run(&database.pool).await?;
+
+    let first_mapping =
+        r#"{"episodes":[{"season_number":2,"episode_number":1,"absolute_episode_number":13}]}"#;
+    let updated_mapping =
+        r#"{"episodes":[{"season_number":2,"episode_number":2,"absolute_episode_number":14}]}"#;
+    for mapping in [first_mapping, updated_mapping] {
+        sqlx::query(
+            "INSERT INTO anizip_mapping_cache \
+             (anilist_id, schema_version, mapping_json, fetched_at_epoch_seconds, \
+              updated_at_epoch_seconds) \
+             VALUES ('100001', 1, $1, 100, 100) \
+             ON CONFLICT(anilist_id) DO UPDATE SET \
+             schema_version = excluded.schema_version, \
+             mapping_json = excluded.mapping_json, \
+             fetched_at_epoch_seconds = 200, \
+             updated_at_epoch_seconds = 200",
+        )
+        .bind(mapping)
+        .execute(&database.pool)
+        .await?;
+    }
+
+    let cached: (i64, String) = sqlx::query_as(
+        "SELECT schema_version, mapping_json FROM anizip_mapping_cache \
+         WHERE anilist_id = '100001'",
+    )
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(cached, (1, updated_mapping.to_string()));
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM anizip_mapping_cache WHERE anilist_id = '100001'")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(row_count, 1);
+
+    let future_version_result = sqlx::query(
+        "INSERT INTO anizip_mapping_cache \
+         (anilist_id, schema_version, mapping_json, fetched_at_epoch_seconds, \
+          updated_at_epoch_seconds) \
+         VALUES ('future-version', 2, '{}', 100, 100)",
+    )
+    .execute(&database.pool)
+    .await;
+    assert!(future_version_result.is_ok());
+    let invalid_version_result = sqlx::query(
+        "INSERT INTO anizip_mapping_cache \
+         (anilist_id, schema_version, mapping_json, fetched_at_epoch_seconds, \
+          updated_at_epoch_seconds) \
+         VALUES ('invalid-version', 0, '{}', 100, 100)",
+    )
+    .execute(&database.pool)
+    .await;
+    assert!(invalid_version_result.is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alm8_library_anime_repair_migration_is_additive_and_idempotent() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+    let database = Database::connect(&config).await?;
+    migrator_through(58).run(&database.pool).await?;
+
+    let media_item_id = Uuid::new_v4().to_string();
+    let media_file_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO media_items (id, type, title) VALUES ($1, 'anime', 'Repair Fixture')")
+        .bind(&media_item_id)
+        .execute(&database.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_files (id, media_item_id, path, scan_state) \
+         VALUES ($1, $2, '/media/repair-fixture.mkv', 'ok')",
+    )
+    .bind(&media_file_id)
+    .bind(&media_item_id)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO classifier_resolution_state \
+         (media_file_id, disposition, confidence) VALUES ($1, 'applied', 0.95)",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+
+    migrator_through(59).run(&database.pool).await?;
+    migrator_through(59).run(&database.pool).await?;
+
+    let classifier_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('classifier_resolution_state') \
+         WHERE name IN ( \
+             'applied_identity_version', \
+             'applied_identity_evidence_json', \
+             'anime_match_assist_json' \
+         ) ORDER BY name",
+    )
+    .fetch_all(&database.pool)
+    .await?;
+    assert_eq!(
+        classifier_columns,
+        vec![
+            "anime_match_assist_json".to_string(),
+            "applied_identity_evidence_json".to_string(),
+            "applied_identity_version".to_string(),
+        ]
+    );
+
+    let repair_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name IN ( \
+             'library_anime_repairs', 'library_anime_repair_runs' \
+         )",
+    )
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(repair_tables, 2);
+
+    let ledger_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('library_anime_repairs') ORDER BY cid",
+    )
+    .fetch_all(&database.pool)
+    .await?;
+    assert_eq!(
+        ledger_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "media_file_id",
+            "repair_version",
+            "status",
+            "claim_token",
+            "attempt_count",
+            "repaired_link_count",
+            "repaired_identity_count",
+            "reason",
+            "evidence_snapshot_json",
+            "last_error",
+            "last_assist_json",
+            "claimed_at",
+            "claim_expires_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+    );
+    let run_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('library_anime_repair_runs') ORDER BY cid",
+    )
+    .fetch_all(&database.pool)
+    .await?;
+    assert_eq!(
+        run_columns.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "repair_version",
+            "status",
+            "claim_token",
+            "claim_expires_at",
+            "scanned_count",
+            "claimed_count",
+            "retryable_count",
+            "completed_count",
+            "protected_count",
+            "repaired_link_count",
+            "repaired_identity_count",
+            "failure_count",
+            "last_error",
+            "started_at",
+            "finished_at",
+            "created_at",
+            "updated_at",
+        ]
+    );
+
+    let repair_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'index' AND name IN ( \
+             'idx_library_anime_repairs_work', \
+             'idx_library_anime_repairs_version_file', \
+             'idx_library_anime_repairs_claim_token', \
+             'idx_library_anime_repair_runs_status', \
+             'idx_library_anime_repair_runs_claim_token' \
+         ) ORDER BY name",
+    )
+    .fetch_all(&database.pool)
+    .await?;
+    assert_eq!(
+        repair_indexes,
+        vec![
+            "idx_library_anime_repair_runs_claim_token".to_string(),
+            "idx_library_anime_repair_runs_status".to_string(),
+            "idx_library_anime_repairs_claim_token".to_string(),
+            "idx_library_anime_repairs_version_file".to_string(),
+            "idx_library_anime_repairs_work".to_string(),
+        ]
+    );
+
+    let migrated_state: (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT applied_identity_version, applied_identity_evidence_json, \
+                anime_match_assist_json \
+         FROM classifier_resolution_state WHERE media_file_id = $1",
+    )
+    .bind(&media_file_id)
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(migrated_state, (0, None, None));
+
+    let identity_evidence =
+        r#"{"seriesExternalIds":[{"source":"classifier","kind":"anilist","value":"100"}]}"#;
+    let assist = r#"{"outcome":"matched","backend":"local"}"#;
+    sqlx::query(
+        "UPDATE classifier_resolution_state \
+         SET applied_identity_version = 1, applied_identity_evidence_json = $2, \
+             anime_match_assist_json = $3, updated_at = CURRENT_TIMESTAMP \
+         WHERE media_file_id = $1",
+    )
+    .bind(&media_file_id)
+    .bind(identity_evidence)
+    .bind(assist)
+    .execute(&database.pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO library_anime_repair_runs (repair_version, status, scanned_count) \
+         VALUES (7, 'pending', 1)",
+    )
+    .execute(&database.pool)
+    .await?;
+    for reason in ["silent_s01e01", "silent_s01e01_refreshed"] {
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, reason, evidence_snapshot_json \
+             ) VALUES ($1, 7, $2, '{}') \
+             ON CONFLICT(media_file_id, repair_version) DO UPDATE SET \
+                 reason = excluded.reason, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&media_file_id)
+        .bind(reason)
+        .execute(&database.pool)
+        .await?;
+    }
+
+    let ledger: (i64, String, String, i64, i64) = sqlx::query_as(
+        "SELECT repair_version, status, reason, repaired_link_count, \
+                repaired_identity_count \
+         FROM library_anime_repairs WHERE media_file_id = $1",
+    )
+    .bind(&media_file_id)
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(
+        ledger,
+        (
+            7,
+            "pending".to_string(),
+            "silent_s01e01_refreshed".to_string(),
+            0,
+            0,
+        )
+    );
+    let ledger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM library_anime_repairs \
+         WHERE media_file_id = $1 AND repair_version = 7",
+    )
+    .bind(&media_file_id)
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(ledger_count, 1);
+    let migration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 59")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(migration_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alm8_library_anime_repair_schema_enforces_state_and_counter_guards() -> Result<()> {
+    let config = DatabaseConfig {
+        url: "sqlite::memory:?cache=shared".to_string(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    };
+    let database = Database::connect(&config).await?;
+    migrator_through(59).run(&database.pool).await?;
+
+    let media_item_id = Uuid::new_v4().to_string();
+    let media_file_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO media_items (id, type, title) VALUES ($1, 'anime', 'Guard Fixture')")
+        .bind(&media_item_id)
+        .execute(&database.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_files (id, media_item_id, path, scan_state) \
+         VALUES ($1, $2, '/media/guard-fixture.mkv', 'ok')",
+    )
+    .bind(&media_file_id)
+    .bind(&media_item_id)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO classifier_resolution_state (media_file_id, disposition) \
+         VALUES ($1, 'applied')",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_anime_repairs ( \
+             media_file_id, repair_version, status, claim_token, attempt_count, reason, \
+             evidence_snapshot_json, claimed_at, claim_expires_at \
+         ) VALUES ($1, 2, 'running', 'ledger-claim-1', 1, 'multiple_links', '{}', \
+                   CURRENT_TIMESTAMP, 4102444800)",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_anime_repairs ( \
+             media_file_id, repair_version, status, attempt_count, reason, \
+             evidence_snapshot_json, last_error \
+         ) VALUES ($1, 3, 'retryable', 1, 'metadata_unavailable', '{}', \
+                   'metadata unavailable')",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_anime_repairs ( \
+             media_file_id, repair_version, status, reason, evidence_snapshot_json, completed_at \
+         ) VALUES ($1, 4, 'protected', 'managed_import', '{}', CURRENT_TIMESTAMP)",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, claim_token, attempt_count, reason, \
+                 evidence_snapshot_json, claimed_at, claim_expires_at \
+             ) VALUES ($1, 5, 'running', 'ledger-claim-1', 1, 'duplicate_claim', '{}', \
+                       CURRENT_TIMESTAMP, 4102444800)",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+
+    assert!(
+        sqlx::query(
+            "UPDATE classifier_resolution_state \
+             SET applied_identity_version = 1 WHERE media_file_id = $1",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    sqlx::query(
+        "UPDATE classifier_resolution_state \
+         SET applied_identity_version = 1, applied_identity_evidence_json = '{}' \
+         WHERE media_file_id = $1",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "UPDATE classifier_resolution_state \
+             SET anime_match_assist_json = '   ' WHERE media_file_id = $1",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, reason, evidence_snapshot_json \
+             ) VALUES ($1, 1, 'invalid', 'fixture', '{}')",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, attempt_count, reason, \
+                 evidence_snapshot_json \
+             ) VALUES ($1, 1, 'running', 1, 'fixture', '{}')",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, claim_token, attempt_count, reason, \
+                 evidence_snapshot_json, claimed_at \
+             ) VALUES ($1, 6, 'running', 'missing-lease', 1, 'fixture', '{}', \
+                       CURRENT_TIMESTAMP)",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, claim_token, reason, \
+                 evidence_snapshot_json \
+             ) VALUES ($1, 1, 'pending', 'stale-claim', 'fixture', '{}')",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, reason, evidence_snapshot_json, \
+                 claim_expires_at \
+             ) VALUES ($1, 6, 'pending', 'stale-lease', '{}', 4102444800)",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, repaired_link_count, reason, \
+                 evidence_snapshot_json, completed_at \
+             ) VALUES ($1, 1, 'protected', 1, 'managed_import', '{}', CURRENT_TIMESTAMP)",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repairs ( \
+                 media_file_id, repair_version, status, attempt_count, reason, \
+                 evidence_snapshot_json \
+             ) VALUES ($1, 1, 'retryable', -1, 'fixture', '{}')",
+        )
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+
+    sqlx::query(
+        "INSERT INTO library_anime_repairs ( \
+             media_file_id, repair_version, status, attempt_count, repaired_link_count, \
+             repaired_identity_count, reason, evidence_snapshot_json, last_assist_json, \
+             completed_at \
+         ) VALUES ($1, 1, 'completed', 1, 1, 2, 'canonical_replacement', '{}', '{}', \
+                   CURRENT_TIMESTAMP)",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs (repair_version, status, scanned_count) \
+             VALUES (1, 'running', -1)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs (repair_version, status, started_at) \
+             VALUES (1, 'running', CURRENT_TIMESTAMP)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs ( \
+                 repair_version, status, claim_token, started_at \
+             ) VALUES (1, 'running', 'missing-run-lease', CURRENT_TIMESTAMP)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs ( \
+                 repair_version, status, claim_expires_at \
+             ) VALUES (1, 'pending', 4102444800)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs (repair_version, status, started_at) \
+             VALUES (1, 'completed', CURRENT_TIMESTAMP)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    sqlx::query(
+        "INSERT INTO library_anime_repair_runs ( \
+             repair_version, status, claim_token, claim_expires_at, scanned_count, \
+             claimed_count, started_at \
+         ) VALUES (1, 'running', 'run-claim-1', 4102444800, 1, 1, \
+                   CURRENT_TIMESTAMP)",
+    )
+    .execute(&database.pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO library_anime_repair_runs ( \
+                 repair_version, status, claim_token, claim_expires_at, started_at \
+             ) VALUES (2, 'running', 'run-claim-1', 4102444800, CURRENT_TIMESTAMP)",
+        )
+        .execute(&database.pool)
+        .await
+        .is_err()
+    );
+    sqlx::query(
+        "UPDATE library_anime_repair_runs \
+         SET status = 'completed', claim_token = NULL, claim_expires_at = NULL, \
+             completed_count = 1, \
+             repaired_link_count = 1, repaired_identity_count = 2, \
+             finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE repair_version = 1",
+    )
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_anime_repair_runs ( \
+             repair_version, status, failure_count, last_error, started_at, finished_at \
+         ) VALUES (2, 'failed', 1, 'worker stopped', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(&database.pool)
+    .await?;
+
+    sqlx::query("DELETE FROM media_files WHERE id = $1")
+        .bind(&media_file_id)
+        .execute(&database.pool)
+        .await?;
+    let ledger_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_anime_repairs")
+        .fetch_one(&database.pool)
+        .await?;
+    assert_eq!(ledger_count, 0);
+
+    Ok(())
+}
+
+#[test]
+fn alm8_library_anime_repair_migration_is_postgres_portable() -> Result<()> {
+    let sqlite = super::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 59)
+        .expect("SQLite migration 0059");
+    let postgres_migrator = super::postgres_migrations::migrator()?;
+    let postgres = postgres_migrator
+        .iter()
+        .find(|migration| migration.version == 59)
+        .expect("PostgreSQL migration 0059");
+
+    assert_eq!(postgres.description, sqlite.description);
+    assert_eq!(postgres.migration_type, sqlite.migration_type);
+    assert_eq!(postgres.sql, sqlite.sql);
+    for required_fragment in [
+        "ADD COLUMN applied_identity_version",
+        "ADD COLUMN applied_identity_evidence_json",
+        "ADD COLUMN anime_match_assist_json",
+        "CREATE TABLE IF NOT EXISTS library_anime_repairs",
+        "CREATE TABLE IF NOT EXISTS library_anime_repair_runs",
+        "claim_expires_at BIGINT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_anime_repairs_claim_token",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_anime_repair_runs_claim_token",
+    ] {
+        assert!(
+            postgres.sql.contains(required_fragment),
+            "migration 0059 is missing {required_fragment:?}"
+        );
+    }
+    assert_eq!(postgres.sql.matches("claim_expires_at BIGINT").count(), 2);
+    for unsupported_fragment in [
+        "INSERT OR IGNORE",
+        "AUTOINCREMENT",
+        "PRAGMA",
+        "BOOLEAN NOT NULL DEFAULT 0",
+        "BOOLEAN NOT NULL DEFAULT 1",
+    ] {
+        assert!(
+            !postgres.sql.contains(unsupported_fragment),
+            "migration 0059 retained SQLite-only fragment {unsupported_fragment:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alm8_postgres_library_anime_repair_upgrade_and_bigint_leases_when_configured() -> Result<()>
+{
+    let Ok(url) = std::env::var("ELIXIR_TEST_POSTGRES_EMPTY_DATABASE_URL") else {
+        return Ok(());
+    };
+    let config = DatabaseConfig {
+        url,
+        max_connections: 4,
+        connect_timeout_seconds: 5,
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.driver, DatabaseDriver::Postgres);
+    postgres_migrator_through(58)?.run(&database.pool).await?;
+
+    let media_item_id = Uuid::new_v4().to_string();
+    let media_file_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO media_items (id, type, title) VALUES ($1, 'anime', $2)")
+        .bind(&media_item_id)
+        .bind("PostgreSQL ALM-8 Upgrade Fixture")
+        .execute(&database.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_files (id, media_item_id, path, scan_state) \
+         VALUES ($1, $2, $3, 'ok')",
+    )
+    .bind(&media_file_id)
+    .bind(&media_item_id)
+    .bind(format!("/media/postgres-alm8-{media_file_id}.mkv"))
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO classifier_resolution_state (media_file_id, disposition, confidence) \
+         VALUES ($1, 'unresolved', 0.25)",
+    )
+    .bind(&media_file_id)
+    .execute(&database.pool)
+    .await?;
+
+    postgres_migrator_through(59)?.run(&database.pool).await?;
+
+    let lease_columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name::text, data_type::text FROM information_schema.columns \
+         WHERE table_schema = CURRENT_SCHEMA() AND column_name = 'claim_expires_at' \
+           AND table_name IN ('library_anime_repairs', 'library_anime_repair_runs') \
+         ORDER BY table_name",
+    )
+    .fetch_all(&database.pool)
+    .await?;
+    assert_eq!(
+        lease_columns,
+        vec![
+            (
+                "library_anime_repair_runs".to_string(),
+                "bigint".to_string()
+            ),
+            ("library_anime_repairs".to_string(), "bigint".to_string()),
+        ]
+    );
+
+    let future_epoch_seconds = 4_102_444_800_i64;
+    sqlx::query(
+        "INSERT INTO library_anime_repair_runs \
+         (repair_version, status, claim_token, claim_expires_at, started_at) \
+         VALUES ($1, 'running', $2, $3, CURRENT_TIMESTAMP)",
+    )
+    .bind(7_i32)
+    .bind("postgres-run-lease")
+    .bind(future_epoch_seconds)
+    .execute(&database.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_anime_repairs \
+         (media_file_id, repair_version, status, claim_token, attempt_count, reason, \
+          evidence_snapshot_json, claimed_at, claim_expires_at) \
+         VALUES ($1, $2, 'running', $3, 1, 'postgres_runtime', '{}', \
+                 CURRENT_TIMESTAMP, $4)",
+    )
+    .bind(&media_file_id)
+    .bind(7_i32)
+    .bind("postgres-file-lease")
+    .bind(future_epoch_seconds)
+    .execute(&database.pool)
+    .await?;
+    let bound_leases: (i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT claim_expires_at FROM library_anime_repair_runs \
+            WHERE repair_version = $1), \
+           (SELECT claim_expires_at FROM library_anime_repairs \
+            WHERE media_file_id = $2 AND repair_version = $1)",
+    )
+    .bind(7_i32)
+    .bind(&media_file_id)
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(bound_leases, (future_epoch_seconds, future_epoch_seconds));
+
+    database.run_migrations().await?;
+    let migration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 59")
+            .fetch_one(&database.pool)
+            .await?;
+    assert_eq!(migration_count, 1);
     Ok(())
 }
 
@@ -1913,7 +2725,7 @@ async fn auth_sessions_postgres_upgrade_rollback_restart_and_concurrency_when_co
     let applied_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&database.pool)
         .await?;
-    assert_eq!(applied_count, 56);
+    assert_eq!(applied_count, super::MIGRATOR.iter().count() as i64);
     let revoked_reason: String =
         sqlx::query_scalar("SELECT revoked_reason FROM account_sessions WHERE id = $1")
             .bind(tokens.session_id.to_string())

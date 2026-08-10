@@ -1,5 +1,7 @@
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -374,6 +376,62 @@ pub static AUTOPLAY_TRANSITIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(opts, &["result", "reason"]).expect("counter vec created")
 });
 
+pub static ANIME_MATCH_ASSIST_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_anime_match_assist_events_total",
+        "Anime matching decisions and local-model assistance outcomes",
+    );
+    IntCounterVec::new(opts, &["event"]).expect("counter vec created")
+});
+
+pub static ANIME_MATCH_ASSIST_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_anime_match_assist_latency_seconds",
+        "Local-model anime matching latency by outcome",
+    );
+    HistogramVec::new(opts, &["result"]).expect("histogram vec created")
+});
+
+pub static ANIME_INFERENCE_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_anime_inference_events_total",
+        "Managed anime inference lifecycle, update, and resource events",
+    );
+    IntCounterVec::new(opts, &["event", "result"]).expect("counter vec created")
+});
+
+pub static ANIME_INFERENCE_OPERATION_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "elixir_anime_inference_operation_duration_seconds",
+        "Managed anime inference operation duration",
+    );
+    HistogramVec::new(opts, &["operation", "result"]).expect("histogram vec created")
+});
+
+pub static ANIME_INFERENCE_RUNTIME_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_anime_inference_runtime_state",
+        "Current managed inference state and automatically selected backend",
+    );
+    IntGaugeVec::new(opts, &["state", "backend"]).expect("gauge vec created")
+});
+
+pub static ANIME_INFERENCE_WORKER_RSS_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "elixir_anime_inference_worker_rss_bytes",
+        "Resident memory used by the managed inference worker",
+    );
+    IntGaugeVec::new(opts, &["backend"]).expect("gauge vec created")
+});
+
+pub static ANIME_INFERENCE_QUEUE_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "elixir_anime_inference_queue_depth",
+        "Requests waiting for the single managed inference slot",
+    )
+    .expect("gauge created")
+});
+
 pub fn init_metrics() {
     crate::live::metrics::register(&REGISTRY);
     REGISTRY.register(Box::new(PLAY_DECISIONS.clone())).ok();
@@ -476,6 +534,27 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(AUTOPLAY_TRANSITIONS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_MATCH_ASSIST_EVENTS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_MATCH_ASSIST_LATENCY.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_INFERENCE_EVENTS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_INFERENCE_OPERATION_DURATION.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_INFERENCE_RUNTIME_STATE.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_INFERENCE_WORKER_RSS_BYTES.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(ANIME_INFERENCE_QUEUE_DEPTH.clone()))
         .ok();
 }
 

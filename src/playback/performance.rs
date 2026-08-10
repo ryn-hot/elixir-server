@@ -32,8 +32,8 @@ use crate::{
         decision::{PlaybackSelection, plan_playback},
         detect_text_subtitles,
         hardware::{
-            HardwareReadinessRecord, collect_host_hardware_inventory, host_hardware_fingerprint,
-            load_current_hardware_readiness_records,
+            HardwareReadinessRecord, HostHardwareInventory, collect_host_hardware_inventory,
+            host_hardware_fingerprint, load_current_hardware_readiness_records,
         },
         plan::{
             Delivery, HdrAction, PlaybackFeasibilityAction, PlaybackMode,
@@ -199,6 +199,14 @@ pub async fn collect_playback_host_identity() -> PlaybackHostIdentity {
     // This intentionally performs inventory only. It must not load, update, or
     // execute the hardware readiness probe state machine.
     let inventory = collect_host_hardware_inventory().await;
+    collect_playback_host_identity_for_inventory(&inventory)
+}
+
+/// Builds the playback identity from the process-shared host inventory used
+/// by playback readiness and local inference startup.
+pub fn collect_playback_host_identity_for_inventory(
+    inventory: &HostHardwareInventory,
+) -> PlaybackHostIdentity {
     let gpu = inventory
         .gpus
         .iter()

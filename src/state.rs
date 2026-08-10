@@ -1,6 +1,10 @@
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock, Weak},
+};
 
 use crate::{
+    anime_matching::AnimeInferenceService,
     artwork::ArtworkService,
     auth::AuthService,
     config::Settings,
@@ -14,12 +18,13 @@ use crate::{
         PlaybackJobCapacityLimits, PlaybackJobLimits, PlaybackJobManager,
         hardware::{
             HardwareCapabilities, HardwareDetectionConfig, HardwarePreference,
-            collect_host_hardware_inventory, host_hardware_fingerprint,
-            load_or_detect_hardware_capabilities, mark_all_hardware_readiness_stale,
+            SharedHostHardwareInventory, host_hardware_fingerprint,
+            load_or_detect_hardware_capabilities_for_inventory, mark_all_hardware_readiness_stale,
         },
         jobs::HardwareFailureCallback,
         performance::PlaybackPerformanceProbeScheduler,
     },
+    runtime::RuntimePaths,
     runtime::docker::DockerStartupConfig,
     secrets::SecretsManager,
 };
@@ -40,6 +45,8 @@ pub struct AppState {
     pub linkers: Arc<LinkerService>,
     pub artwork: Arc<ArtworkService>,
     pub transcodes: Arc<PlaybackJobManager>,
+    pub anime_inference: Arc<AnimeInferenceService>,
+    pub host_hardware_inventory: Arc<SharedHostHardwareInventory>,
     pub hardware_capabilities: Arc<RwLock<Option<HardwareCapabilities>>>,
     pub hardware_host_fingerprint: Arc<RwLock<Option<String>>>,
     pub playback_host_fingerprint: Arc<RwLock<Option<String>>>,
@@ -101,6 +108,7 @@ impl AppState {
             ..PlaybackJobLimits::default()
         };
         let hardware_capabilities = Arc::new(RwLock::new(None));
+        let host_hardware_inventory = Arc::new(SharedHostHardwareInventory::new());
         let hardware_host_fingerprint = Arc::new(RwLock::new(None));
         let playback_host_fingerprint = Arc::new(RwLock::new(None));
         let playback_performance_probes = Arc::new(PlaybackPerformanceProbeScheduler::new(
@@ -108,12 +116,16 @@ impl AppState {
             settings.playback.performance_benchmark_timeout_seconds,
         ));
         let hardware_refresh_active = Arc::new(AtomicBool::new(false));
+        let anime_inference_repair_target =
+            Arc::new(OnceLock::<Weak<AnimeInferenceService>>::new());
         let hardware_acceleration_enabled = settings.playback.hardware_acceleration_enabled;
         let hardware_acceleration = settings.playback.hardware_acceleration.clone();
         let hardware_failure_callback: HardwareFailureCallback = {
             let db_pool = db_pool.clone();
             let hardware_capabilities = hardware_capabilities.clone();
             let hardware_host_fingerprint = hardware_host_fingerprint.clone();
+            let host_hardware_inventory = host_hardware_inventory.clone();
+            let anime_inference_repair_target = anime_inference_repair_target.clone();
             let hardware_refresh_active = hardware_refresh_active.clone();
             Arc::new(move || {
                 if !hardware_acceleration_enabled {
@@ -129,6 +141,8 @@ impl AppState {
                 let db_pool = db_pool.clone();
                 let hardware_capabilities = hardware_capabilities.clone();
                 let hardware_host_fingerprint = hardware_host_fingerprint.clone();
+                let host_hardware_inventory = host_hardware_inventory.clone();
+                let anime_inference_repair_target = anime_inference_repair_target.clone();
                 let hardware_refresh_active = hardware_refresh_active.clone();
                 let hardware_acceleration = hardware_acceleration.clone();
                 tokio::spawn(async move {
@@ -143,9 +157,21 @@ impl AppState {
                     let config = HardwareDetectionConfig {
                         preference: HardwarePreference::parse(&hardware_acceleration),
                     };
-                    match load_or_detect_hardware_capabilities(&db_pool, &config).await {
+                    host_hardware_inventory.invalidate().await;
+                    if let Some(service) =
+                        anime_inference_repair_target.get().and_then(Weak::upgrade)
+                    {
+                        service.request_runtime_repair();
+                    }
+                    let inventory = host_hardware_inventory.get_or_collect().await;
+                    match load_or_detect_hardware_capabilities_for_inventory(
+                        &db_pool,
+                        &config,
+                        inventory.clone(),
+                    )
+                    .await
+                    {
                         Ok(capabilities) => {
-                            let inventory = collect_host_hardware_inventory().await;
                             let host_fingerprint = host_hardware_fingerprint(&inventory);
                             let available_apis = capabilities.available_apis.clone();
                             *hardware_capabilities.write().await = Some(capabilities);
@@ -179,6 +205,26 @@ impl AppState {
                 Some(hardware_failure_callback),
             ),
         );
+        let inference_root = PathBuf::from(
+            RuntimePaths::from_roots(
+                &settings.extensions.storage_root,
+                &settings.library.local_root,
+            )
+            .data_root,
+        )
+        .join("inference");
+        let anime_inference = Arc::new(AnimeInferenceService::new(
+            inference_root,
+            settings.environment.clone(),
+            playback_jobs.clone(),
+            host_hardware_inventory.clone(),
+        ));
+        assert!(
+            anime_inference_repair_target
+                .set(Arc::downgrade(&anime_inference))
+                .is_ok(),
+            "anime inference repair target is initialized exactly once"
+        );
         let live = Arc::new(LiveService::new_with_runtime(
             settings.live.clone(),
             settings.environment.clone(),
@@ -199,6 +245,8 @@ impl AppState {
             linkers: Arc::new(linkers),
             artwork: Arc::new(artwork),
             transcodes: playback_jobs,
+            anime_inference,
+            host_hardware_inventory,
             hardware_capabilities,
             hardware_host_fingerprint,
             playback_host_fingerprint,

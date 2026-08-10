@@ -40,8 +40,8 @@ use crate::{
         },
         load_intent_recovery_views,
         release_resolution::anime::{
-            AnimeMetadataGraphInput, AnimeSeasonMapping, build_anime_metadata_graph,
-            infer_anizip_season_number,
+            AnimeGraphTarget, AnimeMetadataGraphInput, AnimeScopedAlias, AnimeSeasonMapping,
+            build_anime_metadata_graph, infer_anizip_season_number,
         },
         release_resolution::{
             models::{AcquisitionReleaseState, ReleaseCoverageState, ReleaseJobState},
@@ -1599,6 +1599,7 @@ struct FindMediaScopedPreviewTarget {
     thumbnail_url: Option<String>,
     overview: Option<String>,
     runtime_minutes: Option<i32>,
+    resolution_metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1627,6 +1628,7 @@ fn select_scoped_add_targets_from_preview(
                 thumbnail_url: None,
                 overview: None,
                 runtime_minutes: None,
+                resolution_metadata: None,
             }]);
         }
         bail!("movie scoped add only supports movie or entire-title selection");
@@ -1738,6 +1740,7 @@ fn flattened_scope_preview_targets(
                 thumbnail_url: episode.thumbnail_url.clone(),
                 overview: episode.overview.clone(),
                 runtime_minutes: episode.runtime_minutes,
+                resolution_metadata: episode.resolution_metadata.clone(),
             });
         }
     }
@@ -2423,6 +2426,11 @@ fn scoped_add_new_acquisition_target(
             "thumbnailUrl": target.thumbnail_url,
             "overview": target.overview,
             "runtimeMinutes": target.runtime_minutes,
+            "graphFingerprint": target.resolution_metadata.as_ref().and_then(|value| value.get("graphFingerprint")).cloned(),
+            "anilistRootId": target.resolution_metadata.as_ref().and_then(|value| value.get("anilistRootId")).cloned(),
+            "anilistSeasonId": target.resolution_metadata.as_ref().and_then(|value| value.get("anilistSeasonId")).cloned(),
+            "anilistSeason": target.resolution_metadata.as_ref().and_then(|value| value.get("anilistSeason")).cloned(),
+            "scopedAliases": target.resolution_metadata.as_ref().and_then(|value| value.get("scopedAliases")).cloned(),
             "scopeMetadata": {
                 "mediaItemId": media_item_id.to_string(),
                 "libraryEpisodeId": library_episode_id.map(|id| id.to_string()),
@@ -2789,6 +2797,7 @@ async fn build_find_media_tv_scope_preview(
                     thumbnail_url: episode.image,
                     overview: preview_overview_from_raw(&episode.raw),
                     runtime_minutes: preview_runtime_minutes_from_raw(&episode.raw),
+                    resolution_metadata: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -2949,16 +2958,30 @@ fn anime_scope_preview_seasons_from_graph_at(
                             || (target.season_number.is_none()
                                 && target.anilist_season_id == season.anilist_id))
                 })
-                .map(|target| FindMediaScopePreviewEpisode {
-                    target_key: target.target_key.clone(),
-                    season_number: target.season_number.or(Some(season.season_number)),
-                    episode_number: target.episode_number,
-                    absolute_episode_number: target.absolute_episode_number,
-                    title: Some(target.title.clone()),
-                    air_date: target.air_date.clone(),
-                    thumbnail_url: preview_thumbnail_from_raw(&target.raw),
-                    overview: preview_overview_from_raw(&target.raw),
-                    runtime_minutes: preview_runtime_minutes_from_raw(&target.raw),
+                .map(|target| {
+                    let scoped_aliases = anime_scoped_aliases_for_preview_target(
+                        &graph.scoped_aliases,
+                        target,
+                        season.season_number,
+                    );
+                    FindMediaScopePreviewEpisode {
+                        target_key: target.target_key.clone(),
+                        season_number: target.season_number.or(Some(season.season_number)),
+                        episode_number: target.episode_number,
+                        absolute_episode_number: target.absolute_episode_number,
+                        title: Some(target.title.clone()),
+                        air_date: target.air_date.clone(),
+                        thumbnail_url: preview_thumbnail_from_raw(&target.raw),
+                        overview: preview_overview_from_raw(&target.raw),
+                        runtime_minutes: preview_runtime_minutes_from_raw(&target.raw),
+                        resolution_metadata: Some(json!({
+                            "graphFingerprint": graph.fingerprint,
+                            "anilistRootId": graph.root_anilist_id,
+                            "anilistSeasonId": target.anilist_season_id,
+                            "anilistSeason": target.season,
+                            "scopedAliases": scoped_aliases,
+                        })),
+                    }
                 })
                 .collect::<Vec<_>>();
             (!episodes.is_empty()).then_some(FindMediaScopePreviewSeason {
@@ -2968,6 +2991,37 @@ fn anime_scope_preview_seasons_from_graph_at(
             })
         })
         .collect::<Vec<_>>()
+}
+
+fn anime_scoped_aliases_for_preview_target(
+    aliases: &[AnimeScopedAlias],
+    target: &AnimeGraphTarget,
+    fallback_season_number: i32,
+) -> Vec<AnimeScopedAlias> {
+    let target_season_number = target.season_number.unwrap_or(fallback_season_number);
+    aliases
+        .iter()
+        .filter(|alias| {
+            let mut matched_dimension = false;
+            if let Some(alias_season_number) = alias.season_number {
+                if alias_season_number != target_season_number {
+                    return false;
+                }
+                matched_dimension = true;
+            }
+            if let Some(alias_anilist_id) = alias.anilist_season_id.as_deref() {
+                if !alias_anilist_id
+                    .trim()
+                    .eq_ignore_ascii_case(target.anilist_season_id.trim())
+                {
+                    return false;
+                }
+                matched_dimension = true;
+            }
+            matched_dimension
+        })
+        .cloned()
+        .collect()
 }
 
 fn anime_scope_target_is_selectable(
@@ -11549,7 +11603,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn anime_scope_preview_includes_absolute_only_mainline_targets() {
+    fn alm3_anime_scope_preview_includes_only_target_season_aliases() {
         let season_ref = crate::acquisition::release_resolution::anime::AnimeGraphSeasonRef {
             season_number: 1,
             anilist_id: "21".to_string(),
@@ -11653,7 +11707,22 @@ mod tests {
                 },
             ],
             aliases: vec![],
-            scoped_aliases: vec![],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Long Running Anime".to_string(),
+                    source: "anilist_season_title".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("21".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Long Running Anime: The Sequel".to_string(),
+                    source: "anilist_season_title".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(2),
+                    anilist_season_id: Some("22".to_string()),
+                },
+            ],
             fingerprint: "test".to_string(),
         };
 
@@ -11695,10 +11764,21 @@ mod tests {
             Some("Ani.zip episode description.")
         );
         assert_eq!(response.seasons[0].episodes[0].runtime_minutes, Some(24));
+        for episode in &response.seasons[0].episodes {
+            let aliases = episode
+                .resolution_metadata
+                .as_ref()
+                .and_then(|value| value.get("scopedAliases"))
+                .and_then(Value::as_array)
+                .expect("season-scoped aliases");
+            assert_eq!(aliases.len(), 1);
+            assert_eq!(aliases[0]["anilistSeasonId"], "21");
+            assert_eq!(aliases[0]["seasonNumber"], 1);
+        }
     }
 
     #[test]
-    fn scoped_add_target_metadata_carries_media_aliases() {
+    fn alm3_scoped_add_target_metadata_carries_season_aliases() {
         let target = FindMediaScopedPreviewTarget {
             target_key: "S01E01".to_string(),
             season_number: Some(1),
@@ -11709,6 +11789,22 @@ mod tests {
             thumbnail_url: None,
             overview: Some("Episode description from ani.zip.".to_string()),
             runtime_minutes: Some(24),
+            resolution_metadata: Some(json!({
+                "graphFingerprint": "rr3-anime-v3-test",
+                "anilistRootId": "20",
+                "anilistSeasonId": "21",
+                "anilistSeason": {
+                    "seasonNumber": 1,
+                    "anilistId": "21",
+                    "title": "Fullmetal Alchemist Brotherhood"
+                },
+                "scopedAliases": [{
+                    "display": "Fullmetal Alchemist Brotherhood",
+                    "source": "anilist_season_title",
+                    "seasonNumber": 1,
+                    "anilistSeasonId": "21"
+                }]
+            })),
         };
         let aliases = vec![
             "Hagane no Renkinjutsushi: FULLMETAL ALCHEMIST".to_string(),
@@ -11747,6 +11843,22 @@ mod tests {
             metadata.get("runtimeMinutes").and_then(Value::as_i64),
             Some(24)
         );
+        assert_eq!(
+            metadata.get("anilistSeasonId").and_then(Value::as_str),
+            Some("21")
+        );
+        assert_eq!(
+            metadata
+                .pointer("/anilistSeason/title")
+                .and_then(Value::as_str),
+            Some("Fullmetal Alchemist Brotherhood")
+        );
+        assert_eq!(
+            metadata
+                .pointer("/scopedAliases/0/anilistSeasonId")
+                .and_then(Value::as_str),
+            Some("21")
+        );
     }
 
     #[tokio::test]
@@ -11784,6 +11896,7 @@ mod tests {
                         thumbnail_url: None,
                         overview: Some(format!("ani.zip overview {episode}")),
                         runtime_minutes: Some(24),
+                        resolution_metadata: None,
                     })
                     .collect(),
             }],

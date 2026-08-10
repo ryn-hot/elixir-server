@@ -1663,7 +1663,7 @@ pub async fn reset_target_for_candidate_retry(
     state_reason: String,
     next_search_after: DateTime<Utc>,
 ) -> Result<Option<AcquisitionTarget>> {
-    sqlx::query::<sqlx::Any>(
+    let result = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_targets
          SET state = $1,
              state_reason = $2,
@@ -1673,15 +1673,22 @@ pub async fn reset_target_for_candidate_retry(
              download_id = NULL,
              next_search_after = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE target_id = $4",
+         WHERE target_id = $4
+           AND state NOT IN ($5, $6)",
     )
     .bind(AcquisitionTargetState::Pending.as_str())
     .bind(state_reason)
     .bind(db_datetime_string(next_search_after))
     .bind(target_id.to_string())
+    .bind(AcquisitionTargetState::Imported.as_str())
+    .bind(AcquisitionTargetState::Excluded.as_str())
     .execute(pool)
     .await
     .context("resetting acquisition target for candidate retry")?;
+
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
 
     let updated = get_target(pool, target_id).await?;
     if let Some(target) = updated.as_ref() {

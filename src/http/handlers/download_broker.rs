@@ -3,6 +3,9 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::sync::Arc;
+
 use anyhow::{Context, anyhow, bail};
 use axum::{
     Json,
@@ -16,21 +19,26 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
+    acquisition::anime_matching::{
+        acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
+        assess_acquisition_anime_model_audio_profile, assess_acquisition_anime_provider_file_audio,
+        bind_exact_single_anime_provider_file,
+        model_derived_anime_coverage_plans_with_file_selection_support,
+    },
     acquisition::subscriptions::{
-        AcquisitionTarget, AcquisitionTargetState, AcquisitionTargetStateUpdate,
-        list_subscription_targets, reset_target_for_candidate_retry, update_target_state,
+        AcquisitionSubscription, AcquisitionTarget, AcquisitionTargetState,
+        AcquisitionTargetStateUpdate, get_subscription, list_subscription_targets,
+        reset_target_for_candidate_retry, update_target_state,
     },
     acquisition::{
         release_resolution::{
             anime::{
                 AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
-                AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
-                parse_anime_release_title, plan_anime_file_coverage_with_options,
-                score_anime_candidate,
+                AnimeCoverageOptions, AnimeFileCoveragePlan, AnimeReleaseFileInput,
+                AnimeScopedAlias, anime_parser_diagnostics, parse_anime_release_title,
+                plan_anime_file_coverage_with_options, score_anime_candidate,
             },
-            fingerprint::{
-                ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
-            },
+            fingerprint::{ReleaseFingerprintInput, build_release_fingerprint},
             hashing::{HashFileJob, queue_anime_hash_file},
             models::{
                 AcquisitionRelease, AcquisitionReleaseCoverage, AcquisitionReleaseFile,
@@ -45,7 +53,7 @@ use crate::{
             },
             movie_radarr_parser::MovieRadarrStyleParser,
             store::{
-                get_release_by_download_id, get_release_by_fingerprint,
+                get_release, get_release_by_download_id, get_release_by_fingerprint,
                 list_active_releases_by_route, list_release_coverage, list_release_files,
                 list_release_jobs, update_release_coverage_review_state, update_release_job_state,
                 upsert_release, upsert_release_coverage, upsert_release_file, upsert_release_job,
@@ -53,6 +61,11 @@ use crate::{
             tv::{TvCoverageOptions, TvReleaseFileInput, TvSonarrStyleResolver, TvTarget},
         },
         stream_materializer::cleanup_http_stream_partial_from_plan,
+    },
+    anime_matching::{
+        ANIME_MATCH_SCHEMA_VERSION, AnimeDeterministicResult, AnimeMatchAssistProvenance,
+        AnimeMatchAssistResult, AnimeMatchAssistSource, AnimeMatchAudioProfile,
+        AnimeMatchFallbackReason, AnimeMatchingService, DeterministicMatchState,
     },
     db::models::MediaType,
     debrid::{
@@ -73,7 +86,10 @@ use crate::{
         auth::CurrentUser,
         error::{ApiError, ApiResult},
         handlers::{
-            acquisition_sources::{AcquisitionCandidate, validate_stream_candidate_for_broker},
+            acquisition_sources::{
+                AcquisitionCandidate, AcquisitionCandidateFile,
+                validate_stream_candidate_for_broker,
+            },
             extensions::{request_instance_service_form, request_instance_service_json},
         },
     },
@@ -98,6 +114,32 @@ static QBITTORRENT_METADATA_POLL_STATE: LazyLock<
     Mutex<HashMap<Uuid, QbittorrentMetadataPollState>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+#[derive(Clone)]
+struct QbittorrentTestServiceFixture {
+    requests: Arc<Mutex<Vec<Value>>>,
+    file_rows: Value,
+    torrent_info_rows: Value,
+    fail_torrent_info: bool,
+    fail_file_list: bool,
+    fail_form_paths_once: Arc<Mutex<HashSet<String>>>,
+}
+
+#[cfg(test)]
+impl QbittorrentTestServiceFixture {
+    fn fail_form_paths_once(&self, paths: &[&str]) {
+        self.fail_form_paths_once
+            .lock()
+            .expect("qBittorrent one-shot form failure lock")
+            .extend(paths.iter().map(|path| path.trim_matches('/').to_string()));
+    }
+}
+
+#[cfg(test)]
+static QBITTORRENT_TEST_SERVICE_FIXTURES: LazyLock<
+    Mutex<HashMap<Uuid, QbittorrentTestServiceFixture>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Clone)]
 struct QbittorrentMetadataPollState {
     attempts: u32,
@@ -108,6 +150,40 @@ struct QbittorrentMetadataPollState {
 enum QbittorrentStaleReleaseKind {
     MetadataTimeout,
     ZeroSeedStall,
+    ProviderOperationTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QbittorrentProviderOperation {
+    TorrentInspection,
+    FilePolicyRefresh,
+}
+
+impl QbittorrentProviderOperation {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::TorrentInspection => "qbittorrent_torrent_inspection_timeout",
+            Self::FilePolicyRefresh => "qbittorrent_file_policy_refresh_timeout",
+        }
+    }
+
+    fn user_message(self) -> &'static str {
+        match self {
+            Self::TorrentInspection => {
+                "qBittorrent remained unavailable while Elixir inspected the active torrent."
+            }
+            Self::FilePolicyRefresh => {
+                "qBittorrent could not apply or resume the selected anime files in the allowed window."
+            }
+        }
+    }
+
+    fn evidence_state(self) -> &'static str {
+        match self {
+            Self::TorrentInspection => "torrent_inspection_error",
+            Self::FilePolicyRefresh => "file_policy_refresh_error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +210,18 @@ impl QbittorrentStaleReleaseDecision {
             age_seconds,
             reason_code: "qbittorrent_zero_seed_stall",
             user_message: "qBittorrent found metadata but the swarm has no complete seeds.",
+        }
+    }
+
+    fn provider_operation_timeout(
+        age_seconds: i64,
+        operation: QbittorrentProviderOperation,
+    ) -> Self {
+        Self {
+            kind: QbittorrentStaleReleaseKind::ProviderOperationTimeout,
+            age_seconds,
+            reason_code: operation.reason_code(),
+            user_message: operation.user_message(),
         }
     }
 }
@@ -165,9 +253,15 @@ pub struct DownloadBrokerSubmitRequest {
     #[serde(default)]
     pub selected_candidate: Option<AcquisitionCandidate>,
     #[serde(default)]
+    pub request_scope_evidence: Option<Value>,
+    #[serde(default)]
     pub selected_stream_candidate: Option<Value>,
     #[serde(default)]
     pub release_fingerprint: Option<String>,
+    /// Internal acquisition writer barrier. This is never accepted from the
+    /// HTTP payload; only in-process acquisition submission can enable it.
+    #[serde(skip)]
+    pub(crate) defer_anime_debrid_refinement: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -569,6 +663,105 @@ async fn ensure_route_allows_submit(
     Ok(())
 }
 
+#[cfg(test)]
+fn qbittorrent_test_service_json(instance_id: Uuid, path: &str) -> Option<anyhow::Result<Value>> {
+    let fixture = QBITTORRENT_TEST_SERVICE_FIXTURES
+        .lock()
+        .expect("qBittorrent test service fixture lock")
+        .get(&instance_id)
+        .cloned()?;
+    let normalized_path = path.split('?').next().unwrap_or(path).trim_matches('/');
+    let (value, failed) = match normalized_path {
+        "api/v2/torrents/info" => (&fixture.torrent_info_rows, fixture.fail_torrent_info),
+        "api/v2/torrents/files" => (&fixture.file_rows, fixture.fail_file_list),
+        _ => return None,
+    };
+    fixture
+        .requests
+        .lock()
+        .expect("qBittorrent test request fixture lock")
+        .push(json!({ "path": normalized_path }));
+    Some(if failed {
+        Err(anyhow!(
+            "simulated qBittorrent service failure for {normalized_path}"
+        ))
+    } else {
+        Ok(value.clone())
+    })
+}
+
+#[cfg(test)]
+fn qbittorrent_test_service_form(
+    instance_id: Uuid,
+    path: &str,
+    fields: &HashMap<String, String>,
+) -> Option<anyhow::Result<()>> {
+    let fixture = QBITTORRENT_TEST_SERVICE_FIXTURES
+        .lock()
+        .expect("qBittorrent test service fixture lock")
+        .get(&instance_id)
+        .cloned()?;
+    let normalized_path = path.trim_matches('/');
+    if !matches!(
+        normalized_path,
+        "api/v2/torrents/add"
+            | "api/v2/torrents/filePrio"
+            | "api/v2/torrents/resume"
+            | "api/v2/torrents/delete"
+    ) {
+        return None;
+    }
+    fixture
+        .requests
+        .lock()
+        .expect("qBittorrent test request fixture lock")
+        .push(json!({
+            "path": normalized_path,
+            "fields": fields,
+        }));
+    let failed = fixture
+        .fail_form_paths_once
+        .lock()
+        .expect("qBittorrent one-shot form failure lock")
+        .remove(normalized_path);
+    Some(if failed {
+        Err(anyhow!(
+            "simulated qBittorrent service failure for {normalized_path}"
+        ))
+    } else {
+        Ok(())
+    })
+}
+
+async fn request_qbittorrent_service_json(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    method: ReqwestMethod,
+    path: &str,
+    body: Option<Value>,
+) -> anyhow::Result<Value> {
+    #[cfg(test)]
+    if let Some(result) = qbittorrent_test_service_json(instance_id, path) {
+        return result;
+    }
+    request_instance_service_json(state, store, instance_id, method, path, body).await
+}
+
+async fn request_qbittorrent_service_form(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    path: &str,
+    fields: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = qbittorrent_test_service_form(instance_id, path, fields) {
+        return result;
+    }
+    request_instance_service_form(state, store, instance_id, path, fields).await
+}
+
 async fn submit_qbittorrent(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -582,10 +775,21 @@ async fn submit_qbittorrent(
         non_empty(request.category.as_deref()).or_else(|| non_empty(resolved.category.as_deref()));
     let release_context = qbittorrent_release_context(request, resolved, source, owner_id);
     let force_paused = release_context.is_some();
-    let download_id = release_context
+    let raw_candidate_info_hash = request
+        .selected_candidate
         .as_ref()
-        .and_then(|context| context.info_hash.clone())
-        .or_else(|| extract_magnet_info_hash(source));
+        .and_then(|candidate| candidate.info_hash.as_deref());
+    let download_id = qbittorrent_submission_download_id(
+        source,
+        raw_candidate_info_hash,
+        release_context.is_some(),
+    )?;
+
+    if let Some(download_id) = download_id.as_deref() {
+        cleanup_pending_qbittorrent_hash_attempts(state, store, download_id)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     if let Some(context) = release_context.as_ref()
         && let Some(existing) =
@@ -594,15 +798,17 @@ async fn submit_qbittorrent(
                 .map_err(ApiError::from)?
     {
         if let Some(hash) = existing.download_id.as_deref() {
-            refresh_staged_qbittorrent_metadata(state, store, &existing, hash, true)
-                .await
-                .map_err(ApiError::from)?;
+            if qbittorrent_release_needs_file_policy(&existing) {
+                refresh_staged_qbittorrent_metadata(state, store, &existing, hash, true, false)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
             return Ok(Some(hash.to_string()));
         }
     }
 
     let fields = qbittorrent_add_fields(source, category, request, force_paused);
-    request_instance_service_form(
+    request_qbittorrent_service_form(
         state,
         store,
         resolved.record.instance_id,
@@ -628,11 +834,11 @@ async fn submit_qbittorrent(
         .await
         .map_err(ApiError::from)?;
 
-    if let Some(hash) = download_id.as_deref() {
-        refresh_staged_qbittorrent_metadata(state, store, &release, hash, true)
-            .await
-            .map_err(ApiError::from)?;
-    }
+    // Acquisition persists its release coverage and target submission after
+    // the broker returns. The active-release poll performs the first metadata
+    // refinement once that bookkeeping is durable; refining here could make a
+    // correct automatic retry or ready decision and then have it overwritten
+    // by the caller's post-submit persistence.
     Ok(download_id)
 }
 
@@ -963,6 +1169,23 @@ fn debrid_release_context(
         .or_else(|| non_empty(request.name.as_deref()))
         .unwrap_or(&candidate.title)
         .to_string();
+    let mut selected_candidate = broker_selected_candidate_evidence(
+        candidate,
+        request.request_scope_evidence.as_ref(),
+        resolved.record.provider_id,
+    );
+    if media_type == MediaType::Anime
+        && request.defer_anime_debrid_refinement
+        && let Some(object) = selected_candidate.as_object_mut()
+    {
+        object.insert(
+            "submissionBookkeeping".to_string(),
+            json!({
+                "status": "pending",
+                "policyVersion": "acquisition-broker-bookkeeping-v1"
+            }),
+        );
+    }
     Some(DebridReleaseSubmitContext {
         subscription_id: request.subscription_id,
         source_provider_id: request.source_provider_id,
@@ -973,9 +1196,7 @@ fn debrid_release_context(
         info_hash: candidate.info_hash.clone(),
         fingerprint: request.release_fingerprint.clone(),
         score: candidate.score,
-        selected_candidate: serde_json::to_value(candidate)
-            .ok()
-            .or_else(|| Some(json!({ "sourceProviderId": resolved.record.provider_id }))),
+        selected_candidate: Some(selected_candidate),
     })
 }
 
@@ -1026,8 +1247,9 @@ fn qbittorrent_release_context(
         .to_string();
     let info_hash = candidate
         .info_hash
-        .clone()
-        .or_else(|| extract_magnet_info_hash(source));
+        .as_deref()
+        .and_then(qbittorrent_trackable_info_hash)
+        .or_else(|| qbittorrent_magnet_info_hash(source));
     let fingerprint = request.release_fingerprint.clone().unwrap_or_else(|| {
         build_release_fingerprint(&ReleaseFingerprintInput {
             source_kind: &source_kind,
@@ -1051,10 +1273,34 @@ fn qbittorrent_release_context(
         info_hash,
         fingerprint,
         score: candidate.score,
-        selected_candidate: serde_json::to_value(candidate)
-            .ok()
-            .unwrap_or_else(|| json!({ "sourceProviderId": resolved.record.provider_id })),
+        selected_candidate: broker_selected_candidate_evidence(
+            candidate,
+            request.request_scope_evidence.as_ref(),
+            resolved.record.provider_id,
+        ),
     })
+}
+
+fn broker_selected_candidate_evidence(
+    candidate: &AcquisitionCandidate,
+    request_scope_evidence: Option<&Value>,
+    route_provider_id: Uuid,
+) -> Value {
+    let mut value = serde_json::to_value(candidate)
+        .unwrap_or_else(|_| json!({ "sourceProviderId": route_provider_id }));
+    if !value.is_object() {
+        value = json!({ "candidate": value });
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "routeProviderId".to_string(),
+            json!(route_provider_id.to_string()),
+        );
+        if let Some(evidence) = request_scope_evidence {
+            object.insert("requestScopeEvidence".to_string(), evidence.clone());
+        }
+    }
+    value
 }
 
 fn qbittorrent_add_fields(
@@ -1090,6 +1336,122 @@ fn qbittorrent_source_needs_metadata_fetch(source: &str) -> bool {
         .get(..7)
         .map(|scheme| scheme.eq_ignore_ascii_case("magnet:"))
         .unwrap_or(false)
+}
+
+fn qbittorrent_trackable_info_hash(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let stripped = trimmed
+        .get(..9)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("urn:btih:"))
+        .map(|_| &trimmed[9..])
+        .unwrap_or(trimmed);
+    if stripped.len() == 40 && stripped.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(stripped.to_ascii_lowercase());
+    }
+    if stripped.len() != 32
+        || !stripped
+            .chars()
+            .all(|ch| ch.is_ascii_alphabetic() || matches!(ch, '2'..='7'))
+    {
+        return None;
+    }
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    let mut decoded = Vec::with_capacity(20);
+    for ch in stripped.bytes() {
+        let upper = ch.to_ascii_uppercase();
+        let value = match upper {
+            b'A'..=b'Z' => upper - b'A',
+            b'2'..=b'7' => upper - b'2' + 26,
+            _ => return None,
+        };
+        accumulator = (accumulator << 5) | u32::from(value);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            decoded.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    if decoded.len() != 20 || bits != 0 {
+        return None;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut canonical = String::with_capacity(40);
+    for byte in decoded {
+        canonical.push(HEX[(byte >> 4) as usize] as char);
+        canonical.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(canonical)
+}
+
+fn qbittorrent_magnet_info_hash(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if !trimmed
+        .get(..7)
+        .map(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let query = trimmed.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if !key.eq_ignore_ascii_case("xt") {
+            continue;
+        }
+        let Ok(decoded) = urlencoding::decode(value) else {
+            continue;
+        };
+        if let Some(hash) = qbittorrent_trackable_info_hash(&decoded) {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+fn qbittorrent_submission_download_id(
+    source: &str,
+    candidate_info_hash: Option<&str>,
+    acquisition_owned: bool,
+) -> ApiResult<Option<String>> {
+    let canonical_candidate = candidate_info_hash.and_then(qbittorrent_trackable_info_hash);
+    if candidate_info_hash.is_some() && canonical_candidate.is_none() {
+        return Err(ApiError::bad_request(
+            "candidate info hash is malformed or is not a canonical v1 BTIH",
+        ));
+    }
+    let magnet_info_hash = qbittorrent_magnet_info_hash(source);
+    if qbittorrent_source_needs_metadata_fetch(source) && magnet_info_hash.is_none() {
+        return Err(ApiError::bad_request(
+            "qBittorrent magnet submissions require a valid v1 info hash",
+        ));
+    }
+    if let (Some(candidate_hash), Some(magnet_hash)) =
+        (canonical_candidate.as_deref(), magnet_info_hash.as_deref())
+        && candidate_hash != magnet_hash
+    {
+        return Err(ApiError::bad_request(
+            "candidate info hash does not match the submitted magnet",
+        ));
+    }
+    let download_id = magnet_info_hash.or(canonical_candidate);
+    if acquisition_owned && download_id.is_none() {
+        return Err(ApiError::bad_request(
+            "acquisition-owned qBittorrent submissions require an info hash so Elixir can reconcile staged metadata automatically",
+        ));
+    }
+    Ok(download_id)
+}
+
+fn same_optional_qbittorrent_hash(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            qbittorrent_trackable_info_hash(left) == qbittorrent_trackable_info_hash(right)
+                && qbittorrent_trackable_info_hash(left).is_some()
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn qbittorrent_torrent_files_path(hash: &str) -> String {
@@ -1247,7 +1609,7 @@ async fn load_qbittorrent_progress(
     store: &ExtensionStore<'_>,
     record: &DownloadBrokerProviderRecord,
 ) -> ApiResult<Vec<DownloadBrokerProgressItem>> {
-    let value = request_instance_service_json(
+    let value = request_qbittorrent_service_json(
         state,
         store,
         record.instance_id,
@@ -1275,7 +1637,8 @@ async fn load_qbittorrent_progress(
                     | AcquisitionReleaseState::Cancelled
             )
             && let Err(err) =
-                refresh_staged_qbittorrent_metadata(state, store, &release, hash, false).await
+                refresh_staged_qbittorrent_metadata(state, store, &release, hash, false, false)
+                    .await
         {
             tracing::debug!(
                 release_id = %release.release_id,
@@ -1289,6 +1652,7 @@ async fn load_qbittorrent_progress(
                 .map_err(ApiError::from)?
             && release.selected_route_logical_id.as_deref() == Some(record.logical_id.as_str())
             && release.selected_provider_id == Some(record.provider_id)
+            && !qbittorrent_submission_bookkeeping_pending(&release)
         {
             staged_releases.insert(hash.to_string(), release);
         }
@@ -1333,6 +1697,17 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
     limit: i64,
 ) -> anyhow::Result<usize> {
     let store = ExtensionStore::new(&state.db_pool);
+    reconcile_qbittorrent_terminal_release_jobs(
+        &state.db_pool,
+        limit.clamp(1, QBITTORRENT_STALE_RELEASE_BATCH_LIMIT),
+    )
+    .await?;
+    replay_pending_anime_qbittorrent_cleanup(
+        state,
+        &store,
+        limit.clamp(1, QBITTORRENT_STALE_RELEASE_BATCH_LIMIT),
+    )
+    .await?;
     let now = chrono::Utc::now();
     let releases = list_active_releases_by_route(
         &state.db_pool,
@@ -1342,7 +1717,23 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
     .await?;
     let mut failed = 0usize;
 
-    for release in releases {
+    for mut release in releases {
+        if qbittorrent_submission_bookkeeping_pending(&release) {
+            let Some(torrent_hash) = release.download_id.as_deref() else {
+                continue;
+            };
+            if reconcile_qbittorrent_submission_bookkeeping(&state.db_pool, &release, torrent_hash)
+                .await?
+            {
+                let Some(reconciled) = get_release(&state.db_pool, release.release_id).await?
+                else {
+                    continue;
+                };
+                release = reconciled;
+            } else if !qbittorrent_anime_provider_operation_retry_eligible(&release) {
+                continue;
+            }
+        }
         let Some(torrent_hash) = release.download_id.clone() else {
             continue;
         };
@@ -1358,29 +1749,107 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
         .await
         {
             Ok(Some(value)) => value,
-            Ok(None) => continue,
+            Ok(None) => {
+                if retry_aged_anime_qbittorrent_provider_failure(
+                    state,
+                    &store,
+                    release.release_id,
+                    &torrent_hash,
+                    QbittorrentProviderOperation::TorrentInspection,
+                    now,
+                )
+                .await?
+                {
+                    failed += 1;
+                }
+                continue;
+            }
             Err(err) => {
-                tracing::debug!(
-                    release_id = %release.release_id,
-                    torrent_hash = torrent_hash,
-                    "qBittorrent stale-release inspection skipped: {err}"
-                );
+                let retried = retry_aged_anime_qbittorrent_provider_failure(
+                    state,
+                    &store,
+                    release.release_id,
+                    &torrent_hash,
+                    QbittorrentProviderOperation::TorrentInspection,
+                    now,
+                )
+                .await?;
+                if retried {
+                    failed += 1;
+                    tracing::warn!(
+                        release_id = %release.release_id,
+                        torrent_hash = torrent_hash,
+                        "qBittorrent inspection remained unavailable through the attempt window; anime release scheduled for automatic retry: {err}"
+                    );
+                } else {
+                    tracing::debug!(
+                        release_id = %release.release_id,
+                        torrent_hash = torrent_hash,
+                        "qBittorrent stale-release inspection skipped: {err}"
+                    );
+                }
                 continue;
             }
         };
+        let state_before_refresh = release.state;
         if let Err(err) =
-            refresh_staged_qbittorrent_metadata(state, &store, &release, &torrent_hash, false).await
+            refresh_staged_qbittorrent_metadata(state, &store, &release, &torrent_hash, false, true)
+                .await
         {
-            tracing::debug!(
-                release_id = %release.release_id,
-                torrent_hash = torrent_hash,
-                "qBittorrent stale-release metadata refresh skipped: {err}"
-            );
+            let retried = retry_aged_anime_qbittorrent_provider_failure(
+                state,
+                &store,
+                release.release_id,
+                &torrent_hash,
+                QbittorrentProviderOperation::FilePolicyRefresh,
+                now,
+            )
+            .await?;
+            if retried {
+                failed += 1;
+                tracing::warn!(
+                    release_id = %release.release_id,
+                    torrent_hash = torrent_hash,
+                    "qBittorrent file-policy refresh kept failing through the attempt window; anime release scheduled for automatic retry: {err}"
+                );
+            } else {
+                tracing::debug!(
+                    release_id = %release.release_id,
+                    torrent_hash = torrent_hash,
+                    "qBittorrent stale-release metadata refresh skipped: {err}"
+                );
+            }
+            continue;
+        }
+        let Some(release) = get_release(&state.db_pool, release.release_id).await? else {
+            continue;
+        };
+        if matches!(
+            release.state,
+            AcquisitionReleaseState::Failed
+                | AcquisitionReleaseState::Cancelled
+                | AcquisitionReleaseState::Completed
+        ) {
+            continue;
+        }
+        if release.state != state_before_refresh || release.state == AcquisitionReleaseState::Ready
+        {
+            continue;
         }
         let files = list_release_files(&state.db_pool, release.release_id).await?;
-        let Some(decision) =
-            qbittorrent_stale_release_decision(now, &release, &files, &torrent_info)
-        else {
+        let attempt_started_at = qbittorrent_active_attempt_started_at(
+            &state.db_pool,
+            release.release_id,
+            &torrent_hash,
+        )
+        .await?;
+        let Some(decision) = qbittorrent_stale_release_decision(
+            now,
+            &release,
+            &files,
+            &torrent_info,
+            attempt_started_at,
+        ) else {
             continue;
         };
         mark_qbittorrent_release_stale_for_retry(
@@ -1392,9 +1861,12 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
             now,
         )
         .await?;
-        if let Err(err) =
+        let cleanup_result = if release.media_type == MediaType::Anime {
+            cleanup_qbittorrent_retry_torrent(state, &store, &release, &torrent_hash).await
+        } else {
             remove_stale_qbittorrent_runtime_torrent(state, &store, &release, &torrent_hash).await
-        {
+        };
+        if let Err(err) = cleanup_result {
             tracing::warn!(
                 release_id = %release.release_id,
                 torrent_hash = torrent_hash,
@@ -1405,6 +1877,51 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
     }
 
     Ok(failed)
+}
+
+async fn reconcile_qbittorrent_terminal_release_jobs(
+    pool: &sqlx::AnyPool,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    let rows = sqlx::query(
+        "SELECT CAST(j.release_job_id AS TEXT) AS release_job_id,
+                r.state AS release_state,
+                CAST(r.state_reason AS TEXT) AS state_reason
+         FROM acquisition_release_jobs j
+         JOIN acquisition_releases r ON r.release_id = j.release_id
+         WHERE j.active = 1
+           AND j.route_logical_id = $1
+           AND r.state IN ('completed', 'failed', 'cancelled')
+         ORDER BY j.updated_at ASC
+         LIMIT $2",
+    )
+    .bind(TORRENT_DEFAULT_LOGICAL_ID)
+    .bind(limit.clamp(1, QBITTORRENT_STALE_RELEASE_BATCH_LIMIT))
+    .fetch_all(pool)
+    .await?;
+    let mut reconciled = 0usize;
+    for row in rows {
+        let release_job_id: String = row.try_get("release_job_id")?;
+        let release_state: String = row.try_get("release_state")?;
+        let state_reason: Option<String> = row.try_get("state_reason")?;
+        let updated = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = $1,
+                 state_reason = $2,
+                 active = 0,
+                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_job_id = $3
+               AND active = 1",
+        )
+        .bind(release_state)
+        .bind(state_reason.as_deref())
+        .bind(release_job_id)
+        .execute(pool)
+        .await?;
+        reconciled += updated.rows_affected() as usize;
+    }
+    Ok(reconciled)
 }
 
 async fn remove_stale_qbittorrent_runtime_torrent(
@@ -1421,7 +1938,7 @@ async fn remove_stale_qbittorrent_runtime_torrent(
         .await?
         .context("stale qBittorrent provider is missing")?;
     let fields = qbittorrent_delete_fields(torrent_hash, false);
-    request_instance_service_form(
+    request_qbittorrent_service_form(
         state,
         store,
         provider.instance_id,
@@ -1429,6 +1946,163 @@ async fn remove_stale_qbittorrent_runtime_torrent(
         &fields,
     )
     .await
+}
+
+async fn cleanup_qbittorrent_retry_torrent(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+) -> anyhow::Result<()> {
+    let canonical_hash = qbittorrent_trackable_info_hash(torrent_hash)
+        .context("anime qBittorrent cleanup has no canonical info hash")?;
+    let current = get_release(&state.db_pool, release.release_id)
+        .await?
+        .context("anime qBittorrent cleanup release is missing")?;
+    if current.state != AcquisitionReleaseState::Failed
+        || !anime_qbittorrent_cleanup_pending(&current)
+    {
+        return Ok(());
+    }
+    let current_hash = current
+        .download_id
+        .as_deref()
+        .and_then(qbittorrent_trackable_info_hash)
+        .context("anime qBittorrent cleanup release has no canonical download hash")?;
+    let marker_hash = current
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.pointer("/torrentCleanup/torrentHash"))
+        .and_then(Value::as_str)
+        .and_then(qbittorrent_trackable_info_hash)
+        .context("anime qBittorrent cleanup marker has no canonical torrent hash")?;
+    if current_hash != canonical_hash || marker_hash != canonical_hash {
+        anyhow::bail!("anime qBittorrent cleanup hash no longer owns the current release attempt");
+    }
+    reconcile_anime_qbittorrent_retry_bookkeeping(
+        &state.db_pool,
+        current.release_id,
+        &canonical_hash,
+    )
+    .await?;
+    remove_stale_qbittorrent_runtime_torrent(state, store, &current, &canonical_hash).await?;
+    mark_anime_qbittorrent_cleanup_completed(&state.db_pool, current.release_id, &canonical_hash)
+        .await
+}
+
+async fn cleanup_pending_qbittorrent_hash_attempts(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    torrent_hash: &str,
+) -> anyhow::Result<()> {
+    let canonical_hash = qbittorrent_trackable_info_hash(torrent_hash)
+        .context("qBittorrent submission has no canonical torrent hash")?;
+    let rows = sqlx::query(
+        "SELECT CAST(release_id AS TEXT) AS release_id
+         FROM acquisition_releases
+         WHERE selected_route_logical_id = $1
+           AND media_type = 'anime'
+           AND state = 'failed'
+           AND LOWER(download_id) = LOWER($2)
+           AND coverage_plan_json LIKE '%\"torrentCleanup\"%'
+           AND coverage_plan_json LIKE '%\"status\":\"pending\"%'",
+    )
+    .bind(TORRENT_DEFAULT_LOGICAL_ID)
+    .bind(&canonical_hash)
+    .fetch_all(&state.db_pool)
+    .await?;
+    for row in rows {
+        let raw: String = row.try_get("release_id")?;
+        let release_id = Uuid::parse_str(&raw)
+            .with_context(|| format!("invalid qBittorrent cleanup release id '{raw}'"))?;
+        let release = get_release(&state.db_pool, release_id)
+            .await?
+            .context("pending qBittorrent cleanup release disappeared")?;
+        cleanup_qbittorrent_retry_torrent(state, store, &release, &canonical_hash).await?;
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM acquisition_releases
+         WHERE selected_route_logical_id = $1
+           AND media_type = 'anime'
+           AND state = 'failed'
+           AND LOWER(download_id) = LOWER($2)
+           AND coverage_plan_json LIKE '%\"torrentCleanup\"%'
+           AND coverage_plan_json LIKE '%\"status\":\"pending\"%'",
+    )
+    .bind(TORRENT_DEFAULT_LOGICAL_ID)
+    .bind(&canonical_hash)
+    .fetch_one(&state.db_pool)
+    .await?;
+    if pending != 0 {
+        anyhow::bail!(
+            "qBittorrent torrent {canonical_hash} is still owned by pending automatic cleanup"
+        );
+    }
+    Ok(())
+}
+
+async fn replay_pending_anime_qbittorrent_cleanup(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    limit: i64,
+) -> anyhow::Result<usize> {
+    let rows = sqlx::query(
+        "SELECT CAST(release_id AS TEXT) AS release_id
+         FROM acquisition_releases
+         WHERE selected_route_logical_id = $1
+           AND media_type = 'anime'
+           AND state = 'failed'
+           AND coverage_plan_json LIKE '%\"torrentCleanup\"%'
+           AND coverage_plan_json LIKE '%\"status\":\"pending\"%'
+         ORDER BY updated_at ASC
+         LIMIT $2",
+    )
+    .bind(TORRENT_DEFAULT_LOGICAL_ID)
+    .bind(limit.clamp(1, QBITTORRENT_STALE_RELEASE_BATCH_LIMIT))
+    .fetch_all(&state.db_pool)
+    .await?;
+    let mut completed = 0usize;
+    for row in rows {
+        let raw: String = row.try_get("release_id")?;
+        let Ok(release_id) = Uuid::parse_str(&raw) else {
+            continue;
+        };
+        let Some(release) = get_release(&state.db_pool, release_id).await? else {
+            continue;
+        };
+        if !anime_qbittorrent_cleanup_pending(&release) {
+            continue;
+        }
+        let Some(torrent_hash) = release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.pointer("/torrentCleanup/torrentHash"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                release
+                    .download_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        else {
+            continue;
+        };
+        match cleanup_qbittorrent_retry_torrent(state, store, &release, &torrent_hash).await {
+            Ok(()) => completed += 1,
+            Err(err) => tracing::warn!(
+                release_id = %release.release_id,
+                torrent_hash,
+                "pending anime qBittorrent cleanup will be retried: {err}"
+            ),
+        }
+    }
+    Ok(completed)
 }
 
 async fn load_qbittorrent_torrent_info_for_release(
@@ -1444,7 +2118,7 @@ async fn load_qbittorrent_torrent_info_for_release(
     if provider.implementation.as_deref() != Some("qbittorrent") {
         return Ok(None);
     }
-    let value = request_instance_service_json(
+    let value = request_qbittorrent_service_json(
         state,
         store,
         provider.instance_id,
@@ -1457,16 +2131,20 @@ async fn load_qbittorrent_torrent_info_for_release(
     let rows = value
         .as_array()
         .context("qbittorrent torrents/info response was not an array")?;
-    let normalized_hash = torrent_hash.trim().to_ascii_lowercase();
-    Ok(rows
-        .iter()
+    Ok(exact_qbittorrent_torrent_info(rows, torrent_hash))
+}
+
+fn exact_qbittorrent_torrent_info(rows: &[Value], torrent_hash: &str) -> Option<Value> {
+    let canonical_hash = qbittorrent_trackable_info_hash(torrent_hash)?;
+    rows.iter()
         .find(|row| {
             string_field(row, "hash")
-                .map(|hash| hash.eq_ignore_ascii_case(&normalized_hash))
-                .unwrap_or(false)
+                .as_deref()
+                .and_then(qbittorrent_trackable_info_hash)
+                .as_deref()
+                == Some(canonical_hash.as_str())
         })
         .cloned()
-        .or_else(|| rows.first().cloned()))
 }
 
 fn reserve_qbittorrent_metadata_poll(release_id: Uuid, force: bool) -> bool {
@@ -1551,16 +2229,39 @@ async fn load_qbittorrent_torrent_evidence(
     } else if runtime_state == "failed" && release.state != AcquisitionReleaseState::Failed {
         let coverage_plan =
             merge_qbittorrent_runtime_evidence(release.coverage_plan.clone(), &evidence);
-        mark_qbittorrent_release_failed(
-            pool,
-            &release,
-            &torrent_hash,
-            qbittorrent_failure_reason(torrent_info)
-                .as_deref()
-                .unwrap_or("qBittorrent reported a failed torrent state for the staged release."),
-            coverage_plan,
-        )
-        .await?;
+        let provider_reason = qbittorrent_failure_reason(torrent_info).unwrap_or_else(|| {
+            "qBittorrent reported a failed torrent state for the staged release.".to_string()
+        });
+        if release.media_type == MediaType::Anime {
+            let retry_reason = format!(
+                "{} Elixir will try the next release automatically.",
+                provider_reason.trim_end_matches('.')
+            );
+            persist_anime_qbittorrent_runtime_retry(
+                pool,
+                &release,
+                &torrent_hash,
+                coverage_plan,
+                "anime_qbittorrent_runtime_failed",
+                &retry_reason,
+            )
+            .await?;
+            release = get_release_by_download_id(pool, &torrent_hash)
+                .await?
+                .unwrap_or(release);
+            files = list_release_files(pool, release.release_id).await?;
+            evidence =
+                qbittorrent_torrent_evidence(record, &release, &files, torrent_info, "failed");
+        } else {
+            mark_qbittorrent_release_failed(
+                pool,
+                &release,
+                &torrent_hash,
+                &provider_reason,
+                coverage_plan,
+            )
+            .await?;
+        }
     } else {
         let current_runtime_state = release
             .coverage_plan
@@ -1881,11 +2582,127 @@ fn qbittorrent_failure_reason(torrent_info: &Value) -> Option<String> {
     })
 }
 
+async fn qbittorrent_active_attempt_started_at(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    torrent_hash: &str,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    Ok(list_release_jobs(pool, release_id)
+        .await?
+        .into_iter()
+        .filter(|job| {
+            job.active
+                && job.route_logical_id == TORRENT_DEFAULT_LOGICAL_ID
+                && job
+                    .download_id
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(torrent_hash))
+                    .unwrap_or(false)
+        })
+        .filter_map(|job| job.started_at)
+        .max())
+}
+
+fn qbittorrent_provider_operation_failure_decision(
+    now: chrono::DateTime<chrono::Utc>,
+    release: &AcquisitionRelease,
+    attempt_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    operation: QbittorrentProviderOperation,
+) -> Option<QbittorrentStaleReleaseDecision> {
+    if !qbittorrent_anime_provider_operation_retry_eligible(release) {
+        return None;
+    }
+    let age_seconds = now
+        .signed_duration_since(attempt_started_at.unwrap_or(release.created_at))
+        .num_seconds()
+        .max(0);
+    (age_seconds >= QBITTORRENT_METADATA_TIMEOUT_SECONDS).then(|| {
+        QbittorrentStaleReleaseDecision::provider_operation_timeout(age_seconds, operation)
+    })
+}
+
+fn qbittorrent_anime_provider_operation_retry_eligible(release: &AcquisitionRelease) -> bool {
+    release.media_type == MediaType::Anime
+        && matches!(
+            release.state,
+            AcquisitionReleaseState::Staging
+                | AcquisitionReleaseState::Submitted
+                | AcquisitionReleaseState::Ready
+        )
+}
+
+async fn terminalize_aged_anime_qbittorrent_provider_failure(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    torrent_hash: &str,
+    operation: QbittorrentProviderOperation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<AcquisitionRelease>> {
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(None);
+    };
+    let attempt_started_at =
+        qbittorrent_active_attempt_started_at(pool, release.release_id, torrent_hash).await?;
+    let Some(decision) = qbittorrent_provider_operation_failure_decision(
+        now,
+        &release,
+        attempt_started_at,
+        operation,
+    ) else {
+        return Ok(None);
+    };
+    let torrent_info = json!({
+        "hash": torrent_hash,
+        "state": operation.evidence_state(),
+    });
+    mark_qbittorrent_release_stale_for_retry(
+        pool,
+        &release,
+        torrent_hash,
+        &torrent_info,
+        decision,
+        now,
+    )
+    .await?;
+    Ok(Some(release))
+}
+
+async fn retry_aged_anime_qbittorrent_provider_failure(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    release_id: Uuid,
+    torrent_hash: &str,
+    operation: QbittorrentProviderOperation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<bool> {
+    let Some(release) = terminalize_aged_anime_qbittorrent_provider_failure(
+        &state.db_pool,
+        release_id,
+        torrent_hash,
+        operation,
+        now,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    if let Err(err) = cleanup_qbittorrent_retry_torrent(state, store, &release, torrent_hash).await
+    {
+        tracing::warn!(
+            release_id = %release.release_id,
+            torrent_hash,
+            "failed to remove qBittorrent torrent after provider-operation retry was scheduled: {err}"
+        );
+    }
+    Ok(true)
+}
+
 fn qbittorrent_stale_release_decision(
     now: chrono::DateTime<chrono::Utc>,
     release: &AcquisitionRelease,
     files: &[AcquisitionReleaseFile],
     torrent_info: &Value,
+    attempt_started_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<QbittorrentStaleReleaseDecision> {
     if matches!(
         release.state,
@@ -1897,7 +2714,7 @@ fn qbittorrent_stale_release_decision(
         return None;
     }
     let age_seconds = now
-        .signed_duration_since(release.created_at)
+        .signed_duration_since(attempt_started_at.unwrap_or(release.created_at))
         .num_seconds()
         .max(0);
     if qbittorrent_waiting_for_metadata(files, torrent_info)
@@ -1962,6 +2779,21 @@ async fn mark_qbittorrent_release_stale_for_retry(
         &decision,
         now,
     );
+    if release.media_type == MediaType::Anime {
+        let retry_reason = format!(
+            "{} Elixir will try the next release automatically.",
+            decision.user_message.trim_end_matches('.')
+        );
+        return persist_anime_qbittorrent_runtime_retry(
+            pool,
+            release,
+            torrent_hash,
+            coverage_plan,
+            decision.reason_code,
+            &retry_reason,
+        )
+        .await;
+    }
     mark_qbittorrent_release_failed(
         pool,
         release,
@@ -2094,10 +2926,16 @@ async fn record_qbittorrent_runtime_evidence(
     release: &AcquisitionRelease,
     evidence: &DownloadBrokerTorrentEvidence,
 ) -> anyhow::Result<()> {
+    let torrent_hash = release
+        .download_id
+        .as_deref()
+        .context("qBittorrent runtime evidence is missing its torrent hash")?;
     let coverage_plan = merge_qbittorrent_runtime_evidence(release.coverage_plan.clone(), evidence);
     update_qbittorrent_release_state_only(
         pool,
         release.release_id,
+        torrent_hash,
+        release.state,
         release.state,
         release
             .state_reason
@@ -2153,9 +2991,13 @@ async fn refresh_staged_qbittorrent_metadata(
     release: &AcquisitionRelease,
     torrent_hash: &str,
     force: bool,
+    report_provider_errors: bool,
 ) -> anyhow::Result<usize> {
     let hash = torrent_hash.trim();
     if hash.is_empty() {
+        return Ok(0);
+    }
+    if qbittorrent_submission_bookkeeping_pending(release) {
         return Ok(0);
     }
     if !reserve_qbittorrent_metadata_poll(release.release_id, force) {
@@ -2168,7 +3010,7 @@ async fn refresh_staged_qbittorrent_metadata(
         .get_provider(provider_id)
         .await?
         .context("staged qBittorrent provider is missing")?;
-    let value = match request_instance_service_json(
+    let value = match request_qbittorrent_service_json(
         state,
         store,
         store_provider.instance_id,
@@ -2186,6 +3028,9 @@ async fn refresh_staged_qbittorrent_metadata(
                 "qBittorrent file metadata is not available yet: {err}"
             );
             finish_qbittorrent_metadata_poll(release.release_id, 0);
+            if report_provider_errors {
+                return Err(err).context("qBittorrent torrent file-list request failed");
+            }
             return Ok(0);
         }
     };
@@ -2194,16 +3039,144 @@ async fn refresh_staged_qbittorrent_metadata(
         .context("qbittorrent torrents/files response was not an array")?;
     let persisted =
         persist_qbittorrent_release_file_rows(&state.db_pool, release, hash, rows).await?;
-    if persisted > 0
-        && matches!(
-            release.state,
-            AcquisitionReleaseState::Staging | AcquisitionReleaseState::Submitted
-        )
-    {
+    if persisted > 0 && qbittorrent_release_needs_file_policy(release) {
         refine_and_apply_qbittorrent_file_policy(state, store, release, hash).await?;
     }
     finish_qbittorrent_metadata_poll(release.release_id, persisted);
     Ok(persisted)
+}
+
+fn qbittorrent_submission_bookkeeping_marked_pending(release: &AcquisitionRelease) -> bool {
+    release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.pointer("/submissionBookkeeping/status"))
+        .and_then(Value::as_str)
+        == Some("pending")
+}
+
+fn qbittorrent_submission_bookkeeping_pending(release: &AcquisitionRelease) -> bool {
+    release.subscription_id.is_some()
+        && (release.state == AcquisitionReleaseState::Staging
+            || qbittorrent_submission_bookkeeping_marked_pending(release))
+}
+
+// The metadata poll waits for post-submit bookkeeping for every media type.
+// Priority persistence additionally treats staged anime as a hard ownership
+// barrier because ALM-7 refinement can mutate coverage and schedule retries.
+// Existing deterministic Series/Movie decisions may persist from a staged
+// snapshot, but only while the exact torrent hash still owns the release.
+fn qbittorrent_priority_bookkeeping_pending(release: &AcquisitionRelease) -> bool {
+    release.subscription_id.is_some()
+        && (qbittorrent_submission_bookkeeping_marked_pending(release)
+            || (release.media_type == MediaType::Anime
+                && release.state == AcquisitionReleaseState::Staging))
+}
+
+fn qbittorrent_release_needs_file_policy(release: &AcquisitionRelease) -> bool {
+    !qbittorrent_submission_bookkeeping_pending(release)
+        && matches!(
+            release.state,
+            AcquisitionReleaseState::Staging
+                | AcquisitionReleaseState::Submitted
+                | AcquisitionReleaseState::Ready
+        )
+}
+
+async fn reconcile_qbittorrent_submission_bookkeeping(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+) -> anyhow::Result<bool> {
+    if release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.pointer("/submissionBookkeeping/status"))
+        .and_then(Value::as_str)
+        != Some("pending")
+        || release.state != AcquisitionReleaseState::Submitted
+    {
+        return Ok(false);
+    }
+    let Some(subscription_id) = release.subscription_id else {
+        return Ok(false);
+    };
+    let targets = list_subscription_targets(pool, subscription_id).await?;
+    let coverage_rows = list_release_coverage(pool, release.release_id).await?;
+    let expected_targets =
+        qbittorrent_release_scoped_targets(release, &targets, &coverage_rows, torrent_hash);
+    if expected_targets.is_empty() {
+        return Ok(false);
+    }
+    let expected_ids = expected_targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    let covered_ids = coverage_rows
+        .into_iter()
+        .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+        .map(|coverage| coverage.target_id)
+        .collect::<BTreeSet<_>>();
+    if expected_ids != covered_ids
+        || expected_targets.iter().any(|target| {
+            target.state != AcquisitionTargetState::Submitted
+                || target.selected_route_logical_id.as_deref() != Some(TORRENT_DEFAULT_LOGICAL_ID)
+                || target
+                    .download_id
+                    .as_deref()
+                    .map(|value| !value.eq_ignore_ascii_case(torrent_hash))
+                    .unwrap_or(true)
+        })
+    {
+        return Ok(false);
+    }
+    let job_is_durable = list_release_jobs(pool, release.release_id)
+        .await?
+        .into_iter()
+        .any(|job| {
+            job.active
+                && job.route_logical_id == TORRENT_DEFAULT_LOGICAL_ID
+                && job
+                    .download_id
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(torrent_hash))
+                    .unwrap_or(false)
+        });
+    if !job_is_durable {
+        return Ok(false);
+    }
+
+    let original_coverage_plan = release.coverage_plan.clone().unwrap_or_else(|| json!({}));
+    let original_coverage_plan_json = serde_json::to_string(&original_coverage_plan)?;
+    let mut coverage_plan = original_coverage_plan;
+    let completed = json!({
+        "status": "complete",
+        "policyVersion": "acquisition-broker-bookkeeping-v1",
+        "updatedAt": chrono::Utc::now(),
+        "reconciled": true,
+    });
+    if let Some(object) = coverage_plan.as_object_mut() {
+        object.insert("submissionBookkeeping".to_string(), completed);
+    } else {
+        coverage_plan = json!({
+            "coveragePlan": coverage_plan,
+            "submissionBookkeeping": completed,
+        });
+    }
+    let updated = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET coverage_plan_json = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2
+           AND state = 'submitted'
+           AND coverage_plan_json = $3",
+    )
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(release.release_id.to_string())
+    .bind(original_coverage_plan_json)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 async fn persist_qbittorrent_release_file_rows(
@@ -2285,6 +3258,23 @@ struct QbittorrentCoverageRefinement {
     confidence: ReleaseConfidence,
     review_reasons: Vec<String>,
     coverage_plan: Value,
+    anime_match_assist: Option<AnimeMatchAssistProvenance>,
+    anime_model_audio_profile: Option<AnimeMatchAudioProfile>,
+    anime_model_audio_policy: Option<Value>,
+    automatic_retry: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QbittorrentAnimeModelAudioEvidence {
+    profile: AnimeMatchAudioProfile,
+    policy: Value,
+}
+
+#[derive(Debug, Clone)]
+struct QbittorrentAnimeResolvedCoverage {
+    plan: AnimeFileCoveragePlan,
+    model_audio: Option<QbittorrentAnimeModelAudioEvidence>,
+    required_audio_satisfied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2321,6 +3311,39 @@ async fn refine_and_apply_qbittorrent_file_policy(
     let Some(subscription_id) = release.subscription_id else {
         let files = list_release_files(&state.db_pool, release.release_id).await?;
         let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+        if release.media_type == MediaType::Anime {
+            let refinement = QbittorrentCoverageRefinement {
+                release_kind: ReleaseKind::Unknown,
+                resolver_kind: ReleaseResolverKind::Unresolved,
+                resolver_version: QBITTORRENT_SELECTION_POLICY_VERSION.to_string(),
+                confidence: ReleaseConfidence::Low,
+                review_reasons: Vec::new(),
+                coverage_plan: json!({
+                    "source": "qbittorrent_file_list",
+                    "torrentHash": torrent_hash,
+                    "automaticResolution": {
+                        "status": "retryable",
+                        "reason": "missing_subscription_context"
+                    }
+                }),
+                anime_match_assist: None,
+                anime_model_audio_profile: None,
+                anime_model_audio_policy: None,
+                automatic_retry: true,
+            };
+            persist_anime_qbittorrent_retry(&state.db_pool, release, torrent_hash, &refinement)
+                .await?;
+            if let Err(err) =
+                cleanup_qbittorrent_retry_torrent(state, store, release, torrent_hash).await
+            {
+                tracing::warn!(
+                    release_id = %release.release_id,
+                    torrent_hash,
+                    "failed to remove unresolved anime qBittorrent candidate after scheduling retry: {err}"
+                );
+            }
+            return Ok(());
+        }
         let refinement = QbittorrentCoverageRefinement {
             release_kind: ReleaseKind::Unknown,
             resolver_kind: ReleaseResolverKind::Unresolved,
@@ -2332,6 +3355,10 @@ async fn refine_and_apply_qbittorrent_file_policy(
                 "torrentHash": torrent_hash,
                 "reviewReasons": ["missing_subscription_context"]
             }),
+            anime_match_assist: None,
+            anime_model_audio_profile: None,
+            anime_model_audio_policy: None,
+            automatic_retry: false,
         };
         let decision = decide_qbittorrent_file_priority(release, &refinement, &files, &coverage);
         persist_qbittorrent_priority_decision(
@@ -2347,15 +3374,56 @@ async fn refine_and_apply_qbittorrent_file_policy(
         return Ok(());
     };
 
-    let targets = list_subscription_targets(&state.db_pool, subscription_id).await?;
+    let subscription = get_subscription(&state.db_pool, subscription_id).await?;
+    let all_targets = list_subscription_targets(&state.db_pool, subscription_id).await?;
     let files = list_release_files(&state.db_pool, release.release_id).await?;
-    let refinement =
-        refine_qbittorrent_coverage(&state.db_pool, release, torrent_hash, &targets, &files)
-            .await?;
+    let existing_coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
+    let targets =
+        qbittorrent_release_scoped_targets(release, &all_targets, &existing_coverage, torrent_hash);
+    let matching_service = state.anime_inference.matching_service();
+    let refinement = refine_qbittorrent_coverage(
+        &state.db_pool,
+        &matching_service,
+        subscription.as_ref(),
+        release,
+        torrent_hash,
+        &targets,
+        &files,
+    )
+    .await?;
+    if refinement
+        .anime_match_assist
+        .as_ref()
+        .is_some_and(|assist| {
+            matches!(
+                assist.reason,
+                Some(
+                    AnimeMatchFallbackReason::EngineUnavailable
+                        | AnimeMatchFallbackReason::EngineError
+                )
+            )
+        })
+    {
+        state.anime_inference.request_runtime_repair();
+    }
     let coverage = list_release_coverage(&state.db_pool, release.release_id).await?;
     let base_decision = decide_qbittorrent_file_priority(release, &refinement, &files, &coverage);
-    let decision =
-        approved_qbittorrent_user_override(release, &base_decision).unwrap_or(base_decision);
+    if release.media_type == MediaType::Anime
+        && (refinement.automatic_retry || !base_decision.is_approved())
+    {
+        persist_anime_qbittorrent_retry(&state.db_pool, release, torrent_hash, &refinement).await?;
+        if let Err(err) =
+            cleanup_qbittorrent_retry_torrent(state, store, release, torrent_hash).await
+        {
+            tracing::warn!(
+                release_id = %release.release_id,
+                torrent_hash,
+                "failed to remove unresolved anime qBittorrent candidate after scheduling retry: {err}"
+            );
+        }
+        return Ok(());
+    }
+    let decision = qbittorrent_priority_decision_with_legacy_override(release, base_decision);
     persist_qbittorrent_priority_decision(
         &state.db_pool,
         release,
@@ -2388,6 +3456,8 @@ async fn refine_and_apply_qbittorrent_file_policy(
 
 async fn refine_qbittorrent_coverage(
     pool: &sqlx::AnyPool,
+    anime_matching_service: &AnimeMatchingService,
+    subscription: Option<&AcquisitionSubscription>,
     release: &AcquisitionRelease,
     torrent_hash: &str,
     targets: &[AcquisitionTarget],
@@ -2398,7 +3468,16 @@ async fn refine_qbittorrent_coverage(
             refine_tv_qbittorrent_coverage(pool, release, torrent_hash, targets, files).await
         }
         MediaType::Anime => {
-            refine_anime_qbittorrent_coverage(pool, release, torrent_hash, targets, files).await
+            refine_anime_qbittorrent_coverage(
+                pool,
+                anime_matching_service,
+                subscription,
+                release,
+                torrent_hash,
+                targets,
+                files,
+            )
+            .await
         }
         MediaType::Movie => {
             refine_movie_qbittorrent_coverage(pool, release, torrent_hash, targets, files).await
@@ -2480,73 +3559,195 @@ async fn refine_tv_qbittorrent_coverage(
             "tv": plan,
             "reviewReasons": review_reasons
         }),
+        anime_match_assist: None,
+        anime_model_audio_profile: None,
+        anime_model_audio_policy: None,
+        automatic_retry: false,
     })
 }
 
 async fn refine_anime_qbittorrent_coverage(
     pool: &sqlx::AnyPool,
+    matching_service: &AnimeMatchingService,
+    subscription: Option<&AcquisitionSubscription>,
     release: &AcquisitionRelease,
     torrent_hash: &str,
     targets: &[AcquisitionTarget],
     files: &[AcquisitionReleaseFile],
 ) -> anyhow::Result<QbittorrentCoverageRefinement> {
-    let context = anime_scoring_context_from_qbittorrent_release(release, targets);
-    let selected_candidate = release.selected_candidate.as_ref();
-    let candidate = AnimeCandidateInput {
-        title: release.release_title.clone(),
-        source_kind: release.source_kind.clone(),
-        quality: selected_candidate_string(selected_candidate, "quality"),
-        size_bytes: selected_candidate_u64(selected_candidate, "sizeBytes"),
-        seeders: selected_candidate_u64(selected_candidate, "seeders")
-            .and_then(|value| u32::try_from(value).ok()),
-        cached_debrid: selected_candidate_bool(selected_candidate, "cachedDebrid"),
-        rank: selected_candidate_u64(selected_candidate, "rank")
-            .and_then(|value| u32::try_from(value).ok()),
-        source_score: selected_candidate_f64(selected_candidate, "score"),
-        supported_routes: selected_candidate_string_vec(selected_candidate, "supportedRoutes"),
-        default_route: selected_candidate_string(selected_candidate, "defaultRoute"),
-    };
+    let context = anime_scoring_context_from_qbittorrent_release(subscription, release, targets);
+    let acquisition_candidate = qbittorrent_anime_acquisition_candidate(release, files);
+    let candidate = qbittorrent_anime_candidate_input(&acquisition_candidate);
     let file_inputs = files
         .iter()
         .filter_map(qbittorrent_anime_release_file_input)
         .collect::<Vec<_>>();
-    let plan = plan_anime_file_coverage_with_options(
+    let deterministic_plan = plan_anime_file_coverage_with_options(
         &context,
         &candidate,
         &file_inputs,
         AnimeCoverageOptions {
-            file_selection_supported: false,
+            // qBittorrent exposes exact per-file priorities after metadata is
+            // available, so safe deterministic and model mappings may exclude
+            // unrelated media instead of escalating to a user decision.
+            file_selection_supported: true,
         },
     );
+    let deterministic_plan = bind_exact_single_anime_provider_file(
+        deterministic_plan,
+        &context,
+        &candidate,
+        &file_inputs,
+    );
+    let deterministic_required_audio_satisfied = subscription
+        .map(|subscription| {
+            assess_acquisition_anime_provider_file_audio(
+                subscription,
+                &acquisition_candidate,
+                &deterministic_plan.selected_file_keys,
+            )
+            .1
+        })
+        .unwrap_or(true);
+
+    let deterministic_state = acquisition_anime_deterministic_state(&deterministic_plan);
+    let deterministic_is_automatic =
+        anime_qbittorrent_plan_is_automatic(&deterministic_plan, targets);
+    let deterministic_resolution = QbittorrentAnimeResolvedCoverage {
+        plan: deterministic_plan,
+        model_audio: None,
+        required_audio_satisfied: deterministic_required_audio_satisfied,
+    };
+    let (resolution, anime_match_assist) = if deterministic_state
+        == DeterministicMatchState::Definitive
+        && deterministic_is_automatic
+        && deterministic_required_audio_satisfied
+    {
+        (
+            deterministic_resolution,
+            Some(anime_deterministic_fast_path_provenance()),
+        )
+    } else if let Some(subscription) = subscription {
+        match acquisition_anime_match_batch_input(
+            format!("qbittorrent:{}:{torrent_hash}", release.release_id),
+            subscription,
+            targets,
+            &context,
+            std::slice::from_ref(&acquisition_candidate),
+        ) {
+            Ok(input) => {
+                let override_context = context.clone();
+                let override_candidate = acquisition_candidate.clone();
+                let override_subscription = subscription.clone();
+                let outcome = matching_service
+                    .match_or_fallback(
+                        AnimeDeterministicResult::difficult(deterministic_resolution),
+                        input,
+                        move |_, request, matches, source_map| {
+                            let mut coverages =
+                                model_derived_anime_coverage_plans_with_file_selection_support(
+                                request,
+                                &override_context,
+                                std::slice::from_ref(&override_candidate),
+                                true,
+                                matches,
+                                source_map,
+                            )?;
+                            if coverages.len() != 1 || coverages[0].candidate_index != 0 {
+                                bail!(
+                                    "qBittorrent anime refinement requires exactly one mapping for its staged candidate"
+                                );
+                            }
+                            let model = coverages.remove(0);
+                            let (assessment, required_audio_satisfied) =
+                                assess_acquisition_anime_model_audio_profile(
+                                    &override_subscription,
+                                    model.audio_profile,
+                                );
+                            Ok(QbittorrentAnimeResolvedCoverage {
+                                plan: model.plan,
+                                model_audio: Some(QbittorrentAnimeModelAudioEvidence {
+                                    profile: model.audio_profile,
+                                    policy: qbittorrent_anime_audio_policy_evidence(
+                                        &assessment,
+                                        required_audio_satisfied,
+                                    ),
+                                }),
+                                required_audio_satisfied,
+                            })
+                        },
+                    )
+                    .await;
+                (outcome.value, Some(outcome.provenance))
+            }
+            Err(error) => (
+                deterministic_resolution,
+                Some(anime_invalid_request_fallback_provenance(error.to_string())),
+            ),
+        }
+    } else {
+        (
+            deterministic_resolution,
+            Some(anime_invalid_request_fallback_provenance(
+                "staged anime release has no subscription context".to_string(),
+            )),
+        )
+    };
+
+    let QbittorrentAnimeResolvedCoverage {
+        plan,
+        model_audio,
+        required_audio_satisfied,
+    } = resolution;
+    let anime_model_audio_profile = model_audio.as_ref().map(|evidence| evidence.profile);
+    let anime_model_audio_policy = model_audio.as_ref().map(|evidence| evidence.policy.clone());
+    let automatic_retry =
+        !anime_qbittorrent_plan_is_automatic(&plan, targets) || !required_audio_satisfied;
     let targets_by_key = targets
         .iter()
         .map(|target| (target.target_key.clone(), target.target_id))
         .collect::<HashMap<_, _>>();
     let file_ids = release_file_ids_by_provider_file_id(files);
-    for entry in &plan.entries {
-        let Some(target_id) = targets_by_key.get(&entry.target_key).copied() else {
-            continue;
-        };
-        upsert_release_coverage(
-            pool,
-            NewAcquisitionReleaseCoverage {
-                coverage_id: None,
-                release_id: release.release_id,
-                release_file_id: entry
-                    .release_file_key
-                    .as_ref()
-                    .and_then(|file_id| file_ids.get(file_id))
-                    .copied(),
-                target_id,
-                coverage_kind: entry.coverage_kind,
-                confidence: entry.confidence,
-                score: entry.score,
-                reason: Some(entry.reason.clone()),
-                state: entry.state,
-                verified_by: Some("rr5b_qbittorrent_anime_file_list".to_string()),
-            },
-        )
-        .await?;
+    if !automatic_retry {
+        for entry in &plan.entries {
+            let target_id = targets_by_key
+                .get(&entry.target_key)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "qBittorrent anime mapping references unknown scoped target '{}'",
+                        entry.target_key
+                    )
+                })?;
+            let release_file_key = entry.release_file_key.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "qBittorrent anime mapping for '{}' has no selected release file",
+                    entry.target_key
+                )
+            })?;
+            let release_file_id = file_ids.get(release_file_key).copied().ok_or_else(|| {
+                anyhow!(
+                    "qBittorrent anime mapping references unavailable release file '{}'",
+                    release_file_key
+                )
+            })?;
+            upsert_release_coverage(
+                pool,
+                NewAcquisitionReleaseCoverage {
+                    coverage_id: None,
+                    release_id: release.release_id,
+                    release_file_id: Some(release_file_id),
+                    target_id,
+                    coverage_kind: entry.coverage_kind,
+                    confidence: entry.confidence,
+                    score: entry.score,
+                    reason: Some(entry.reason.clone()),
+                    state: entry.state,
+                    verified_by: Some("alm7_qbittorrent_anime_file_list".to_string()),
+                },
+            )
+            .await?;
+        }
     }
     let mut review_reasons = plan.review_reasons.clone();
     review_reasons.extend(plan.rejection_reasons.clone());
@@ -2565,8 +3766,15 @@ async fn refine_anime_qbittorrent_coverage(
             "torrentHash": torrent_hash,
             "anime": plan,
             "diagnostics": diagnostics,
+            "animeMatchAssist": anime_match_assist,
+            "modelAudioProfile": anime_model_audio_profile,
+            "modelAudioPolicy": anime_model_audio_policy,
             "reviewReasons": review_reasons
         }),
+        anime_match_assist,
+        anime_model_audio_profile,
+        anime_model_audio_policy,
+        automatic_retry,
     })
 }
 
@@ -2650,6 +3858,10 @@ async fn refine_movie_qbittorrent_coverage(
             },
             "reviewReasons": review_reasons
         }),
+        anime_match_assist: None,
+        anime_model_audio_profile: None,
+        anime_model_audio_policy: None,
+        automatic_retry: false,
     })
 }
 
@@ -2793,6 +4005,16 @@ fn approved_qbittorrent_user_override(
     })
 }
 
+fn qbittorrent_priority_decision_with_legacy_override(
+    release: &AcquisitionRelease,
+    fallback: QbittorrentFilePriorityDecision,
+) -> QbittorrentFilePriorityDecision {
+    if release.media_type == MediaType::Anime {
+        return fallback;
+    }
+    approved_qbittorrent_user_override(release, &fallback).unwrap_or(fallback)
+}
+
 async fn apply_qbittorrent_file_priorities(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -2841,7 +4063,7 @@ async fn request_qbittorrent_file_priority(
     priority: i64,
 ) -> anyhow::Result<()> {
     let fields = qbittorrent_file_priority_fields(torrent_hash, file_ids, priority);
-    request_instance_service_form(
+    request_qbittorrent_service_form(
         state,
         store,
         instance_id,
@@ -2877,7 +4099,7 @@ async fn resume_qbittorrent_torrent(
         .await?
         .context("staged qBittorrent provider is missing")?;
     let fields = qbittorrent_resume_fields(torrent_hash);
-    request_instance_service_form(
+    request_qbittorrent_service_form(
         state,
         store,
         store_provider.instance_id,
@@ -2893,6 +4115,473 @@ fn qbittorrent_resume_fields(torrent_hash: &str) -> HashMap<String, String> {
     fields
 }
 
+async fn persist_anime_qbittorrent_retry(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+    refinement: &QbittorrentCoverageRefinement,
+) -> anyhow::Result<()> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let reason =
+        "Anime files could not be mapped safely. Elixir will try the next release automatically.";
+    let suppress_automatic_rediscovery = anime_qbittorrent_retry_suppresses_rediscovery(refinement);
+    persist_anime_qbittorrent_retry_disposition(
+        pool,
+        release,
+        torrent_hash,
+        refinement,
+        "anime_qbittorrent_file_mapping_unresolved",
+        reason,
+        suppress_automatic_rediscovery,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_anime_qbittorrent_retry_disposition(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+    refinement: &QbittorrentCoverageRefinement,
+    retry_reason_code: &str,
+    reason: &str,
+    suppress_automatic_rediscovery: bool,
+) -> anyhow::Result<usize> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let now = chrono::Utc::now();
+    let coverage_plan = merge_anime_qbittorrent_retry_evidence(
+        refinement.coverage_plan.clone(),
+        torrent_hash,
+        now,
+        retry_reason_code,
+        suppress_automatic_rediscovery,
+    );
+    terminalize_anime_qbittorrent_retry(
+        pool,
+        release,
+        torrent_hash,
+        refinement,
+        reason,
+        coverage_plan,
+    )
+    .await?;
+    reconcile_anime_qbittorrent_retry_bookkeeping(pool, release.release_id, torrent_hash).await
+}
+
+async fn persist_anime_qbittorrent_runtime_retry(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+    coverage_plan: Value,
+    retry_reason_code: &str,
+    reason: &str,
+) -> anyhow::Result<usize> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let coverage = list_release_coverage(pool, release.release_id).await?;
+    let all_targets = match release.subscription_id {
+        Some(subscription_id) => list_subscription_targets(pool, subscription_id).await?,
+        None => Vec::new(),
+    };
+    let targets =
+        qbittorrent_release_scoped_targets(release, &all_targets, &coverage, torrent_hash);
+    let refinement = QbittorrentCoverageRefinement {
+        release_kind: release.release_kind,
+        resolver_kind: release.resolver_kind,
+        resolver_version: release.resolver_version.clone(),
+        confidence: release.confidence,
+        review_reasons: Vec::new(),
+        coverage_plan,
+        anime_match_assist: None,
+        anime_model_audio_profile: None,
+        anime_model_audio_policy: None,
+        automatic_retry: true,
+    };
+    let reset = persist_anime_qbittorrent_retry_disposition(
+        pool,
+        release,
+        torrent_hash,
+        &refinement,
+        retry_reason_code,
+        reason,
+        true,
+    )
+    .await?;
+    Ok(reset.min(targets.len()))
+}
+
+async fn terminalize_anime_qbittorrent_retry(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+    refinement: &QbittorrentCoverageRefinement,
+    reason: &str,
+    coverage_plan: Value,
+) -> anyhow::Result<()> {
+    let canonical_hash = qbittorrent_trackable_info_hash(torrent_hash)
+        .context("anime qBittorrent retry has no canonical torrent hash")?;
+    let current = get_release(pool, release.release_id)
+        .await?
+        .context("anime qBittorrent retry release disappeared")?;
+    if current.state == AcquisitionReleaseState::Failed
+        && current
+            .download_id
+            .as_deref()
+            .and_then(qbittorrent_trackable_info_hash)
+            .as_deref()
+            == Some(canonical_hash.as_str())
+        && anime_qbittorrent_cleanup_pending(&current)
+    {
+        let current_suppresses = current
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.pointer("/retrySuppression/suppressAutomaticRediscovery"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let desired_suppresses = coverage_plan
+            .pointer("/retrySuppression/suppressAutomaticRediscovery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if desired_suppresses && !current_suppresses {
+            let original_plan_json = current
+                .coverage_plan
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_default();
+            let upgraded = sqlx::query::<sqlx::Any>(
+                "UPDATE acquisition_releases
+                 SET release_kind = $1,
+                     resolver_kind = $2,
+                     resolver_version = $3,
+                     confidence = $4,
+                     state_reason = $5,
+                     coverage_plan_json = $6,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE release_id = $7
+                   AND state = 'failed'
+                   AND LOWER(download_id) = LOWER($8)
+                   AND COALESCE(coverage_plan_json, '') = $9",
+            )
+            .bind(refinement.release_kind.as_str())
+            .bind(refinement.resolver_kind.as_str())
+            .bind(refinement.resolver_version.as_str())
+            .bind(refinement.confidence.as_str())
+            .bind(reason)
+            .bind(serde_json::to_string(&coverage_plan)?)
+            .bind(release.release_id.to_string())
+            .bind(&canonical_hash)
+            .bind(original_plan_json)
+            .execute(pool)
+            .await?;
+            if upgraded.rows_affected() != 1 {
+                anyhow::bail!(
+                    "anime qBittorrent retry could not strengthen the active cleanup disposition"
+                );
+            }
+        }
+        return Ok(());
+    }
+    if matches!(
+        current.state,
+        AcquisitionReleaseState::Failed
+            | AcquisitionReleaseState::Cancelled
+            | AcquisitionReleaseState::Completed
+    ) {
+        return Ok(());
+    }
+    let expected_coverage_plan_json = release
+        .coverage_plan
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_default();
+    let mut transaction = pool.begin().await?;
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET release_kind = $1,
+             resolver_kind = $2,
+             resolver_version = $3,
+             confidence = $4,
+             state = $5,
+             state_reason = $6,
+             coverage_plan_json = $7,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $8
+           AND LOWER(download_id) = LOWER($9)
+           AND state NOT IN ('failed', 'cancelled', 'completed')
+           AND COALESCE(coverage_plan_json, '') = $10
+           AND NOT EXISTS (
+               SELECT 1
+               FROM acquisition_release_coverage c
+               JOIN acquisition_targets t ON t.target_id = c.target_id
+               WHERE c.release_id = acquisition_releases.release_id
+                 AND c.state != 'rejected'
+                 AND t.state NOT IN ('imported', 'excluded')
+                 AND (
+                     (COALESCE(t.download_id, '') != '' AND LOWER(t.download_id) != LOWER($9))
+                     OR (COALESCE(t.selected_route_logical_id, '') != ''
+                         AND t.selected_route_logical_id != $11)
+                 )
+           )",
+    )
+    .bind(refinement.release_kind.as_str())
+    .bind(refinement.resolver_kind.as_str())
+    .bind(refinement.resolver_version.as_str())
+    .bind(refinement.confidence.as_str())
+    .bind(AcquisitionReleaseState::Failed.as_str())
+    .bind(reason)
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(release.release_id.to_string())
+    .bind(&canonical_hash)
+    .bind(expected_coverage_plan_json)
+    .bind(TORRENT_DEFAULT_LOGICAL_ID)
+    .execute(&mut *transaction)
+    .await?;
+    if release_update.rows_affected() != 1 {
+        anyhow::bail!(
+            "anime qBittorrent retry lost ownership of the active release attempt for hash {torrent_hash}"
+        );
+    }
+    let job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1,
+             state_reason = $2,
+             active = 0,
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $3
+           AND LOWER(download_id) = LOWER($4)
+           AND active = 1",
+    )
+    .bind(ReleaseJobState::Failed.as_str())
+    .bind(reason)
+    .bind(release.release_id.to_string())
+    .bind(&canonical_hash)
+    .execute(&mut *transaction)
+    .await?;
+    if job_update.rows_affected() == 0 {
+        anyhow::bail!(
+            "anime qBittorrent retry could not terminalize its active release job for hash {torrent_hash}"
+        );
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn reconcile_anime_qbittorrent_retry_bookkeeping(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    torrent_hash: &str,
+) -> anyhow::Result<usize> {
+    let canonical_hash = qbittorrent_trackable_info_hash(torrent_hash)
+        .context("anime qBittorrent retry reconciliation has no canonical torrent hash")?;
+    let release = get_release(pool, release_id)
+        .await?
+        .context("anime qBittorrent retry reconciliation release disappeared")?;
+    if release.state != AcquisitionReleaseState::Failed
+        || !anime_qbittorrent_cleanup_pending(&release)
+        || release
+            .download_id
+            .as_deref()
+            .and_then(qbittorrent_trackable_info_hash)
+            .as_deref()
+            != Some(canonical_hash.as_str())
+    {
+        return Ok(0);
+    }
+
+    let coverage = list_release_coverage(pool, release_id).await?;
+    let all_targets = match release.subscription_id {
+        Some(subscription_id) => list_subscription_targets(pool, subscription_id).await?,
+        None => Vec::new(),
+    };
+    let targets =
+        qbittorrent_release_scoped_targets(&release, &all_targets, &coverage, &canonical_hash);
+    let scoped_target_ids = targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    let retry_reason_code = release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.pointer("/automaticRetry/reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("anime_qbittorrent_file_mapping_unresolved");
+    let reason = release.state_reason.as_deref().unwrap_or(
+        "Anime files could not be mapped safely. Elixir will try the next release automatically.",
+    );
+
+    for file in list_release_files(pool, release_id).await? {
+        update_release_file_selected(pool, file.release_file_id, false).await?;
+    }
+    for entry in coverage
+        .iter()
+        .filter(|entry| scoped_target_ids.contains(&entry.target_id))
+    {
+        update_release_coverage_review_state(
+            pool,
+            entry.coverage_id,
+            ReleaseCoverageState::Rejected,
+            Some(retry_reason_code.to_string()),
+            Some("alm7_qbittorrent_automatic_retry".to_string()),
+        )
+        .await?;
+    }
+
+    let now = chrono::Utc::now();
+    let mut reset = 0usize;
+    for target in targets {
+        let target_still_owns_attempt = target
+            .download_id
+            .as_deref()
+            .and_then(qbittorrent_trackable_info_hash)
+            .as_deref()
+            == Some(canonical_hash.as_str())
+            && target.selected_route_logical_id.as_deref() == Some(TORRENT_DEFAULT_LOGICAL_ID);
+        if !target_still_owns_attempt {
+            continue;
+        }
+        let retry_after = now
+            + chrono::Duration::seconds(
+                QBITTORRENT_STALE_RELEASE_RETRY_SECONDS
+                    + i64::from(target.target_id.as_bytes()[0] % 15),
+            );
+        if reset_target_for_candidate_retry(pool, target.target_id, reason.to_string(), retry_after)
+            .await?
+            .is_some()
+        {
+            reset += 1;
+        }
+    }
+    Ok(reset)
+}
+
+fn merge_anime_qbittorrent_retry_evidence(
+    coverage_plan: Value,
+    torrent_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    retry_reason_code: &str,
+    suppress_automatic_rediscovery: bool,
+) -> Value {
+    let automatic_retry = json!({
+        "status": "scheduled",
+        "reason": retry_reason_code,
+        "torrentHash": torrent_hash,
+        "scheduledAt": now,
+        "policyVersion": "alm7-qbittorrent-anime-retry-v1",
+    });
+    let retry_suppression = json!({
+        "status": if suppress_automatic_rediscovery { "rejected" } else { "retryable" },
+        "suppressAutomaticRediscovery": suppress_automatic_rediscovery,
+        "reason": retry_reason_code,
+        "failedAt": now,
+    });
+    let torrent_cleanup = json!({
+        "status": "pending",
+        "torrentHash": torrent_hash,
+        "deleteFiles": false,
+        "requestedAt": now,
+        "policyVersion": "alm7-qbittorrent-cleanup-v1",
+    });
+    match coverage_plan {
+        Value::Object(mut object) => {
+            object.insert("automaticRetry".to_string(), automatic_retry);
+            object.insert("retrySuppression".to_string(), retry_suppression);
+            object.insert("torrentCleanup".to_string(), torrent_cleanup);
+            Value::Object(object)
+        }
+        value => json!({
+            "previousCoveragePlan": value,
+            "automaticRetry": automatic_retry,
+            "retrySuppression": retry_suppression,
+            "torrentCleanup": torrent_cleanup,
+        }),
+    }
+}
+
+fn anime_qbittorrent_cleanup_pending(release: &AcquisitionRelease) -> bool {
+    release
+        .coverage_plan
+        .as_ref()
+        .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+        .and_then(Value::as_str)
+        == Some("pending")
+}
+
+async fn mark_anime_qbittorrent_cleanup_completed(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    torrent_hash: &str,
+) -> anyhow::Result<()> {
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(());
+    };
+    if release.state != AcquisitionReleaseState::Failed
+        || !anime_qbittorrent_cleanup_pending(&release)
+    {
+        return Ok(());
+    }
+    let original_coverage_plan = release.coverage_plan.clone().unwrap_or_else(|| json!({}));
+    let original_coverage_plan_json = serde_json::to_string(&original_coverage_plan)?;
+    let completed = json!({
+        "status": "completed",
+        "torrentHash": torrent_hash,
+        "deleteFiles": false,
+        "completedAt": chrono::Utc::now(),
+        "policyVersion": "alm7-qbittorrent-cleanup-v1",
+    });
+    let coverage_plan = match original_coverage_plan {
+        Value::Object(mut object) => {
+            object.insert("torrentCleanup".to_string(), completed);
+            Value::Object(object)
+        }
+        value => json!({
+            "previousCoveragePlan": value,
+            "torrentCleanup": completed,
+        }),
+    };
+    let updated = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET coverage_plan_json = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2
+           AND state = 'failed'
+           AND LOWER(download_id) = LOWER($3)
+           AND coverage_plan_json = $4",
+    )
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(release.release_id.to_string())
+    .bind(torrent_hash)
+    .bind(original_coverage_plan_json)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 1 {
+        return Ok(());
+    }
+    let current = get_release(pool, release_id).await?;
+    if current.as_ref().is_some_and(|release| {
+        release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+            .and_then(Value::as_str)
+            == Some("completed")
+    }) {
+        return Ok(());
+    }
+    anyhow::bail!("anime qBittorrent cleanup completion lost ownership of release {release_id}")
+}
+
+fn anime_qbittorrent_retry_suppresses_rediscovery(
+    refinement: &QbittorrentCoverageRefinement,
+) -> bool {
+    refinement
+        .anime_match_assist
+        .as_ref()
+        .is_some_and(|assist| assist.result != AnimeMatchAssistResult::Fallback)
+}
+
 async fn persist_qbittorrent_priority_decision(
     pool: &sqlx::AnyPool,
     release: &AcquisitionRelease,
@@ -2902,6 +4591,22 @@ async fn persist_qbittorrent_priority_decision(
     decision: &QbittorrentFilePriorityDecision,
     priority_applied: bool,
 ) -> anyhow::Result<()> {
+    let current = get_release(pool, release.release_id)
+        .await?
+        .context("qBittorrent priority release disappeared")?;
+    if matches!(
+        current.state,
+        AcquisitionReleaseState::Failed
+            | AcquisitionReleaseState::Cancelled
+            | AcquisitionReleaseState::Completed
+    ) || qbittorrent_priority_bookkeeping_pending(&current)
+        || !same_optional_qbittorrent_hash(
+            current.download_id.as_deref(),
+            release.download_id.as_deref(),
+        )
+    {
+        anyhow::bail!("qBittorrent priority decision no longer owns the active release attempt");
+    }
     let selected_ids = decision
         .selected_file_ids
         .iter()
@@ -2972,9 +4677,14 @@ async fn persist_qbittorrent_priority_decision(
         decision,
         priority_applied,
     );
+    let torrent_hash = release
+        .download_id
+        .as_deref()
+        .context("qBittorrent priority decision is missing its torrent hash")?;
     update_qbittorrent_release_refinement(
         pool,
         release.release_id,
+        torrent_hash,
         refinement,
         release_state,
         reason,
@@ -3082,13 +4792,14 @@ async fn sync_qbittorrent_target_states(
 async fn update_qbittorrent_release_refinement(
     pool: &sqlx::AnyPool,
     release_id: Uuid,
+    torrent_hash: &str,
     refinement: &QbittorrentCoverageRefinement,
     state: AcquisitionReleaseState,
     reason: &str,
     coverage_plan: Value,
 ) -> anyhow::Result<()> {
     let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
-    sqlx::query::<sqlx::Any>(
+    let updated = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
          SET release_kind = $1,
              resolver_kind = $2,
@@ -3098,7 +4809,9 @@ async fn update_qbittorrent_release_refinement(
              state_reason = $6,
              coverage_plan_json = $7,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = $8",
+         WHERE release_id = $8
+           AND state NOT IN ('failed', 'cancelled', 'completed')
+           AND LOWER(download_id) = LOWER($9)",
     )
     .bind(refinement.release_kind.as_str())
     .bind(refinement.resolver_kind.as_str())
@@ -3108,8 +4821,12 @@ async fn update_qbittorrent_release_refinement(
     .bind(reason)
     .bind(coverage_plan_json)
     .bind(release_id.to_string())
+    .bind(torrent_hash)
     .execute(pool)
     .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent refinement lost ownership of the active release attempt");
+    }
     Ok(())
 }
 
@@ -3123,25 +4840,35 @@ async fn update_qbittorrent_release_job_state(
     let Some(download_id) = download_id else {
         return Ok(());
     };
-    sqlx::query::<sqlx::Any>(
+    let updated = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_release_jobs
          SET state = $1,
              state_reason = $2,
              active = $3,
              updated_at = CURRENT_TIMESTAMP
          WHERE release_id = $4
-           AND download_id = $5",
+           AND LOWER(download_id) = LOWER($5)
+           AND active = 1",
     )
     .bind(state.as_str())
     .bind(reason)
-    .bind(!matches!(
-        state,
-        ReleaseJobState::Completed | ReleaseJobState::Failed | ReleaseJobState::Cancelled
-    ))
+    .bind(
+        if matches!(
+            state,
+            ReleaseJobState::Completed | ReleaseJobState::Failed | ReleaseJobState::Cancelled
+        ) {
+            0_i64
+        } else {
+            1_i64
+        },
+    )
     .bind(release_id.to_string())
     .bind(download_id)
     .execute(pool)
     .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent release job update lost ownership of the active attempt");
+    }
     Ok(())
 }
 
@@ -3150,26 +4877,46 @@ async fn mark_qbittorrent_release_resumed(
     release: &AcquisitionRelease,
     torrent_hash: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query::<sqlx::Any>(
+    let mut transaction = pool.begin().await?;
+    let updated = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
          SET state = $1,
              state_reason = $2,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = $3",
+         WHERE release_id = $3
+           AND state = 'ready'
+           AND LOWER(download_id) = LOWER($4)",
     )
     .bind(AcquisitionReleaseState::Downloading.as_str())
     .bind("qBittorrent accepted deterministic file priorities and resumed.")
     .bind(release.release_id.to_string())
-    .execute(pool)
+    .bind(torrent_hash)
+    .execute(&mut *transaction)
     .await?;
-    update_qbittorrent_release_job_state(
-        pool,
-        release.release_id,
-        Some(torrent_hash),
-        ReleaseJobState::Downloading,
-        "qBittorrent accepted deterministic file priorities and resumed.",
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent resume lost ownership of the active release attempt");
+    }
+    let job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1,
+             state_reason = $2,
+             active = 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $3
+           AND LOWER(download_id) = LOWER($4)
+           AND active = 1",
     )
-    .await
+    .bind(ReleaseJobState::Downloading.as_str())
+    .bind("qBittorrent accepted deterministic file priorities and resumed.")
+    .bind(release.release_id.to_string())
+    .bind(torrent_hash)
+    .execute(&mut *transaction)
+    .await?;
+    if job_update.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent resume lost ownership of the active release job");
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn mark_qbittorrent_release_completed(
@@ -3179,20 +4926,14 @@ async fn mark_qbittorrent_release_completed(
     reason: &str,
     coverage_plan: Value,
 ) -> anyhow::Result<()> {
-    update_qbittorrent_release_state_only(
+    terminalize_qbittorrent_release_and_job(
         pool,
-        release.release_id,
+        release,
+        torrent_hash,
         AcquisitionReleaseState::Completed,
-        reason,
-        coverage_plan,
-    )
-    .await?;
-    update_qbittorrent_release_job_state(
-        pool,
-        release.release_id,
-        Some(torrent_hash),
         ReleaseJobState::Completed,
         reason,
+        coverage_plan,
     )
     .await
 }
@@ -3204,20 +4945,14 @@ async fn mark_qbittorrent_release_failed(
     reason: &str,
     coverage_plan: Value,
 ) -> anyhow::Result<()> {
-    update_qbittorrent_release_state_only(
+    terminalize_qbittorrent_release_and_job(
         pool,
-        release.release_id,
+        release,
+        torrent_hash,
         AcquisitionReleaseState::Failed,
-        reason,
-        coverage_plan,
-    )
-    .await?;
-    update_qbittorrent_release_job_state(
-        pool,
-        release.release_id,
-        Some(torrent_hash),
         ReleaseJobState::Failed,
         reason,
+        coverage_plan,
     )
     .await
 }
@@ -3245,46 +4980,108 @@ async fn mark_qbittorrent_release_cancelled(
         }),
         None => json!({ "torrentRuntime": evidence }),
     };
-    update_qbittorrent_release_state_only(
+    terminalize_qbittorrent_release_and_job(
         pool,
-        release.release_id,
+        release,
+        torrent_hash,
         AcquisitionReleaseState::Cancelled,
-        "qBittorrent staged acquisition job was cancelled.",
-        coverage_plan,
-    )
-    .await?;
-    update_qbittorrent_release_job_state(
-        pool,
-        release.release_id,
-        Some(torrent_hash),
         ReleaseJobState::Cancelled,
         "qBittorrent staged acquisition job was cancelled.",
+        coverage_plan,
     )
     .await
 }
 
-async fn update_qbittorrent_release_state_only(
+async fn terminalize_qbittorrent_release_and_job(
     pool: &sqlx::AnyPool,
-    release_id: Uuid,
-    state: AcquisitionReleaseState,
+    release: &AcquisitionRelease,
+    torrent_hash: &str,
+    release_state: AcquisitionReleaseState,
+    job_state: ReleaseJobState,
     reason: &str,
     coverage_plan: Value,
 ) -> anyhow::Result<()> {
-    let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
-    sqlx::query::<sqlx::Any>(
+    let mut transaction = pool.begin().await?;
+    let release_update = sqlx::query::<sqlx::Any>(
         "UPDATE acquisition_releases
          SET state = $1,
              state_reason = $2,
              coverage_plan_json = $3,
              updated_at = CURRENT_TIMESTAMP
-         WHERE release_id = $4",
+         WHERE release_id = $4
+           AND LOWER(download_id) = LOWER($5)
+           AND state = $6
+           AND state NOT IN ('failed', 'cancelled', 'completed')",
+    )
+    .bind(release_state.as_str())
+    .bind(reason)
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(release.release_id.to_string())
+    .bind(torrent_hash)
+    .bind(release.state.as_str())
+    .execute(&mut *transaction)
+    .await?;
+    if release_update.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent terminal transition lost ownership of the active release");
+    }
+    let job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1,
+             state_reason = $2,
+             active = 0,
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $3
+           AND LOWER(download_id) = LOWER($4)
+           AND active = 1",
+    )
+    .bind(job_state.as_str())
+    .bind(reason)
+    .bind(release.release_id.to_string())
+    .bind(torrent_hash)
+    .execute(&mut *transaction)
+    .await?;
+    if job_update.rows_affected() != 1 {
+        anyhow::bail!("qBittorrent terminal transition lost ownership of the active release job");
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn update_qbittorrent_release_state_only(
+    pool: &sqlx::AnyPool,
+    release_id: Uuid,
+    torrent_hash: &str,
+    expected_state: AcquisitionReleaseState,
+    state: AcquisitionReleaseState,
+    reason: &str,
+    coverage_plan: Value,
+) -> anyhow::Result<()> {
+    let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
+    let updated = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = $1,
+             state_reason = $2,
+             coverage_plan_json = $3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $4
+           AND LOWER(download_id) = LOWER($5)
+           AND state NOT IN ('failed', 'cancelled', 'completed')
+           AND state = $6",
     )
     .bind(state.as_str())
     .bind(reason)
     .bind(coverage_plan_json)
     .bind(release_id.to_string())
+    .bind(torrent_hash)
+    .bind(expected_state.as_str())
     .execute(pool)
     .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "qBittorrent release state update lost ownership of the active release attempt"
+        );
+    }
     Ok(())
 }
 
@@ -3399,6 +5196,307 @@ fn qbittorrent_tv_release_file_input(file: &AcquisitionReleaseFile) -> Option<Tv
     })
 }
 
+fn qbittorrent_release_scoped_targets(
+    release: &AcquisitionRelease,
+    targets: &[AcquisitionTarget],
+    existing_coverage: &[AcquisitionReleaseCoverage],
+    torrent_hash: &str,
+) -> Vec<AcquisitionTarget> {
+    if let Some(scoped_targets) = qbittorrent_request_scope_targets(release, targets) {
+        if scoped_targets.is_empty() {
+            return Vec::new();
+        }
+        let scoped_ids = scoped_targets
+            .iter()
+            .map(|target| target.target_id)
+            .collect::<BTreeSet<_>>();
+        let covered_ids = existing_coverage
+            .iter()
+            .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+            .map(|coverage| coverage.target_id)
+            .collect::<BTreeSet<_>>();
+        let bound_ids = targets
+            .iter()
+            .filter(|target| {
+                target
+                    .download_id
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(torrent_hash))
+                    .unwrap_or(false)
+                    && target.selected_route_logical_id.as_deref()
+                        == Some(TORRENT_DEFAULT_LOGICAL_ID)
+            })
+            .map(|target| target.target_id)
+            .collect::<BTreeSet<_>>();
+        if (!covered_ids.is_empty() && covered_ids != scoped_ids)
+            || (!bound_ids.is_empty() && bound_ids != scoped_ids)
+        {
+            return Vec::new();
+        }
+        return scoped_targets;
+    }
+
+    let covered_target_ids = existing_coverage
+        .iter()
+        .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+        .map(|coverage| coverage.target_id)
+        .collect::<BTreeSet<_>>();
+    if !covered_target_ids.is_empty() {
+        return targets
+            .iter()
+            .filter(|target| covered_target_ids.contains(&target.target_id))
+            .cloned()
+            .collect();
+    }
+
+    let bound_targets = targets
+        .iter()
+        .filter(|target| {
+            target
+                .download_id
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(torrent_hash))
+                .unwrap_or(false)
+                && target.selected_route_logical_id.as_deref() == Some(TORRENT_DEFAULT_LOGICAL_ID)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !bound_targets.is_empty() {
+        return bound_targets;
+    }
+
+    if targets.len() == 1 {
+        return targets.to_vec();
+    }
+    Vec::new()
+}
+
+fn qbittorrent_request_scope_targets(
+    release: &AcquisitionRelease,
+    targets: &[AcquisitionTarget],
+) -> Option<Vec<AcquisitionTarget>> {
+    let evidence = release.selected_candidate.as_ref().and_then(|candidate| {
+        candidate
+            .get("requestScopeEvidence")
+            .or_else(|| candidate.get("request_scope_evidence"))
+    })?;
+    let ids_value = evidence
+        .get("targetIds")
+        .or_else(|| evidence.get("target_ids"));
+    let keys_value = evidence
+        .get("targetKeys")
+        .or_else(|| evidence.get("target_keys"));
+    let ids_present = ids_value.is_some();
+    let keys_present = keys_value.is_some();
+    if !ids_present && !keys_present {
+        return Some(Vec::new());
+    }
+    let mut scoped_ids = BTreeSet::new();
+    if let Some(ids) = ids_value {
+        let Some(ids) = ids.as_array() else {
+            return Some(Vec::new());
+        };
+        if ids.is_empty() {
+            return Some(Vec::new());
+        }
+        for value in ids {
+            let Some(value) = value.as_str() else {
+                return Some(Vec::new());
+            };
+            let Ok(target_id) = Uuid::parse_str(value.trim()) else {
+                return Some(Vec::new());
+            };
+            if !targets.iter().any(|target| target.target_id == target_id) {
+                return Some(Vec::new());
+            }
+            scoped_ids.insert(target_id);
+        }
+    }
+    let mut keyed_ids = BTreeSet::new();
+    if let Some(keys) = keys_value {
+        let Some(keys) = keys.as_array() else {
+            return Some(Vec::new());
+        };
+        if keys.is_empty() {
+            return Some(Vec::new());
+        }
+        for value in keys {
+            let Some(key) = value.as_str().map(str::trim).filter(|key| !key.is_empty()) else {
+                return Some(Vec::new());
+            };
+            let matching = targets
+                .iter()
+                .filter(|target| target.target_key == key)
+                .map(|target| target.target_id)
+                .collect::<BTreeSet<_>>();
+            if matching.len() != 1 {
+                return Some(Vec::new());
+            }
+            keyed_ids.extend(matching);
+        }
+    }
+    if ids_present && keys_present && scoped_ids != keyed_ids {
+        return Some(Vec::new());
+    }
+    let selected_ids = if ids_present { scoped_ids } else { keyed_ids };
+    Some(
+        targets
+            .iter()
+            .filter(|target| selected_ids.contains(&target.target_id))
+            .cloned()
+            .collect(),
+    )
+}
+
+fn qbittorrent_anime_acquisition_candidate(
+    release: &AcquisitionRelease,
+    files: &[AcquisitionReleaseFile],
+) -> AcquisitionCandidate {
+    let mut candidate = release
+        .selected_candidate
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<AcquisitionCandidate>(value.clone()).ok())
+        .unwrap_or_else(|| AcquisitionCandidate {
+            id: None,
+            title: release.release_title.clone(),
+            source: release.source.clone(),
+            source_kind: release.source_kind.clone(),
+            info_hash: release.info_hash.clone(),
+            file_index: None,
+            quality: None,
+            size_bytes: None,
+            seeders: None,
+            language: None,
+            cached_debrid: None,
+            rank: None,
+            score: release.score,
+            score_badges: Vec::new(),
+            files: Vec::new(),
+            supported_routes: vec![TORRENT_DEFAULT_LOGICAL_ID.to_string()],
+            default_route: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+            raw: None,
+        });
+    candidate.title = release.release_title.clone();
+    candidate.source = release.source.clone();
+    candidate.source_kind = release.source_kind.clone();
+    candidate.info_hash = release.info_hash.clone().or(candidate.info_hash);
+    if !candidate
+        .supported_routes
+        .iter()
+        .any(|route| route == TORRENT_DEFAULT_LOGICAL_ID)
+    {
+        candidate
+            .supported_routes
+            .push(TORRENT_DEFAULT_LOGICAL_ID.to_string());
+    }
+    candidate.default_route = Some(TORRENT_DEFAULT_LOGICAL_ID.to_string());
+    candidate.files = files
+        .iter()
+        .filter_map(|file| {
+            Some(AcquisitionCandidateFile {
+                file_id: Some(qbittorrent_file_key(file)?),
+                file_index: file.file_index,
+                path: file.path.clone(),
+                size_bytes: file.size_bytes.and_then(|value| u64::try_from(value).ok()),
+                selectable: Some(file.selectable),
+            })
+        })
+        .collect();
+    candidate
+}
+
+fn qbittorrent_anime_candidate_input(candidate: &AcquisitionCandidate) -> AnimeCandidateInput {
+    AnimeCandidateInput {
+        title: candidate.title.clone(),
+        source_kind: candidate.source_kind.clone(),
+        quality: candidate.quality.clone(),
+        size_bytes: candidate.size_bytes,
+        seeders: candidate.seeders,
+        cached_debrid: candidate.cached_debrid,
+        rank: candidate.rank,
+        source_score: candidate.score,
+        supported_routes: candidate.supported_routes.clone(),
+        default_route: candidate.default_route.clone(),
+    }
+}
+
+fn anime_qbittorrent_plan_is_automatic(
+    plan: &AnimeFileCoveragePlan,
+    targets: &[AcquisitionTarget],
+) -> bool {
+    let wanted_target_keys = targets
+        .iter()
+        .map(|target| target.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let planned_target_keys = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    !wanted_target_keys.is_empty()
+        && wanted_target_keys == planned_target_keys
+        && planned_target_keys.len() == plan.entries.len()
+        && plan.confidence == ReleaseConfidence::High
+        && !plan.entries.is_empty()
+        && !plan.selected_file_keys.is_empty()
+        && plan.review_reasons.is_empty()
+        && plan.rejection_reasons.is_empty()
+        && plan.entries.iter().all(|entry| {
+            entry.confidence == ReleaseConfidence::High
+                && entry.release_file_key.is_some()
+                && !matches!(
+                    entry.state,
+                    ReleaseCoverageState::ReviewRequired | ReleaseCoverageState::Rejected
+                )
+        })
+}
+
+fn anime_deterministic_fast_path_provenance() -> AnimeMatchAssistProvenance {
+    AnimeMatchAssistProvenance {
+        source: AnimeMatchAssistSource::DeterministicFastPath,
+        result: AnimeMatchAssistResult::Definitive,
+        matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+        request_fingerprint: None,
+        reason: None,
+        detail: None,
+        runtime: None,
+        latency_ms: 0,
+    }
+}
+
+fn anime_invalid_request_fallback_provenance(detail: String) -> AnimeMatchAssistProvenance {
+    AnimeMatchAssistProvenance {
+        source: AnimeMatchAssistSource::DeterministicFallback,
+        result: AnimeMatchAssistResult::Fallback,
+        matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+        request_fingerprint: None,
+        reason: Some(AnimeMatchFallbackReason::InvalidRequest),
+        detail: Some(detail),
+        runtime: None,
+        latency_ms: 0,
+    }
+}
+
+fn qbittorrent_anime_audio_policy_evidence(
+    assessment: &crate::acquisition::language_policy::LanguagePreferenceAssessment,
+    required_preference_satisfied: bool,
+) -> Value {
+    json!({
+        "state": assessment.state.as_str(),
+        "scoreDelta": assessment.score_delta,
+        "matchingAudio": assessment.matching_audio,
+        "matchingSubtitles": assessment.matching_subtitles,
+        "matchingProfiles": assessment.matching_profiles,
+        "desiredAudio": assessment.desired_audio,
+        "desiredSubtitles": assessment.desired_subtitles,
+        "desiredProfiles": assessment.desired_profiles,
+        "evidenceAudio": assessment.evidence_audio,
+        "evidenceSubtitles": assessment.evidence_subtitles,
+        "evidenceProfiles": assessment.evidence_profiles,
+        "requiredPreferenceSatisfied": required_preference_satisfied,
+    })
+}
+
 fn qbittorrent_anime_release_file_input(
     file: &AcquisitionReleaseFile,
 ) -> Option<AnimeReleaseFileInput> {
@@ -3471,32 +5569,65 @@ fn qbittorrent_file_key(file: &AcquisitionReleaseFile) -> Option<String> {
 }
 
 fn anime_scoring_context_from_qbittorrent_release(
+    subscription: Option<&AcquisitionSubscription>,
     release: &AcquisitionRelease,
     targets: &[AcquisitionTarget],
 ) -> AnimeCandidateScoringContext {
     let mut aliases = Vec::new();
+    let mut scoped_aliases = HashMap::<String, AnimeScopedAlias>::new();
+    if let Some(subscription) = subscription {
+        push_unique_alias(&mut aliases, &subscription.title);
+        if let Some(scope) = subscription.scope.as_ref() {
+            if let Some(title) = scope.pointer("/media/title").and_then(Value::as_str) {
+                push_unique_alias(&mut aliases, title);
+            }
+            push_aliases_from_json(&mut aliases, scope.pointer("/media/aliases"));
+        }
+    }
     push_unique_alias(&mut aliases, &release.title);
     for target in targets {
         push_unique_alias(&mut aliases, &target.title);
         if let Some(metadata) = target.metadata.as_ref() {
             for key in ["aliases", "titles", "anilistTitles"] {
-                if let Some(values) = metadata.get(key).and_then(Value::as_array) {
-                    for value in values.iter().filter_map(Value::as_str) {
-                        push_unique_alias(&mut aliases, value);
-                    }
-                }
+                push_aliases_from_json(&mut aliases, metadata.get(key));
+            }
+            for key in ["scopedAliases", "scoped_aliases"] {
+                push_scoped_aliases_from_json(&mut scoped_aliases, metadata.get(key));
             }
         }
     }
-    AnimeCandidateScoringContext {
-        graph_fingerprint: release
+    let graph_fingerprints = targets
+        .iter()
+        .filter_map(|target| metadata_json_string(target.metadata.as_ref(), "graphFingerprint"))
+        .collect::<BTreeSet<_>>();
+    let graph_fingerprint = match graph_fingerprints.len() {
+        1 => graph_fingerprints.first().cloned(),
+        0 => release
             .coverage_plan
             .as_ref()
-            .and_then(|value| value.get("graphFingerprint"))
+            .and_then(|value| {
+                value.get("graphFingerprint").or_else(|| {
+                    value.pointer("/diagnostics/parserProvenance/graph/graphFingerprint")
+                })
+            })
             .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(str::to_string),
+        _ => None,
+    };
+    let mut scoped_aliases = scoped_aliases.into_values().collect::<Vec<_>>();
+    scoped_aliases.sort_by(|left, right| {
+        left.season_number
+            .cmp(&right.season_number)
+            .then_with(|| left.anilist_season_id.cmp(&right.anilist_season_id))
+            .then_with(|| left.display.cmp(&right.display))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    AnimeCandidateScoringContext {
+        graph_fingerprint,
         aliases,
-        scoped_aliases: vec![],
+        scoped_aliases,
         targets: targets
             .iter()
             .map(|target| {
@@ -3517,6 +5648,50 @@ fn anime_scoring_context_from_qbittorrent_release(
     }
 }
 
+fn push_aliases_from_json(aliases: &mut Vec<String>, value: Option<&Value>) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for value in values.iter().filter_map(Value::as_str) {
+        push_unique_alias(aliases, value);
+    }
+}
+
+fn push_scoped_aliases_from_json(
+    aliases: &mut HashMap<String, AnimeScopedAlias>,
+    value: Option<&Value>,
+) {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for value in values {
+        let Ok(alias) = serde_json::from_value::<AnimeScopedAlias>(value.clone()) else {
+            continue;
+        };
+        let display = alias.display.trim();
+        if display.is_empty()
+            || (alias.season_number.is_none() && alias.anilist_season_id.is_none())
+        {
+            continue;
+        }
+        let key = format!(
+            "{}:{}:{}:{}",
+            display.to_ascii_lowercase(),
+            alias.source.to_ascii_lowercase(),
+            alias
+                .season_number
+                .map(|season| season.to_string())
+                .unwrap_or_default(),
+            alias
+                .anilist_season_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        );
+        aliases.entry(key).or_insert(alias);
+    }
+}
+
 fn push_unique_alias(aliases: &mut Vec<String>, value: &str) {
     let trimmed = value.trim();
     if !trimmed.is_empty() && !aliases.iter().any(|alias| alias == trimmed) {
@@ -3531,43 +5706,6 @@ fn metadata_json_string(metadata: Option<&Value>, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn selected_candidate_string(candidate: Option<&Value>, key: &str) -> Option<String> {
-    candidate?
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn selected_candidate_string_vec(candidate: Option<&Value>, key: &str) -> Vec<String> {
-    candidate
-        .and_then(|candidate| candidate.get(key))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn selected_candidate_u64(candidate: Option<&Value>, key: &str) -> Option<u64> {
-    candidate?.get(key).and_then(Value::as_u64)
-}
-
-fn selected_candidate_f64(candidate: Option<&Value>, key: &str) -> Option<f64> {
-    candidate?.get(key).and_then(Value::as_f64)
-}
-
-fn selected_candidate_bool(candidate: Option<&Value>, key: &str) -> Option<bool> {
-    candidate?.get(key).and_then(Value::as_bool)
 }
 
 fn qbittorrent_coverage_fingerprint(
@@ -3839,7 +5977,7 @@ async fn cancel_qbittorrent(
 ) -> ApiResult<bool> {
     let id = normalized_source(download_id)?;
     let fields = qbittorrent_delete_fields(id, delete_files);
-    request_instance_service_form(
+    request_qbittorrent_service_form(
         state,
         store,
         record.instance_id,
@@ -4494,6 +6632,13 @@ fn progress_fraction(downloaded: Option<u64>, total: Option<u64>) -> Option<f64>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::{
         acquisition::{
@@ -4506,7 +6651,13 @@ mod tests {
                 upsert_subscription_targets,
             },
         },
-        config::DatabaseConfig,
+        anime_matching::{
+            AnimeCandidateMatch, AnimeMatchAudioProfile, AnimeMatchEngine, AnimeMatchRequest,
+            AnimeMatchResponse,
+        },
+        artwork::ArtworkService,
+        auth::AuthService,
+        config::{DatabaseConfig, Settings},
         db::{
             Database,
             models::{ExtensionKind, ExtensionTrustLevel, ProviderHealthState, SlotCardinality},
@@ -4516,12 +6667,123 @@ mod tests {
             HTTP_STREAM_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID,
             resolve_logical_downloader_for_owner,
         },
-        extensions::store::{NewExtension, NewExtensionInstance, NewProvider},
+        extensions::{
+            ExtensionManager,
+            store::{NewExtension, NewExtensionInstance, NewProvider},
+        },
+        library::LinkerService,
+        metadata::MetadataService,
+        secrets::SecretsManager,
     };
 
     const TEST_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
     const TEST_MAGNET: &str =
         "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Show.S01";
+
+    #[derive(Debug, Clone, Copy)]
+    enum QbittorrentAnimeEngineBehavior {
+        MatchWantedFiles,
+        Empty,
+        Error,
+        Timeout,
+        InvalidFileReference,
+    }
+
+    #[derive(Debug)]
+    struct QbittorrentAnimeMatchEngine {
+        behavior: QbittorrentAnimeEngineBehavior,
+        calls: AtomicUsize,
+    }
+
+    impl QbittorrentAnimeMatchEngine {
+        fn new(behavior: QbittorrentAnimeEngineBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                behavior,
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn service(self: &Arc<Self>) -> AnimeMatchingService {
+            AnimeMatchingService::with_engine(self.clone())
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl AnimeMatchEngine for QbittorrentAnimeMatchEngine {
+        async fn match_candidates(
+            &self,
+            request: AnimeMatchRequest,
+        ) -> anyhow::Result<AnimeMatchResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                QbittorrentAnimeEngineBehavior::Error => {
+                    bail!("simulated qBittorrent anime matcher failure")
+                }
+                QbittorrentAnimeEngineBehavior::Timeout => {
+                    bail!("local model request deadline exceeded")
+                }
+                QbittorrentAnimeEngineBehavior::Empty => Ok(AnimeMatchResponse {
+                    schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                    matches: Vec::new(),
+                }),
+                QbittorrentAnimeEngineBehavior::InvalidFileReference => {
+                    let candidate = request
+                        .candidates
+                        .first()
+                        .context("matcher fixture expected one candidate")?;
+                    let target_key = request
+                        .target
+                        .wanted_target_keys
+                        .first()
+                        .cloned()
+                        .context("matcher fixture expected one wanted target")?;
+                    Ok(AnimeMatchResponse {
+                        schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                        matches: vec![AnimeCandidateMatch {
+                            candidate_key: candidate.candidate_key.clone(),
+                            matched_target_keys: vec![target_key],
+                            audio_profile: AnimeMatchAudioProfile::Unknown,
+                            selected_file_keys: Some(vec![
+                                "candidate-0-file-does-not-exist".to_string(),
+                            ]),
+                        }],
+                    })
+                }
+                QbittorrentAnimeEngineBehavior::MatchWantedFiles => {
+                    let candidate = request
+                        .candidates
+                        .first()
+                        .context("matcher fixture expected one candidate")?;
+                    let target_keys = request.target.wanted_target_keys.clone();
+                    if target_keys.is_empty() {
+                        bail!("matcher fixture expected at least one wanted target");
+                    }
+                    let selected_file_keys = candidate
+                        .files
+                        .iter()
+                        .take(target_keys.len())
+                        .map(|file| file.file_key.clone())
+                        .collect::<Vec<_>>();
+                    if selected_file_keys.len() != target_keys.len() {
+                        bail!("matcher fixture expected one real file per wanted target");
+                    }
+                    Ok(AnimeMatchResponse {
+                        schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                        matches: vec![AnimeCandidateMatch {
+                            candidate_key: candidate.candidate_key.clone(),
+                            matched_target_keys: target_keys,
+                            audio_profile: AnimeMatchAudioProfile::JaAudioEnSubs,
+                            selected_file_keys: Some(selected_file_keys),
+                        }],
+                    })
+                }
+            }
+        }
+    }
 
     async fn setup_db() -> anyhow::Result<Database> {
         let config = DatabaseConfig {
@@ -4532,6 +6794,86 @@ mod tests {
         let database = Database::connect(&config).await?;
         database.run_migrations().await?;
         Ok(database)
+    }
+
+    fn setup_state_for_database(database: &Database) -> anyhow::Result<AppState> {
+        let settings = Settings::default();
+        let auth_service = AuthService::new(settings.auth.clone())?;
+        let metadata = MetadataService::new(settings.metadata.clone())?;
+        let linkers = LinkerService::new(settings.classifier.clone())?;
+        let artwork = ArtworkService::new(
+            settings.library.artwork_cache_dir.clone(),
+            settings.metadata.request_timeout_seconds,
+        )?;
+        Ok(AppState::new(
+            settings,
+            database.clone(),
+            auth_service,
+            ExtensionManager::new(),
+            metadata,
+            linkers,
+            artwork,
+            SecretsManager::from_key_bytes([0u8; 32], true),
+        ))
+    }
+
+    async fn start_qbittorrent_priority_fixture(
+        file_rows: Vec<Value>,
+    ) -> anyhow::Result<(QbittorrentTestServiceFixture, Arc<Mutex<Vec<Value>>>)> {
+        start_qbittorrent_priority_fixture_with_failures(file_rows, false, false).await
+    }
+
+    async fn start_qbittorrent_priority_fixture_with_failures(
+        file_rows: Vec<Value>,
+        fail_torrent_info: bool,
+        fail_file_list: bool,
+    ) -> anyhow::Result<(QbittorrentTestServiceFixture, Arc<Mutex<Vec<Value>>>)> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let fixture = QbittorrentTestServiceFixture {
+            requests: requests.clone(),
+            file_rows: Value::Array(file_rows),
+            torrent_info_rows: json!([{
+                "hash": TEST_HASH,
+                "state": "pausedDL",
+                "progress": 0.0,
+                "dlspeed": 0,
+            }]),
+            fail_torrent_info,
+            fail_file_list,
+            fail_form_paths_once: Arc::new(Mutex::new(HashSet::new())),
+        };
+        Ok((fixture, requests))
+    }
+
+    async fn configure_qbittorrent_priority_fixture_endpoint(
+        database: &Database,
+        resolved: &ResolvedDownloadBrokerProvider,
+        fixture: QbittorrentTestServiceFixture,
+    ) -> anyhow::Result<()> {
+        QBITTORRENT_TEST_SERVICE_FIXTURES
+            .lock()
+            .expect("qBittorrent test service fixture lock")
+            .insert(resolved.record.instance_id, fixture);
+        ExtensionStore::new(&database.pool)
+            .upsert_provider(&NewProvider {
+                provider_id: resolved.record.provider_id,
+                instance_id: resolved.record.instance_id,
+                capability: resolved.record.capability.clone(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("qbittorrent".to_string()),
+                scope_json: Some(json!({
+                    "downloadBroker": {
+                        "enabled": true,
+                        "logicalId": TORRENT_DEFAULT_LOGICAL_ID,
+                        "providerKind": "managed"
+                    }
+                })),
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        Ok(())
     }
 
     async fn setup_qbittorrent_resolved(
@@ -4734,6 +7076,109 @@ mod tests {
         Ok(release)
     }
 
+    async fn setup_ready_anime_qbittorrent_provider_attempt(
+        database: &Database,
+        resolved: &ResolvedDownloadBrokerProvider,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(AcquisitionRelease, AcquisitionTarget)> {
+        let (subscription, targets) = setup_subscription_with_targets(
+            database,
+            MediaType::Anime,
+            "Provider Retry Anime",
+            vec![NewAcquisitionTarget {
+                target_key: Some("anilist:9101:A0001".to_string()),
+                media_type: Some(MediaType::Anime),
+                title: Some("Provider Retry Anime".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        let release = setup_staged_qbittorrent_release_for(
+            database,
+            resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Provider Retry Anime",
+            "anime",
+            "[Group] Provider Retry Anime - 01 [1080p]",
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("selected anime target".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_provider_operation_retry_test".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("submitted to qBittorrent".to_string()),
+                selected_provider_id: release.source_provider_id,
+                selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: Some(TEST_HASH.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let mut coverage_plan = release.coverage_plan.clone().unwrap_or_else(|| json!({}));
+        let complete = json!({
+            "status": "complete",
+            "policyVersion": "acquisition-broker-bookkeeping-v1",
+        });
+        if let Some(object) = coverage_plan.as_object_mut() {
+            object.insert("submissionBookkeeping".to_string(), complete);
+        }
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = 'ready',
+                 state_reason = 'file policy ready for provider application',
+                 coverage_plan_json = $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2",
+        )
+        .bind(serde_json::to_string(&coverage_plan)?)
+        .bind(release.release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = 'ready',
+                 state_reason = 'file policy ready for provider application',
+                 active = 1,
+                 started_at = $1,
+                 completed_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2
+               AND LOWER(download_id) = LOWER($3)",
+        )
+        .bind(started_at.format("%Y-%m-%d %H:%M:%S").to_string())
+        .bind(release.release_id.to_string())
+        .bind(TEST_HASH)
+        .execute(&database.pool)
+        .await?;
+        let ready = get_release(&database.pool, release.release_id)
+            .await?
+            .context("ready anime qBittorrent provider attempt")?;
+        Ok((ready, targets[0].clone()))
+    }
+
     fn sample_candidate() -> AcquisitionCandidate {
         AcquisitionCandidate {
             id: Some("candidate-1".to_string()),
@@ -4772,8 +7217,10 @@ mod tests {
             media_type: acquisition_owned.then_some(MediaType::Series),
             media_title: acquisition_owned.then(|| "Show".to_string()),
             selected_candidate: acquisition_owned.then(sample_candidate),
+            request_scope_evidence: None,
             selected_stream_candidate: None,
             release_fingerprint: None,
+            defer_anime_debrid_refinement: false,
         }
     }
 
@@ -4826,6 +7273,103 @@ mod tests {
             state: None,
             next_search_after: None,
         }
+    }
+
+    fn tokyo_ghoul_root_a_target_metadata(episode_number: i32) -> Value {
+        json!({
+            "graphFingerprint": "tokyo-ghoul-graph-v1",
+            "targetCanonicalKey": format!("anilist:1002:episode:{episode_number}"),
+            "anilistSeasonId": "1002",
+            "aliases": ["Tokyo Ghoul"],
+            "scopedAliases": [{
+                "display": "Tokyo Ghoul Root A",
+                "source": "anilist_english",
+                "language": "en",
+                "seasonNumber": 2,
+                "anilistSeasonId": "1002"
+            }, {
+                "display": "東京喰種トーキョーグール√A",
+                "source": "anilist_native",
+                "language": "ja",
+                "seasonNumber": 2,
+                "anilistSeasonId": "1002"
+            }]
+        })
+    }
+
+    async fn alm7_qbittorrent_retry_persistence_snapshot(
+        database: &Database,
+        release_id: Uuid,
+        targets: &[AcquisitionTarget],
+    ) -> anyhow::Result<Value> {
+        let release = get_release(&database.pool, release_id)
+            .await?
+            .context("ALM-7 retry release was not persisted")?;
+        let mut jobs = list_release_jobs(&database.pool, release_id)
+            .await?
+            .into_iter()
+            .map(|job| (job.state.as_str().to_string(), job.active))
+            .collect::<Vec<_>>();
+        jobs.sort();
+        let mut coverage = list_release_coverage(&database.pool, release_id)
+            .await?
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.target_id.to_string(),
+                    entry.state.as_str().to_string(),
+                    entry.verified_by,
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        let mut files = list_release_files(&database.pool, release_id)
+            .await?
+            .into_iter()
+            .map(|file| (file.provider_file_id, file.selected))
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut target_states = Vec::new();
+        for target in targets {
+            let persisted =
+                crate::acquisition::subscriptions::get_target(&database.pool, target.target_id)
+                    .await?
+                    .context("ALM-7 retry target was not persisted")?;
+            target_states.push((
+                persisted.target_id.to_string(),
+                persisted.state.as_str().to_string(),
+                persisted.next_search_after.is_some(),
+                persisted.selected_candidate.is_some(),
+                persisted.download_id.is_some(),
+            ));
+        }
+        target_states.sort();
+        let review_release_count = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM acquisition_releases
+             WHERE subscription_id = $1 AND state = 'review_required'",
+        )
+        .bind(
+            release
+                .subscription_id
+                .context("ALM-7 retry release is missing its subscription")?
+                .to_string(),
+        )
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(json!({
+            "release": {
+                "state": release.state.as_str(),
+                "confidence": release.confidence.as_str(),
+                "selectedCandidate": release.selected_candidate.is_some(),
+                "downloadId": release.download_id,
+            },
+            "jobs": jobs,
+            "coverage": coverage,
+            "files": files,
+            "targets": target_states,
+            "reviewReleaseCount": review_release_count,
+        }))
     }
 
     #[test]
@@ -5027,6 +7571,74 @@ mod tests {
     }
 
     #[test]
+    fn alm7_qbittorrent_info_hashes_are_canonical_and_mismatches_fail_before_submit() {
+        let zero_hex = "0000000000000000000000000000000000000000";
+        let zero_base32 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            qbittorrent_trackable_info_hash(&zero_hex.to_ascii_uppercase()).as_deref(),
+            Some(zero_hex)
+        );
+        assert_eq!(
+            qbittorrent_trackable_info_hash(&format!("urn:btih:{zero_base32}")).as_deref(),
+            Some(zero_hex)
+        );
+        assert!(qbittorrent_trackable_info_hash("").is_none());
+        assert!(
+            qbittorrent_trackable_info_hash("00000000000000000000-00000000000000000000").is_none()
+        );
+        assert!(
+            qbittorrent_trackable_info_hash("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none()
+        );
+
+        let equivalent_magnet = format!("magnet:?xt=urn%3Abtih%3A{zero_base32}&dn=canonical");
+        assert_eq!(
+            qbittorrent_submission_download_id(&equivalent_magnet, Some(zero_hex), true)
+                .expect("equivalent base32 and hexadecimal BTIH values")
+                .as_deref(),
+            Some(zero_hex)
+        );
+        assert!(
+            qbittorrent_submission_download_id(
+                &equivalent_magnet,
+                Some("1111111111111111111111111111111111111111"),
+                true,
+            )
+            .is_err(),
+            "candidate/magnet disagreement must fail before qBittorrent mutation"
+        );
+        assert!(
+            qbittorrent_submission_download_id(
+                TEST_MAGNET,
+                Some("0123456789abcdef0123-456789abcdef01234567"),
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn alm7_qbittorrent_torrent_lookup_never_falls_back_to_an_unrelated_row() {
+        let rows = vec![
+            json!({
+                "hash": "1111111111111111111111111111111111111111",
+                "name": "unrelated"
+            }),
+            json!({ "hash": TEST_HASH.to_ascii_uppercase(), "name": "wanted" }),
+        ];
+        assert_eq!(
+            exact_qbittorrent_torrent_info(&rows, TEST_HASH)
+                .as_ref()
+                .and_then(|row| row.get("name"))
+                .and_then(Value::as_str),
+            Some("wanted")
+        );
+        assert!(
+            exact_qbittorrent_torrent_info(&rows[..1], "2222222222222222222222222222222222222222")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn qbittorrent_file_priority_fields_are_exact() {
         let file_ids = vec!["0".to_string(), "3".to_string(), "7".to_string()];
         let fields = qbittorrent_file_priority_fields(TEST_HASH, &file_ids, 0);
@@ -5110,6 +7722,295 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alm7_normal_broker_debrid_context_owns_internal_anime_bookkeeping_barrier()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let mut request = sample_request(true);
+        request.media_type = Some(MediaType::Anime);
+        request.defer_anime_debrid_refinement = true;
+
+        let context =
+            debrid_release_context(&request, &resolved, Some("elixir.marketplace.torrentio"))
+                .context("anime Debrid broker context")?;
+        assert_eq!(
+            context
+                .selected_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.pointer("/submissionBookkeeping/status"))
+                .and_then(Value::as_str),
+            Some("pending")
+        );
+
+        request.defer_anime_debrid_refinement = false;
+        let ordinary =
+            debrid_release_context(&request, &resolved, Some("elixir.marketplace.torrentio"))
+                .context("ordinary Debrid broker context")?;
+        assert!(
+            ordinary
+                .selected_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.get("submissionBookkeeping"))
+                .is_none()
+        );
+
+        let decoded: DownloadBrokerSubmitRequest = serde_json::from_value(json!({
+            "source": TEST_MAGNET,
+            "deferAnimeDebridRefinement": true
+        }))?;
+        assert!(
+            !decoded.defer_anime_debrid_refinement,
+            "the HTTP payload must not control the internal acquisition barrier"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_initial_qbittorrent_scope_evidence_selects_one_target_and_fails_closed_otherwise()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Scoped Anime",
+            vec![
+                NewAcquisitionTarget {
+                    target_key: Some("anilist:7001:s01e01".to_string()),
+                    media_type: Some(MediaType::Anime),
+                    title: Some("Episode One".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    ..empty_target()
+                },
+                NewAcquisitionTarget {
+                    target_key: Some("anilist:7001:s01e02".to_string()),
+                    media_type: Some(MediaType::Anime),
+                    title: Some("Episode Two".to_string()),
+                    season_number: Some(1),
+                    episode_number: Some(2),
+                    absolute_episode_number: Some(2),
+                    ..empty_target()
+                },
+            ],
+        )
+        .await?;
+        let wanted = &targets[1];
+        let wanted_id = wanted.target_id.to_string();
+        let mut request = sample_request(true);
+        request.subscription_id = Some(subscription.subscription_id);
+        request.category = Some("anime".to_string());
+        request.media_type = Some(MediaType::Anime);
+        request.media_title = Some("Scoped Anime".to_string());
+        request.name = Some("Opaque.Initial.Release".to_string());
+        request.request_scope_evidence = Some(json!({
+            "targetIds": [wanted_id.clone()],
+            "targetKeys": [wanted.target_key.clone()],
+        }));
+        if let Some(candidate) = request.selected_candidate.as_mut() {
+            candidate.title = "Opaque.Initial.Release".to_string();
+        }
+        let context = qbittorrent_release_context(&request, &resolved, TEST_MAGNET, None)
+            .context("initial qBittorrent release context")?;
+        let release = upsert_qbittorrent_acquisition_release(
+            &database.pool,
+            &resolved,
+            &context,
+            Some("anime"),
+            Some(TEST_HASH),
+        )
+        .await?;
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert!(coverage.is_empty());
+        assert_eq!(
+            release
+                .selected_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.pointer("/requestScopeEvidence/targetIds/0"))
+                .and_then(Value::as_str),
+            Some(wanted_id.as_str())
+        );
+
+        let scoped = qbittorrent_release_scoped_targets(&release, &targets, &coverage, TEST_HASH);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].target_id, wanted.target_id);
+
+        let mut absent = release.clone();
+        absent
+            .selected_candidate
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .context("selected candidate evidence object")?
+            .remove("requestScopeEvidence");
+        assert!(
+            qbittorrent_release_scoped_targets(&absent, &targets, &coverage, TEST_HASH).is_empty(),
+            "multiple unbound targets without initial scope evidence must fail closed"
+        );
+
+        let mut invalid = release.clone();
+        invalid
+            .selected_candidate
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .context("selected candidate evidence object")?
+            .insert(
+                "requestScopeEvidence".to_string(),
+                json!({
+                    "targetIds": ["not-a-uuid"],
+                    "targetKeys": ["anilist:7001:s99e99"],
+                }),
+            );
+        assert!(
+            qbittorrent_release_scoped_targets(&invalid, &targets, &coverage, TEST_HASH).is_empty(),
+            "invalid initial scope evidence must not widen to the subscription"
+        );
+
+        let mut partial_disagreement = release.clone();
+        partial_disagreement
+            .selected_candidate
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .context("selected candidate evidence object")?
+            .insert(
+                "requestScopeEvidence".to_string(),
+                json!({
+                    "targetIds": [targets[0].target_id, targets[1].target_id],
+                    "targetKeys": [targets[0].target_key.clone()],
+                }),
+            );
+        assert!(
+            qbittorrent_request_scope_targets(&partial_disagreement, &targets)
+                .is_some_and(|targets| targets.is_empty()),
+            "partially overlapping ID/key evidence must fail closed"
+        );
+
+        for target in &targets {
+            upsert_release_coverage(
+                &database.pool,
+                NewAcquisitionReleaseCoverage {
+                    coverage_id: None,
+                    release_id: release.release_id,
+                    release_file_id: None,
+                    target_id: target.target_id,
+                    coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                    confidence: ReleaseConfidence::High,
+                    score: Some(1.0),
+                    reason: Some("scope-authority regression".to_string()),
+                    state: ReleaseCoverageState::Submitted,
+                    verified_by: Some("alm7_scope_test".to_string()),
+                },
+            )
+            .await?;
+        }
+        let widened_coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert!(
+            qbittorrent_release_scoped_targets(&release, &targets, &widened_coverage, TEST_HASH,)
+                .is_empty(),
+            "coverage outside authoritative request scope must fail closed"
+        );
+
+        let mut widened_bindings = targets.clone();
+        for target in &mut widened_bindings {
+            target.download_id = Some(TEST_HASH.to_string());
+            target.selected_route_logical_id = Some(TORRENT_DEFAULT_LOGICAL_ID.to_string());
+        }
+        assert!(
+            qbittorrent_release_scoped_targets(&release, &widened_bindings, &[], TEST_HASH)
+                .is_empty(),
+            "bindings outside authoritative request scope must fail closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_pending_bookkeeping_reconciles_after_a_writer_crash()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_series_subscription(&database, 1..=1).await?;
+        let release = setup_staged_qbittorrent_release(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("durable acquisition bookkeeping".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_bookkeeping_test".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("submitted before writer restart".to_string()),
+                selected_provider_id: release.source_provider_id,
+                selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: Some(TEST_HASH.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut pending_plan = release.coverage_plan.clone().unwrap_or_else(|| json!({}));
+        pending_plan
+            .as_object_mut()
+            .context("bookkeeping coverage plan object")?
+            .insert(
+                "submissionBookkeeping".to_string(),
+                json!({
+                    "status": "pending",
+                    "policyVersion": "acquisition-broker-bookkeeping-v1"
+                }),
+            );
+        update_qbittorrent_release_state_only(
+            &database.pool,
+            release.release_id,
+            TEST_HASH,
+            AcquisitionReleaseState::Staging,
+            AcquisitionReleaseState::Submitted,
+            "acquisition writer stopped before closing its bookkeeping marker",
+            pending_plan,
+        )
+        .await?;
+        let pending = get_release(&database.pool, release.release_id)
+            .await?
+            .context("pending bookkeeping release")?;
+        assert!(qbittorrent_submission_bookkeeping_pending(&pending));
+        assert!(
+            reconcile_qbittorrent_submission_bookkeeping(&database.pool, &pending, TEST_HASH)
+                .await?
+        );
+        let reconciled = get_release(&database.pool, release.release_id)
+            .await?
+            .context("reconciled bookkeeping release")?;
+        assert_eq!(
+            reconciled
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/submissionBookkeeping/status"))
+                .and_then(Value::as_str),
+            Some("complete")
+        );
+        assert!(!qbittorrent_submission_bookkeeping_pending(&reconciled));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn asr4_qbittorrent_staged_magnet_lifecycle_contract() -> anyhow::Result<()> {
         let database = setup_db().await?;
         let resolved = setup_qbittorrent_resolved(&database).await?;
@@ -5153,6 +8054,8 @@ mod tests {
         .await?;
         upsert_qbittorrent_release_job(&database.pool, &resolved, &release, Some(TEST_HASH))
             .await?;
+        assert!(qbittorrent_submission_bookkeeping_pending(&release));
+        assert!(!qbittorrent_priority_bookkeeping_pending(&release));
 
         assert_eq!(release.state, AcquisitionReleaseState::Staging);
         assert_eq!(
@@ -5388,6 +8291,13 @@ mod tests {
             "Show.S01.COMPLETE.1080p.WEB-DL-GROUP",
         )
         .await?;
+        assert_eq!(release.state, AcquisitionReleaseState::Staging);
+        assert!(
+            list_release_files(&database.pool, release.release_id)
+                .await?
+                .is_empty(),
+            "fresh qBittorrent submission must wait for the active-release metadata poll"
+        );
         let rows = vec![
             json!({
                 "index": 0,
@@ -6023,14 +8933,26 @@ mod tests {
         persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
 
         let files = list_release_files(&database.pool, release.release_id).await?;
+        let engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::MatchWantedFiles);
         let refinement = refine_anime_qbittorrent_coverage(
             &database.pool,
+            &engine.service(),
+            Some(&subscription),
             &release,
             TEST_HASH,
             &targets,
             &files,
         )
         .await?;
+        assert_eq!(engine.call_count(), 0);
+        assert_eq!(
+            refinement
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.source),
+            Some(AnimeMatchAssistSource::DeterministicFastPath)
+        );
         assert_eq!(refinement.release_kind, ReleaseKind::Single);
         assert_eq!(refinement.confidence, ReleaseConfidence::High);
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
@@ -6039,6 +8961,120 @@ mod tests {
         assert!(decision.is_approved());
         assert_eq!(decision.selected_file_ids, vec!["0"]);
         assert!(decision.skipped_file_ids.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_required_audio_uses_selected_provider_filename_before_fast_path()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (mut subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Example Title",
+            vec![NewAcquisitionTarget {
+                target_key: Some("anilist:9301:A0001".to_string()),
+                media_type: Some(MediaType::Anime),
+                title: Some("Episode One".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                metadata: Some(json!({
+                    "graphFingerprint": "example-title-graph-v1",
+                    "anilistSeasonId": "9301",
+                    "targetCanonicalKey": "anilist:9301:episode:1",
+                    "aliases": ["Example Title"],
+                    "scopedAliases": [{
+                        "display": "Example Title",
+                        "source": "anilist_english",
+                        "language": "en",
+                        "seasonNumber": 1,
+                        "anilistSeasonId": "9301"
+                    }]
+                })),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        subscription.quality_profile = Some(json!({
+            "animeAudioPreference": {
+                "mode": "require_dub_review",
+                "language": "en"
+            }
+        }));
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Example Title",
+            "anime",
+            "[Group] Example Title - 01 [Dual Audio] [1080p]",
+        )
+        .await?;
+        persist_qbittorrent_release_file_rows(
+            &database.pool,
+            &release,
+            TEST_HASH,
+            &[json!({
+                "index": 0,
+                "name": "Example Title - 01 [Subbed] [1080p].mkv",
+                "size": 1_500_000_000u64,
+                "priority": 1,
+                "progress": 0.0
+            })],
+        )
+        .await?;
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let provider_candidate = qbittorrent_anime_acquisition_candidate(&release, &files);
+        let provider_file_ids = vec!["0".to_string()];
+        assert!(
+            !assess_acquisition_anime_provider_file_audio(
+                &subscription,
+                &provider_candidate,
+                &provider_file_ids,
+            )
+            .1,
+            "the public require_dub_review contract must reject an explicitly subbed selected file"
+        );
+        let engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::MatchWantedFiles);
+        let refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+
+        assert_eq!(
+            engine.call_count(),
+            1,
+            "explicit selected-file audio mismatch must bypass the deterministic fast path"
+        );
+        assert_eq!(
+            refinement
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.source),
+            Some(AnimeMatchAssistSource::LocalModel)
+        );
+        assert!(
+            refinement.automatic_retry,
+            "the model's non-dub mapping must not satisfy a required English dub"
+        );
+        assert_eq!(
+            refinement
+                .anime_model_audio_policy
+                .as_ref()
+                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
         Ok(())
     }
 
@@ -6093,8 +9129,11 @@ mod tests {
         persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
 
         let files = list_release_files(&database.pool, release.release_id).await?;
+        let matching_service = AnimeMatchingService::disabled();
         let refinement = refine_anime_qbittorrent_coverage(
             &database.pool,
+            &matching_service,
+            Some(&subscription),
             &release,
             TEST_HASH,
             &targets,
@@ -6109,12 +9148,613 @@ mod tests {
         assert!(decision.is_approved());
         assert_eq!(decision.selected_file_ids, vec!["0", "1"]);
         assert_eq!(decision.skipped_file_ids, vec!["2", "3"]);
+
+        let (fixture, requests) = start_qbittorrent_priority_fixture(rows.clone()).await?;
+        fixture.fail_form_paths_once(&["api/v2/torrents/filePrio", "api/v2/torrents/resume"]);
+        configure_qbittorrent_priority_fixture_endpoint(&database, &resolved, fixture).await?;
+        let state = setup_state_for_database(&database)?;
+        let store = ExtensionStore::new(&database.pool);
+        let submitted = get_release(&database.pool, release.release_id)
+            .await?
+            .context("fresh qBittorrent release")?;
+        assert_eq!(submitted.state, AcquisitionReleaseState::Staging);
+        assert_eq!(
+            refresh_staged_qbittorrent_metadata(
+                &state,
+                &store,
+                &submitted,
+                TEST_HASH,
+                true,
+                false,
+            )
+                .await?,
+            0,
+            "broker staging must not race acquisition's post-submit bookkeeping"
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("qBittorrent priority fixture lock")
+                .is_empty()
+        );
+        update_qbittorrent_release_state_only(
+            &database.pool,
+            submitted.release_id,
+            TEST_HASH,
+            AcquisitionReleaseState::Staging,
+            AcquisitionReleaseState::Submitted,
+            "Acquisition caller bookkeeping is durable.",
+            submitted.coverage_plan.clone().unwrap_or_else(|| json!({})),
+        )
+        .await?;
+        let submitted = get_release(&database.pool, release.release_id)
+            .await?
+            .context("bookkept qBittorrent release")?;
+        let priority_error =
+            refresh_staged_qbittorrent_metadata(&state, &store, &submitted, TEST_HASH, true, false)
+                .await
+                .expect_err("the first file-priority request must fail once");
+        assert!(priority_error.to_string().contains("filePrio"));
+        let ready_after_priority_failure = get_release(&database.pool, release.release_id)
+            .await?
+            .context("Ready release after file-priority failure")?;
+        assert_eq!(
+            ready_after_priority_failure.state,
+            AcquisitionReleaseState::Ready
+        );
+        assert_eq!(
+            ready_after_priority_failure
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/priorityPolicy/priorityApplied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let resume_error = refresh_staged_qbittorrent_metadata(
+            &state,
+            &store,
+            &ready_after_priority_failure,
+            TEST_HASH,
+            true,
+            false,
+        )
+        .await
+        .expect_err("the first resume request must fail once");
+        assert!(resume_error.to_string().contains("resume"));
+        let ready_after_resume_failure = get_release(&database.pool, release.release_id)
+            .await?
+            .context("Ready release after resume failure")?;
+        assert_eq!(
+            ready_after_resume_failure.state,
+            AcquisitionReleaseState::Ready
+        );
+        assert_eq!(
+            ready_after_resume_failure
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/priorityPolicy/priorityApplied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        assert_eq!(
+            refresh_staged_qbittorrent_metadata(
+                &state,
+                &store,
+                &ready_after_resume_failure,
+                TEST_HASH,
+                true,
+                false,
+            )
+            .await?,
+            rows.len()
+        );
+        let captured = requests
+            .lock()
+            .expect("qBittorrent priority fixture lock")
+            .clone();
+        let captured_paths = captured
+            .iter()
+            .filter_map(|request| request.pointer("/path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured_paths,
+            vec![
+                "api/v2/torrents/files",
+                "api/v2/torrents/filePrio",
+                "api/v2/torrents/files",
+                "api/v2/torrents/filePrio",
+                "api/v2/torrents/filePrio",
+                "api/v2/torrents/resume",
+                "api/v2/torrents/files",
+                "api/v2/torrents/filePrio",
+                "api/v2/torrents/filePrio",
+                "api/v2/torrents/resume",
+            ]
+        );
+        assert_eq!(
+            captured[1].pointer("/fields/id").and_then(Value::as_str),
+            Some("2|3")
+        );
+        assert_eq!(
+            captured[1]
+                .pointer("/fields/priority")
+                .and_then(Value::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            captured[8].pointer("/fields/id").and_then(Value::as_str),
+            Some("0|1")
+        );
+        assert_eq!(
+            captured[8]
+                .pointer("/fields/priority")
+                .and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[9]
+                .pointer("/fields/hashes")
+                .and_then(Value::as_str),
+            Some(TEST_HASH)
+        );
+        let downloading = get_release(&database.pool, release.release_id)
+            .await?
+            .context("outer qBittorrent policy release")?;
+        assert_eq!(downloading.state, AcquisitionReleaseState::Downloading);
+        assert_eq!(
+            downloading
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/priorityPolicy/priorityApplied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn qbittorrent_anime_unrelated_mixed_media_stays_paused_for_review() -> anyhow::Result<()>
+    async fn alm7_qbittorrent_anime_model_maps_real_pack_files_and_skips_unselected_media()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Tokyo Ghoul",
+            vec![
+                NewAcquisitionTarget {
+                    target_key: Some("anilist:1002:s02e01".to_string()),
+                    title: Some("Episode One".to_string()),
+                    season_number: Some(2),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(13),
+                    metadata: Some(tokyo_ghoul_root_a_target_metadata(1)),
+                    ..empty_target()
+                },
+                NewAcquisitionTarget {
+                    target_key: Some("anilist:1002:s02e02".to_string()),
+                    title: Some("Episode Two".to_string()),
+                    season_number: Some(2),
+                    episode_number: Some(2),
+                    absolute_episode_number: Some(14),
+                    metadata: Some(tokyo_ghoul_root_a_target_metadata(2)),
+                    ..empty_target()
+                },
+            ],
+        )
+        .await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Tokyo Ghoul",
+            "anime",
+            "[Group] TGRA-X-A [1080p]",
+        )
+        .await?;
+        let rows = vec![
+            json!({ "index": 0, "name": "TGRA-X-A/track-alpha.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "TGRA-X-A/track-beta.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 2, "name": "TGRA-X-A/other-show-track.mkv", "size": 900_000_000u64, "priority": 1, "progress": 0.0 }),
+        ];
+        persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::MatchWantedFiles);
+        let refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+
+        assert_eq!(engine.call_count(), 1);
+        assert_eq!(refinement.confidence, ReleaseConfidence::High);
+        assert!(!refinement.automatic_retry);
+        assert_eq!(
+            refinement.anime_model_audio_profile,
+            Some(AnimeMatchAudioProfile::JaAudioEnSubs)
+        );
+        assert_eq!(
+            refinement
+                .anime_model_audio_policy
+                .as_ref()
+                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            refinement
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.source),
+            Some(AnimeMatchAssistSource::LocalModel)
+        );
+        assert_eq!(
+            refinement
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| assist.result),
+            Some(AnimeMatchAssistResult::Matched)
+        );
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 2);
+        let coverage_by_target = coverage
+            .iter()
+            .map(|entry| (entry.target_id, entry.release_file_id))
+            .collect::<HashMap<_, _>>();
+        for (target, provider_file_id) in targets.iter().zip(["0", "1"]) {
+            let expected_file_id = files
+                .iter()
+                .find(|file| file.provider_file_id.as_deref() == Some(provider_file_id))
+                .map(|file| file.release_file_id);
+            assert_eq!(
+                coverage_by_target.get(&target.target_id),
+                Some(&expected_file_id)
+            );
+        }
+        let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        assert!(decision.is_approved());
+        assert_eq!(decision.selected_file_ids, vec!["0", "1"]);
+        assert_eq!(decision.skipped_file_ids, vec!["2"]);
+        assert!(qbittorrent_priority_bookkeeping_pending(&release));
+        assert!(
+            persist_qbittorrent_priority_decision(
+                &database.pool,
+                &release,
+                &files,
+                &coverage,
+                &refinement,
+                &decision,
+                true,
+            )
+            .await
+            .is_err(),
+            "a staged anime priority decision must wait for acquisition bookkeeping"
+        );
+        let skipped_fields = qbittorrent_file_priority_fields(
+            TEST_HASH,
+            &decision.skipped_file_ids,
+            decision.skipped_priority,
+        );
+        assert_eq!(skipped_fields.get("id").map(String::as_str), Some("2"));
+        assert_eq!(
+            skipped_fields.get("priority").map(String::as_str),
+            Some("0")
+        );
+        let wanted_fields = qbittorrent_file_priority_fields(
+            TEST_HASH,
+            &decision.selected_file_ids,
+            decision.wanted_priority,
+        );
+        assert_eq!(wanted_fields.get("id").map(String::as_str), Some("0|1"));
+        assert_eq!(wanted_fields.get("priority").map(String::as_str), Some("1"));
+        update_qbittorrent_release_state_only(
+            &database.pool,
+            release.release_id,
+            TEST_HASH,
+            AcquisitionReleaseState::Staging,
+            AcquisitionReleaseState::Submitted,
+            "ALM-7 acquisition bookkeeping is durable.",
+            release.coverage_plan.clone().unwrap_or_else(|| json!({})),
+        )
+        .await?;
+        let bookkept_release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("ALM-7 bookkept qBittorrent release")?;
+        persist_qbittorrent_priority_decision(
+            &database.pool,
+            &bookkept_release,
+            &files,
+            &coverage,
+            &refinement,
+            &decision,
+            true,
+        )
+        .await?;
+        let ready = get_release(&database.pool, release.release_id)
+            .await?
+            .context("ALM-7 model-selected qBittorrent release was not persisted")?;
+        assert_eq!(ready.state, AcquisitionReleaseState::Ready);
+        assert_eq!(
+            ready
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/priorityPolicy/priorityApplied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let persisted_files = list_release_files(&database.pool, release.release_id).await?;
+        assert_eq!(
+            persisted_files
+                .iter()
+                .filter(|file| file.selected == Some(true))
+                .filter_map(|file| file.provider_file_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["0", "1"]
+        );
+        assert_eq!(
+            persisted_files
+                .iter()
+                .filter(|file| file.selected == Some(false))
+                .filter_map(|file| file.provider_file_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["2"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_pending_cleanup_replays_and_preserves_terminal_targets()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Cleanup Anime",
+            vec![NewAcquisitionTarget {
+                target_key: Some("anilist:9001:s01e01".to_string()),
+                media_type: Some(MediaType::Anime),
+                title: Some("Episode One".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Cleanup Anime",
+            "anime",
+            "[Group] Cleanup.Anime.01 [1080p]",
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("selected anime target".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_cleanup_test".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("submitted to qBittorrent".to_string()),
+                selected_provider_id: release.source_provider_id,
+                selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: Some(TEST_HASH.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let refinement = QbittorrentCoverageRefinement {
+            release_kind: ReleaseKind::Unknown,
+            resolver_kind: ReleaseResolverKind::Unresolved,
+            resolver_version: QBITTORRENT_SELECTION_POLICY_VERSION.to_string(),
+            confidence: ReleaseConfidence::Low,
+            review_reasons: Vec::new(),
+            coverage_plan: release.coverage_plan.clone().unwrap_or_else(|| json!({})),
+            anime_match_assist: None,
+            anime_model_audio_profile: None,
+            anime_model_audio_policy: None,
+            automatic_retry: true,
+        };
+        persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &refinement).await?;
+        let failed = get_release(&database.pool, release.release_id)
+            .await?
+            .context("failed anime release with cleanup intent")?;
+        assert!(anime_qbittorrent_cleanup_pending(&failed));
+
+        let (fixture, requests) = start_qbittorrent_priority_fixture(Vec::new()).await?;
+        fixture.fail_form_paths_once(&["api/v2/torrents/delete"]);
+        configure_qbittorrent_priority_fixture_endpoint(&database, &resolved, fixture).await?;
+        let state = setup_state_for_database(&database)?;
+        let store = ExtensionStore::new(&database.pool);
+        let failed_replay = replay_pending_anime_qbittorrent_cleanup(&state, &store, 10).await?;
+        assert_eq!(failed_replay, 0);
+        let still_pending = get_release(&database.pool, release.release_id)
+            .await?
+            .context("anime release after failed cleanup request")?;
+        assert_eq!(still_pending.state, AcquisitionReleaseState::Failed);
+        assert!(anime_qbittorrent_cleanup_pending(&still_pending));
+
+        let replayed = replay_pending_anime_qbittorrent_cleanup(&state, &store, 10).await?;
+        assert_eq!(replayed, 1);
+        let captured = requests.lock().expect("cleanup request fixture").clone();
+        assert_eq!(captured.len(), 2);
+        for request in &captured {
+            assert_eq!(
+                request.pointer("/path").and_then(Value::as_str),
+                Some("api/v2/torrents/delete")
+            );
+            assert_eq!(
+                request.pointer("/fields/hashes").and_then(Value::as_str),
+                Some(TEST_HASH)
+            );
+        }
+        let cleaned = get_release(&database.pool, release.release_id)
+            .await?
+            .context("cleaned anime release")?;
+        assert_eq!(
+            cleaned
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        let target =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("automatic retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_stale_retry_cannot_mutate_a_new_target_binding() -> anyhow::Result<()>
     {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Attempt Ownership Anime",
+            vec![NewAcquisitionTarget {
+                target_key: Some("anilist:9101:s01e01".to_string()),
+                media_type: Some(MediaType::Anime),
+                season_number: Some(1),
+                episode_number: Some(1),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Attempt Ownership Anime",
+            "anime",
+            "[Group] Attempt.Ownership.01 [1080p]",
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("attempt A coverage".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_attempt_a".to_string()),
+            },
+        )
+        .await?;
+        let newer_hash = "1111111111111111111111111111111111111111";
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("newer attempt B".to_string()),
+                selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+                download_id: Some(newer_hash.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let refinement = QbittorrentCoverageRefinement {
+            release_kind: ReleaseKind::Unknown,
+            resolver_kind: ReleaseResolverKind::Unresolved,
+            resolver_version: QBITTORRENT_SELECTION_POLICY_VERSION.to_string(),
+            confidence: ReleaseConfidence::Low,
+            review_reasons: Vec::new(),
+            coverage_plan: release.coverage_plan.clone().unwrap_or_else(|| json!({})),
+            anime_match_assist: None,
+            anime_model_audio_profile: None,
+            anime_model_audio_policy: None,
+            automatic_retry: true,
+        };
+        assert!(
+            persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &refinement)
+                .await
+                .is_err()
+        );
+        let current_release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("attempt A release")?;
+        assert_eq!(current_release.state, AcquisitionReleaseState::Staging);
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs[0].state, ReleaseJobState::Staging);
+        assert!(jobs[0].active);
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage[0].state, ReleaseCoverageState::Submitted);
+        let current_target =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("attempt B target")?;
+        assert_eq!(current_target.state, AcquisitionTargetState::Submitted);
+        assert_eq!(current_target.download_id.as_deref(), Some(newer_hash));
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Imported,
+                state_reason: Some("concurrent import completed".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            reset_target_for_candidate_retry(
+                &database.pool,
+                targets[0].target_id,
+                "late retry".to_string(),
+                chrono::Utc::now(),
+            )
+            .await?
+            .is_none()
+        );
+        let imported =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("imported target")?;
+        assert_eq!(imported.state, AcquisitionTargetState::Imported);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_anime_unresolved_mapping_fails_and_schedules_retry()
+    -> anyhow::Result<()> {
         let database = setup_db().await?;
         let resolved = setup_qbittorrent_resolved(&database).await?;
         let (subscription, targets) = setup_subscription_with_targets(
@@ -6122,11 +9762,24 @@ mod tests {
             MediaType::Anime,
             "Example Title",
             vec![NewAcquisitionTarget {
+                target_key: Some("anilist:2001:s01e01".to_string()),
                 title: Some("Episode One".to_string()),
                 season_number: Some(1),
                 episode_number: Some(1),
                 absolute_episode_number: Some(1),
-                metadata: Some(json!({ "aliases": ["Example Title"] })),
+                metadata: Some(json!({
+                    "graphFingerprint": "example-title-graph-v1",
+                    "targetCanonicalKey": "anilist:2001:episode:1",
+                    "anilistSeasonId": "2001",
+                    "aliases": ["Example Title"],
+                    "scoped_aliases": [{
+                        "display": "Example Title",
+                        "source": "anilist_english",
+                        "language": "en",
+                        "seasonNumber": 1,
+                        "anilistSeasonId": "2001"
+                    }]
+                })),
                 ..empty_target()
             }],
         )
@@ -6138,51 +9791,412 @@ mod tests {
             MediaType::Anime,
             "Example Title",
             "anime",
-            "[SubsPlease] Example Title S01 Batch [1080p]",
+            "[Group] opaque-collection-x [1080p]",
         )
         .await?;
         let rows = vec![
-            json!({ "index": 0, "name": "Example Title - 01 [1080p].mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
-            json!({ "index": 1, "name": "Different Title - 02 [1080p].mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 0, "name": "opaque-collection-x/track-alpha.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "opaque-collection-x/track-beta.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
         ];
         persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
 
         let files = list_release_files(&database.pool, release.release_id).await?;
-        let refinement = refine_anime_qbittorrent_coverage(
+        upsert_release_coverage(
             &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("initial candidate target".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("test".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("submitted to qBittorrent".to_string()),
+                selected_provider_id: release.source_provider_id,
+                selected_route_logical_id: release.selected_route_logical_id.clone(),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: release.download_id.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let disabled_refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &AnimeMatchingService::disabled(),
+            Some(&subscription),
             &release,
             TEST_HASH,
             &targets,
             &files,
         )
         .await?;
-        assert_eq!(refinement.confidence, ReleaseConfidence::ReviewRequired);
-        assert!(
+        let error_engine = QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::Error);
+        let error_refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &error_engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        let timeout_engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::Timeout);
+        let timeout_refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &timeout_engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        let invalid_engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::InvalidFileReference);
+        let invalid_refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &invalid_engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        let engine = QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::Empty);
+        let refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &engine.service(),
+            Some(&subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        assert_eq!(error_engine.call_count(), 1);
+        assert_eq!(timeout_engine.call_count(), 1);
+        assert_eq!(invalid_engine.call_count(), 1);
+        assert_eq!(engine.call_count(), 1);
+        assert!(disabled_refinement.automatic_retry);
+        assert!(error_refinement.automatic_retry);
+        assert!(timeout_refinement.automatic_retry);
+        assert!(invalid_refinement.automatic_retry);
+        assert!(refinement.automatic_retry);
+        assert_eq!(
+            disabled_refinement.coverage_plan.get("anime"),
+            refinement.coverage_plan.get("anime"),
+            "empty model output must retain the exact deterministic coverage plan"
+        );
+        assert_eq!(
+            disabled_refinement.coverage_plan.get("anime"),
+            error_refinement.coverage_plan.get("anime"),
+            "model errors must retain the exact deterministic coverage plan"
+        );
+        assert_eq!(
+            disabled_refinement.coverage_plan.get("anime"),
+            timeout_refinement.coverage_plan.get("anime"),
+            "model deadlines must retain the exact deterministic coverage plan"
+        );
+        assert_eq!(
+            disabled_refinement.coverage_plan.get("anime"),
+            invalid_refinement.coverage_plan.get("anime"),
+            "invalid model file references must retain the exact deterministic coverage plan"
+        );
+        assert_eq!(
+            error_refinement
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::EngineError)
+        );
+        assert_eq!(
+            timeout_refinement
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::EngineError)
+        );
+        assert_eq!(
+            invalid_refinement
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::InvalidModelResponse)
+        );
+        assert_eq!(
             refinement
-                .review_reasons
-                .iter()
-                .any(|reason| reason == "unmapped_media_files")
+                .anime_match_assist
+                .as_ref()
+                .and_then(|assist| assist.reason),
+            Some(AnimeMatchFallbackReason::EmptyModelMatches)
+        );
+        assert!(
+            !anime_qbittorrent_retry_suppresses_rediscovery(&disabled_refinement),
+            "a missing local runtime must remain eligible after scheduler backoff"
+        );
+        assert!(
+            !anime_qbittorrent_retry_suppresses_rediscovery(&error_refinement),
+            "a transient model failure must remain eligible after runtime repair"
+        );
+        assert!(
+            !anime_qbittorrent_retry_suppresses_rediscovery(&timeout_refinement),
+            "a model deadline must remain eligible after scheduler backoff"
+        );
+        assert!(
+            !anime_qbittorrent_retry_suppresses_rediscovery(&invalid_refinement),
+            "invalid model output must preserve disabled-inference retry semantics"
+        );
+        assert!(
+            !anime_qbittorrent_retry_suppresses_rediscovery(&refinement),
+            "empty model output must preserve disabled-inference retry semantics"
+        );
+
+        let mut required_dub_subscription = subscription.clone();
+        required_dub_subscription.quality_profile = Some(json!({
+            "animeAudioPreference": {
+                "mode": "require_dub_review",
+                "language": "en"
+            }
+        }));
+        let required_audio_engine =
+            QbittorrentAnimeMatchEngine::new(QbittorrentAnimeEngineBehavior::MatchWantedFiles);
+        let required_audio_refinement = refine_anime_qbittorrent_coverage(
+            &database.pool,
+            &required_audio_engine.service(),
+            Some(&required_dub_subscription),
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        assert_eq!(required_audio_engine.call_count(), 1);
+        assert!(required_audio_refinement.automatic_retry);
+        assert_eq!(
+            required_audio_refinement.anime_model_audio_profile,
+            Some(AnimeMatchAudioProfile::JaAudioEnSubs)
+        );
+        assert_eq!(
+            required_audio_refinement
+                .anime_model_audio_policy
+                .as_ref()
+                .and_then(|policy| policy.get("state"))
+                .and_then(Value::as_str),
+            Some("mismatch")
+        );
+        assert_eq!(
+            required_audio_refinement
+                .anime_model_audio_policy
+                .as_ref()
+                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            required_audio_refinement
+                .anime_match_assist
+                .as_ref()
+                .map(|assist| (assist.source, assist.result)),
+            Some((
+                AnimeMatchAssistSource::LocalModel,
+                AnimeMatchAssistResult::Matched
+            )),
+            "a structurally valid model match must still retry when required audio is absent"
+        );
+        assert!(
+            anime_qbittorrent_retry_suppresses_rediscovery(&required_audio_refinement),
+            "a required-audio mismatch must move on from this release"
         );
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(
+            coverage.len(),
+            1,
+            "required-audio rejection must not persist model file coverage"
+        );
+        let disabled_decision =
+            decide_qbittorrent_file_priority(&release, &disabled_refinement, &files, &coverage);
+        let error_decision =
+            decide_qbittorrent_file_priority(&release, &error_refinement, &files, &coverage);
+        let timeout_decision =
+            decide_qbittorrent_file_priority(&release, &timeout_refinement, &files, &coverage);
+        let invalid_decision =
+            decide_qbittorrent_file_priority(&release, &invalid_refinement, &files, &coverage);
         let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        assert_eq!(disabled_decision.status, error_decision.status);
+        assert_eq!(disabled_decision.status, timeout_decision.status);
+        assert_eq!(disabled_decision.status, invalid_decision.status);
+        assert_eq!(disabled_decision.status, decision.status);
+        assert_eq!(
+            disabled_decision.selected_file_ids,
+            error_decision.selected_file_ids
+        );
+        assert_eq!(
+            disabled_decision.selected_file_ids,
+            timeout_decision.selected_file_ids
+        );
+        assert_eq!(
+            disabled_decision.selected_file_ids,
+            invalid_decision.selected_file_ids
+        );
+        assert_eq!(
+            disabled_decision.selected_file_ids,
+            decision.selected_file_ids
+        );
+        assert_eq!(
+            disabled_decision.skipped_file_ids,
+            error_decision.skipped_file_ids
+        );
+        assert_eq!(
+            disabled_decision.skipped_file_ids,
+            timeout_decision.skipped_file_ids
+        );
+        assert_eq!(
+            disabled_decision.skipped_file_ids,
+            invalid_decision.skipped_file_ids
+        );
+        assert_eq!(
+            disabled_decision.skipped_file_ids,
+            decision.skipped_file_ids
+        );
         assert!(!decision.is_approved());
-        persist_qbittorrent_priority_decision(
+
+        let mut release_with_stored_override = release.clone();
+        release_with_stored_override.coverage_plan = Some(json!({
+            "priorityPolicy": {
+                "status": "approved",
+                "userApproved": true,
+                "selectedFileIds": ["0"],
+                "skippedFileIds": ["1"]
+            }
+        }));
+        let decision = qbittorrent_priority_decision_with_legacy_override(
+            &release_with_stored_override,
+            decision,
+        );
+        assert!(!decision.is_approved());
+        assert!(!decision.user_approved);
+
+        persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &disabled_refinement)
+            .await?;
+        let disabled_persistence =
+            alm7_qbittorrent_retry_persistence_snapshot(&database, release.release_id, &targets)
+                .await?;
+
+        persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &timeout_refinement)
+            .await?;
+        assert_eq!(
+            alm7_qbittorrent_retry_persistence_snapshot(&database, release.release_id, &targets,)
+                .await?,
+            disabled_persistence,
+            "timeout fallback persistence must equal disabled-inference retry persistence"
+        );
+
+        persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &invalid_refinement)
+            .await?;
+        assert_eq!(
+            alm7_qbittorrent_retry_persistence_snapshot(&database, release.release_id, &targets,)
+                .await?,
+            disabled_persistence,
+            "invalid-model fallback persistence must equal disabled-inference retry persistence"
+        );
+
+        persist_anime_qbittorrent_retry(&database.pool, &release, TEST_HASH, &invalid_refinement)
+            .await?;
+        assert_eq!(
+            alm7_qbittorrent_retry_persistence_snapshot(&database, release.release_id, &targets,)
+                .await?,
+            disabled_persistence,
+            "repeating the same retry persistence must not duplicate or drift canonical rows"
+        );
+
+        persist_anime_qbittorrent_retry(
             &database.pool,
             &release,
-            &files,
-            &coverage,
-            &refinement,
-            &decision,
-            false,
+            TEST_HASH,
+            &required_audio_refinement,
         )
         .await?;
         let updated_release = get_release(&database.pool, release.release_id)
             .await?
             .expect("release");
+        assert_eq!(updated_release.state, AcquisitionReleaseState::Failed);
         assert_eq!(
-            updated_release.state,
-            AcquisitionReleaseState::ReviewRequired
+            updated_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/status"))
+                .and_then(Value::as_str),
+            Some("scheduled")
         );
+        assert_eq!(
+            updated_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| { plan.pointer("/retrySuppression/suppressAutomaticRediscovery") })
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            updated_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("modelAudioProfile"))
+                .and_then(Value::as_str),
+            Some("ja_audio_en_subs")
+        );
+        assert_eq!(
+            updated_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/modelAudioPolicy/requiredPreferenceSatisfied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs[0].state, ReleaseJobState::Failed);
+        assert!(!jobs[0].active);
+        let rejected_coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert!(
+            rejected_coverage
+                .iter()
+                .all(|entry| entry.state == ReleaseCoverageState::Rejected)
+        );
+        let updated_files = list_release_files(&database.pool, release.release_id).await?;
+        assert!(
+            updated_files
+                .iter()
+                .all(|file| file.selected == Some(false))
+        );
+        let target =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .expect("target");
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.next_search_after.is_some());
+        assert!(target.selected_candidate.is_none());
+        let manual_review_count = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM acquisition_releases
+             WHERE subscription_id = $1 AND state = 'review_required'",
+        )
+        .bind(subscription.subscription_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(manual_review_count, 0);
         Ok(())
     }
 
@@ -6303,6 +10317,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alm7_qbittorrent_fresh_ready_provider_failures_remain_retryable_in_place()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let now = chrono::Utc::now();
+        let started_at = now - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS - 1);
+        let (ready, target) =
+            setup_ready_anime_qbittorrent_provider_attempt(&database, &resolved, started_at)
+                .await?;
+
+        for operation in [
+            QbittorrentProviderOperation::TorrentInspection,
+            QbittorrentProviderOperation::FilePolicyRefresh,
+        ] {
+            assert!(
+                terminalize_aged_anime_qbittorrent_provider_failure(
+                    &database.pool,
+                    ready.release_id,
+                    TEST_HASH,
+                    operation,
+                    now,
+                )
+                .await?
+                .is_none(),
+                "transient {operation:?} failures must retain a fresh Ready attempt"
+            );
+        }
+
+        let retained = get_release(&database.pool, ready.release_id)
+            .await?
+            .context("fresh Ready qBittorrent attempt")?;
+        assert_eq!(retained.state, AcquisitionReleaseState::Ready);
+        assert!(
+            retained
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("automaticRetry"))
+                .is_none()
+        );
+        let jobs = list_release_jobs(&database.pool, ready.release_id).await?;
+        assert_eq!(jobs[0].state, ReleaseJobState::Ready);
+        assert!(jobs[0].active);
+        let target =
+            crate::acquisition::subscriptions::get_target(&database.pool, target.target_id)
+                .await?
+                .context("fresh Ready target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Submitted);
+        assert_eq!(target.download_id.as_deref(), Some(TEST_HASH));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_aged_ready_provider_failures_retry_without_review()
+    -> anyhow::Result<()> {
+        for operation in [
+            QbittorrentProviderOperation::TorrentInspection,
+            QbittorrentProviderOperation::FilePolicyRefresh,
+        ] {
+            let database = setup_db().await?;
+            let resolved = setup_qbittorrent_resolved(&database).await?;
+            let now = chrono::Utc::now();
+            let started_at =
+                now - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS + 1);
+            let (ready, target) =
+                setup_ready_anime_qbittorrent_provider_attempt(&database, &resolved, started_at)
+                    .await?;
+
+            assert!(
+                terminalize_aged_anime_qbittorrent_provider_failure(
+                    &database.pool,
+                    ready.release_id,
+                    TEST_HASH,
+                    operation,
+                    now,
+                )
+                .await?
+                .is_some(),
+                "aged {operation:?} failures must leave Ready through automatic retry"
+            );
+
+            let failed = get_release(&database.pool, ready.release_id)
+                .await?
+                .context("provider-failed anime qBittorrent release")?;
+            assert_eq!(failed.state, AcquisitionReleaseState::Failed);
+            assert_eq!(
+                failed
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.pointer("/automaticRetry/status"))
+                    .and_then(Value::as_str),
+                Some("scheduled")
+            );
+            assert_eq!(
+                failed
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.pointer("/automaticRetry/reason"))
+                    .and_then(Value::as_str),
+                Some(operation.reason_code())
+            );
+            assert_eq!(
+                failed
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+                    .and_then(Value::as_str),
+                Some("pending"),
+                "the existing durable cleanup path must own provider-operation retries"
+            );
+            assert!(
+                failed
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.get("reviewReasons"))
+                    .is_none()
+            );
+            let coverage = list_release_coverage(&database.pool, ready.release_id).await?;
+            assert!(
+                coverage
+                    .iter()
+                    .all(|entry| entry.state == ReleaseCoverageState::Rejected)
+            );
+            let jobs = list_release_jobs(&database.pool, ready.release_id).await?;
+            assert_eq!(jobs[0].state, ReleaseJobState::Failed);
+            assert!(!jobs[0].active);
+            let target =
+                crate::acquisition::subscriptions::get_target(&database.pool, target.target_id)
+                    .await?
+                    .context("automatic provider retry target")?;
+            assert_eq!(target.state, AcquisitionTargetState::Pending);
+            assert!(target.selected_candidate.is_none());
+            assert!(target.selected_route_logical_id.is_none());
+            assert!(target.download_id.is_none());
+            assert!(target.next_search_after.is_some());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_aged_staging_inspection_failure_retries_without_review()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_subscription_with_targets(
+            &database,
+            MediaType::Anime,
+            "Staging Provider Retry Anime",
+            vec![NewAcquisitionTarget {
+                target_key: Some("anilist:9201:A0001".to_string()),
+                media_type: Some(MediaType::Anime),
+                title: Some("Staging Provider Retry Anime".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                ..empty_target()
+            }],
+        )
+        .await?;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Anime,
+            "Staging Provider Retry Anime",
+            "anime",
+            "[Group] Staging Provider Retry Anime - 01 [1080p]",
+        )
+        .await?;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: targets[0].target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("submitted anime target".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_staging_provider_retry_test".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            targets[0].target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("submitted to qBittorrent".to_string()),
+                selected_provider_id: release.source_provider_id,
+                selected_route_logical_id: Some(TORRENT_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: release.selected_candidate.clone(),
+                download_id: Some(TEST_HASH.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let started_at = chrono::Utc::now()
+            - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS + 1);
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET started_at = $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2
+               AND LOWER(download_id) = LOWER($3)
+               AND active = 1",
+        )
+        .bind(started_at.format("%Y-%m-%d %H:%M:%S").to_string())
+        .bind(release.release_id.to_string())
+        .bind(TEST_HASH)
+        .execute(&database.pool)
+        .await?;
+
+        let (fixture, requests) =
+            start_qbittorrent_priority_fixture_with_failures(Vec::new(), true, false).await?;
+        configure_qbittorrent_priority_fixture_endpoint(&database, &resolved, fixture).await?;
+        let state = setup_state_for_database(&database)?;
+        assert_eq!(
+            process_stale_qbittorrent_acquisition_releases(&state, 10).await?,
+            1
+        );
+        let failed = get_release(&database.pool, release.release_id)
+            .await?
+            .context("failed staging provider attempt")?;
+        assert_eq!(failed.state, AcquisitionReleaseState::Failed);
+        assert_eq!(
+            failed
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/reason"))
+                .and_then(Value::as_str),
+            Some("qbittorrent_torrent_inspection_timeout")
+        );
+        assert_eq!(
+            failed
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert!(
+            coverage
+                .iter()
+                .all(|entry| entry.state == ReleaseCoverageState::Rejected)
+        );
+        let target =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("staging provider retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.download_id.is_none());
+        let review_count = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM acquisition_releases
+             WHERE subscription_id = $1 AND state = 'review_required'",
+        )
+        .bind(subscription.subscription_id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(review_count, 0);
+        let captured = requests.lock().expect("provider retry fixture").clone();
+        assert!(captured.iter().any(|request| {
+            request.pointer("/path").and_then(Value::as_str) == Some("api/v2/torrents/info")
+        }));
+        assert!(captured.iter().any(|request| {
+            request.pointer("/path").and_then(Value::as_str) == Some("api/v2/torrents/delete")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_aged_ready_file_list_failure_retries_without_review()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let started_at = chrono::Utc::now()
+            - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS + 1);
+        let (ready, target) =
+            setup_ready_anime_qbittorrent_provider_attempt(&database, &resolved, started_at)
+                .await?;
+        let (fixture, requests) =
+            start_qbittorrent_priority_fixture_with_failures(Vec::new(), false, true).await?;
+        configure_qbittorrent_priority_fixture_endpoint(&database, &resolved, fixture).await?;
+        let state = setup_state_for_database(&database)?;
+        assert_eq!(
+            process_stale_qbittorrent_acquisition_releases(&state, 10).await?,
+            1
+        );
+        let failed = get_release(&database.pool, ready.release_id)
+            .await?
+            .context("failed Ready file-list attempt")?;
+        assert_eq!(failed.state, AcquisitionReleaseState::Failed);
+        assert_eq!(
+            failed
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/reason"))
+                .and_then(Value::as_str),
+            Some("qbittorrent_file_policy_refresh_timeout")
+        );
+        assert_eq!(
+            failed
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/torrentCleanup/status"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        let target =
+            crate::acquisition::subscriptions::get_target(&database.pool, target.target_id)
+                .await?
+                .context("Ready file-list retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.download_id.is_none());
+        let review_count = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM acquisition_releases
+             WHERE subscription_id = $1 AND state = 'review_required'",
+        )
+        .bind(
+            ready
+                .subscription_id
+                .context("Ready anime subscription")?
+                .to_string(),
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(review_count, 0);
+        let captured = requests.lock().expect("file-list retry fixture").clone();
+        for expected_path in [
+            "api/v2/torrents/info",
+            "api/v2/torrents/files",
+            "api/v2/torrents/delete",
+        ] {
+            assert!(captured.iter().any(|request| {
+                request.pointer("/path").and_then(Value::as_str) == Some(expected_path)
+            }));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn qbittorrent_stale_policy_classifies_metadata_timeout() -> anyhow::Result<()> {
         let database = setup_db().await?;
         let resolved = setup_qbittorrent_resolved(&database).await?;
@@ -6325,17 +10682,126 @@ mod tests {
             "dlspeed": 0
         });
 
-        let decision = qbittorrent_stale_release_decision(now, &release, &files, &torrent_info)
-            .expect("metadata timeout");
+        let decision =
+            qbittorrent_stale_release_decision(now, &release, &files, &torrent_info, None)
+                .expect("metadata timeout");
         assert_eq!(decision.kind, QbittorrentStaleReleaseKind::MetadataTimeout);
         assert_eq!(decision.reason_code, "qbittorrent_metadata_timeout");
+
+        let fresh_attempt =
+            now - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS - 1);
+        assert!(
+            qbittorrent_stale_release_decision(
+                now,
+                &release,
+                &files,
+                &torrent_info,
+                Some(fresh_attempt),
+            )
+            .is_none(),
+            "a new job attempt must not inherit the reused release row's age"
+        );
 
         release.created_at =
             now - chrono::Duration::seconds(QBITTORRENT_METADATA_TIMEOUT_SECONDS - 1);
         assert!(
-            qbittorrent_stale_release_decision(now, &release, &files, &torrent_info).is_none(),
+            qbittorrent_stale_release_decision(now, &release, &files, &torrent_info, None)
+                .is_none(),
             "fresh metadata waits should not be failed"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_late_runtime_evidence_cannot_regress_a_newer_state()
+    -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, _targets) = setup_series_subscription(&database, 1..=1).await?;
+        let stale = setup_staged_qbittorrent_release(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = 'downloading',
+                 state_reason = 'newer attempt is downloading',
+                 coverage_plan_json = $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2",
+        )
+        .bind(serde_json::to_string(&json!({ "newerAttempt": true }))?)
+        .bind(stale.release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let files = Vec::new();
+        let torrent_info = json!({
+            "hash": TEST_HASH,
+            "state": "metaDL",
+            "progress": 0.0,
+            "dlspeed": 0
+        });
+        let runtime_state = qbittorrent_runtime_state(&stale, &files, &torrent_info);
+        let evidence = qbittorrent_torrent_evidence(
+            &resolved.record,
+            &stale,
+            &files,
+            &torrent_info,
+            &runtime_state,
+        );
+        assert!(
+            record_qbittorrent_runtime_evidence(&database.pool, &stale, &evidence)
+                .await
+                .is_err(),
+            "the stale Staging snapshot must lose its conditional update"
+        );
+        let current = get_release(&database.pool, stale.release_id)
+            .await?
+            .context("current qBittorrent release")?;
+        assert_eq!(current.state, AcquisitionReleaseState::Downloading);
+        assert_eq!(
+            current
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.get("newerAttempt"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_qbittorrent_terminal_release_reconciles_an_active_job() -> anyhow::Result<()> {
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, _targets) = setup_series_subscription(&database, 1..=1).await?;
+        let release = setup_staged_qbittorrent_release(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = 'completed', state_reason = 'simulated crash after release commit'
+             WHERE release_id = $1",
+        )
+        .bind(release.release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        assert_eq!(
+            reconcile_qbittorrent_terminal_release_jobs(&database.pool, 10).await?,
+            1
+        );
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Completed);
+        assert!(!jobs[0].active);
+        assert!(jobs[0].completed_at.is_some());
         Ok(())
     }
 
@@ -6393,8 +10859,9 @@ mod tests {
             "amount_left": 750_000_000_u64
         });
 
-        let decision = qbittorrent_stale_release_decision(now, &release, &files, &torrent_info)
-            .expect("zero-seed stall");
+        let decision =
+            qbittorrent_stale_release_decision(now, &release, &files, &torrent_info, None)
+                .expect("zero-seed stall");
         assert_eq!(decision.kind, QbittorrentStaleReleaseKind::ZeroSeedStall);
         assert_eq!(decision.reason_code, "qbittorrent_zero_seed_stall");
 
@@ -6408,7 +10875,8 @@ mod tests {
             "availability": 1.0
         });
         assert!(
-            qbittorrent_stale_release_decision(now, &release, &files, &healthy_swarm).is_none(),
+            qbittorrent_stale_release_decision(now, &release, &files, &healthy_swarm, None)
+                .is_none(),
             "a stalled qB state with complete seed evidence should remain eligible"
         );
         Ok(())
@@ -6590,6 +11058,8 @@ mod tests {
         update_qbittorrent_release_state_only(
             &database.pool,
             release.release_id,
+            TEST_HASH,
+            AcquisitionReleaseState::Staging,
             AcquisitionReleaseState::ReviewRequired,
             "manual review approved selected files",
             json!({

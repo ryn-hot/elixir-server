@@ -4,6 +4,7 @@ use std::{collections::BTreeSet, str::FromStr};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -347,6 +348,8 @@ pub struct FindMediaScopePreviewEpisode {
     pub thumbnail_url: Option<String>,
     pub overview: Option<String>,
     pub runtime_minutes: Option<i32>,
+    #[serde(skip)]
+    pub resolution_metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

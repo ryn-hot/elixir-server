@@ -25,7 +25,10 @@ use crate::{
     },
     db::models::MediaType,
     extensions::ExternalIds,
-    library::{AniListSeasonChainEntry, AniZipMapping},
+    library::{
+        AniListSeasonChainEntry, AniZipMapping, anizip_prefers_mainline_numbering,
+        resolve_anizip_target_numbers,
+    },
 };
 
 pub const ANIME_SHOKO_STYLE_RESOLVER_VERSION: &str = "rr3-anime-shoko-style-v0";
@@ -352,6 +355,8 @@ pub struct AnimeAliasMatch {
 pub struct AnimeScopedAlias {
     pub display: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default)]
     pub season_number: Option<i32>,
     #[serde(default)]
@@ -1492,12 +1497,15 @@ pub fn build_anime_metadata_graph(input: AnimeMetadataGraphInput) -> AnimeMetada
         );
         insert_generated_season_aliases(&mut scoped_aliases, &input.title, &season_input.season);
         if let Some(mapping) = season_input.mapping.as_ref() {
-            for title in mapping.titles.values() {
+            let mut localized_titles = mapping.titles.iter().collect::<Vec<_>>();
+            localized_titles.sort_by(|left, right| left.0.cmp(right.0));
+            for (language, title) in localized_titles {
                 insert_alias(&mut aliases, title);
-                insert_scoped_alias(
+                insert_scoped_alias_with_language(
                     &mut scoped_aliases,
                     title,
                     "anizip_title",
+                    Some(language),
                     &season_input.season,
                 );
             }
@@ -2393,19 +2401,6 @@ pub fn infer_anizip_season_number(mapping: &AniZipMapping) -> Option<i32> {
         .map(|(season, _)| season)
 }
 
-fn anizip_prefers_mainline_numbering(mapping: &AniZipMapping) -> bool {
-    let mut structured_count = 0_usize;
-    let mut absolute_only_count = 0_usize;
-    for episode in &mapping.episodes {
-        if episode.season_number.is_some() || episode.episode_number.is_some() {
-            structured_count += 1;
-        } else if episode.mainline_episode_number.is_some() {
-            absolute_only_count += 1;
-        }
-    }
-    absolute_only_count > structured_count
-}
-
 fn normalized_season_inputs(input: &AnimeMetadataGraphInput) -> Vec<AnimeSeasonMapping> {
     let mut seasons = input.seasons.clone();
     if seasons.is_empty() {
@@ -2448,31 +2443,8 @@ fn graph_target_from_anizip(
     episode: &crate::library::AniZipEpisodeRecord,
     prefer_mainline_numbering: bool,
 ) -> Option<AnimeGraphTarget> {
-    let mainline_episode_number = episode
-        .mainline_episode_number
-        .filter(|episode| *episode > 0);
-    let use_mainline_numbering = prefer_mainline_numbering && mainline_episode_number.is_some();
-    let has_structured_tv_numbering =
-        episode.season_number.is_some() || episode.episode_number.is_some();
-    let season_number = if use_mainline_numbering {
-        None
-    } else if has_structured_tv_numbering {
-        episode.season_number.or(Some(season.season_number))
-    } else {
-        None
-    };
-    let episode_number = if use_mainline_numbering {
-        None
-    } else {
-        episode.episode_number.filter(|episode| *episode > 0)
-    };
-    let absolute_episode_number = if use_mainline_numbering {
-        mainline_episode_number
-    } else {
-        episode
-            .absolute_episode_number
-            .filter(|episode| *episode > 0)
-    };
+    let (season_number, episode_number, absolute_episode_number) =
+        resolve_anizip_target_numbers(season.season_number, prefer_mainline_numbering, episode);
     let target_key = graph_target_key(season_number, episode_number, absolute_episode_number)?;
     let air_date = extract_air_date(&episode.raw);
     let air_time = air_date
@@ -3330,7 +3302,7 @@ fn anime_release_kind(parsed: &AnimeParsedRelease) -> ReleaseKind {
     }
 }
 
-fn anime_release_kind_for_coverage(parsed: &AnimeParsedRelease) -> ReleaseKind {
+pub(crate) fn anime_release_kind_for_coverage(parsed: &AnimeParsedRelease) -> ReleaseKind {
     let parsed_kind = anime_release_kind(parsed);
     let sonarr_kind = parsed.sonarr_facts.release_kind;
     match (sonarr_kind, parsed_kind) {
@@ -3344,7 +3316,7 @@ fn anime_release_kind_for_coverage(parsed: &AnimeParsedRelease) -> ReleaseKind {
     }
 }
 
-fn anime_coverage_kind(release_kind: ReleaseKind) -> ReleaseCoverageKind {
+pub(crate) fn anime_coverage_kind(release_kind: ReleaseKind) -> ReleaseCoverageKind {
     match release_kind {
         ReleaseKind::Single => ReleaseCoverageKind::SingleEpisode,
         ReleaseKind::MultiEpisode => ReleaseCoverageKind::MultiEpisodeRange,
@@ -3580,9 +3552,10 @@ fn graph_fingerprint(
     }));
     material.extend(scoped_aliases.iter().map(|alias| {
         format!(
-            "alias:{}:{}:{}:{}",
+            "alias:{}:{}:{}:{}:{}",
             alias.display,
             alias.source,
+            alias.language.clone().unwrap_or_default(),
             alias
                 .season_number
                 .map(|season| season.to_string())
@@ -3660,6 +3633,16 @@ fn insert_scoped_alias(
     source: &str,
     season: &AniListSeasonChainEntry,
 ) {
+    insert_scoped_alias_with_language(scoped_aliases, value, source, None, season);
+}
+
+fn insert_scoped_alias_with_language(
+    scoped_aliases: &mut BTreeMap<String, AnimeScopedAlias>,
+    value: &str,
+    source: &str,
+    language: Option<&str>,
+    season: &AniListSeasonChainEntry,
+) {
     let display = cleanup_anime_title(value);
     if display.is_empty() || is_metadata_segment(&display) {
         return;
@@ -3677,6 +3660,10 @@ fn insert_scoped_alias(
         .or_insert_with(|| AnimeScopedAlias {
             display,
             source: source.to_string(),
+            language: language
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             season_number: Some(season.season_number),
             anilist_season_id: Some(season.anilist_id.clone()),
         });
@@ -5959,7 +5946,91 @@ mod tests {
     }
 
     #[test]
-    fn rr3_metadata_graph_keeps_numeric_anizip_mainline_episode_rows() {
+    fn metadata_graph_normalizes_tokyo_ghoul_relation_and_provider_numbering() {
+        let season = |season_number, anilist_id: &str, title: &str| AniListSeasonChainEntry {
+            season_number,
+            anilist_id: anilist_id.to_string(),
+            title: title.to_string(),
+            format: Some("TV".to_string()),
+            season_year: None,
+            start_year: None,
+            status: Some("FINISHED".to_string()),
+            episodes: Some(12),
+            next_airing_episode: None,
+            next_airing_at: None,
+            confidence: 1.0,
+        };
+        let mapping = |anilist_id: &str,
+                       provider_season: i32,
+                       provider_episode: i32,
+                       local_episode: i32,
+                       absolute_episode: i32,
+                       tvdb_episode_id: &str| AniZipMapping {
+            ids: ExternalIds {
+                anilist: Some(anilist_id.to_string()),
+                tvdb_series: Some("305014".to_string()),
+                ..Default::default()
+            },
+            episodes: vec![crate::library::AniZipEpisodeRecord {
+                season_number: Some(provider_season),
+                episode_number: Some(provider_episode),
+                absolute_episode_number: Some(absolute_episode),
+                episode_label: Some(local_episode.to_string()),
+                mainline_episode_number: Some(local_episode),
+                tvdb_id: Some(tvdb_episode_id.to_string()),
+                raw: serde_json::json!({
+                    "seasonNumber": provider_season,
+                    "episodeNumber": provider_episode,
+                    "absoluteEpisodeNumber": absolute_episode,
+                    "episode": local_episode,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let graph = build_anime_metadata_graph(AnimeMetadataGraphInput {
+            title: "Tokyo Ghoul".to_string(),
+            year: Some(2014),
+            seed_anilist_id: "20605".to_string(),
+            seed_season_number: 1,
+            external_ids: ExternalIds::default(),
+            seasons: vec![
+                AnimeSeasonMapping {
+                    season: season(2, "20850", "Tokyo Ghoul Root A"),
+                    mapping: Some(mapping("20850", 2, 1, 1, 13, "root-a-tvdb-1")),
+                },
+                AnimeSeasonMapping {
+                    season: season(4, "102351", "Tokyo Ghoul:re 2nd Season"),
+                    mapping: Some(mapping("102351", 3, 16, 4, 40, "re-2-tvdb-16")),
+                },
+            ],
+        });
+
+        let root_a = graph
+            .targets
+            .iter()
+            .find(|target| target.anilist_season_id == "20850")
+            .expect("Root A target");
+        assert_eq!(root_a.target_key, "S02E01");
+        assert_eq!(root_a.absolute_episode_number, Some(13));
+
+        let re_second = graph
+            .targets
+            .iter()
+            .find(|target| target.anilist_season_id == "102351")
+            .expect("Tokyo Ghoul:re 2 target");
+        assert_eq!(re_second.season.season_number, 4);
+        assert_eq!(re_second.target_key, "S04E04");
+        assert_eq!(re_second.season_number, Some(4));
+        assert_eq!(re_second.episode_number, Some(4));
+        assert_eq!(re_second.absolute_episode_number, Some(40));
+        assert_eq!(re_second.tvdb_episode_id.as_deref(), Some("re-2-tvdb-16"));
+        assert_eq!(re_second.raw["seasonNumber"], 3);
+        assert_eq!(re_second.raw["episodeNumber"], 16);
+    }
+
+    #[test]
+    fn alm3_metadata_graph_keeps_localized_titles_with_language_scope() {
         let graph = build_anime_metadata_graph(AnimeMetadataGraphInput {
             title: "Long Running Anime".to_string(),
             year: Some(1999),
@@ -6088,10 +6159,22 @@ mod tests {
                         },
                     ],
                     images: Vec::new(),
-                    titles: HashMap::new(),
+                    titles: HashMap::from([
+                        ("en".to_string(), "Long Running Anime".to_string()),
+                        ("x-jat".to_string(), "Long Running Anime Romaji".to_string()),
+                        ("ja".to_string(), "長編アニメ".to_string()),
+                    ]),
                 }),
             }],
         });
+
+        assert!(graph.scoped_aliases.iter().any(|alias| {
+            alias.display == "Long Running Anime Romaji"
+                && alias.language.as_deref() == Some("x-jat")
+        }));
+        assert!(graph.scoped_aliases.iter().any(|alias| {
+            alias.display == "長編アニメ" && alias.language.as_deref() == Some("ja")
+        }));
 
         let target_keys = graph
             .targets
@@ -6451,18 +6534,21 @@ mod tests {
                 AnimeScopedAlias {
                     display: "Tokyo Ghoul".to_string(),
                     source: "anilist_season_title".to_string(),
+                    language: None,
                     season_number: Some(1),
                     anilist_season_id: Some("1001".to_string()),
                 },
                 AnimeScopedAlias {
                     display: "Tokyo Ghoul Root A".to_string(),
                     source: "anilist_season_title".to_string(),
+                    language: None,
                     season_number: Some(2),
                     anilist_season_id: Some("1002".to_string()),
                 },
                 AnimeScopedAlias {
                     display: "Tokyo Ghoul Season 2".to_string(),
                     source: "generated_season_ordinal".to_string(),
+                    language: None,
                     season_number: Some(2),
                     anilist_season_id: Some("1002".to_string()),
                 },

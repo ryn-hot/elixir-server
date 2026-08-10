@@ -64,8 +64,16 @@ impl Database {
         // Enable default Any drivers (Postgres + SQLite). This is a no-op if already installed.
         sqlx::any::install_default_drivers();
 
+        let max_connections = effective_pool_max_connections(driver, config.max_connections);
+        if max_connections != config.max_connections {
+            tracing::warn!(
+                configured = config.max_connections,
+                effective = max_connections,
+                "PostgreSQL reserves a second database connection for cross-process library identity coordination"
+            );
+        }
         let pool = AnyPoolOptions::new()
-            .max_connections(config.max_connections)
+            .max_connections(max_connections)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(config.connect_timeout_seconds))
             .connect(&config.url)
@@ -91,6 +99,18 @@ impl Database {
         .context("database migrations failed")?;
         backfill_media_interaction_state(&self.pool).await?;
         Ok(())
+    }
+}
+
+pub(crate) fn effective_pool_max_connections(driver: DatabaseDriver, configured: u32) -> u32 {
+    match driver {
+        // ALM-8 holds one PostgreSQL connection for its transaction-scoped
+        // advisory lock while scan/import/repair work uses the pool. Silently
+        // disabling that coordinator at one connection would make a supported
+        // configuration race across server processes, so reserve the minimum
+        // automatically instead of creating a user-facing setup decision.
+        DatabaseDriver::Postgres => configured.max(2),
+        DatabaseDriver::Sqlite => configured,
     }
 }
 

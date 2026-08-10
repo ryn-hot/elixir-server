@@ -1,3 +1,5 @@
+pub(crate) mod anime_matching;
+pub mod anime_qualification;
 pub mod audit;
 pub mod automation;
 pub mod episode_state;

@@ -17,36 +17,54 @@ use sqlx::{Row, TypeInfo, Value as SqlxValue, ValueRef};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::acquisition::release_resolution::{
-    anime::{
-        AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
-        AnimeCoverageOptions, AnimeReleaseFileInput, anime_parser_diagnostics,
-        parse_anime_release_title, plan_anime_file_coverage_with_options, score_anime_candidate,
+use crate::acquisition::{
+    anime_matching::{
+        acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
+        assess_acquisition_anime_model_audio_profile, assess_acquisition_anime_provider_file_audio,
+        bind_exact_single_anime_provider_file,
+        model_derived_anime_coverage_plans_with_file_selection_support,
     },
-    fingerprint::{ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash},
-    hashing::{HashFileJob, queue_anime_hash_file},
-    models::{
-        AcquisitionRelease, AcquisitionReleaseCoverage, AcquisitionReleaseFile,
-        AcquisitionReleaseState, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
-        NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
-        ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
-        ReleaseResolverKind,
+    episode_state::sync_library_episode_acquisition_state_for_target,
+    release_resolution::{
+        anime::{
+            AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
+            AnimeCoverageOptions, AnimeFileCoveragePlan, AnimeReleaseFileInput, AnimeScopedAlias,
+            anime_parser_diagnostics, parse_anime_release_title,
+            plan_anime_file_coverage_with_options, score_anime_candidate,
+        },
+        fingerprint::{
+            ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
+        },
+        hashing::{HashFileJob, queue_anime_hash_file},
+        models::{
+            AcquisitionRelease, AcquisitionReleaseCoverage, AcquisitionReleaseFile,
+            AcquisitionReleaseState, NewAcquisitionRelease, NewAcquisitionReleaseCoverage,
+            NewAcquisitionReleaseFile, NewAcquisitionReleaseJob, ReleaseConfidence,
+            ReleaseCoverageKind, ReleaseCoverageState, ReleaseJobState, ReleaseKind,
+            ReleaseResolverKind,
+        },
+        movie::{
+            MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput,
+            select_movie_main_file,
+        },
+        movie_radarr_parser::MovieRadarrStyleParser,
+        review_candidates::SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
+        store::{
+            get_release, get_release_by_download_id, list_release_coverage, list_release_files,
+            update_release_coverage_review_state, upsert_release, upsert_release_coverage,
+            upsert_release_file, upsert_release_job,
+        },
+        tv::{TvCoverageOptions, TvReleaseFileInput, TvSonarrStyleResolver, TvTarget},
     },
-    movie::{
-        MOVIE_RADARR_STYLE_RESOLVER_VERSION, MovieReleaseFileSelectionInput, select_movie_main_file,
+    subscriptions::{
+        AcquisitionTargetState, AcquisitionTargetStateUpdate, get_subscription, get_target,
+        list_subscription_targets, reset_target_for_candidate_retry, update_target_state,
     },
-    movie_radarr_parser::MovieRadarrStyleParser,
-    review_candidates::SYNTHETIC_SOURCE_CANDIDATE_FILE_ID,
-    store::{
-        get_release, get_release_by_download_id, list_release_coverage, list_release_files,
-        update_release_coverage_review_state, upsert_release, upsert_release_coverage,
-        upsert_release_file, upsert_release_job,
-    },
-    tv::{TvCoverageOptions, TvReleaseFileInput, TvSonarrStyleResolver, TvTarget},
 };
-use crate::acquisition::subscriptions::{
-    AcquisitionTargetState, AcquisitionTargetStateUpdate, list_subscription_targets,
-    update_target_state,
+use crate::anime_matching::{
+    ANIME_MATCH_SCHEMA_VERSION, AnimeDeterministicResult, AnimeMatchAssistProvenance,
+    AnimeMatchAssistResult, AnimeMatchAssistSource, AnimeMatchAudioProfile,
+    AnimeMatchFallbackReason, AnimeMatchingService, DeterministicMatchState,
 };
 use crate::db::models::{
     ExtensionKind, ExtensionTrustLevel, MediaType, ProviderHealthState, ProviderReadinessPhase,
@@ -59,6 +77,7 @@ use crate::download_broker::{
 use crate::extensions::store::{
     ExtensionStore, NewExtension, NewExtensionInstance, NewProvider, NewSecret,
 };
+use crate::http::handlers::acquisition_sources::{AcquisitionCandidate, AcquisitionCandidateFile};
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::planner::stable_provider_id;
 use crate::runtime::RuntimePaths;
@@ -93,6 +112,7 @@ const TORBOX_USER_AGENT: &str = "Elixir/0.1 TorBox";
 const ALL_DEBRID_USER_AGENT: &str = "Elixir/0.1 AllDebrid";
 const MAX_DOWNLOAD_FILE_NAME_LEN: usize = 180;
 const DEBRID_SELECTION_POLICY_VERSION: &str = "rr4f-deterministic-selection-v1";
+const ANIME_DEBRID_CANDIDATE_RETRY_SECONDS: i64 = 30;
 const DEBRID_ACTIVE_SERVICE_CONFIG_KEY: &str = "activeService";
 pub const DEBRID_CONCURRENT_DOWNLOADS_CONFIG_KEY: &str = "maxConcurrentDownloads";
 const TORBOX_CREATE_TORRENT_MINUTE_LIMIT: usize = 10;
@@ -5662,12 +5682,14 @@ pub async fn submit_debrid(
     let adapter = factory
         .adapter_for_provider_implementation(store, instance_id, provider_implementation)
         .await?;
-    submit_debrid_with_adapter(
+    let anime_matching = state.anime_inference.matching_service();
+    submit_debrid_with_adapter_and_anime_matching(
         &state.db_pool,
         provider_id,
         instance_id,
         source,
         options,
+        &anime_matching,
         &*adapter,
     )
     .await
@@ -5695,7 +5717,33 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
     options: DebridSubmitOptions<'_>,
     adapter: &A,
 ) -> Result<Uuid> {
+    let anime_matching = AnimeMatchingService::disabled();
+    submit_debrid_with_adapter_and_anime_matching(
+        pool,
+        provider_id,
+        instance_id,
+        source,
+        options,
+        &anime_matching,
+        adapter,
+    )
+    .await
+}
+
+async fn submit_debrid_with_adapter_and_anime_matching<A: DebridProviderAdapter + ?Sized>(
+    pool: &sqlx::AnyPool,
+    provider_id: Uuid,
+    instance_id: Uuid,
+    source: &str,
+    options: DebridSubmitOptions<'_>,
+    anime_matching: &AnimeMatchingService,
+    adapter: &A,
+) -> Result<Uuid> {
     let source_kind = debrid_source_kind(source)?;
+    let defer_anime_refinement = options
+        .release_context
+        .as_ref()
+        .is_some_and(debrid_submit_context_bookkeeping_pending);
     if !options.paused {
         let cap = debrid_concurrent_downloads_for_instance(pool, instance_id).await?;
         let active_jobs = count_active_debrid_jobs_for_instance(pool, instance_id).await?;
@@ -5749,6 +5797,7 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
                         record_debrid_release_failure_without_job(
                             pool,
                             release.as_ref(),
+                            job_id,
                             provider_id,
                             adapter,
                             &provider_capabilities,
@@ -5798,6 +5847,7 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
                         record_debrid_release_failure_without_job(
                             pool,
                             release.as_ref(),
+                            job_id,
                             provider_id,
                             adapter,
                             &provider_capabilities,
@@ -5831,6 +5881,14 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
             .or_else(|| remote_download_id.clone())
     });
     let remote_release_status = remote_release_status.or_else(|| Some(status.clone()));
+    let deferred_anime_provider_failure = defer_anime_refinement
+        && remote_release_status.as_deref() == Some(DebridReleaseStatus::Failed.as_str());
+    if deferred_anime_provider_failure {
+        // Keep the failed provider result discoverable while acquisition owns
+        // the submission barrier. Inspection/automatic retry begins only
+        // after the writer completes or the barrier recovery deadline passes.
+        status = "anime_retry_pending".to_string();
+    }
 
     insert_debrid_job(
         pool,
@@ -5880,7 +5938,11 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
             &options,
             remote_release_id.as_deref(),
             Some(&job_id.to_string()),
-            acquisition_state_for_job_status(remote_release_status.as_deref()),
+            if deferred_anime_provider_failure {
+                AcquisitionReleaseState::Staging
+            } else {
+                acquisition_state_for_job_status(remote_release_status.as_deref())
+            },
             Some("Debrid job recorded with provider provenance."),
             release_shape_from_release(existing),
             Some(merge_debrid_provider_provenance(
@@ -5903,18 +5965,28 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
             provider_id,
             job_id,
             remote_release_id.as_deref(),
-            release_job_state_for_job_status(remote_release_status.as_deref()),
+            if deferred_anime_provider_failure {
+                ReleaseJobState::Staging
+            } else {
+                release_job_state_for_job_status(remote_release_status.as_deref())
+            },
             "Debrid job recorded with provider provenance.",
         )
         .await?;
     }
     if !options.paused
+        && !defer_anime_refinement
         && source_kind == "magnet"
         && let Some(remote_release_id) = remote_release_id.as_deref()
     {
         let staged_result = async {
             let inspection = adapter.inspect_release(remote_release_id).await?;
-            update_debrid_job_from_inspection(pool, job_id, &inspection).await?;
+            if !update_debrid_job_from_inspection(pool, job_id, &inspection).await? {
+                return Ok(());
+            }
+            if consume_failed_anime_debrid_inspection(pool, adapter, job_id, &inspection).await? {
+                return Ok(());
+            }
             cleanup_uncached_no_seed_release(pool, adapter, job_id, &inspection).await?;
             if matches!(
                 inspection.release.status,
@@ -5927,64 +5999,137 @@ async fn submit_debrid_with_adapter<A: DebridProviderAdapter + ?Sized>(
                     existing,
                     &options,
                     &inspection,
+                    anime_matching,
                 )
                 .await?;
-                if let Some(updated) = upsert_debrid_acquisition_release(
-                    pool,
+                let coverage_plan = Some(merge_debrid_provider_provenance(
+                    refinement.coverage_plan.clone(),
                     provider_id,
-                    source,
-                    source_kind,
-                    &options,
+                    adapter.implementation(),
+                    &provider_capabilities,
                     Some(&inspection.release.remote_release_id),
-                    Some(&job_id.to_string()),
-                    refinement.state,
-                    refinement.state_reason.as_deref(),
-                    refinement.shape,
-                    Some(merge_debrid_provider_provenance(
-                        refinement.coverage_plan,
-                        provider_id,
-                        adapter.implementation(),
-                        &provider_capabilities,
-                        Some(&inspection.release.remote_release_id),
-                        Some(inspection.release.status.as_str()),
-                        source_kind,
-                        Some(job_id),
-                    )),
-                )
-                .await?
-                {
-                    upsert_debrid_release_job(
+                    Some(inspection.release.status.as_str()),
+                    source_kind,
+                    Some(job_id),
+                ));
+                let updated = if existing.media_type == MediaType::Anime {
+                    commit_anime_debrid_refinement_if_owned(
                         pool,
-                        &updated,
+                        existing,
                         provider_id,
                         job_id,
-                        Some(&inspection.release.remote_release_id),
-                        refinement.job_state,
-                        refinement
-                            .job_state_reason
-                            .as_deref()
-                            .unwrap_or("Debrid release inspected and staged."),
-                    )
-                    .await?;
-                    let _ = apply_debrid_file_selection_policy(
-                        pool,
-                        adapter,
-                        job_id,
-                        &updated,
                         &inspection,
+                        &refinement,
+                        coverage_plan,
+                    )
+                    .await?
+                } else {
+                    let updated = upsert_debrid_acquisition_release(
+                        pool,
+                        provider_id,
+                        source,
+                        source_kind,
+                        &options,
+                        Some(&inspection.release.remote_release_id),
+                        Some(&job_id.to_string()),
+                        refinement.state,
+                        refinement.state_reason.as_deref(),
+                        refinement.shape.clone(),
+                        coverage_plan,
                     )
                     .await?;
+                    if let Some(updated) = updated.as_ref() {
+                        upsert_debrid_release_job(
+                            pool,
+                            updated,
+                            provider_id,
+                            job_id,
+                            Some(&inspection.release.remote_release_id),
+                            refinement.job_state,
+                            refinement
+                                .job_state_reason
+                                .as_deref()
+                                .unwrap_or("Debrid release inspected and staged."),
+                        )
+                        .await?;
+                    }
+                    updated
+                };
+                if let Some(updated) = updated {
+                    if let Some(automatic_retry) = refinement.automatic_retry.as_ref() {
+                        stage_anime_debrid_retry_disposition(pool, job_id, automatic_retry).await?;
+                    } else if refinement.apply_file_selection_policy {
+                        let _ = apply_debrid_file_selection_policy(
+                            pool,
+                            adapter,
+                            job_id,
+                            &updated,
+                            &inspection,
+                            false,
+                        )
+                        .await?;
+                    }
                 }
             }
             Ok::<(), anyhow::Error>(())
         }
         .await;
         if let Err(err) = staged_result {
-            mark_debrid_job_status(pool, job_id, "failed", Some(&err.to_string())).await?;
+            if let Some(existing) = release
+                .as_ref()
+                .filter(|release| release.media_type == MediaType::Anime)
+            {
+                let retry = anime_debrid_runtime_error_retry_disposition(
+                    pool,
+                    job_id,
+                    existing,
+                    "anime_debrid_staging_error",
+                    &err,
+                )
+                .await?;
+                stage_anime_debrid_retry_disposition(pool, job_id, &retry).await?;
+                persist_anime_debrid_retry_with_adapter(
+                    pool,
+                    adapter,
+                    job_id,
+                    existing,
+                    remote_release_id,
+                    adapter.implementation(),
+                    &retry,
+                )
+                .await?;
+            } else {
+                mark_debrid_job_status(pool, job_id, "failed", Some(&err.to_string())).await?;
+            }
             return Err(err);
         }
     }
     Ok(job_id)
+}
+
+fn debrid_submit_context_bookkeeping_pending(context: &DebridReleaseSubmitContext) -> bool {
+    context.media_type == MediaType::Anime
+        && context
+            .selected_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.pointer("/submissionBookkeeping/status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+}
+
+fn debrid_release_bookkeeping_pending(release: &AcquisitionRelease) -> bool {
+    release
+        .selected_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.pointer("/submissionBookkeeping/status"))
+        .and_then(Value::as_str)
+        == Some("pending")
+        || release
+            .coverage_plan
+            .as_ref()
+            .and_then(|plan| plan.pointer("/submissionBookkeeping/status"))
+            .and_then(Value::as_str)
+            == Some("pending")
 }
 
 #[derive(Debug, Clone)]
@@ -6013,6 +6158,39 @@ struct DebridCoverageRefinement {
     state_reason: Option<String>,
     job_state: ReleaseJobState,
     job_state_reason: Option<String>,
+    coverage_plan: Option<Value>,
+    /// Difficult anime remains entirely automatic. The provider selection
+    /// policy is only run once deterministic coverage or a validated local
+    /// model result has proved an exact file set.
+    apply_file_selection_policy: bool,
+    /// An unresolved anime file map rejects only this release and returns the
+    /// scoped targets to the normal acquisition scheduler. It is never a
+    /// user-facing review state.
+    automatic_retry: Option<AnimeDebridAutomaticRetry>,
+    /// Anime coverage is computed without touching shared release rows. The
+    /// worker commits these entries together with the exact-attempt ownership
+    /// check after any local-model call has completed.
+    anime_coverage_entries: Vec<AnimeDebridCoverageWrite>,
+}
+
+#[derive(Debug, Clone)]
+struct AnimeDebridCoverageWrite {
+    target_id: Uuid,
+    provider_file_id: String,
+    coverage_kind: ReleaseCoverageKind,
+    confidence: ReleaseConfidence,
+    score: Option<f64>,
+    reason: String,
+    state: ReleaseCoverageState,
+    verified_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimeDebridAutomaticRetry {
+    target_ids: Vec<Uuid>,
+    reason_code: String,
+    suppress_automatic_rediscovery: bool,
     coverage_plan: Option<Value>,
 }
 
@@ -6100,6 +6278,10 @@ async fn upsert_debrid_release_job(
     state: ReleaseJobState,
     reason: &str,
 ) -> Result<()> {
+    let terminal = matches!(
+        state,
+        ReleaseJobState::Completed | ReleaseJobState::Failed | ReleaseJobState::Cancelled
+    );
     upsert_release_job(
         pool,
         NewAcquisitionReleaseJob {
@@ -6111,9 +6293,9 @@ async fn upsert_debrid_release_job(
             remote_release_id: remote_release_id.map(str::to_string),
             state,
             state_reason: Some(reason.to_string()),
-            active: true,
+            active: !terminal,
             started_at: Some(chrono::Utc::now()),
-            completed_at: None,
+            completed_at: terminal.then(chrono::Utc::now),
         },
     )
     .await?;
@@ -6125,10 +6307,53 @@ async fn persist_debrid_file_list_and_refine_coverage(
     release: &AcquisitionRelease,
     options: &DebridSubmitOptions<'_>,
     inspection: &DebridReleaseInspection,
+    anime_matching: &AnimeMatchingService,
 ) -> Result<DebridCoverageRefinement> {
-    let file_ids = persist_debrid_release_files(pool, release, &inspection.files).await?;
+    // Anime may spend measurable time in the local model. Do not write its
+    // provider files or coverage until the exact attempt is revalidated and
+    // committed transactionally after inference.
+    let file_ids = if release.media_type == MediaType::Anime {
+        HashMap::new()
+    } else {
+        persist_debrid_release_files(pool, release, &inspection.files).await?
+    };
     let base = refinement_from_debrid_status(inspection.release.status);
     let Some(subscription_id) = release.subscription_id else {
+        if release.media_type == MediaType::Anime {
+            let coverage_plan = json!({
+                "source": "debrid_provider_file_list",
+                "providerImplementation": inspection.release.provider_implementation,
+                "remoteReleaseId": inspection.release.remote_release_id,
+                "files": inspection.files.len(),
+                "automaticResolution": {
+                    "status": "pending",
+                    "reason": "missing_subscription_context",
+                    "retryDisposition": "retryable"
+                }
+            });
+            return Ok(DebridCoverageRefinement {
+                coverage_plan: Some(coverage_plan.clone()),
+                state: AcquisitionReleaseState::Staging,
+                state_reason: Some(
+                    "Anime file matching is pending automatic subscription-context recovery."
+                        .to_string(),
+                ),
+                job_state: ReleaseJobState::Staging,
+                job_state_reason: Some(
+                    "Anime file matching will retry automatically when context is available."
+                        .to_string(),
+                ),
+                apply_file_selection_policy: false,
+                automatic_retry: Some(AnimeDebridAutomaticRetry {
+                    target_ids: Vec::new(),
+                    reason_code: "anime_debrid_missing_subscription_context".to_string(),
+                    suppress_automatic_rediscovery: false,
+                    coverage_plan: Some(coverage_plan),
+                }),
+                anime_coverage_entries: Vec::new(),
+                ..base
+            });
+        }
         return Ok(DebridCoverageRefinement {
             coverage_plan: Some(json!({
                 "source": "debrid_provider_file_list",
@@ -6141,6 +6366,9 @@ async fn persist_debrid_file_list_and_refine_coverage(
             state_reason: Some(
                 "Debrid file list staged without subscription target context.".to_string(),
             ),
+            apply_file_selection_policy: true,
+            automatic_retry: None,
+            anime_coverage_entries: Vec::new(),
             ..base
         });
     };
@@ -6151,8 +6379,27 @@ async fn persist_debrid_file_list_and_refine_coverage(
             refine_tv_debrid_coverage(pool, release, inspection, &targets, &file_ids).await
         }
         MediaType::Anime => {
-            refine_anime_debrid_coverage(pool, release, options, inspection, &targets, &file_ids)
-                .await
+            let subscription = get_subscription(pool, subscription_id).await?;
+            let existing_coverage = list_release_coverage(pool, release.release_id).await?;
+            let bound_target_ids = match release.download_id.as_deref() {
+                Some(download_id) => target_ids_for_download_id(pool, download_id).await?,
+                None => Vec::new(),
+            };
+            let scoped_targets = debrid_release_scoped_targets(
+                release,
+                &targets,
+                &existing_coverage,
+                &bound_target_ids,
+            );
+            refine_anime_debrid_coverage(
+                release,
+                options,
+                inspection,
+                subscription.as_ref(),
+                &scoped_targets,
+                anime_matching,
+            )
+            .await
         }
         MediaType::Movie => {
             refine_movie_debrid_coverage(pool, release, inspection, &targets, &file_ids).await
@@ -6212,6 +6459,537 @@ async fn persist_debrid_release_files(
         file_ids.insert(file.provider_file_id.clone(), release_file.release_file_id);
     }
     Ok(file_ids)
+}
+
+async fn commit_anime_debrid_refinement_if_owned(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    provider_id: Uuid,
+    job_id: Uuid,
+    inspection: &DebridReleaseInspection,
+    refinement: &DebridCoverageRefinement,
+    coverage_plan: Option<Value>,
+) -> Result<Option<AcquisitionRelease>> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let release_id = release.release_id.to_string();
+    let job_id = job_id.to_string();
+    let provider_id = provider_id.to_string();
+    let remote_release_id = inspection.release.remote_release_id.trim();
+    if remote_release_id.is_empty() {
+        return Ok(None);
+    }
+    let mut transaction = pool.begin().await?;
+
+    // This row lock and compare-and-set is the commit point for an anime
+    // provider-file resolution. A delayed worker for attempt A cannot write
+    // files, coverage, or state after the scheduler has rebound the release
+    // to attempt B.
+    let ownership = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND remote_release_id = $5
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1
+               FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.remote_release_id = $5
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )
+           AND EXISTS (
+               SELECT 1
+               FROM debrid_download_jobs d
+               WHERE d.job_id = $2
+                 AND d.release_id = acquisition_releases.release_id
+                 AND d.provider_id = $4
+                 AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = $5
+                 AND d.status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')
+           )",
+    )
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await
+    .context("claiming exact anime Debrid refinement commit")?;
+    if ownership.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+
+    let file_ids = persist_anime_debrid_files_in_transaction(
+        &mut transaction,
+        release.release_id,
+        &inspection.files,
+    )
+    .await?;
+    for entry in &refinement.anime_coverage_entries {
+        let Some(release_file_id) = file_ids.get(&entry.provider_file_id).copied() else {
+            transaction.rollback().await?;
+            bail!(
+                "anime Debrid coverage references unavailable provider file '{}'",
+                entry.provider_file_id
+            );
+        };
+        upsert_anime_debrid_coverage_in_transaction(
+            &mut transaction,
+            release.release_id,
+            release_file_id,
+            entry,
+        )
+        .await?;
+    }
+
+    let coverage_plan_json = coverage_plan
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serializing exact anime Debrid refinement coverage")?;
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET release_kind = $1,
+             resolver_kind = $2,
+             resolver_version = $3,
+             confidence = $4,
+             state = $5,
+             state_reason = $6,
+             coverage_plan_json = $7,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $8
+           AND download_id = $9
+           AND selected_route_logical_id = $10
+           AND selected_provider_id = $11
+           AND remote_release_id = $12",
+    )
+    .bind(refinement.shape.release_kind.as_str())
+    .bind(refinement.shape.resolver_kind.as_str())
+    .bind(&refinement.shape.resolver_version)
+    .bind(refinement.shape.confidence.as_str())
+    .bind(refinement.state.as_str())
+    .bind(refinement.state_reason.as_deref())
+    .bind(coverage_plan_json.as_deref())
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await
+    .context("committing exact anime Debrid release refinement")?;
+    if release_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+
+    let terminal = matches!(
+        refinement.job_state,
+        ReleaseJobState::Completed | ReleaseJobState::Failed | ReleaseJobState::Cancelled
+    );
+    let release_job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1,
+             state_reason = $2,
+             active = $3,
+             completed_at = CASE WHEN $3 = 0 THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $4
+           AND download_id = $5
+           AND route_logical_id = $6
+           AND provider_id = $7
+           AND remote_release_id = $8
+           AND active = 1",
+    )
+    .bind(refinement.job_state.as_str())
+    .bind(
+        refinement
+            .job_state_reason
+            .as_deref()
+            .unwrap_or("Debrid release inspected and staged."),
+    )
+    .bind(if terminal { 0_i64 } else { 1_i64 })
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await
+    .context("committing exact anime Debrid release-job refinement")?;
+    if release_job_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
+    transaction.commit().await?;
+    get_release(pool, release.release_id).await
+}
+
+async fn anime_debrid_attempt_is_current(
+    pool: &sqlx::AnyPool,
+    release: &AcquisitionRelease,
+    provider_id: Uuid,
+    job_id: Uuid,
+    remote_release_id: &str,
+) -> Result<bool> {
+    if release.media_type != MediaType::Anime {
+        return Ok(true);
+    }
+    let remote_release_id = remote_release_id.trim();
+    if remote_release_id.is_empty() {
+        return Ok(false);
+    }
+    let count = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_releases r
+         JOIN debrid_download_jobs d
+           ON d.release_id = r.release_id
+          AND d.job_id = $2
+          AND d.provider_id = $4
+         WHERE r.release_id = $1
+           AND r.media_type = 'anime'
+           AND r.download_id = $2
+           AND r.selected_route_logical_id = $3
+           AND r.selected_provider_id = $4
+           AND r.remote_release_id = $5
+           AND r.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = $5
+           AND d.status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')
+           AND EXISTS (
+               SELECT 1
+               FROM acquisition_release_jobs j
+               WHERE j.release_id = r.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.remote_release_id = $5
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )",
+    )
+    .bind(release.release_id.to_string())
+    .bind(job_id.to_string())
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(provider_id.to_string())
+    .bind(remote_release_id)
+    .fetch_one(pool)
+    .await
+    .context("checking exact anime Debrid worker ownership")?;
+    Ok(count == 1)
+}
+
+async fn persist_anime_debrid_files_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    release_id: Uuid,
+    files: &[DebridRemoteFile],
+) -> Result<HashMap<String, Uuid>> {
+    let release_id = release_id.to_string();
+    let mut file_ids = HashMap::new();
+    for file in files {
+        let existing = sqlx::query_scalar::<sqlx::Any, String>(
+            "SELECT release_file_id
+             FROM acquisition_release_files
+             WHERE release_id = $1 AND provider_file_id = $2
+             LIMIT 1",
+        )
+        .bind(&release_id)
+        .bind(&file.provider_file_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let release_file_id = existing
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        let parse_name = if file.basename.trim().is_empty() {
+            file.path.as_str()
+        } else {
+            file.basename.as_str()
+        };
+        let parsed = parsed_file_metadata(MediaType::Anime, parse_name);
+        let raw_json = file
+            .raw
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing anime Debrid provider file")?;
+        let provider_metadata_json = serde_json::to_string(&json!({
+            "providerFileId": file.provider_file_id,
+            "fileIndex": file.file_index,
+            "selectable": file.selectable,
+            "selected": file.selected,
+            "sizeBytes": file.size_bytes
+        }))?;
+        if existing.is_some() {
+            sqlx::query::<sqlx::Any>(
+                "UPDATE acquisition_release_files
+                 SET file_index = $1, file_id = $2, provider_file_id = $3,
+                     path = $4, basename = $5, size_bytes = $6, selectable = $7,
+                     selected = $8, parsed_title = $9, parsed_season_number = $10,
+                     parsed_episode_number = $11, parsed_episode_end_number = $12,
+                     parsed_absolute_episode_number = $13,
+                     parsed_absolute_episode_end_number = $14, parsed_air_date = $15,
+                     parsed_quality = $16, parsed_language = $17,
+                     parsed_release_group = $18, parser_confidence = $19,
+                     parser_reason = $20, raw_json = $21,
+                     provider_metadata_json = $22, updated_at = CURRENT_TIMESTAMP
+                 WHERE release_file_id = $23 AND release_id = $24",
+            )
+            .bind(file.file_index)
+            .bind(&file.provider_file_id)
+            .bind(&file.provider_file_id)
+            .bind(file.path.trim())
+            .bind(&file.basename)
+            .bind(file.size_bytes.and_then(u64_to_i64))
+            .bind(if file.selectable { 1_i64 } else { 0_i64 })
+            .bind(file.selected.map(|value| if value { 1_i64 } else { 0_i64 }))
+            .bind(parsed.title.as_deref())
+            .bind(parsed.season_number)
+            .bind(parsed.episode_number)
+            .bind(parsed.episode_end_number)
+            .bind(parsed.absolute_episode_number)
+            .bind(parsed.absolute_episode_end_number)
+            .bind(parsed.air_date.as_deref())
+            .bind(parsed.quality.as_deref())
+            .bind(parsed.language.as_deref())
+            .bind(parsed.release_group.as_deref())
+            .bind(parsed.confidence.as_str())
+            .bind(parsed.reason.as_deref())
+            .bind(raw_json.as_deref())
+            .bind(&provider_metadata_json)
+            .bind(release_file_id.to_string())
+            .bind(&release_id)
+            .execute(&mut **transaction)
+            .await
+            .context("updating exact anime Debrid provider file")?;
+        } else {
+            sqlx::query::<sqlx::Any>(
+                "INSERT INTO acquisition_release_files (
+                    release_file_id, release_id, file_index, file_id, provider_file_id,
+                    path, basename, size_bytes, selectable, selected, parsed_title,
+                    parsed_season_number, parsed_episode_number, parsed_episode_end_number,
+                    parsed_absolute_episode_number, parsed_absolute_episode_end_number,
+                    parsed_air_date, parsed_quality, parsed_language, parsed_release_group,
+                    parser_confidence, parser_reason, raw_json, provider_metadata_json
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                           $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+            )
+            .bind(release_file_id.to_string())
+            .bind(&release_id)
+            .bind(file.file_index)
+            .bind(&file.provider_file_id)
+            .bind(&file.provider_file_id)
+            .bind(file.path.trim())
+            .bind(&file.basename)
+            .bind(file.size_bytes.and_then(u64_to_i64))
+            .bind(if file.selectable { 1_i64 } else { 0_i64 })
+            .bind(file.selected.map(|value| if value { 1_i64 } else { 0_i64 }))
+            .bind(parsed.title.as_deref())
+            .bind(parsed.season_number)
+            .bind(parsed.episode_number)
+            .bind(parsed.episode_end_number)
+            .bind(parsed.absolute_episode_number)
+            .bind(parsed.absolute_episode_end_number)
+            .bind(parsed.air_date.as_deref())
+            .bind(parsed.quality.as_deref())
+            .bind(parsed.language.as_deref())
+            .bind(parsed.release_group.as_deref())
+            .bind(parsed.confidence.as_str())
+            .bind(parsed.reason.as_deref())
+            .bind(raw_json.as_deref())
+            .bind(&provider_metadata_json)
+            .execute(&mut **transaction)
+            .await
+            .context("creating exact anime Debrid provider file")?;
+        }
+        file_ids.insert(file.provider_file_id.clone(), release_file_id);
+    }
+    Ok(file_ids)
+}
+
+async fn upsert_anime_debrid_coverage_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    release_id: Uuid,
+    release_file_id: Uuid,
+    entry: &AnimeDebridCoverageWrite,
+) -> Result<()> {
+    let release_id = release_id.to_string();
+    let release_file_id = release_file_id.to_string();
+    let target_id = entry.target_id.to_string();
+    let existing = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT coverage_id
+         FROM acquisition_release_coverage
+         WHERE release_id = $1 AND target_id = $2 AND release_file_id = $3
+         LIMIT 1",
+    )
+    .bind(&release_id)
+    .bind(&target_id)
+    .bind(&release_file_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(coverage_id) = existing {
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_coverage
+             SET coverage_kind = $1, confidence = $2, score = $3, reason = $4,
+                 state = $5, verified_by = $6, updated_at = CURRENT_TIMESTAMP
+             WHERE coverage_id = $7 AND release_id = $8",
+        )
+        .bind(entry.coverage_kind.as_str())
+        .bind(entry.confidence.as_str())
+        .bind(entry.score)
+        .bind(&entry.reason)
+        .bind(entry.state.as_str())
+        .bind(&entry.verified_by)
+        .bind(coverage_id)
+        .bind(&release_id)
+        .execute(&mut **transaction)
+        .await?;
+    } else {
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_release_coverage (
+                coverage_id, release_id, release_file_id, target_id, coverage_kind,
+                confidence, score, reason, state, verified_by
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&release_id)
+        .bind(&release_file_id)
+        .bind(&target_id)
+        .bind(entry.coverage_kind.as_str())
+        .bind(entry.confidence.as_str())
+        .bind(entry.score)
+        .bind(&entry.reason)
+        .bind(entry.state.as_str())
+        .bind(&entry.verified_by)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+fn debrid_release_scoped_targets(
+    release: &AcquisitionRelease,
+    targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
+    existing_coverage: &[AcquisitionReleaseCoverage],
+    bound_target_ids: &[Uuid],
+) -> Vec<crate::acquisition::subscriptions::AcquisitionTarget> {
+    let request_scope = release.selected_candidate.as_ref().and_then(|candidate| {
+        candidate
+            .get("requestScopeEvidence")
+            .or_else(|| candidate.get("request_scope_evidence"))
+    });
+    if let Some(scope) = request_scope {
+        let target_ids_value = scope.get("targetIds").or_else(|| scope.get("target_ids"));
+        let target_keys_value = scope.get("targetKeys").or_else(|| scope.get("target_keys"));
+        let target_ids_present = target_ids_value.is_some();
+        let target_keys_present = target_keys_value.is_some();
+        if !target_ids_present && !target_keys_present {
+            return Vec::new();
+        }
+        let mut target_ids = BTreeSet::new();
+        if let Some(ids) = target_ids_value {
+            let Some(ids) = ids.as_array() else {
+                return Vec::new();
+            };
+            if ids.is_empty() {
+                return Vec::new();
+            }
+            for value in ids {
+                let Some(value) = value.as_str() else {
+                    return Vec::new();
+                };
+                let Ok(target_id) = Uuid::parse_str(value.trim()) else {
+                    return Vec::new();
+                };
+                if !targets.iter().any(|target| target.target_id == target_id) {
+                    return Vec::new();
+                }
+                target_ids.insert(target_id);
+            }
+        }
+        let mut keyed_ids = BTreeSet::new();
+        if let Some(keys) = target_keys_value {
+            let Some(keys) = keys.as_array() else {
+                return Vec::new();
+            };
+            if keys.is_empty() {
+                return Vec::new();
+            }
+            for value in keys {
+                let Some(key) = value.as_str().map(str::trim).filter(|key| !key.is_empty()) else {
+                    return Vec::new();
+                };
+                let matching = targets
+                    .iter()
+                    .filter(|target| target.target_key == key)
+                    .map(|target| target.target_id)
+                    .collect::<BTreeSet<_>>();
+                if matching.len() != 1 {
+                    return Vec::new();
+                }
+                keyed_ids.extend(matching);
+            }
+        }
+        if target_ids_present && target_keys_present && target_ids != keyed_ids {
+            return Vec::new();
+        }
+        let scoped_ids = if target_ids_present {
+            target_ids
+        } else {
+            keyed_ids
+        };
+        let covered_ids = existing_coverage
+            .iter()
+            .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+            .map(|coverage| coverage.target_id)
+            .collect::<BTreeSet<_>>();
+        let bound_ids = bound_target_ids.iter().copied().collect::<BTreeSet<_>>();
+        if (!covered_ids.is_empty() && covered_ids != scoped_ids)
+            || (!bound_ids.is_empty() && bound_ids != scoped_ids)
+        {
+            return Vec::new();
+        }
+        return targets
+            .iter()
+            .filter(|target| scoped_ids.contains(&target.target_id))
+            .cloned()
+            .collect();
+    }
+
+    let covered_target_ids = existing_coverage
+        .iter()
+        .filter(|coverage| coverage.state != ReleaseCoverageState::Rejected)
+        .map(|coverage| coverage.target_id)
+        .collect::<BTreeSet<_>>();
+    if !covered_target_ids.is_empty() {
+        return targets
+            .iter()
+            .filter(|target| covered_target_ids.contains(&target.target_id))
+            .cloned()
+            .collect();
+    }
+
+    let bound_target_ids = bound_target_ids.iter().copied().collect::<BTreeSet<_>>();
+    if !bound_target_ids.is_empty() {
+        return targets
+            .iter()
+            .filter(|target| bound_target_ids.contains(&target.target_id))
+            .cloned()
+            .collect();
+    }
+
+    if targets.len() == 1 {
+        return targets.to_vec();
+    }
+    Vec::new()
 }
 
 #[derive(Debug, Clone)]
@@ -6498,12 +7276,12 @@ async fn refine_tv_debrid_coverage(
 }
 
 async fn refine_anime_debrid_coverage(
-    pool: &sqlx::AnyPool,
     release: &AcquisitionRelease,
     options: &DebridSubmitOptions<'_>,
     inspection: &DebridReleaseInspection,
+    subscription: Option<&crate::acquisition::subscriptions::AcquisitionSubscription>,
     targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
-    file_ids: &HashMap<String, Uuid>,
+    anime_matching: &AnimeMatchingService,
 ) -> Result<DebridCoverageRefinement> {
     let context = anime_scoring_context_from_release(release, targets);
     let selected_candidate = options
@@ -6537,7 +7315,7 @@ async fn refine_anime_debrid_coverage(
             selectable: file.selectable,
         })
         .collect::<Vec<_>>();
-    let plan = plan_anime_file_coverage_with_options(
+    let deterministic_plan = plan_anime_file_coverage_with_options(
         &context,
         &candidate,
         &files,
@@ -6545,34 +7323,203 @@ async fn refine_anime_debrid_coverage(
             file_selection_supported: inspection.capabilities.supports_file_selection,
         },
     );
+    let deterministic_plan =
+        bind_exact_single_anime_provider_file(deterministic_plan, &context, &candidate, &files);
+    let deterministic_required_audio_satisfied = subscription
+        .map(|subscription| {
+            let candidate = acquisition_candidate_from_debrid_file_list(
+                release,
+                selected_candidate,
+                inspection,
+            );
+            assess_acquisition_anime_provider_file_audio(
+                subscription,
+                &candidate,
+                &deterministic_plan.selected_file_keys,
+            )
+            .1
+        })
+        .unwrap_or(true);
+    let deterministic_state = debrid_anime_deterministic_state(
+        &deterministic_plan,
+        &files,
+        &inspection.capabilities,
+        targets,
+    );
+    let deterministic = ResolvedAnimeDebridCoverage {
+        plan: deterministic_plan,
+        model_audio_profile: None,
+        model_audio_assessment: None,
+        required_audio_satisfied: deterministic_required_audio_satisfied,
+    };
+
+    let (resolved, match_assist) = if deterministic_state == DeterministicMatchState::Definitive
+        && deterministic_required_audio_satisfied
+    {
+        (
+            deterministic,
+            AnimeMatchAssistProvenance {
+                source: AnimeMatchAssistSource::DeterministicFastPath,
+                result: AnimeMatchAssistResult::Definitive,
+                matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                request_fingerprint: None,
+                reason: None,
+                detail: None,
+                runtime: None,
+                latency_ms: 0,
+            },
+        )
+    } else if let Some(subscription) = subscription {
+        let acquisition_candidate =
+            acquisition_candidate_from_debrid_file_list(release, selected_candidate, inspection);
+        let acquisition_candidates = vec![acquisition_candidate];
+        match acquisition_anime_match_batch_input(
+            format!(
+                "debrid-real-files:{}:{}",
+                release.release_id, inspection.release.remote_release_id
+            ),
+            subscription,
+            targets,
+            &context,
+            &acquisition_candidates,
+        ) {
+            Ok(batch_input) => {
+                let context_for_model = context.clone();
+                let files_for_validation = files.clone();
+                let capabilities_for_validation = inspection.capabilities.clone();
+                let file_selection_supported = inspection.capabilities.supports_file_selection;
+                let subscription_for_model = subscription.clone();
+                let targets_for_validation = targets.to_vec();
+                let outcome = anime_matching
+                    .match_or_fallback(
+                        AnimeDeterministicResult {
+                            value: deterministic,
+                            state: DeterministicMatchState::Difficult,
+                        },
+                        batch_input,
+                        move |_deterministic, request, matches, source_map| {
+                            let mut plans =
+                                model_derived_anime_coverage_plans_with_file_selection_support(
+                                request,
+                                &context_for_model,
+                                &acquisition_candidates,
+                                file_selection_supported,
+                                matches,
+                                source_map,
+                            )?;
+                            if plans.len() != 1 || plans[0].candidate_index != 0 {
+                                bail!(
+                                    "Debrid anime model response must resolve the inspected release exactly once"
+                                );
+                            }
+                            let model = plans.remove(0);
+                            let (audio_assessment, required_audio_satisfied) =
+                                assess_acquisition_anime_model_audio_profile(
+                                    &subscription_for_model,
+                                    model.audio_profile,
+                                );
+                            if !anime_plan_ready_for_automatic_selection(
+                                &model.plan,
+                                &files_for_validation,
+                                &capabilities_for_validation,
+                                &targets_for_validation,
+                            ) {
+                                bail!(
+                                    "Debrid anime model mapping did not prove an automatically selectable file set"
+                                );
+                            }
+                            Ok(ResolvedAnimeDebridCoverage {
+                                plan: model.plan,
+                                model_audio_profile: Some(model.audio_profile),
+                                model_audio_assessment: Some(json!({
+                                    "state": audio_assessment.state.as_str(),
+                                    "scoreDelta": audio_assessment.score_delta,
+                                    "matchingAudio": audio_assessment.matching_audio,
+                                    "matchingSubtitles": audio_assessment.matching_subtitles,
+                                    "matchingProfiles": audio_assessment.matching_profiles,
+                                    "desiredAudio": audio_assessment.desired_audio,
+                                    "desiredSubtitles": audio_assessment.desired_subtitles,
+                                    "desiredProfiles": audio_assessment.desired_profiles,
+                                    "evidenceAudio": audio_assessment.evidence_audio,
+                                    "evidenceSubtitles": audio_assessment.evidence_subtitles,
+                                    "evidenceProfiles": audio_assessment.evidence_profiles,
+                                    "requiredPreferenceSatisfied": required_audio_satisfied
+                                })),
+                                required_audio_satisfied,
+                            })
+                        },
+                    )
+                    .await;
+                (outcome.value, outcome.provenance)
+            }
+            Err(error) => (
+                deterministic,
+                anime_match_invalid_request_fallback(error.to_string()),
+            ),
+        }
+    } else {
+        (
+            deterministic,
+            anime_match_invalid_request_fallback(
+                "anime subscription was unavailable after provider file inspection".to_string(),
+            ),
+        )
+    };
+
+    // The model result is fully reference- and coverage-validated above. No
+    // coverage row is written before this point, so invalid output cannot
+    // partially replace the deterministic state.
+    let ResolvedAnimeDebridCoverage {
+        plan,
+        model_audio_profile,
+        model_audio_assessment,
+        required_audio_satisfied,
+    } = resolved;
+    let used_model = match_assist.result == AnimeMatchAssistResult::Matched;
+    let ready_for_selection = required_audio_satisfied
+        && anime_plan_ready_for_automatic_selection(
+            &plan,
+            &files,
+            &inspection.capabilities,
+            targets,
+        );
     let targets_by_key = targets
         .iter()
         .map(|target| (target.target_key.clone(), target.target_id))
         .collect::<HashMap<_, _>>();
-    for entry in &plan.entries {
-        let Some(target_id) = targets_by_key.get(&entry.target_key).copied() else {
-            continue;
-        };
-        upsert_release_coverage(
-            pool,
-            NewAcquisitionReleaseCoverage {
-                coverage_id: None,
-                release_id: release.release_id,
-                release_file_id: entry
-                    .release_file_key
-                    .as_ref()
-                    .and_then(|file_id| file_ids.get(file_id))
-                    .copied(),
+    let mut anime_coverage_entries = Vec::new();
+    if ready_for_selection {
+        for entry in &plan.entries {
+            let target_id = targets_by_key
+                .get(&entry.target_key)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Debrid anime mapping references unknown scoped target '{}'",
+                        entry.target_key
+                    )
+                })?;
+            let provider_file_id = entry.release_file_key.as_ref().cloned().ok_or_else(|| {
+                anyhow!(
+                    "Debrid anime mapping for '{}' has no available provider file",
+                    entry.target_key
+                )
+            })?;
+            anime_coverage_entries.push(AnimeDebridCoverageWrite {
                 target_id,
+                provider_file_id,
                 coverage_kind: entry.coverage_kind,
                 confidence: entry.confidence,
                 score: entry.score,
-                reason: Some(entry.reason.clone()),
+                reason: entry.reason.clone(),
                 state: entry.state,
-                verified_by: Some("rr4e_anime_file_list".to_string()),
-            },
-        )
-        .await?;
+                verified_by: if used_model {
+                    "alm7_debrid_local_model_file_list".to_string()
+                } else {
+                    "rr4e_anime_file_list".to_string()
+                },
+            });
+        }
     }
     let mut review_reasons = plan.review_reasons.clone();
     review_reasons.extend(plan.rejection_reasons.clone());
@@ -6580,24 +7527,283 @@ async fn refine_anime_debrid_coverage(
     review_reasons.dedup();
     let score = score_anime_candidate(&context, &candidate);
     let diagnostics = anime_parser_diagnostics(&context, &score, Some(&plan));
-    Ok(refinement_from_plan(
-        ReleaseShape {
-            release_kind: plan.release_kind,
-            resolver_kind: plan.resolver_kind,
-            resolver_version: plan.resolver_version.clone(),
-            confidence: plan.confidence,
+    let anime_plan_evidence =
+        serde_json::to_value(&plan).context("serializing anime Debrid file coverage evidence")?;
+    let anime_plan_evidence = if ready_for_selection {
+        anime_plan_evidence
+    } else {
+        sanitize_anime_automatic_resolution_evidence(anime_plan_evidence)
+    };
+    let diagnostics = if ready_for_selection {
+        diagnostics
+    } else {
+        sanitize_anime_automatic_resolution_evidence(diagnostics)
+    };
+    let request_scope_evidence = selected_candidate.and_then(|candidate| {
+        candidate
+            .get("requestScopeEvidence")
+            .or_else(|| candidate.get("request_scope_evidence"))
+            .cloned()
+    });
+    let suppress_automatic_rediscovery = anime_debrid_retry_suppresses_rediscovery(&match_assist);
+    let mapping_diagnostics = sanitize_anime_automatic_resolution_evidence(json!(review_reasons));
+    let coverage_plan = json!({
+        "source": "debrid_provider_file_list",
+        "providerImplementation": inspection.release.provider_implementation,
+        "remoteReleaseId": inspection.release.remote_release_id,
+        "anime": anime_plan_evidence,
+        "diagnostics": diagnostics,
+        "animeMatchAssist": match_assist,
+        "modelAudioProfile": model_audio_profile,
+        "modelAudioAssessment": model_audio_assessment,
+        "requestScopeEvidence": request_scope_evidence,
+        "automaticResolution": {
+            "status": if ready_for_selection { "resolved" } else { "pending" },
+            "selectionPolicyReady": ready_for_selection,
+            "requiredAudioSatisfied": required_audio_satisfied,
+            "scopedTargetKeys": targets.iter().map(|target| target.target_key.clone()).collect::<Vec<_>>()
         },
-        json!({
-            "source": "debrid_provider_file_list",
-            "providerImplementation": inspection.release.provider_implementation,
-            "remoteReleaseId": inspection.release.remote_release_id,
-            "anime": plan,
-            "diagnostics": diagnostics,
-            "reviewReasons": review_reasons
+        "mappingDiagnostics": mapping_diagnostics
+    });
+    let shape = ReleaseShape {
+        release_kind: plan.release_kind,
+        resolver_kind: plan.resolver_kind,
+        resolver_version: plan.resolver_version.clone(),
+        confidence: plan.confidence,
+    };
+    if ready_for_selection {
+        let mut refinement =
+            refinement_from_plan(shape, coverage_plan, Vec::new(), inspection.release.status);
+        refinement.anime_coverage_entries = anime_coverage_entries;
+        return Ok(refinement);
+    }
+
+    Ok(DebridCoverageRefinement {
+        shape,
+        state: AcquisitionReleaseState::Staging,
+        state_reason: Some(
+            "Anime file matching retained the deterministic fallback and will retry automatically."
+                .to_string(),
+        ),
+        job_state: ReleaseJobState::Staging,
+        job_state_reason: Some(
+            "Anime provider-file resolution is pending an automatic retry.".to_string(),
+        ),
+        coverage_plan: Some(coverage_plan.clone()),
+        apply_file_selection_policy: false,
+        automatic_retry: Some(AnimeDebridAutomaticRetry {
+            target_ids: targets
+                .iter()
+                .filter(|target| {
+                    !matches!(
+                        target.state,
+                        AcquisitionTargetState::Imported | AcquisitionTargetState::Excluded
+                    )
+                })
+                .map(|target| target.target_id)
+                .collect(),
+            reason_code: "anime_debrid_file_mapping_unresolved".to_string(),
+            suppress_automatic_rediscovery,
+            coverage_plan: Some(coverage_plan),
         }),
-        review_reasons,
-        inspection.release.status,
-    ))
+        anime_coverage_entries: Vec::new(),
+    })
+}
+
+#[derive(Debug)]
+struct ResolvedAnimeDebridCoverage {
+    plan: AnimeFileCoveragePlan,
+    model_audio_profile: Option<AnimeMatchAudioProfile>,
+    model_audio_assessment: Option<Value>,
+    required_audio_satisfied: bool,
+}
+
+fn debrid_anime_deterministic_state(
+    plan: &AnimeFileCoveragePlan,
+    files: &[AnimeReleaseFileInput],
+    capabilities: &DebridProviderCapabilities,
+    targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
+) -> DeterministicMatchState {
+    if acquisition_anime_deterministic_state(plan) == DeterministicMatchState::Definitive
+        && anime_plan_ready_for_automatic_selection(plan, files, capabilities, targets)
+    {
+        DeterministicMatchState::Definitive
+    } else {
+        DeterministicMatchState::Difficult
+    }
+}
+
+fn anime_plan_ready_for_automatic_selection(
+    plan: &AnimeFileCoveragePlan,
+    files: &[AnimeReleaseFileInput],
+    capabilities: &DebridProviderCapabilities,
+    targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
+) -> bool {
+    let wanted_target_keys = targets
+        .iter()
+        .map(|target| target.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let planned_target_keys = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    if plan.confidence != ReleaseConfidence::High
+        || plan.entries.is_empty()
+        || wanted_target_keys.is_empty()
+        || wanted_target_keys.len() != targets.len()
+        || wanted_target_keys != planned_target_keys
+        || planned_target_keys.len() != plan.entries.len()
+        || !plan.review_reasons.is_empty()
+        || !plan.rejection_reasons.is_empty()
+        || plan.entries.iter().any(|entry| {
+            entry.confidence != ReleaseConfidence::High
+                || matches!(
+                    entry.state,
+                    ReleaseCoverageState::ReviewRequired | ReleaseCoverageState::Rejected
+                )
+        })
+    {
+        return false;
+    }
+
+    let selectable_media = files
+        .iter()
+        .filter(|file| {
+            file.selectable
+                && is_debrid_media_file(&file.path)
+                && !is_debrid_sample_or_extra_file(&file.path)
+        })
+        .map(|file| file.file_key.as_str())
+        .collect::<BTreeSet<_>>();
+    if selectable_media.is_empty() {
+        return false;
+    }
+    let selected = plan
+        .selected_file_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected.len() != plan.selected_file_keys.len() || !selected.is_subset(&selectable_media) {
+        return false;
+    }
+    if selected.is_empty() {
+        return false;
+    }
+    if !capabilities.supports_file_selection && selected != selectable_media {
+        return false;
+    }
+    let mapped_files = plan
+        .entries
+        .iter()
+        .filter_map(|entry| entry.release_file_key.as_deref())
+        .collect::<BTreeSet<_>>();
+    mapped_files == selected
+        && plan
+            .entries
+            .iter()
+            .all(|entry| entry.release_file_key.is_some())
+}
+
+fn anime_match_invalid_request_fallback(detail: String) -> AnimeMatchAssistProvenance {
+    AnimeMatchAssistProvenance {
+        source: AnimeMatchAssistSource::DeterministicFallback,
+        result: AnimeMatchAssistResult::Fallback,
+        matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+        request_fingerprint: None,
+        reason: Some(AnimeMatchFallbackReason::InvalidRequest),
+        detail: Some(detail),
+        runtime: None,
+        latency_ms: 0,
+    }
+}
+
+fn anime_debrid_retry_suppresses_rediscovery(match_assist: &AnimeMatchAssistProvenance) -> bool {
+    match_assist.result != AnimeMatchAssistResult::Fallback
+}
+
+fn sanitize_anime_automatic_resolution_evidence(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| {
+                    let key = key
+                        .replace("Review", "Unresolved")
+                        .replace("review", "unresolved");
+                    (key, sanitize_anime_automatic_resolution_evidence(value))
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(sanitize_anime_automatic_resolution_evidence)
+                .collect(),
+        ),
+        Value::String(value) => Value::String(
+            value
+                .replace("review_required", "unresolved")
+                .replace("requires_review", "unresolved")
+                .replace("requires review", "unresolved")
+                .replace("review required", "automatic retry required")
+                .replace("waiting for review", "waiting for automatic retry")
+                .replace("_review", "_unresolved")
+                .replace("Review", "Unresolved")
+                .replace("review", "unresolved"),
+        ),
+        value => value,
+    }
+}
+
+fn acquisition_candidate_from_debrid_file_list(
+    release: &AcquisitionRelease,
+    selected_candidate: Option<&Value>,
+    inspection: &DebridReleaseInspection,
+) -> AcquisitionCandidate {
+    let mut supported_routes = selected_candidate_string_vec(selected_candidate, "supportedRoutes");
+    if supported_routes.is_empty() {
+        supported_routes.push(DEBRID_DEFAULT_LOGICAL_ID.to_string());
+    }
+    AcquisitionCandidate {
+        id: selected_candidate_string(selected_candidate, "id"),
+        title: release.release_title.clone(),
+        source: release.source.clone(),
+        source_kind: release.source_kind.clone(),
+        info_hash: release.info_hash.clone(),
+        file_index: selected_candidate_u64(selected_candidate, "fileIndex")
+            .and_then(|value| i64::try_from(value).ok()),
+        quality: selected_candidate_string(selected_candidate, "quality"),
+        size_bytes: selected_candidate_u64(selected_candidate, "sizeBytes"),
+        seeders: selected_candidate_u64(selected_candidate, "seeders")
+            .and_then(|value| u32::try_from(value).ok()),
+        language: selected_candidate_string(selected_candidate, "language"),
+        cached_debrid: selected_candidate_bool(selected_candidate, "cachedDebrid"),
+        rank: selected_candidate_u64(selected_candidate, "rank")
+            .and_then(|value| u32::try_from(value).ok()),
+        score: release
+            .score
+            .or_else(|| selected_candidate_f64(selected_candidate, "score")),
+        score_badges: Vec::new(),
+        files: inspection
+            .files
+            .iter()
+            .map(|file| AcquisitionCandidateFile {
+                file_id: Some(file.provider_file_id.clone()),
+                file_index: file.file_index,
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+                selectable: Some(file.selectable),
+            })
+            .collect(),
+        supported_routes,
+        default_route: selected_candidate_string(selected_candidate, "defaultRoute")
+            .or_else(|| Some(DEBRID_DEFAULT_LOGICAL_ID.to_string())),
+        raw: selected_candidate
+            .and_then(|candidate| candidate.get("raw"))
+            .cloned()
+            .or_else(|| selected_candidate.cloned()),
+    }
 }
 
 fn anime_scoring_context_from_release(
@@ -6605,10 +7811,15 @@ fn anime_scoring_context_from_release(
     targets: &[crate::acquisition::subscriptions::AcquisitionTarget],
 ) -> AnimeCandidateScoringContext {
     let mut aliases = Vec::new();
+    let mut scoped_aliases = BTreeMap::new();
+    let mut graph_fingerprints = BTreeSet::new();
     push_unique_alias(&mut aliases, &release.title);
     for target in targets {
         push_unique_alias(&mut aliases, &target.title);
         if let Some(metadata) = target.metadata.as_ref() {
+            if let Some(fingerprint) = metadata_json_string(Some(metadata), "graphFingerprint") {
+                graph_fingerprints.insert(fingerprint);
+            }
             for key in ["aliases", "titles", "anilistTitles"] {
                 if let Some(values) = metadata.get(key).and_then(Value::as_array) {
                     for value in values.iter().filter_map(Value::as_str) {
@@ -6616,17 +7827,45 @@ fn anime_scoring_context_from_release(
                     }
                 }
             }
+            for key in ["scopedAliases", "scoped_aliases"] {
+                let Some(values) = metadata.get(key).and_then(Value::as_array) else {
+                    continue;
+                };
+                for value in values {
+                    let Ok(alias) = serde_json::from_value::<AnimeScopedAlias>(value.clone())
+                    else {
+                        continue;
+                    };
+                    let display = alias.display.trim();
+                    if display.is_empty()
+                        || (alias.season_number.is_none() && alias.anilist_season_id.is_none())
+                    {
+                        continue;
+                    }
+                    let key = format!(
+                        "{}:{}:{}:{}",
+                        display.to_ascii_lowercase(),
+                        alias.source,
+                        alias.season_number.unwrap_or_default(),
+                        alias.anilist_season_id.as_deref().unwrap_or_default()
+                    );
+                    scoped_aliases.entry(key).or_insert(alias);
+                }
+            }
         }
     }
-    AnimeCandidateScoringContext {
-        graph_fingerprint: release
+    let graph_fingerprint = match graph_fingerprints.len() {
+        1 => graph_fingerprints.first().cloned(),
+        0 => release
             .coverage_plan
             .as_ref()
-            .and_then(|value| value.get("graphFingerprint"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(find_anime_graph_fingerprint),
+        _ => None,
+    };
+    AnimeCandidateScoringContext {
+        graph_fingerprint,
         aliases,
-        scoped_aliases: vec![],
+        scoped_aliases: scoped_aliases.into_values().collect(),
         targets: targets
             .iter()
             .map(|target| {
@@ -6645,6 +7884,26 @@ fn anime_scoring_context_from_release(
             })
             .collect(),
     }
+}
+
+fn find_anime_graph_fingerprint(value: &Value) -> Option<String> {
+    for key in ["graphFingerprint", "graph_fingerprint"] {
+        if let Some(fingerprint) = json_scalar_string(value.get(key)) {
+            return Some(fingerprint);
+        }
+    }
+    for key in [
+        "anime",
+        "animeCoveragePlan",
+        "coveragePlan",
+        "previousCoveragePlan",
+        "debridCoveragePlan",
+    ] {
+        if let Some(fingerprint) = value.get(key).and_then(find_anime_graph_fingerprint) {
+            return Some(fingerprint);
+        }
+    }
+    None
 }
 
 fn push_unique_alias(aliases: &mut Vec<String>, value: &str) {
@@ -6671,6 +7930,9 @@ fn refinement_from_plan(
             job_state: ReleaseJobState::Staging,
             job_state_reason: Some("Debrid file selection is waiting for review.".to_string()),
             coverage_plan: Some(coverage_plan),
+            apply_file_selection_policy: true,
+            automatic_retry: None,
+            anime_coverage_entries: Vec::new(),
         }
     } else {
         DebridCoverageRefinement {
@@ -6684,6 +7946,9 @@ fn refinement_from_plan(
                 "Debrid file list coverage resolved with high confidence.".to_string(),
             ),
             coverage_plan: Some(coverage_plan),
+            apply_file_selection_policy: true,
+            automatic_retry: None,
+            anime_coverage_entries: Vec::new(),
         }
     }
 }
@@ -6696,6 +7961,9 @@ fn refinement_from_debrid_status(status: DebridReleaseStatus) -> DebridCoverageR
         job_state: release_job_state_for_debrid_status(status),
         job_state_reason: Some("Debrid release staged.".to_string()),
         coverage_plan: None,
+        apply_file_selection_policy: true,
+        automatic_retry: None,
+        anime_coverage_entries: Vec::new(),
     }
 }
 
@@ -6767,12 +8035,17 @@ fn acquisition_state_for_job_status(status: Option<&str>) -> AcquisitionReleaseS
 }
 
 fn metadata_json_string(metadata: Option<&Value>, key: &str) -> Option<String> {
-    metadata?
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    json_scalar_string(metadata?.get(key))
+}
+
+fn json_scalar_string(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
 fn selected_candidate_string(candidate: Option<&Value>, key: &str) -> Option<String> {
@@ -6874,13 +8147,122 @@ async fn apply_debrid_file_selection_policy<A: DebridProviderAdapter + ?Sized>(
     job_id: Uuid,
     release: &AcquisitionRelease,
     inspection: &DebridReleaseInspection,
+    allow_automatic_retry: bool,
 ) -> Result<Option<DebridReleaseInspection>> {
+    if release.media_type == MediaType::Anime {
+        let Some(provider_id) = release.selected_provider_id else {
+            mark_stale_anime_debrid_provider_job(
+                pool,
+                job_id,
+                "Anime Debrid selection lost its provider ownership.",
+            )
+            .await?;
+            return Ok(None);
+        };
+        if !anime_debrid_attempt_is_current(
+            pool,
+            release,
+            provider_id,
+            job_id,
+            &inspection.release.remote_release_id,
+        )
+        .await?
+        {
+            mark_stale_anime_debrid_provider_job(
+                pool,
+                job_id,
+                "Superseded by a newer anime Debrid attempt.",
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
     let files = list_release_files(pool, release.release_id).await?;
     let coverage = list_release_coverage(pool, release.release_id).await?;
     let decision = decide_debrid_file_selection(release, &files, &coverage, inspection);
-    persist_debrid_selection_decision(pool, job_id, release, &files, &coverage, &decision).await?;
+    if release.media_type == MediaType::Anime && !decision.is_approved() {
+        let retry = AnimeDebridAutomaticRetry {
+            target_ids: coverage.iter().map(|entry| entry.target_id).collect(),
+            reason_code: "anime_debrid_file_selection_unapproved".to_string(),
+            suppress_automatic_rediscovery: true,
+            coverage_plan: release.coverage_plan.clone(),
+        };
+        if allow_automatic_retry {
+            if !stage_anime_debrid_retry_disposition(pool, job_id, &retry).await? {
+                mark_stale_anime_debrid_provider_job(
+                    pool,
+                    job_id,
+                    "Superseded while staging anime Debrid selection retry.",
+                )
+                .await?;
+                return Ok(None);
+            }
+            persist_anime_debrid_retry_with_adapter(
+                pool,
+                adapter,
+                job_id,
+                release,
+                &inspection.release.remote_release_id,
+                &inspection.release.provider_implementation,
+                &retry,
+            )
+            .await?;
+            return Ok(None);
+        }
+        if !stage_anime_debrid_retry_disposition(pool, job_id, &retry).await? {
+            mark_stale_anime_debrid_provider_job(
+                pool,
+                job_id,
+                "Superseded while staging anime Debrid selection retry.",
+            )
+            .await?;
+        }
+        return Ok(None);
+    }
+    if !persist_debrid_selection_decision(pool, job_id, release, &files, &coverage, &decision)
+        .await?
+    {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job_id,
+            "Superseded while committing anime Debrid selection intent.",
+        )
+        .await?;
+        return Ok(None);
+    }
     if !decision.is_approved() {
         return Ok(None);
+    }
+    if !inspection.capabilities.supports_file_selection {
+        if release.media_type == MediaType::Anime {
+            if !mark_debrid_selection_applied(pool, release, job_id, inspection).await? {
+                mark_stale_anime_debrid_provider_job(
+                    pool,
+                    job_id,
+                    "Superseded while applying implicit anime Debrid selection.",
+                )
+                .await?;
+                return Ok(None);
+            }
+            return Ok(Some(inspection.clone()));
+        }
+        update_release_state(
+            pool,
+            release.release_id,
+            acquisition_state_for_debrid_status(inspection.release.status),
+            "Debrid provider requires no explicit selection for the exact mapped file set.",
+            None,
+        )
+        .await?;
+        update_debrid_release_job_selection_state(
+            pool,
+            release.release_id,
+            job_id,
+            release_job_state_for_debrid_status(inspection.release.status),
+            "Debrid provider requires no explicit selection for the exact mapped file set.",
+        )
+        .await?;
+        return Ok(Some(inspection.clone()));
     }
 
     let selected = adapter
@@ -6895,10 +8277,1068 @@ async fn apply_debrid_file_selection_policy<A: DebridProviderAdapter + ?Sized>(
                 inspection.release.remote_release_id
             )
         })?;
-    update_debrid_job_from_inspection(pool, job_id, &selected).await?;
-    persist_debrid_release_files(pool, release, &selected.files).await?;
-    mark_debrid_selection_applied(pool, release, job_id, &selected).await?;
+    if release.media_type == MediaType::Anime
+        && let Some(provider_id) = release.selected_provider_id
+        && !anime_debrid_attempt_is_current(
+            pool,
+            release,
+            provider_id,
+            job_id,
+            &inspection.release.remote_release_id,
+        )
+        .await?
+    {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job_id,
+            "Superseded during anime Debrid provider-file selection.",
+        )
+        .await?;
+        return Ok(None);
+    }
+    if !update_debrid_job_from_inspection(pool, job_id, &selected).await? {
+        return Ok(None);
+    }
+    if consume_failed_anime_debrid_inspection(pool, adapter, job_id, &selected).await? {
+        return Ok(None);
+    }
+    if release.media_type != MediaType::Anime {
+        persist_debrid_release_files(pool, release, &selected.files).await?;
+    }
+    if !mark_debrid_selection_applied(pool, release, job_id, &selected).await? {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job_id,
+            "Superseded while committing anime Debrid provider selection.",
+        )
+        .await?;
+        return Ok(None);
+    }
     Ok(Some(selected))
+}
+
+async fn persist_anime_debrid_retry_with_adapter<A: DebridProviderAdapter + ?Sized>(
+    pool: &sqlx::AnyPool,
+    adapter: &A,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    remote_release_id: &str,
+    provider_implementation: &str,
+    retry: &AnimeDebridAutomaticRetry,
+) -> Result<()> {
+    let remote_release_id = remote_release_id.trim();
+    let now = chrono::Utc::now();
+    let reason =
+        "Anime files could not be mapped safely. Elixir will try the next release automatically.";
+    let initial_claim = claim_anime_debrid_retry_attempt(
+        pool,
+        job_id,
+        release,
+        remote_release_id,
+        retry,
+        json!({
+            "status": "pending",
+            "deleted": false,
+            "policyVersion": "alm7-debrid-owned-cleanup-v1"
+        }),
+        now,
+        reason,
+    )
+    .await?;
+    if matches!(initial_claim, AnimeDebridRetryClaim::LostOwnership) {
+        finish_anime_debrid_retry_claim(pool, job_id, release, initial_claim, now, reason).await?;
+        return Ok(());
+    }
+
+    // Cleanup is authorized only after the exact attempt is durably claimed.
+    // The target remains bound to this failed attempt until cleanup evidence
+    // is persisted, so the scheduler cannot create a normal replacement in
+    // the external-call window.
+    let cleanup = if remote_release_id.is_empty() {
+        json!({
+            "status": "not_applicable",
+            "deleted": false,
+            "reason": "missing_remote_release_id"
+        })
+    } else if anime_debrid_remote_release_is_shared_with_active_attempt(
+        pool,
+        job_id,
+        remote_release_id,
+    )
+    .await?
+    {
+        json!({
+            "status": "retained_shared_active_attempt",
+            "deleted": false,
+            "reason": "remote_release_id_is_owned_by_another_active_attempt"
+        })
+    } else {
+        match adapter.delete_release(remote_release_id).await {
+            Ok(deleted) => json!({
+                "status": if deleted { "deleted" } else { "already_absent" },
+                "deleted": deleted
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    debrid_job_id = %job_id,
+                    remote_release_id,
+                    provider_implementation,
+                    "debrid anime automatic-retry cleanup failed: {error}"
+                );
+                json!({
+                    "status": "delete_failed",
+                    "deleted": false,
+                    "error": error.to_string()
+                })
+            }
+        }
+    };
+    let final_claim = claim_anime_debrid_retry_attempt(
+        pool,
+        job_id,
+        release,
+        remote_release_id,
+        retry,
+        sanitize_anime_automatic_resolution_evidence(cleanup),
+        chrono::Utc::now(),
+        reason,
+    )
+    .await?;
+    finish_anime_debrid_retry_claim(pool, job_id, release, final_claim, now, reason).await
+}
+
+async fn anime_debrid_remote_release_is_shared_with_active_attempt(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    remote_release_id: &str,
+) -> Result<bool> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(true);
+    };
+    let active_provider_jobs = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM debrid_download_jobs
+         WHERE job_id <> $1
+           AND provider_id = $2
+           AND instance_id = $3
+           AND status NOT IN ('completed', 'failed', 'cancelled')
+           AND (remote_release_id = $4 OR remote_torrent_id = $4)",
+    )
+    .bind(job_id.to_string())
+    .bind(job.provider_id.to_string())
+    .bind(job.instance_id.to_string())
+    .bind(remote_release_id)
+    .fetch_one(pool)
+    .await
+    .context("checking shared active Debrid provider cleanup ownership")?;
+    if active_provider_jobs > 0 {
+        return Ok(true);
+    }
+    let active_release_jobs = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_release_jobs
+         WHERE active = 1
+           AND provider_id = $1
+           AND COALESCE(download_id, '') <> $2
+           AND remote_release_id = $3",
+    )
+    .bind(job.provider_id.to_string())
+    .bind(job_id.to_string())
+    .bind(remote_release_id)
+    .fetch_one(pool)
+    .await
+    .context("checking shared active Debrid release-job cleanup ownership")?;
+    Ok(active_release_jobs > 0)
+}
+
+async fn anime_debrid_runtime_error_retry_disposition(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    reason_code: &str,
+    error: &anyhow::Error,
+) -> Result<AnimeDebridAutomaticRetry> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let job_download_id = job_id.to_string();
+    let mut bound_target_ids = BTreeSet::new();
+    if let Some(download_id) = release.download_id.as_deref() {
+        bound_target_ids.extend(target_ids_for_download_id(pool, download_id).await?);
+    }
+    if release.download_id.as_deref() != Some(job_download_id.as_str()) {
+        bound_target_ids.extend(target_ids_for_download_id(pool, &job_download_id).await?);
+    }
+
+    let target_ids = if let Some(subscription_id) = release.subscription_id {
+        let targets = list_subscription_targets(pool, subscription_id).await?;
+        let coverage = list_release_coverage(pool, release.release_id).await?;
+        debrid_release_scoped_targets(
+            release,
+            &targets,
+            &coverage,
+            &bound_target_ids.iter().copied().collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .filter(|target| {
+            !matches!(
+                target.state,
+                AcquisitionTargetState::Imported | AcquisitionTargetState::Excluded
+            )
+        })
+        .map(|target| target.target_id)
+        .collect::<Vec<_>>()
+    } else {
+        let mut target_ids = Vec::new();
+        for target_id in bound_target_ids {
+            if get_target(pool, target_id).await?.is_some_and(|target| {
+                !matches!(
+                    target.state,
+                    AcquisitionTargetState::Imported | AcquisitionTargetState::Excluded
+                )
+            }) {
+                target_ids.push(target_id);
+            }
+        }
+        target_ids
+    };
+    let error_evidence = sanitize_anime_automatic_resolution_evidence(json!({
+        "status": "retryable",
+        "reason": reason_code,
+        "message": error.to_string(),
+        "retryDisposition": "automatic",
+        "policyVersion": "alm7-debrid-anime-runtime-retry-v1"
+    }));
+    let coverage_plan = merge_debrid_evidence_object(
+        release.coverage_plan.clone(),
+        "automaticResolutionError",
+        error_evidence,
+    );
+    Ok(AnimeDebridAutomaticRetry {
+        target_ids,
+        reason_code: reason_code.to_string(),
+        suppress_automatic_rediscovery: false,
+        coverage_plan: Some(coverage_plan),
+    })
+}
+
+async fn persist_anime_debrid_retry(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    remote_release_id: &str,
+    retry: &AnimeDebridAutomaticRetry,
+    cleanup: Value,
+) -> Result<()> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let now = chrono::Utc::now();
+    let reason =
+        "Anime files could not be mapped safely. Elixir will try the next release automatically.";
+
+    let claim = claim_anime_debrid_retry_attempt(
+        pool,
+        job_id,
+        release,
+        remote_release_id,
+        retry,
+        cleanup,
+        now,
+        reason,
+    )
+    .await?;
+    finish_anime_debrid_retry_claim(pool, job_id, release, claim, now, reason).await
+}
+
+async fn finish_anime_debrid_retry_claim(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    claim: AnimeDebridRetryClaim,
+    now: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) -> Result<()> {
+    let AnimeDebridRetryClaim::Owned {
+        target_ids,
+        provider_id,
+    } = claim
+    else {
+        tracing::info!(
+            debrid_job_id = %job_id,
+            release_id = %release.release_id,
+            "ignored stale anime Debrid retry after release ownership moved to a newer attempt"
+        );
+        // Job A is still ours to terminalize even though the shared release is
+        // not. Consuming its durable marker prevents the materializer from
+        // selecting the stale job forever and repeatedly deleting remote A.
+        mark_anime_debrid_retry_job_failed(pool, job_id, reason).await?;
+        return Ok(());
+    };
+
+    for target_id in target_ids {
+        let retry_after = now
+            + chrono::Duration::seconds(
+                ANIME_DEBRID_CANDIDATE_RETRY_SECONDS + i64::from(target_id.as_bytes()[0] % 15),
+            );
+        reset_anime_debrid_target_for_candidate_retry_if_owned(
+            pool,
+            target_id,
+            job_id,
+            provider_id,
+            reason,
+            retry_after,
+        )
+        .await?;
+    }
+
+    // Terminalize the provider job last. Until this write succeeds, the
+    // durable disposition remains visible to the materializer and every step
+    // above is safe to replay after a crash. This is an automatic routing
+    // outcome, so bypass generic failure classification and its review policy.
+    mark_anime_debrid_retry_job_failed(pool, job_id, reason).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnimeDebridRetryClaim {
+    /// The exact attempt owns the release, including idempotent replays of an
+    /// already-claimed failure. Only these target IDs may be reset.
+    Owned {
+        target_ids: BTreeSet<Uuid>,
+        provider_id: Uuid,
+    },
+    /// A newer attempt owns the release. The delayed disposition must not
+    /// mutate that release, its coverage, or its targets.
+    LostOwnership,
+}
+
+async fn claim_anime_debrid_retry_attempt(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    remote_release_id: &str,
+    retry: &AnimeDebridAutomaticRetry,
+    cleanup: Value,
+    now: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) -> Result<AnimeDebridRetryClaim> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    };
+    if job.release_id != Some(release.release_id) {
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+
+    let job_id_string = job_id.to_string();
+    let provider_id_string = job.provider_id.to_string();
+    let release_id_string = release.release_id.to_string();
+    let mut transaction = pool.begin().await?;
+
+    // This no-op CAS acquires the release row before evidence is read. It
+    // prevents a concurrent attempt from rebinding the release between the
+    // ownership check and the terminal failure write on both SQLite and
+    // PostgreSQL.
+    let ownership_lock = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1
+               FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )",
+    )
+    .bind(&release_id_string)
+    .bind(&job_id_string)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id_string)
+    .execute(&mut *transaction)
+    .await
+    .context("claiming exact anime Debrid retry attempt")?;
+
+    if ownership_lock.rows_affected() == 1 {
+        let target_ids = anime_debrid_retry_target_ids_for_attempt(
+            &mut transaction,
+            job_id,
+            job.provider_id,
+            retry,
+            None,
+        )
+        .await?;
+        if !lock_anime_debrid_retry_targets_for_attempt(
+            &mut transaction,
+            &target_ids,
+            job_id,
+            job.provider_id,
+        )
+        .await?
+        {
+            transaction.rollback().await?;
+            return Ok(AnimeDebridRetryClaim::LostOwnership);
+        }
+        let current_coverage_plan =
+            anime_debrid_retry_coverage_plan_in_transaction(&mut transaction, release.release_id)
+                .await?
+                .or_else(|| release.coverage_plan.clone());
+        let current_coverage_plan =
+            merge_debrid_coverage_plans(current_coverage_plan, retry.coverage_plan.clone());
+        let coverage_plan = merge_anime_debrid_retry_evidence(
+            current_coverage_plan,
+            job_id,
+            remote_release_id,
+            retry,
+            &target_ids,
+            cleanup,
+            now,
+        );
+        let coverage_plan_json = serde_json::to_string(&coverage_plan)
+            .context("serializing claimed anime Debrid retry evidence")?;
+
+        let release_job_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = 'failed',
+                 state_reason = $1,
+                 active = 0,
+                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2
+               AND download_id = $3
+               AND route_logical_id = $4
+               AND provider_id = $5
+               AND active = 1
+               AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+        )
+        .bind(reason)
+        .bind(&release_id_string)
+        .bind(&job_id_string)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(&provider_id_string)
+        .execute(&mut *transaction)
+        .await
+        .context("terminalizing claimed anime Debrid release job")?;
+        if release_job_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(AnimeDebridRetryClaim::LostOwnership);
+        }
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_files
+             SET selected = 0, updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $1",
+        )
+        .bind(&release_id_string)
+        .execute(&mut *transaction)
+        .await
+        .context("clearing files for claimed anime Debrid retry")?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_coverage
+             SET state = 'rejected',
+                 reason = $1,
+                 verified_by = 'alm7_debrid_automatic_retry',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2",
+        )
+        .bind(&retry.reason_code)
+        .bind(&release_id_string)
+        .execute(&mut *transaction)
+        .await
+        .context("rejecting coverage for claimed anime Debrid retry")?;
+        let release_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = 'failed',
+                 state_reason = $1,
+                 coverage_plan_json = $2,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $3
+               AND download_id = $4
+               AND selected_route_logical_id = $5
+               AND selected_provider_id = $6
+               AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+        )
+        .bind(reason)
+        .bind(coverage_plan_json)
+        .bind(&release_id_string)
+        .bind(&job_id_string)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(&provider_id_string)
+        .execute(&mut *transaction)
+        .await
+        .context("failing claimed anime Debrid release")?;
+        if release_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(AnimeDebridRetryClaim::LostOwnership);
+        }
+        transaction.commit().await?;
+        return Ok(AnimeDebridRetryClaim::Owned {
+            target_ids,
+            provider_id: job.provider_id,
+        });
+    }
+    transaction.rollback().await?;
+
+    claim_anime_debrid_retry_replay(
+        pool,
+        &job,
+        release,
+        remote_release_id,
+        retry,
+        cleanup,
+        now,
+        reason,
+    )
+    .await
+}
+
+async fn claim_anime_debrid_retry_replay(
+    pool: &sqlx::AnyPool,
+    job: &DebridDownloadJob,
+    release: &AcquisitionRelease,
+    remote_release_id: &str,
+    retry: &AnimeDebridAutomaticRetry,
+    cleanup: Value,
+    now: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) -> Result<AnimeDebridRetryClaim> {
+    let job_id_string = job.job_id.to_string();
+    let provider_id_string = job.provider_id.to_string();
+    let release_id_string = release.release_id.to_string();
+    let mut transaction = pool.begin().await?;
+    let replay_lock = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND state = 'failed'",
+    )
+    .bind(&release_id_string)
+    .bind(&job_id_string)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id_string)
+    .execute(&mut *transaction)
+    .await
+    .context("locking replayed anime Debrid retry")?;
+    if replay_lock.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+
+    let current_coverage_plan =
+        anime_debrid_retry_coverage_plan_in_transaction(&mut transaction, release.release_id)
+            .await?;
+    if anime_debrid_retry_evidence_job_id(current_coverage_plan.as_ref()) != Some(job.job_id) {
+        transaction.rollback().await?;
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+    let matching_release_jobs = sqlx::query_scalar::<sqlx::Any, i64>(
+        "SELECT COUNT(*)
+         FROM acquisition_release_jobs
+         WHERE release_id = $1
+           AND download_id = $2
+           AND route_logical_id = $3
+           AND provider_id = $4
+           AND (
+               (active = 0 AND state = 'failed')
+               OR (active = 1 AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing'))
+           )",
+    )
+    .bind(&release_id_string)
+    .bind(&job_id_string)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id_string)
+    .fetch_one(&mut *transaction)
+    .await
+    .context("verifying replayed anime Debrid release job")?;
+    if matching_release_jobs != 1 {
+        transaction.rollback().await?;
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+
+    let target_ids = anime_debrid_retry_target_ids_for_attempt(
+        &mut transaction,
+        job.job_id,
+        job.provider_id,
+        retry,
+        current_coverage_plan.as_ref(),
+    )
+    .await?;
+    if !lock_anime_debrid_retry_targets_for_attempt(
+        &mut transaction,
+        &target_ids,
+        job.job_id,
+        job.provider_id,
+    )
+    .await?
+    {
+        transaction.rollback().await?;
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+    let current_coverage_plan =
+        merge_debrid_coverage_plans(current_coverage_plan, retry.coverage_plan.clone());
+    let coverage_plan = merge_anime_debrid_retry_evidence(
+        current_coverage_plan,
+        job.job_id,
+        remote_release_id,
+        retry,
+        &target_ids,
+        cleanup,
+        now,
+    );
+    let coverage_plan_json = serde_json::to_string(&coverage_plan)
+        .context("serializing replayed anime Debrid retry evidence")?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = 'failed',
+             state_reason = $1,
+             active = 0,
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2
+           AND download_id = $3
+           AND route_logical_id = $4
+           AND provider_id = $5",
+    )
+    .bind(reason)
+    .bind(&release_id_string)
+    .bind(&job_id_string)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id_string)
+    .execute(&mut *transaction)
+    .await
+    .context("reconciling replayed anime Debrid release job")?;
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state_reason = $1,
+             coverage_plan_json = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $3
+           AND download_id = $4
+           AND selected_route_logical_id = $5
+           AND selected_provider_id = $6
+           AND state = 'failed'",
+    )
+    .bind(reason)
+    .bind(coverage_plan_json)
+    .bind(&release_id_string)
+    .bind(&job_id_string)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id_string)
+    .execute(&mut *transaction)
+    .await
+    .context("reconciling replayed anime Debrid retry evidence")?;
+    if release_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(AnimeDebridRetryClaim::LostOwnership);
+    }
+    transaction.commit().await?;
+    Ok(AnimeDebridRetryClaim::Owned {
+        target_ids,
+        provider_id: job.provider_id,
+    })
+}
+
+async fn anime_debrid_retry_coverage_plan_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    release_id: Uuid,
+) -> Result<Option<Value>> {
+    let raw = sqlx::query_scalar::<sqlx::Any, Option<String>>(
+        "SELECT CAST(coverage_plan_json AS TEXT)
+         FROM acquisition_releases
+         WHERE release_id = $1",
+    )
+    .bind(release_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("loading anime Debrid retry evidence")?
+    .flatten();
+    raw.map(|raw| {
+        serde_json::from_str(&raw).context("parsing acquisition release coverage plan JSON")
+    })
+    .transpose()
+}
+
+async fn anime_debrid_retry_target_ids_for_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    job_id: Uuid,
+    provider_id: Uuid,
+    retry: &AnimeDebridAutomaticRetry,
+    existing_coverage_plan: Option<&Value>,
+) -> Result<BTreeSet<Uuid>> {
+    let mut target_ids = retry.target_ids.iter().copied().collect::<BTreeSet<_>>();
+    target_ids.extend(anime_debrid_retry_evidence_target_ids(
+        existing_coverage_plan,
+    ));
+    let rows = sqlx::query_scalar::<sqlx::Any, String>(
+        "SELECT target_id
+         FROM acquisition_targets
+         WHERE download_id = $1
+           AND selected_route_logical_id = $2
+           AND selected_provider_id = $3
+           AND state NOT IN ('imported', 'excluded')",
+    )
+    .bind(job_id.to_string())
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(provider_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await
+    .context("loading exact anime Debrid retry targets")?;
+    for target_id in rows {
+        target_ids.insert(
+            Uuid::parse_str(&target_id)
+                .with_context(|| format!("acquisition target id '{target_id}' is invalid"))?,
+        );
+    }
+    Ok(target_ids)
+}
+
+async fn lock_anime_debrid_retry_targets_for_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    target_ids: &BTreeSet<Uuid>,
+    job_id: Uuid,
+    provider_id: Uuid,
+) -> Result<bool> {
+    for target_id in target_ids {
+        let lock = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_targets
+             SET updated_at = updated_at
+             WHERE target_id = $1
+               AND (
+                   state IN ('imported', 'excluded')
+                   OR (
+                       download_id = $2
+                       AND selected_route_logical_id = $3
+                       AND selected_provider_id = $4
+                   )
+                   OR (
+                       state = 'pending'
+                       AND download_id IS NULL
+                       AND selected_route_logical_id IS NULL
+                       AND selected_provider_id IS NULL
+                   )
+               )",
+        )
+        .bind(target_id.to_string())
+        .bind(job_id.to_string())
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(provider_id.to_string())
+        .execute(&mut **transaction)
+        .await
+        .context("locking exact anime Debrid retry target")?;
+        if lock.rows_affected() == 1 {
+            continue;
+        }
+        let exists = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*) FROM acquisition_targets WHERE target_id = $1",
+        )
+        .bind(target_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await
+        .context("checking anime Debrid retry target ownership")?;
+        if exists != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn anime_debrid_retry_evidence_job_id(coverage_plan: Option<&Value>) -> Option<Uuid> {
+    coverage_plan?
+        .pointer("/automaticRetry/jobId")?
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn anime_debrid_retry_evidence_target_ids(coverage_plan: Option<&Value>) -> BTreeSet<Uuid> {
+    coverage_plan
+        .and_then(|plan| plan.pointer("/automaticRetry/targetIds"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|value| Uuid::parse_str(value).ok())
+        .collect()
+}
+
+async fn reset_anime_debrid_target_for_candidate_retry_if_owned(
+    pool: &sqlx::AnyPool,
+    target_id: Uuid,
+    job_id: Uuid,
+    expected_provider_id: Uuid,
+    reason: &str,
+    retry_after: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let result = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = 'pending',
+             state_reason = $1,
+             selected_provider_id = NULL,
+             selected_route_logical_id = NULL,
+             selected_candidate_json = NULL,
+             download_id = NULL,
+             next_search_after = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE target_id = $3
+           AND (
+               (
+                   download_id = $4
+                   AND selected_route_logical_id = $5
+                   AND selected_provider_id = $6
+               )
+               OR (
+                   state = 'pending'
+                   AND download_id IS NULL
+                   AND selected_route_logical_id IS NULL
+                   AND selected_provider_id IS NULL
+               )
+           )
+           AND state NOT IN ('imported', 'excluded')",
+    )
+    .bind(reason)
+    .bind(retry_after.format("%Y-%m-%d %H:%M:%S").to_string())
+    .bind(target_id.to_string())
+    .bind(job_id.to_string())
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(expected_provider_id.to_string())
+    .execute(pool)
+    .await
+    .context("resetting exact anime Debrid retry target")?;
+    if result.rows_affected() != 1 {
+        return Ok(false);
+    }
+    if let Some(target) = get_target(pool, target_id).await? {
+        sync_library_episode_acquisition_state_for_target(pool, &target).await?;
+    }
+    Ok(true)
+}
+
+async fn stage_anime_debrid_retry_disposition(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    retry: &AnimeDebridAutomaticRetry,
+) -> Result<bool> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        bail!("Debrid job disappeared while staging anime automatic retry");
+    };
+    let Some(release_id) = job.release_id else {
+        return Ok(false);
+    };
+    let job_id = job_id.to_string();
+    let release_id = release_id.to_string();
+    let provider_id = job.provider_id.to_string();
+    let mut transaction = pool.begin().await?;
+    let ownership = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1 FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )
+           AND EXISTS (
+               SELECT 1 FROM debrid_download_jobs d
+               WHERE d.job_id = $2
+                 AND d.release_id = acquisition_releases.release_id
+                 AND d.provider_id = $4
+                 AND d.status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required')
+           )",
+    )
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .execute(&mut *transaction)
+    .await
+    .context("claiming exact anime Debrid retry staging attempt")?;
+    if ownership.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let Some(snapshot) = sqlx::query::<sqlx::Any>(
+        "SELECT status, COALESCE(provider_status_json, '') AS provider_status_json
+         FROM debrid_download_jobs
+         WHERE job_id = $1 AND release_id = $2 AND provider_id = $3",
+    )
+    .bind(&job_id)
+    .bind(&release_id)
+    .bind(&provider_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    let expected_status: String = snapshot.try_get("status")?;
+    let expected_provider_status: String = snapshot.try_get("provider_status_json")?;
+    let current_provider_status = if expected_provider_status.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str(&expected_provider_status).ok()
+    };
+    let provider_status = merge_debrid_evidence_object(
+        current_provider_status,
+        "animeAutomaticRetry",
+        serde_json::to_value(retry).context("serializing anime Debrid retry disposition")?,
+    );
+    let update = sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET status = 'anime_retry_pending',
+             provider_status_json = $1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $2
+           AND release_id = $3
+           AND provider_id = $4
+           AND status = $5
+           AND COALESCE(provider_status_json, '') = $6",
+    )
+    .bind(serde_json::to_string(&provider_status)?)
+    .bind(&job_id)
+    .bind(&release_id)
+    .bind(&provider_id)
+    .bind(&expected_status)
+    .bind(&expected_provider_status)
+    .execute(&mut *transaction)
+    .await?;
+    if update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+fn anime_debrid_retry_disposition_from_job(
+    job: &DebridDownloadJob,
+) -> Option<AnimeDebridAutomaticRetry> {
+    serde_json::from_value(
+        job.provider_status
+            .as_ref()?
+            .get("animeAutomaticRetry")?
+            .clone(),
+    )
+    .ok()
+}
+
+async fn mark_anime_debrid_retry_job_failed(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    reason: &str,
+) -> Result<()> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(());
+    };
+    let mut provider_status = match job.provider_status {
+        Some(Value::Object(object)) => object,
+        Some(previous) => {
+            serde_json::Map::from_iter([("previousProviderStatus".to_string(), previous)])
+        }
+        None => serde_json::Map::new(),
+    };
+    let consumed_retry = provider_status.remove("animeAutomaticRetry");
+    if let Some(retry) = consumed_retry {
+        provider_status.insert(
+            "animeAutomaticRetryConsumed".to_string(),
+            json!({
+                "status": "consumed",
+                "retry": retry,
+                "consumedAt": chrono::Utc::now(),
+                "policyVersion": "alm7-debrid-anime-retry-consumption-v1"
+            }),
+        );
+    }
+    let provider_status_json = serde_json::to_string(&Value::Object(provider_status))
+        .context("serializing consumed anime Debrid retry disposition")?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET status = 'failed',
+             remote_release_status = 'failed',
+             last_error = $1,
+             selection_error = NULL,
+             provider_status_json = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $3",
+    )
+    .bind(reason)
+    .bind(provider_status_json)
+    .bind(job_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_stale_anime_debrid_provider_job(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    reason: &str,
+) -> Result<()> {
+    // Only the superseded provider-attempt row is ours to terminalize. The
+    // shared release, targets, files, coverage, and remote object belong to
+    // the newer exact attempt and are intentionally untouched.
+    sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET status = 'failed', last_error = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $2
+           AND status NOT IN ('completed', 'failed', 'cancelled')",
+    )
+    .bind(reason)
+    .bind(job_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn merge_anime_debrid_retry_evidence(
+    coverage_plan: Option<Value>,
+    job_id: Uuid,
+    remote_release_id: &str,
+    retry: &AnimeDebridAutomaticRetry,
+    target_ids: &BTreeSet<Uuid>,
+    cleanup: Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let coverage_plan = merge_debrid_evidence_object(
+        coverage_plan,
+        "automaticRetry",
+        json!({
+            "status": "scheduled",
+            "reason": retry.reason_code,
+            "jobId": job_id,
+            "remoteReleaseId": remote_release_id,
+            "targetIds": target_ids,
+            "retryDelaySeconds": ANIME_DEBRID_CANDIDATE_RETRY_SECONDS,
+            "scheduledAt": now,
+            "policyVersion": "alm7-debrid-anime-retry-v1",
+            "providerCleanup": cleanup
+        }),
+    );
+    merge_debrid_evidence_object(
+        Some(coverage_plan),
+        "retrySuppression",
+        json!({
+            "status": if retry.suppress_automatic_rediscovery { "rejected" } else { "retryable" },
+            "suppressAutomaticRediscovery": retry.suppress_automatic_rediscovery,
+            "reason": retry.reason_code,
+            "failedAt": now,
+        }),
+    )
 }
 
 fn decide_debrid_file_selection(
@@ -6907,7 +9347,9 @@ fn decide_debrid_file_selection(
     coverage: &[AcquisitionReleaseCoverage],
     inspection: &DebridReleaseInspection,
 ) -> DebridFileSelectionDecision {
-    if let Some(decision) = approved_debrid_user_override(release, files, &inspection.capabilities)
+    if release.media_type != MediaType::Anime
+        && let Some(decision) =
+            approved_debrid_user_override(release, files, &inspection.capabilities)
     {
         return decision.with_inferred_target_file_selections(release, files, coverage);
     }
@@ -6917,10 +9359,6 @@ fn decide_debrid_file_selection(
     if release.confidence != ReleaseConfidence::High {
         review_reasons.insert("coverage_not_high_confidence".to_string());
     }
-    if !capabilities.supports_file_selection {
-        review_reasons.insert("file_selection_unsupported".to_string());
-    }
-
     let selectable_files = files
         .iter()
         .filter(|file| file.selectable)
@@ -6993,6 +9431,9 @@ fn decide_debrid_file_selection(
                 .or_else(|| file.file_id.clone())
         })
         .collect::<BTreeSet<_>>();
+    if !capabilities.supports_file_selection && selected_file_ids != selectable_media_ids {
+        review_reasons.insert("file_selection_unsupported".to_string());
+    }
     let missing_wanted_media = selectable_media_ids
         .difference(&selected_file_ids)
         .cloned()
@@ -7058,6 +9499,15 @@ fn decide_debrid_file_selection(
 }
 
 fn release_allows_scoped_overfetch_skip(release: &AcquisitionRelease) -> bool {
+    if release.media_type == MediaType::Anime
+        && release.coverage_plan.as_ref().is_some_and(|plan| {
+            plan.pointer("/automaticResolution/selectionPolicyReady")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+    {
+        return true;
+    }
     let Some(evidence) = release
         .coverage_plan
         .as_ref()
@@ -7860,24 +10310,24 @@ async fn persist_debrid_selection_decision(
     files: &[AcquisitionReleaseFile],
     coverage: &[AcquisitionReleaseCoverage],
     decision: &DebridFileSelectionDecision,
-) -> Result<()> {
-    update_debrid_job_selection_decision(pool, job_id, decision).await?;
+) -> Result<bool> {
     let selected_ids = decision
         .selected_file_ids
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
-    for file in files {
-        let provider_id = file.provider_file_id.as_ref().or(file.file_id.as_ref());
-        update_release_file_selected(
-            pool,
-            file.release_file_id,
-            provider_id
-                .map(|file_id| selected_ids.contains(file_id))
-                .unwrap_or(false),
-        )
-        .await?;
-    }
+    let file_updates = files
+        .iter()
+        .map(|file| {
+            let provider_id = file.provider_file_id.as_ref().or(file.file_id.as_ref());
+            (
+                file.release_file_id,
+                provider_id
+                    .map(|file_id| selected_ids.contains(file_id))
+                    .unwrap_or(false),
+            )
+        })
+        .collect::<Vec<_>>();
     let file_aliases = synthetic_source_candidate_release_file_aliases(files);
     let selected_provider_file_to_release_file = files
         .iter()
@@ -7916,27 +10366,27 @@ async fn persist_debrid_selection_decision(
         })
         .chain(target_selection_by_target_id.keys().copied())
         .collect::<HashSet<_>>();
-    for entry in coverage {
-        let release_file_id = entry
-            .release_file_id
-            .and_then(|release_file_id| {
-                file_aliases
-                    .get(&release_file_id)
-                    .copied()
-                    .or(Some(release_file_id))
-            })
-            .or_else(|| target_selection_by_target_id.get(&entry.target_id).copied());
-        let selected = release_file_id
-            .and_then(|release_file_id| {
-                files
-                    .iter()
-                    .find(|file| file.release_file_id == release_file_id)
-            })
-            .and_then(|file| file.provider_file_id.as_ref().or(file.file_id.as_ref()))
-            .map(|file_id| selected_ids.contains(file_id))
-            .unwrap_or(false);
-        upsert_release_coverage(
-            pool,
+    let coverage_updates = coverage
+        .iter()
+        .map(|entry| {
+            let release_file_id = entry
+                .release_file_id
+                .and_then(|release_file_id| {
+                    file_aliases
+                        .get(&release_file_id)
+                        .copied()
+                        .or(Some(release_file_id))
+                })
+                .or_else(|| target_selection_by_target_id.get(&entry.target_id).copied());
+            let selected = release_file_id
+                .and_then(|release_file_id| {
+                    files
+                        .iter()
+                        .find(|file| file.release_file_id == release_file_id)
+                })
+                .and_then(|file| file.provider_file_id.as_ref().or(file.file_id.as_ref()))
+                .map(|file_id| selected_ids.contains(file_id))
+                .unwrap_or(false);
             NewAcquisitionReleaseCoverage {
                 coverage_id: Some(entry.coverage_id),
                 release_id: entry.release_id,
@@ -7959,10 +10409,9 @@ async fn persist_debrid_selection_decision(
                     ReleaseCoverageState::ReviewRequired
                 },
                 verified_by: entry.verified_by.clone(),
-            },
-        )
-        .await?;
-    }
+            }
+        })
+        .collect::<Vec<_>>();
     let state = if decision.is_approved() {
         AcquisitionReleaseState::Ready
     } else {
@@ -7973,6 +10422,27 @@ async fn persist_debrid_selection_decision(
     } else {
         "RR-4F deterministic file selection requires review."
     };
+    if release.media_type == MediaType::Anime {
+        return persist_anime_debrid_selection_intent_if_owned(
+            pool,
+            job_id,
+            release,
+            &file_updates,
+            &coverage_updates,
+            decision,
+            state,
+            reason,
+        )
+        .await;
+    }
+
+    update_debrid_job_selection_decision(pool, job_id, decision).await?;
+    for (release_file_id, selected) in file_updates {
+        update_release_file_selected(pool, release_file_id, selected).await?;
+    }
+    for update in coverage_updates {
+        upsert_release_coverage(pool, update).await?;
+    }
     update_debrid_release_selection_evidence(pool, release, state, reason, decision).await?;
     update_debrid_release_job_selection_state(
         pool,
@@ -7986,7 +10456,222 @@ async fn persist_debrid_selection_decision(
         reason,
     )
     .await?;
-    Ok(())
+    Ok(true)
+}
+
+async fn persist_anime_debrid_selection_intent_if_owned(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    release: &AcquisitionRelease,
+    file_updates: &[(Uuid, bool)],
+    coverage_updates: &[NewAcquisitionReleaseCoverage],
+    decision: &DebridFileSelectionDecision,
+    state: AcquisitionReleaseState,
+    reason: &str,
+) -> Result<bool> {
+    debug_assert_eq!(release.media_type, MediaType::Anime);
+    let Some(provider_id) = release.selected_provider_id else {
+        return Ok(false);
+    };
+    let Some(remote_release_id) = release.remote_release_id.as_deref() else {
+        return Ok(false);
+    };
+    let release_id = release.release_id.to_string();
+    let job_id = job_id.to_string();
+    let provider_id = provider_id.to_string();
+    let mut transaction = pool.begin().await?;
+    let ownership = lock_anime_debrid_selection_attempt(
+        &mut transaction,
+        &release_id,
+        &job_id,
+        &provider_id,
+        remote_release_id,
+    )
+    .await?;
+    if !ownership {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let selected = serde_json::to_string(&decision.selected_file_ids)?;
+    let skipped = serde_json::to_string(&decision.skipped_file_ids)?;
+    let error = (!decision.is_approved()).then(|| decision.review_reasons.join(","));
+    let job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE debrid_download_jobs
+         SET selected_file_ids_json = $1,
+             skipped_file_ids_json = $2,
+             selection_error = $3,
+             status = CASE WHEN $4 THEN status ELSE 'review_required' END,
+             remote_release_status = CASE WHEN $4 THEN remote_release_status ELSE 'review_required' END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $5
+           AND release_id = $6
+           AND provider_id = $7
+           AND COALESCE(remote_release_id, remote_torrent_id, '') = $8
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')",
+    )
+    .bind(selected)
+    .bind(skipped)
+    .bind(error.as_deref())
+    .bind(decision.is_approved())
+    .bind(&job_id)
+    .bind(&release_id)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await?;
+    if job_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    for (release_file_id, selected) in file_updates {
+        let update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_files
+             SET selected = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE release_file_id = $2 AND release_id = $3",
+        )
+        .bind(if *selected { 1_i64 } else { 0_i64 })
+        .bind(release_file_id.to_string())
+        .bind(&release_id)
+        .execute(&mut *transaction)
+        .await?;
+        if update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    for update in coverage_updates {
+        let Some(coverage_id) = update.coverage_id else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        let coverage_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_coverage
+             SET release_file_id = $1, coverage_kind = $2, confidence = $3,
+                 score = $4, reason = $5, state = $6, verified_by = $7,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE coverage_id = $8 AND release_id = $9",
+        )
+        .bind(update.release_file_id.map(|value| value.to_string()))
+        .bind(update.coverage_kind.as_str())
+        .bind(update.confidence.as_str())
+        .bind(update.score)
+        .bind(update.reason.as_deref())
+        .bind(update.state.as_str())
+        .bind(update.verified_by.as_deref())
+        .bind(coverage_id.to_string())
+        .bind(&release_id)
+        .execute(&mut *transaction)
+        .await?;
+        if coverage_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    let coverage_plan = merge_selection_policy_evidence(release.coverage_plan.clone(), decision);
+    let coverage_plan_json = serde_json::to_string(&coverage_plan)?;
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = $1, state_reason = $2, coverage_plan_json = $3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $4
+           AND download_id = $5
+           AND selected_route_logical_id = $6
+           AND selected_provider_id = $7
+           AND remote_release_id = $8
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')",
+    )
+    .bind(state.as_str())
+    .bind(reason)
+    .bind(coverage_plan_json)
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await?;
+    if release_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let release_job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1, state_reason = $2, active = 1,
+             completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $3
+           AND download_id = $4
+           AND route_logical_id = $5
+           AND provider_id = $6
+           AND remote_release_id = $7
+           AND active = 1",
+    )
+    .bind(if decision.is_approved() {
+        ReleaseJobState::Ready.as_str()
+    } else {
+        ReleaseJobState::Staging.as_str()
+    })
+    .bind(reason)
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await?;
+    if release_job_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn lock_anime_debrid_selection_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    release_id: &str,
+    job_id: &str,
+    provider_id: &str,
+    remote_release_id: &str,
+) -> Result<bool> {
+    let lock = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND remote_release_id = $5
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1 FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.remote_release_id = $5
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )
+           AND EXISTS (
+               SELECT 1 FROM debrid_download_jobs d
+               WHERE d.job_id = $2
+                 AND d.release_id = acquisition_releases.release_id
+                 AND d.provider_id = $4
+                 AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = $5
+                 AND d.status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')
+           )",
+    )
+    .bind(release_id)
+    .bind(job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(provider_id)
+    .bind(remote_release_id)
+    .execute(&mut **transaction)
+    .await
+    .context("locking exact anime Debrid selection attempt")?;
+    Ok(lock.rows_affected() == 1)
 }
 
 async fn mark_debrid_selection_applied(
@@ -7994,7 +10679,91 @@ async fn mark_debrid_selection_applied(
     release: &AcquisitionRelease,
     job_id: Uuid,
     inspection: &DebridReleaseInspection,
-) -> Result<()> {
+) -> Result<bool> {
+    if release.media_type == MediaType::Anime {
+        let Some(provider_id) = release.selected_provider_id else {
+            return Ok(false);
+        };
+        let release_id = release.release_id.to_string();
+        let job_id = job_id.to_string();
+        let provider_id = provider_id.to_string();
+        let remote_release_id = inspection.release.remote_release_id.trim();
+        let mut transaction = pool.begin().await?;
+        if remote_release_id.is_empty()
+            || !lock_anime_debrid_selection_attempt(
+                &mut transaction,
+                &release_id,
+                &job_id,
+                &provider_id,
+                remote_release_id,
+            )
+            .await?
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        persist_anime_debrid_files_in_transaction(
+            &mut transaction,
+            release.release_id,
+            &inspection.files,
+        )
+        .await?;
+        let release_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET state = $1, state_reason = $2, updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $3
+               AND download_id = $4
+               AND selected_route_logical_id = $5
+               AND selected_provider_id = $6
+               AND remote_release_id = $7",
+        )
+        .bind(acquisition_state_for_debrid_status(inspection.release.status).as_str())
+        .bind("Debrid provider accepted deterministic file selection.")
+        .bind(&release_id)
+        .bind(&job_id)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(&provider_id)
+        .bind(remote_release_id)
+        .execute(&mut *transaction)
+        .await?;
+        if release_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let state = release_job_state_for_debrid_status(inspection.release.status);
+        let terminal = matches!(
+            state,
+            ReleaseJobState::Completed | ReleaseJobState::Failed | ReleaseJobState::Cancelled
+        );
+        let release_job_update = sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = $1, state_reason = $2, active = $3,
+                 completed_at = CASE WHEN $3 = 0 THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $4
+               AND download_id = $5
+               AND route_logical_id = $6
+               AND provider_id = $7
+               AND remote_release_id = $8
+               AND active = 1",
+        )
+        .bind(state.as_str())
+        .bind("Debrid provider accepted deterministic file selection.")
+        .bind(if terminal { 0_i64 } else { 1_i64 })
+        .bind(&release_id)
+        .bind(&job_id)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(&provider_id)
+        .bind(remote_release_id)
+        .execute(&mut *transaction)
+        .await?;
+        if release_job_update.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        return Ok(true);
+    }
     update_release_state(
         pool,
         release.release_id,
@@ -8011,7 +10780,7 @@ async fn mark_debrid_selection_applied(
         "Debrid provider accepted deterministic file selection.",
     )
     .await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn update_debrid_job_selection_decision(
@@ -8979,15 +11748,8 @@ async fn process_debrid_jobs_once(state: &AppState) -> Result<()> {
                 &worker_state.settings.extensions.storage_root,
                 &worker_state.settings.library.local_root,
             );
-            if let Err(err) = process_debrid_job(&worker_state, &store, &paths, job.clone()).await {
-                mark_debrid_job_status(
-                    &worker_state.db_pool,
-                    job.job_id,
-                    "failed",
-                    Some(&err.to_string()),
-                )
-                .await?;
-            }
+            let result = process_debrid_job(&worker_state, &store, &paths, job.clone()).await;
+            handle_debrid_job_processing_result(&worker_state, &store, &job, result).await?;
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -8999,6 +11761,112 @@ async fn process_debrid_jobs_once(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+async fn handle_debrid_job_processing_result(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    job: &DebridDownloadJob,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => handle_debrid_job_processing_error(state, store, job, &error).await,
+    }
+}
+
+async fn handle_debrid_job_processing_error(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    job: &DebridDownloadJob,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let release = match job.release_id {
+        Some(release_id) => get_release(&state.db_pool, release_id).await?,
+        None => None,
+    };
+    let Some(release) = release.filter(|release| release.media_type == MediaType::Anime) else {
+        return mark_debrid_job_status(
+            &state.db_pool,
+            job.job_id,
+            "failed",
+            Some(&error.to_string()),
+        )
+        .await;
+    };
+    if debrid_release_bookkeeping_pending(&release)
+        && chrono::Utc::now()
+            .signed_duration_since(release.updated_at)
+            .num_seconds()
+            .max(0)
+            < ANIME_DEBRID_CANDIDATE_RETRY_SECONDS
+    {
+        // The acquisition writer still owns this fresh half-commit. A worker
+        // or adapter error must not race it into a terminal retry state.
+        return Ok(());
+    }
+
+    let retry = anime_debrid_runtime_error_retry_disposition(
+        &state.db_pool,
+        job.job_id,
+        &release,
+        "anime_debrid_worker_error",
+        error,
+    )
+    .await?;
+    stage_anime_debrid_retry_disposition(&state.db_pool, job.job_id, &retry).await?;
+    let remote_release_id = job
+        .remote_release_id
+        .as_deref()
+        .or(job.remote_torrent_id.as_deref())
+        .unwrap_or_default();
+    let provider_implementation = job
+        .provider_implementation
+        .as_deref()
+        .unwrap_or("unavailable");
+    let factory = DebridAdapterFactory::from_state(state);
+    match factory
+        .adapter_for_job_implementation(
+            store,
+            job.instance_id,
+            job.provider_implementation.as_deref(),
+        )
+        .await
+    {
+        Ok(adapter) => {
+            persist_anime_debrid_retry_with_adapter(
+                &state.db_pool,
+                &*adapter,
+                job.job_id,
+                &release,
+                remote_release_id,
+                provider_implementation,
+                &retry,
+            )
+            .await
+        }
+        Err(adapter_error) => {
+            tracing::warn!(
+                debrid_job_id = %job.job_id,
+                provider_implementation,
+                "recovering anime Debrid worker failure without remote cleanup: {adapter_error}"
+            );
+            let cleanup = sanitize_anime_automatic_resolution_evidence(json!({
+                "status": "adapter_unavailable",
+                "deleted": false,
+                "error": adapter_error.to_string()
+            }));
+            persist_anime_debrid_retry(
+                &state.db_pool,
+                job.job_id,
+                &release,
+                remote_release_id,
+                &retry,
+                cleanup,
+            )
+            .await
+        }
+    }
+}
+
 async fn process_debrid_job(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -9008,7 +11876,141 @@ async fn process_debrid_job(
     if job.status == "paused" || job.status == "cancelled" {
         return Ok(());
     }
+    let mut job = job;
     let factory = DebridAdapterFactory::from_state(state);
+    if let Some(release_id) = job.release_id
+        && let Some(release) = get_release(&state.db_pool, release_id).await?
+        && release.media_type == MediaType::Anime
+        && debrid_release_bookkeeping_pending(&release)
+    {
+        let bookkeeping_age = chrono::Utc::now()
+            .signed_duration_since(release.updated_at)
+            .num_seconds()
+            .max(0);
+        if bookkeeping_age < ANIME_DEBRID_CANDIDATE_RETRY_SECONDS {
+            return Ok(());
+        }
+        let error = anyhow!(
+            "anime Debrid submission bookkeeping did not complete before its recovery deadline"
+        );
+        let retry = anime_debrid_runtime_error_retry_disposition(
+            &state.db_pool,
+            job.job_id,
+            &release,
+            "anime_debrid_submission_bookkeeping_timeout",
+            &error,
+        )
+        .await?;
+        stage_anime_debrid_retry_disposition(&state.db_pool, job.job_id, &retry).await?;
+        let remote_release_id = job
+            .remote_release_id
+            .as_deref()
+            .or(job.remote_torrent_id.as_deref())
+            .unwrap_or_default();
+        let provider_implementation = job
+            .provider_implementation
+            .as_deref()
+            .unwrap_or("unavailable");
+        match factory
+            .adapter_for_job_implementation(
+                store,
+                job.instance_id,
+                job.provider_implementation.as_deref(),
+            )
+            .await
+        {
+            Ok(adapter) => {
+                persist_anime_debrid_retry_with_adapter(
+                    &state.db_pool,
+                    &*adapter,
+                    job.job_id,
+                    &release,
+                    remote_release_id,
+                    provider_implementation,
+                    &retry,
+                )
+                .await?;
+            }
+            Err(adapter_error) => {
+                persist_anime_debrid_retry(
+                    &state.db_pool,
+                    job.job_id,
+                    &release,
+                    remote_release_id,
+                    &retry,
+                    sanitize_anime_automatic_resolution_evidence(json!({
+                        "status": "adapter_unavailable",
+                        "deleted": false,
+                        "error": adapter_error.to_string()
+                    })),
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+    if stage_deferred_anime_debrid_provider_failure_if_ready(&state.db_pool, &job).await? {
+        job = load_debrid_job(&state.db_pool, job.job_id)
+            .await?
+            .ok_or_else(|| anyhow!("Debrid job disappeared while staging provider failure"))?;
+    }
+    if let Some(automatic_retry) = anime_debrid_retry_disposition_from_job(&job)
+        && let Some(release_id) = job.release_id
+        && let Some(release) = get_release(&state.db_pool, release_id).await?
+        && release.media_type == MediaType::Anime
+    {
+        let remote_release_id = job
+            .remote_release_id
+            .clone()
+            .or_else(|| job.remote_torrent_id.clone())
+            .unwrap_or_default();
+        let provider_implementation = job
+            .provider_implementation
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+        match factory
+            .adapter_for_job_implementation(
+                store,
+                job.instance_id,
+                job.provider_implementation.as_deref(),
+            )
+            .await
+        {
+            Ok(adapter) => {
+                persist_anime_debrid_retry_with_adapter(
+                    &state.db_pool,
+                    &*adapter,
+                    job.job_id,
+                    &release,
+                    &remote_release_id,
+                    &provider_implementation,
+                    &automatic_retry,
+                )
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    debrid_job_id = %job.job_id,
+                    provider_implementation,
+                    "consuming staged anime Debrid retry without remote cleanup: {error}"
+                );
+                persist_anime_debrid_retry(
+                    &state.db_pool,
+                    job.job_id,
+                    &release,
+                    &remote_release_id,
+                    &automatic_retry,
+                    json!({
+                        "status": "adapter_unavailable",
+                        "deleted": false,
+                        "error": error.to_string()
+                    }),
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
     let adapter = factory
         .adapter_for_job_implementation(
             store,
@@ -9016,7 +12018,6 @@ async fn process_debrid_job(
             job.provider_implementation.as_deref(),
         )
         .await?;
-    let mut job = job;
     let remote_torrent_release_id = job.remote_torrent_id.clone().or_else(|| {
         (job.source_kind == "magnet")
             .then(|| job.remote_release_id.clone())
@@ -9041,17 +12042,63 @@ async fn process_debrid_job(
         && let Some(remote_release_id) = remote_torrent_release_id
     {
         let inspection = adapter.inspect_release(&remote_release_id).await?;
-        update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection).await?;
+        if !update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection).await? {
+            return Ok(());
+        }
+        if consume_failed_anime_debrid_inspection(
+            &state.db_pool,
+            &*adapter,
+            job.job_id,
+            &inspection,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         cleanup_uncached_no_seed_release(&state.db_pool, &*adapter, job.job_id, &inspection)
             .await?;
         job = load_debrid_job(&state.db_pool, job.job_id)
             .await?
             .ok_or_else(|| anyhow!("Debrid job disappeared during refresh"))?;
+        if let Some(release_id) = job.release_id
+            && let Some(release) = get_release(&state.db_pool, release_id).await?
+            && release.media_type == MediaType::Anime
+            && !anime_debrid_attempt_is_current(
+                &state.db_pool,
+                &release,
+                job.provider_id,
+                job.job_id,
+                &inspection.release.remote_release_id,
+            )
+            .await?
+        {
+            mark_stale_anime_debrid_provider_job(
+                &state.db_pool,
+                job.job_id,
+                "Superseded by a newer anime Debrid attempt.",
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(release_id) = job.release_id
+            && let Some(release) = get_release(&state.db_pool, release_id).await?
+            && replay_ready_anime_debrid_provider_selection(
+                &state.db_pool,
+                &*adapter,
+                &job,
+                &release,
+                &inspection,
+            )
+            .await?
+        {
+            // Ready is durable provider intent. Reconciliation or replay owns
+            // this tick; a later inspection advances transfer/materialization.
+            return Ok(());
+        }
         if matches!(
             inspection.release.status,
             DebridReleaseStatus::WaitingFiles | DebridReleaseStatus::Downloaded
         ) && job.source_kind == "magnet"
-            && job.selected_file_ids.is_empty()
             && !inspection.files.is_empty()
             && let Some(release_id) = job.release_id
             && let Some(release) = crate::acquisition::release_resolution::store::get_release(
@@ -9059,6 +12106,7 @@ async fn process_debrid_job(
                 release_id,
             )
             .await?
+            && debrid_provider_selection_needs_application(&job.selected_file_ids, release.state)
         {
             let release_context = DebridReleaseSubmitContext {
                 subscription_id: release.subscription_id,
@@ -9080,66 +12128,108 @@ async fn process_debrid_job(
                 release_context: Some(release_context),
             };
             let provider_capabilities = adapter.capabilities();
+            let anime_matching = state.anime_inference.matching_service();
             let refinement = persist_debrid_file_list_and_refine_coverage(
                 &state.db_pool,
                 &release,
                 &options,
                 &inspection,
+                &anime_matching,
             )
             .await?;
-            let refinement_state = refinement.state;
-            let refinement_state_reason = refinement.state_reason.clone();
-            let refinement_shape = refinement.shape.clone();
             let refinement_coverage_plan = merge_debrid_coverage_plans(
                 release.coverage_plan.clone(),
                 refinement.coverage_plan.clone(),
             );
-            let refinement_job_state = refinement.job_state;
-            let refinement_job_state_reason = refinement.job_state_reason.clone();
-            let updated_release = upsert_debrid_acquisition_release(
-                &state.db_pool,
+            let automatic_retry = refinement.automatic_retry.clone();
+            let coverage_plan = Some(merge_debrid_provider_provenance(
+                refinement_coverage_plan,
                 job.provider_id,
-                &job.source,
+                adapter.implementation(),
+                &provider_capabilities,
+                Some(&inspection.release.remote_release_id),
+                Some(inspection.release.status.as_str()),
                 &job.source_kind,
-                &options,
-                Some(&inspection.release.remote_release_id),
-                Some(&job.job_id.to_string()),
-                refinement_state,
-                refinement_state_reason.as_deref(),
-                refinement_shape,
-                Some(merge_debrid_provider_provenance(
-                    refinement_coverage_plan,
+                Some(job.job_id),
+            ));
+            let updated_release = if release.media_type == MediaType::Anime {
+                let Some(updated) = commit_anime_debrid_refinement_if_owned(
+                    &state.db_pool,
+                    &release,
                     job.provider_id,
-                    adapter.implementation(),
-                    &provider_capabilities,
-                    Some(&inspection.release.remote_release_id),
-                    Some(inspection.release.status.as_str()),
+                    job.job_id,
+                    &inspection,
+                    &refinement,
+                    coverage_plan,
+                )
+                .await?
+                else {
+                    mark_stale_anime_debrid_provider_job(
+                        &state.db_pool,
+                        job.job_id,
+                        "Superseded by a newer anime Debrid attempt.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                updated
+            } else {
+                let updated = upsert_debrid_acquisition_release(
+                    &state.db_pool,
+                    job.provider_id,
+                    &job.source,
                     &job.source_kind,
-                    Some(job.job_id),
-                )),
-            )
-            .await?
-            .unwrap_or(release);
-            upsert_debrid_release_job(
-                &state.db_pool,
-                &updated_release,
-                job.provider_id,
-                job.job_id,
-                Some(&inspection.release.remote_release_id),
-                refinement_job_state,
-                refinement_job_state_reason
-                    .as_deref()
-                    .unwrap_or("Debrid release inspected and staged."),
-            )
-            .await?;
-            let _ = apply_debrid_file_selection_policy(
-                &state.db_pool,
-                &*adapter,
-                job.job_id,
-                &updated_release,
-                &inspection,
-            )
-            .await?;
+                    &options,
+                    Some(&inspection.release.remote_release_id),
+                    Some(&job.job_id.to_string()),
+                    refinement.state,
+                    refinement.state_reason.as_deref(),
+                    refinement.shape.clone(),
+                    coverage_plan,
+                )
+                .await?
+                .unwrap_or(release);
+                upsert_debrid_release_job(
+                    &state.db_pool,
+                    &updated,
+                    job.provider_id,
+                    job.job_id,
+                    Some(&inspection.release.remote_release_id),
+                    refinement.job_state,
+                    refinement
+                        .job_state_reason
+                        .as_deref()
+                        .unwrap_or("Debrid release inspected and staged."),
+                )
+                .await?;
+                updated
+            };
+            if let Some(automatic_retry) = automatic_retry.as_ref() {
+                stage_anime_debrid_retry_disposition(&state.db_pool, job.job_id, automatic_retry)
+                    .await?;
+                persist_anime_debrid_retry_with_adapter(
+                    &state.db_pool,
+                    &*adapter,
+                    job.job_id,
+                    &updated_release,
+                    &inspection.release.remote_release_id,
+                    &inspection.release.provider_implementation,
+                    automatic_retry,
+                )
+                .await?;
+                return Ok(());
+            }
+            if refinement.apply_file_selection_policy {
+                let _ = apply_debrid_file_selection_policy(
+                    &state.db_pool,
+                    &*adapter,
+                    job.job_id,
+                    &updated_release,
+                    &inspection,
+                    true,
+                )
+                .await?;
+            }
             job = load_debrid_job(&state.db_pool, job.job_id)
                 .await?
                 .ok_or_else(|| anyhow!("Debrid job disappeared during selection"))?;
@@ -9169,13 +12259,217 @@ async fn process_debrid_job(
     materialize_debrid_links(state, &*adapter, paths, &job).await
 }
 
+async fn stage_deferred_anime_debrid_provider_failure_if_ready(
+    pool: &sqlx::AnyPool,
+    job: &DebridDownloadJob,
+) -> Result<bool> {
+    if job.status != "anime_retry_pending"
+        || anime_debrid_retry_disposition_from_job(job).is_some()
+        || job.remote_release_status.as_deref() != Some(DebridReleaseStatus::Failed.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(release_id) = job.release_id else {
+        return Ok(false);
+    };
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(false);
+    };
+    if release.media_type != MediaType::Anime || debrid_release_bookkeeping_pending(&release) {
+        return Ok(false);
+    }
+
+    // The provider can reject a magnet synchronously while the acquisition
+    // writer still owns its bookkeeping barrier. Once that barrier closes,
+    // turn the already-durable provider result into the normal automatic
+    // retry marker without requiring another provider inspection.
+    let error = anyhow!("Debrid provider rejected the anime release during submission");
+    let retry = anime_debrid_runtime_error_retry_disposition(
+        pool,
+        job.job_id,
+        &release,
+        "anime_debrid_provider_failed",
+        &error,
+    )
+    .await?;
+    stage_anime_debrid_retry_disposition(pool, job.job_id, &retry).await
+}
+
+/// `Ready` is the durable provider-selection intent. The selected IDs are
+/// persisted before the remote call, so a restart must replay them until the
+/// provider response advances the release away from `Ready`.
+fn debrid_provider_selection_needs_application(
+    selected_file_ids: &[String],
+    release_state: AcquisitionReleaseState,
+) -> bool {
+    selected_file_ids.is_empty() || release_state == AcquisitionReleaseState::Ready
+}
+
+fn debrid_inspection_confirms_provider_selection_applied(
+    inspection: &DebridReleaseInspection,
+    expected_file_ids: &[String],
+) -> bool {
+    if expected_file_ids.is_empty() {
+        return false;
+    }
+    if matches!(
+        inspection.release.status,
+        DebridReleaseStatus::Selected
+            | DebridReleaseStatus::Transferring
+            | DebridReleaseStatus::Downloaded
+            | DebridReleaseStatus::Materializing
+            | DebridReleaseStatus::Completed
+    ) {
+        return true;
+    }
+
+    let expected = expected_file_ids
+        .iter()
+        .map(|file_id| file_id.trim())
+        .filter(|file_id| !file_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    let observed = inspection
+        .selection
+        .as_ref()
+        .into_iter()
+        .flat_map(|selection| selection.selected_file_ids.iter())
+        .map(|file_id| file_id.trim())
+        .filter(|file_id| !file_id.is_empty())
+        .chain(
+            inspection
+                .files
+                .iter()
+                .filter(|file| file.selected == Some(true))
+                .map(|file| file.provider_file_id.trim())
+                .filter(|file_id| !file_id.is_empty()),
+        )
+        .collect::<BTreeSet<_>>();
+    !expected.is_empty() && observed == expected
+}
+
+/// Reconcile or replay an exact persisted anime selection before recomputing
+/// coverage. The provider call is outside the database transaction, so exact
+/// attempt ownership is checked both before and after it; the final applied
+/// state is committed through the existing owner-CAS transaction.
+async fn replay_ready_anime_debrid_provider_selection<A: DebridProviderAdapter + ?Sized>(
+    pool: &sqlx::AnyPool,
+    adapter: &A,
+    job: &DebridDownloadJob,
+    release: &AcquisitionRelease,
+    inspection: &DebridReleaseInspection,
+) -> Result<bool> {
+    if release.media_type != MediaType::Anime
+        || release.state != AcquisitionReleaseState::Ready
+        || job.selected_file_ids.is_empty()
+    {
+        return Ok(false);
+    }
+    let Some(provider_id) = release.selected_provider_id else {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job.job_id,
+            "Anime Debrid Ready selection lost its provider ownership.",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let remote_release_id = inspection.release.remote_release_id.trim();
+    if remote_release_id.is_empty()
+        || !anime_debrid_attempt_is_current(
+            pool,
+            release,
+            provider_id,
+            job.job_id,
+            remote_release_id,
+        )
+        .await?
+    {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job.job_id,
+            "Superseded before replaying anime Debrid provider selection.",
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    if debrid_inspection_confirms_provider_selection_applied(inspection, &job.selected_file_ids) {
+        if !mark_debrid_selection_applied(pool, release, job.job_id, inspection).await? {
+            mark_stale_anime_debrid_provider_job(
+                pool,
+                job.job_id,
+                "Superseded while reconciling anime Debrid provider selection.",
+            )
+            .await?;
+        }
+        return Ok(true);
+    }
+    if !inspection.capabilities.supports_file_selection {
+        return Ok(false);
+    }
+
+    let selected = adapter
+        .select_files(remote_release_id, &job.selected_file_ids)
+        .await
+        .with_context(|| {
+            format!(
+                "replaying persisted anime Debrid selection for remote release '{remote_release_id}'"
+            )
+        })?;
+    if !anime_debrid_attempt_is_current(pool, release, provider_id, job.job_id, remote_release_id)
+        .await?
+    {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job.job_id,
+            "Superseded during anime Debrid provider-selection replay.",
+        )
+        .await?;
+        return Ok(true);
+    }
+    if !update_debrid_job_from_inspection(pool, job.job_id, &selected).await? {
+        return Ok(true);
+    }
+    if consume_failed_anime_debrid_inspection(pool, adapter, job.job_id, &selected).await? {
+        return Ok(true);
+    }
+    if !mark_debrid_selection_applied(pool, release, job.job_id, &selected).await? {
+        mark_stale_anime_debrid_provider_job(
+            pool,
+            job.job_id,
+            "Superseded while committing replayed anime Debrid provider selection.",
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
 async fn materialize_debrid_links(
     state: &AppState,
     adapter: &dyn DebridProviderAdapter,
     paths: &RuntimePaths,
     job: &DebridDownloadJob,
 ) -> Result<()> {
-    mark_debrid_job_status(&state.db_pool, job.job_id, "materializing", None).await?;
+    let anime_release = match job.release_id {
+        Some(release_id) => get_release(&state.db_pool, release_id)
+            .await?
+            .filter(|release| release.media_type == MediaType::Anime),
+        None => None,
+    };
+    if anime_release.is_some() {
+        if !transition_anime_debrid_runtime_if_owned(
+            &state.db_pool,
+            job.job_id,
+            AnimeDebridRuntimeTransition::Materializing,
+            None,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    } else {
+        mark_debrid_job_status(&state.db_pool, job.job_id, "materializing", None).await?;
+    }
     let mut target_dir = Path::new(&paths.downloads_root).join(
         job.category
             .as_deref()
@@ -9233,7 +12527,9 @@ async fn materialize_debrid_links(
             "queueing anime hash jobs failed: {err}"
         );
     }
-    mark_debrid_job_completed(&state.db_pool, job.job_id, local_path.as_deref()).await?;
+    if !mark_debrid_job_completed(&state.db_pool, job.job_id, local_path.as_deref()).await? {
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -9413,6 +12709,16 @@ async fn refresh_debrid_remote_state(
     let jobs = list_refreshable_debrid_jobs(&state.db_pool, provider_id).await?;
     let factory = DebridAdapterFactory::from_state(state);
     for job in jobs {
+        if let Some(release_id) = job.release_id
+            && let Some(release) = get_release(&state.db_pool, release_id).await?
+            && release.media_type == MediaType::Anime
+            && debrid_release_bookkeeping_pending(&release)
+        {
+            // Acquisition still owns the submit-to-bind window. The worker
+            // performs bounded timeout recovery; status polling is read-only
+            // until that durable barrier closes.
+            continue;
+        }
         let adapter = match factory
             .adapter_for_job_implementation(
                 store,
@@ -9435,8 +12741,21 @@ async fn refresh_debrid_remote_state(
         if let Some(remote_release_id) = remote_torrent_release_id {
             match adapter.inspect_release(remote_release_id).await {
                 Ok(inspection) => {
-                    update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection)
-                        .await?;
+                    if !update_debrid_job_from_inspection(&state.db_pool, job.job_id, &inspection)
+                        .await?
+                    {
+                        continue;
+                    }
+                    if consume_failed_anime_debrid_inspection(
+                        &state.db_pool,
+                        &*adapter,
+                        job.job_id,
+                        &inspection,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     cleanup_uncached_no_seed_release(
                         &state.db_pool,
                         &*adapter,
@@ -9582,6 +12901,10 @@ async fn list_active_debrid_jobs(
          WHERE (
                status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
                OR (
+                   status = 'failed'
+                   AND COALESCE(CAST(provider_status_json AS TEXT), '') LIKE '%\"animeAutomaticRetry\"%'
+               )
+               OR (
                    status = 'review_required'
                    AND COALESCE(selection_error, '') LIKE '%no_selected_files%'
                )
@@ -9622,7 +12945,7 @@ async fn list_refreshable_debrid_jobs(
         " FROM debrid_download_jobs
          WHERE provider_id = $1
            AND (remote_torrent_id IS NOT NULL OR remote_release_id IS NOT NULL)
-           AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing')
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')
          ORDER BY updated_at DESC
          LIMIT 50"
     ))
@@ -9854,12 +13177,108 @@ async fn update_debrid_job_from_inspection(
     pool: &sqlx::AnyPool,
     job_id: Uuid,
     inspection: &DebridReleaseInspection,
-) -> Result<()> {
-    let status = debrid_status_to_job_status(inspection.release.status);
+) -> Result<bool> {
+    // Inspection is an optimistic state transition, not an unconditional
+    // snapshot write. The worker and the status endpoint may inspect the same
+    // provider release concurrently; a response that started before an anime
+    // retry was claimed must never resurrect that terminal/pending attempt.
+    let Some(snapshot) = sqlx::query::<sqlx::Any>(
+        "SELECT status,
+                COALESCE(remote_release_status, '') AS remote_release_status,
+                COALESCE(provider_status_json, '') AS provider_status_json,
+                COALESCE(selected_file_ids_json, '') AS selected_file_ids_json,
+                COALESCE(skipped_file_ids_json, '') AS skipped_file_ids_json,
+                COALESCE(selection_error, '') AS selection_error,
+                COALESCE(release_id, '') AS release_id
+         FROM debrid_download_jobs
+         WHERE job_id = $1",
+    )
+    .bind(job_id.to_string())
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let expected_status: String = snapshot.try_get("status")?;
+    let expected_remote_status: String = snapshot.try_get("remote_release_status")?;
+    let expected_provider_status: String = snapshot.try_get("provider_status_json")?;
+    let expected_selected_file_ids: String = snapshot.try_get("selected_file_ids_json")?;
+    let expected_skipped_file_ids: String = snapshot.try_get("skipped_file_ids_json")?;
+    let expected_selection_error: String = snapshot.try_get("selection_error")?;
+    let expected_release_id: String = snapshot.try_get("release_id")?;
+    if matches!(
+        expected_status.as_str(),
+        "completed"
+            | "failed"
+            | "cancelled"
+            | "paused"
+            | "review_required"
+            | "materializing"
+            | "anime_retry_pending"
+    ) {
+        return Ok(false);
+    }
+    if debrid_remote_status_progress_rank(&expected_remote_status)
+        .zip(debrid_remote_status_progress_rank(
+            inspection.release.status.as_str(),
+        ))
+        .is_some_and(|(current, incoming)| incoming < current)
+    {
+        return Ok(false);
+    }
+
+    let failed_job = if inspection.release.status == DebridReleaseStatus::Failed {
+        load_debrid_job(pool, job_id).await?
+    } else {
+        None
+    };
+    let failed_release = match failed_job.as_ref().and_then(|job| job.release_id) {
+        Some(release_id) => get_release(pool, release_id).await?,
+        None => None,
+    };
+    let anime_retry = if let Some(release) = failed_release
+        .as_ref()
+        .filter(|release| release.media_type == MediaType::Anime)
+    {
+        let error = anyhow!(
+            "{}",
+            debrid_failure_message_from_inspection(inspection).unwrap_or_else(|| {
+                "Debrid provider reported a failed anime release.".to_string()
+            })
+        );
+        Some(
+            anime_debrid_runtime_error_retry_disposition(
+                pool,
+                job_id,
+                release,
+                "anime_debrid_provider_failed",
+                &error,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    // Failure state and the automatic disposition are one durable write. A
+    // restart can therefore either retry the inspection or consume this
+    // marker; it can never observe a terminal anime job with no retry intent.
+    let status = if anime_retry.is_some() {
+        "anime_retry_pending".to_string()
+    } else {
+        debrid_status_to_job_status(inspection.release.status)
+    };
     let links = selected_link_urls_from_inspection(inspection);
     let links_json = serde_json::to_string(&links)?;
     let provider_capabilities_json = serde_json::to_string(&inspection.capabilities)?;
-    let provider_status = debrid_provider_status_from_inspection(inspection);
+    let mut provider_status = debrid_provider_status_from_inspection(inspection);
+    if let Some(retry) = anime_retry.as_ref() {
+        provider_status = merge_debrid_evidence_object(
+            Some(provider_status),
+            "animeAutomaticRetry",
+            serde_json::to_value(retry)
+                .context("serializing atomic anime Debrid retry disposition")?,
+        );
+    }
     let provider_status_json = serde_json::to_string(&provider_status)?;
     let failure_message = debrid_failure_message_from_inspection(inspection);
     let (selected_file_ids, skipped_file_ids) = inspection
@@ -9876,7 +13295,7 @@ async fn update_debrid_job_from_inspection(
     let selected_file_ids_json = serde_json::to_string(&selected_file_ids)?;
     let skipped_file_ids_json = serde_json::to_string(&skipped_file_ids)?;
     let progress = inspection.progress.as_ref();
-    sqlx::query::<sqlx::Any>(
+    let update = sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
          SET status = $1, remote_release_status = $2, display_name = COALESCE(display_name, $3),
              links_json = CASE WHEN $4 != '[]' THEN $5 ELSE links_json END,
@@ -9890,7 +13309,14 @@ async fn update_debrid_job_from_inspection(
              selected_file_ids_json = CASE WHEN $16 != '[]' THEN $17 ELSE selected_file_ids_json END,
              skipped_file_ids_json = CASE WHEN $18 != '[]' THEN $19 ELSE skipped_file_ids_json END,
              updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = $20",
+         WHERE job_id = $20
+           AND status = $21
+           AND COALESCE(remote_release_status, '') = $22
+           AND COALESCE(provider_status_json, '') = $23
+           AND COALESCE(selected_file_ids_json, '') = $24
+           AND COALESCE(skipped_file_ids_json, '') = $25
+           AND COALESCE(selection_error, '') = $26
+           AND COALESCE(release_id, '') = $27",
     )
     .bind(&status)
     .bind(inspection.release.status.as_str())
@@ -9929,14 +13355,94 @@ async fn update_debrid_job_from_inspection(
     .bind(&skipped_file_ids_json)
     .bind(&skipped_file_ids_json)
     .bind(job_id.to_string())
+    .bind(&expected_status)
+    .bind(&expected_remote_status)
+    .bind(&expected_provider_status)
+    .bind(&expected_selected_file_ids)
+    .bind(&expected_skipped_file_ids)
+    .bind(&expected_selection_error)
+    .bind(&expected_release_id)
     .execute(pool)
     .await?;
+    if update.rows_affected() != 1 {
+        return Ok(false);
+    }
     if inspection.release.status == DebridReleaseStatus::Failed
+        && anime_retry.is_none()
         && let Some(job) = load_debrid_job(pool, job_id).await?
     {
         record_debrid_release_failure_evidence(pool, &job).await?;
     }
-    Ok(())
+    Ok(true)
+}
+
+fn debrid_remote_status_progress_rank(status: &str) -> Option<u8> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "staging" => Some(0),
+        "waiting_files" => Some(1),
+        "selected" => Some(2),
+        "transferring" => Some(3),
+        "downloaded" => Some(4),
+        "materializing" => Some(5),
+        "completed" => Some(6),
+        _ => None,
+    }
+}
+
+async fn consume_failed_anime_debrid_inspection<A: DebridProviderAdapter + ?Sized>(
+    pool: &sqlx::AnyPool,
+    adapter: &A,
+    job_id: Uuid,
+    inspection: &DebridReleaseInspection,
+) -> Result<bool> {
+    if inspection.release.status != DebridReleaseStatus::Failed {
+        return Ok(false);
+    }
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(false);
+    };
+    let Some(release_id) = job.release_id else {
+        return Ok(false);
+    };
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(false);
+    };
+    if release.media_type != MediaType::Anime {
+        return Ok(false);
+    }
+    let retry = if let Some(retry) = anime_debrid_retry_disposition_from_job(&job) {
+        retry
+    } else {
+        // Legacy/direct callers may reach the consumer without the atomic
+        // inspection writer. Stage first so a crash before persistence is
+        // still recoverable by the materializer.
+        let error = anyhow!(
+            "{}",
+            debrid_failure_message_from_inspection(inspection)
+                .unwrap_or_else(|| "Debrid provider reported a failed anime release.".to_string())
+        );
+        let retry = anime_debrid_runtime_error_retry_disposition(
+            pool,
+            job_id,
+            &release,
+            "anime_debrid_provider_failed",
+            &error,
+        )
+        .await?;
+        stage_anime_debrid_retry_disposition(pool, job_id, &retry).await?;
+        retry
+    };
+    persist_anime_debrid_retry_with_adapter(
+        pool,
+        adapter,
+        job_id,
+        &release,
+        &inspection.release.remote_release_id,
+        &inspection.release.provider_implementation,
+        &retry,
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn update_debrid_job_links(
@@ -9965,7 +13471,7 @@ async fn update_debrid_job_download_progress(
         "UPDATE debrid_download_jobs
          SET status = 'materializing', downloaded_bytes = $1, total_bytes = COALESCE($2, total_bytes),
              progress = $3, download_rate_bps = $4, updated_at = CURRENT_TIMESTAMP
-         WHERE job_id = $5",
+         WHERE job_id = $5 AND status = 'materializing'",
     )
     .bind(u64_to_i64(downloaded))
     .bind(total.and_then(u64_to_i64))
@@ -9983,7 +13489,9 @@ async fn update_debrid_job_local_path(
     path: &str,
 ) -> Result<()> {
     sqlx::query::<sqlx::Any>(
-        "UPDATE debrid_download_jobs SET local_path = $1, updated_at = CURRENT_TIMESTAMP WHERE job_id = $2",
+        "UPDATE debrid_download_jobs
+         SET local_path = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE job_id = $2 AND status = 'materializing'",
     )
     .bind(path)
     .bind(job_id.to_string())
@@ -9998,6 +13506,47 @@ async fn mark_debrid_job_status(
     status: &str,
     error: Option<&str>,
 ) -> Result<()> {
+    if status == "failed"
+        && let Some(job) = load_debrid_job(pool, job_id).await?
+        && let Some(release_id) = job.release_id
+        && let Some(release) = get_release(pool, release_id)
+            .await?
+            .filter(|release| release.media_type == MediaType::Anime)
+    {
+        let failure = anyhow!(
+            "{}",
+            error.unwrap_or("Debrid provider reported an anime runtime failure.")
+        );
+        let retry = anime_debrid_runtime_error_retry_disposition(
+            pool,
+            job_id,
+            &release,
+            "anime_debrid_runtime_failure",
+            &failure,
+        )
+        .await?;
+        if !stage_anime_debrid_retry_disposition(pool, job_id, &retry).await? {
+            return Ok(());
+        }
+        persist_anime_debrid_retry(
+            pool,
+            job_id,
+            &release,
+            job.remote_release_id
+                .as_deref()
+                .or(job.remote_torrent_id.as_deref())
+                .unwrap_or_default(),
+            &retry,
+            sanitize_anime_automatic_resolution_evidence(json!({
+                "status": "not_attempted",
+                "deleted": false,
+                "reason": "provider_adapter_not_available_in_failure_writer"
+            })),
+        )
+        .await?;
+        return Ok(());
+    }
+
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
          SET status = $1, remote_release_status = $2, last_error = $3, updated_at = CURRENT_TIMESTAMP
@@ -10011,7 +13560,9 @@ async fn mark_debrid_job_status(
     .await?;
     if let Some(job) = load_debrid_job(pool, job_id).await? {
         match status {
-            "failed" => record_debrid_release_failure_evidence(pool, &job).await?,
+            "failed" => {
+                record_debrid_release_failure_evidence(pool, &job).await?;
+            }
             "materializing" => {
                 sync_debrid_release_runtime_state(
                     pool,
@@ -10080,6 +13631,7 @@ async fn record_debrid_release_failure_evidence(
 async fn record_debrid_release_failure_without_job(
     pool: &sqlx::AnyPool,
     release: Option<&AcquisitionRelease>,
+    job_id: Uuid,
     provider_id: Uuid,
     adapter: &(impl DebridProviderAdapter + ?Sized),
     capabilities: &DebridProviderCapabilities,
@@ -10089,6 +13641,60 @@ async fn record_debrid_release_failure_without_job(
     let Some(release) = release else {
         return Ok(());
     };
+    if release.media_type == MediaType::Anime {
+        let retry = anime_debrid_runtime_error_retry_disposition(
+            pool,
+            job_id,
+            release,
+            "anime_debrid_provider_submit_error",
+            error,
+        )
+        .await?;
+        let now = chrono::Utc::now();
+        let target_ids = retry.target_ids.iter().copied().collect::<BTreeSet<_>>();
+        let coverage_plan = merge_anime_debrid_retry_evidence(
+            merge_debrid_coverage_plans(release.coverage_plan.clone(), retry.coverage_plan.clone()),
+            job_id,
+            "",
+            &retry,
+            &target_ids,
+            json!({
+                "status": "not_applicable",
+                "deleted": false,
+                "reason": "provider_submission_failed_before_remote_creation"
+            }),
+            now,
+        );
+        let reason =
+            "Anime provider submission failed. Elixir will try another release automatically.";
+        update_release_state(
+            pool,
+            release.release_id,
+            AcquisitionReleaseState::Failed,
+            reason,
+            Some(coverage_plan),
+        )
+        .await?;
+        for target_id in target_ids {
+            let retry_after = now
+                + chrono::Duration::seconds(
+                    ANIME_DEBRID_CANDIDATE_RETRY_SECONDS + i64::from(target_id.as_bytes()[0] % 15),
+                );
+            reset_target_for_candidate_retry(pool, target_id, reason.to_string(), retry_after)
+                .await?;
+        }
+        upsert_debrid_release_job(
+            pool,
+            release,
+            provider_id,
+            job_id,
+            None,
+            ReleaseJobState::Failed,
+            reason,
+        )
+        .await?;
+        return Ok(());
+    }
     let message = error.to_string();
     let failure_class = classify_debrid_failure("failed", Some("failed"), Some(&message), None)
         .unwrap_or(DebridFailureClass::Unknown);
@@ -10133,7 +13739,21 @@ async fn mark_debrid_job_completed(
     pool: &sqlx::AnyPool,
     job_id: Uuid,
     local_path: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
+    if let Some(job) = load_debrid_job(pool, job_id).await?
+        && let Some(release_id) = job.release_id
+        && get_release(pool, release_id)
+            .await?
+            .is_some_and(|release| release.media_type == MediaType::Anime)
+    {
+        return transition_anime_debrid_runtime_if_owned(
+            pool,
+            job_id,
+            AnimeDebridRuntimeTransition::Completed,
+            local_path,
+        )
+        .await;
+    }
     sqlx::query::<sqlx::Any>(
         "UPDATE debrid_download_jobs
          SET status = 'completed', local_path = COALESCE($1, local_path), progress = 1.0,
@@ -10156,7 +13776,239 @@ async fn mark_debrid_job_completed(
         )
         .await?;
     }
-    Ok(())
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimeDebridRuntimeTransition {
+    Materializing,
+    Completed,
+}
+
+async fn transition_anime_debrid_runtime_if_owned(
+    pool: &sqlx::AnyPool,
+    job_id: Uuid,
+    transition: AnimeDebridRuntimeTransition,
+    local_path: Option<&str>,
+) -> Result<bool> {
+    let Some(job) = load_debrid_job(pool, job_id).await? else {
+        return Ok(false);
+    };
+    let Some(release_id) = job.release_id else {
+        return Ok(false);
+    };
+    let Some(release) = get_release(pool, release_id).await? else {
+        return Ok(false);
+    };
+    if release.media_type != MediaType::Anime {
+        return Ok(false);
+    }
+    let Some(remote_release_id) = job
+        .remote_release_id
+        .as_deref()
+        .or(job.remote_torrent_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    let release_id = release_id.to_string();
+    let job_id = job_id.to_string();
+    let provider_id = job.provider_id.to_string();
+    let mut transaction = pool.begin().await?;
+    let expected_job_predicate = match transition {
+        AnimeDebridRuntimeTransition::Materializing => {
+            "d.status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')"
+        }
+        AnimeDebridRuntimeTransition::Completed => "d.status = 'materializing'",
+    };
+    let ownership_sql = format!(
+        "UPDATE acquisition_releases
+         SET updated_at = updated_at
+         WHERE release_id = $1
+           AND media_type = 'anime'
+           AND download_id = $2
+           AND selected_route_logical_id = $3
+           AND selected_provider_id = $4
+           AND remote_release_id = $5
+           AND state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           AND EXISTS (
+               SELECT 1 FROM acquisition_release_jobs j
+               WHERE j.release_id = acquisition_releases.release_id
+                 AND j.download_id = $2
+                 AND j.route_logical_id = $3
+                 AND j.provider_id = $4
+                 AND j.remote_release_id = $5
+                 AND j.active = 1
+                 AND j.state IN ('staging', 'ready', 'submitted', 'downloading', 'materializing')
+           )
+           AND EXISTS (
+               SELECT 1 FROM debrid_download_jobs d
+               WHERE d.job_id = $2
+                 AND d.release_id = acquisition_releases.release_id
+                 AND d.provider_id = $4
+                 AND COALESCE(d.remote_release_id, d.remote_torrent_id, '') = $5
+                 AND {expected_job_predicate}
+           )"
+    );
+    let ownership = sqlx::query::<sqlx::Any>(&ownership_sql)
+        .bind(&release_id)
+        .bind(&job_id)
+        .bind(DEBRID_DEFAULT_LOGICAL_ID)
+        .bind(&provider_id)
+        .bind(remote_release_id)
+        .execute(&mut *transaction)
+        .await
+        .context("claiming exact anime Debrid materializer transition")?;
+    if ownership.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let job_update = match transition {
+        AnimeDebridRuntimeTransition::Materializing => sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs
+             SET status = 'materializing', remote_release_status = 'materializing',
+                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE job_id = $1 AND release_id = $2 AND provider_id = $3
+               AND COALESCE(remote_release_id, remote_torrent_id, '') = $4
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'paused', 'review_required', 'materializing', 'anime_retry_pending')",
+        )
+        .bind(&job_id)
+        .bind(&release_id)
+        .bind(&provider_id)
+        .bind(remote_release_id)
+        .execute(&mut *transaction)
+        .await?,
+        AnimeDebridRuntimeTransition::Completed => sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs
+             SET status = 'completed', remote_release_status = 'completed',
+                 local_path = COALESCE($1, local_path), progress = 1.0,
+                 download_rate_bps = 0, completed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE job_id = $2 AND release_id = $3 AND provider_id = $4
+               AND COALESCE(remote_release_id, remote_torrent_id, '') = $5
+               AND status = 'materializing'",
+        )
+        .bind(local_path)
+        .bind(&job_id)
+        .bind(&release_id)
+        .bind(&provider_id)
+        .bind(remote_release_id)
+        .execute(&mut *transaction)
+        .await?,
+    };
+    if job_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let (release_state, release_job_state, reason, terminal) = match transition {
+        AnimeDebridRuntimeTransition::Materializing => (
+            AcquisitionReleaseState::Materializing,
+            ReleaseJobState::Materializing,
+            "Debrid materializer is downloading selected files.",
+            false,
+        ),
+        AnimeDebridRuntimeTransition::Completed => (
+            AcquisitionReleaseState::Completed,
+            ReleaseJobState::Completed,
+            "Debrid materializer completed selected files.",
+            true,
+        ),
+    };
+    let runtime_evidence = json!({
+        "status": match transition {
+            AnimeDebridRuntimeTransition::Materializing => "materializing",
+            AnimeDebridRuntimeTransition::Completed => "completed",
+        },
+        "remoteStatus": match transition {
+            AnimeDebridRuntimeTransition::Materializing => "materializing",
+            AnimeDebridRuntimeTransition::Completed => "completed",
+        },
+        "providerImplementation": job.provider_implementation,
+        "remoteReleaseId": remote_release_id,
+        "sourceKind": job.source_kind,
+        "progress": if terminal { Some(1.0) } else { job.progress },
+        "downloadedBytes": job.downloaded_bytes,
+        "totalBytes": job.total_bytes,
+        "downloadRateBps": if terminal { Some(0_u64) } else { job.download_rate_bps },
+        "localPath": local_path.or(job.local_path.as_deref()),
+        "selectedFileCount": job.selected_file_ids.len(),
+        "skippedFileCount": job.skipped_file_ids.len(),
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let coverage_plan = merge_debrid_evidence_object(
+        release.coverage_plan.clone(),
+        "debridRuntime",
+        runtime_evidence,
+    );
+    let release_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_releases
+         SET state = $1, state_reason = $2, coverage_plan_json = $3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $4 AND download_id = $5
+           AND selected_route_logical_id = $6 AND selected_provider_id = $7
+           AND remote_release_id = $8",
+    )
+    .bind(release_state.as_str())
+    .bind(reason)
+    .bind(serde_json::to_string(&coverage_plan)?)
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await?;
+    if release_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    let release_job_update = sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_jobs
+         SET state = $1, state_reason = $2, active = $3,
+             completed_at = CASE WHEN $3 = 0 THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $4 AND download_id = $5
+           AND route_logical_id = $6 AND provider_id = $7
+           AND remote_release_id = $8 AND active = 1",
+    )
+    .bind(release_job_state.as_str())
+    .bind(reason)
+    .bind(if terminal { 0_i64 } else { 1_i64 })
+    .bind(&release_id)
+    .bind(&job_id)
+    .bind(DEBRID_DEFAULT_LOGICAL_ID)
+    .bind(&provider_id)
+    .bind(remote_release_id)
+    .execute(&mut *transaction)
+    .await?;
+    if release_job_update.rows_affected() != 1 {
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_release_coverage
+         SET state = 'submitted', reason = $1, verified_by = 'debrid_materializer',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE release_id = $2 AND release_file_id IS NOT NULL AND state <> 'rejected'",
+    )
+    .bind(reason)
+    .bind(&release_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query::<sqlx::Any>(
+        "UPDATE acquisition_targets
+         SET state = 'submitted', state_reason = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE download_id = $2 AND state NOT IN ('imported', 'excluded')",
+    )
+    .bind(reason)
+    .bind(&job_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
 }
 
 async fn sync_debrid_release_runtime_state(
@@ -10927,7 +14779,10 @@ mod tests {
     use chrono::Utc;
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
     };
     use tokio::{net::TcpListener, sync::oneshot};
 
@@ -12751,7 +16606,11 @@ mod tests {
         let database = setup_db().await?;
         let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
         let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
-        let adapter = FakeDebridAdapter::new();
+        // This test owns the provider-failure transition. Do not let the
+        // submit fixture first enter the terminal selection-review state for
+        // an unrelated synthetic file list; terminal jobs intentionally
+        // reject later inspection snapshots.
+        let adapter = FakeDebridAdapter::with_files(Vec::new());
         let source = "magnet:?xt=urn:btih:29638f38523bf01f688fd524ffd2c21b17ea3792";
         let job_id = submit_debrid_with_adapter(
             &database.pool,
@@ -13547,13 +17406,21 @@ mod tests {
     #[derive(Clone)]
     struct FakeDebridAdapter {
         state: Arc<Mutex<FakeDebridState>>,
+        fail_submit: bool,
+        force_failed_submit_status: bool,
+        fail_inspect: bool,
+        force_failed_inspection: bool,
         fail_select: bool,
+        fail_unrestrict: bool,
+        fail_delete: bool,
+        template_files: Vec<DebridRemoteFile>,
     }
 
     #[derive(Default)]
     struct FakeDebridState {
         next_id: u64,
         releases: HashMap<String, FakeDebridRelease>,
+        deleted_release_ids: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -13563,18 +17430,230 @@ mod tests {
         selected_file_ids: Vec<String>,
     }
 
+    #[derive(Clone, Copy)]
+    enum FakeAnimeMatchBehavior {
+        MatchFirst,
+        MatchSubbed,
+        EngineError,
+        EngineTimeout,
+        Empty,
+        InvalidOutput,
+        UnknownFile,
+    }
+
+    #[derive(Clone)]
+    struct FakeAnimeMatchEngine {
+        behavior: FakeAnimeMatchBehavior,
+        calls: Arc<AtomicUsize>,
+        observed_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeAnimeMatchEngine {
+        fn new(behavior: FakeAnimeMatchBehavior) -> Self {
+            Self {
+                behavior,
+                calls: Arc::new(AtomicUsize::new(0)),
+                observed_paths: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn service(&self) -> AnimeMatchingService {
+            AnimeMatchingService::with_engine(Arc::new(self.clone()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::anime_matching::AnimeMatchEngine for FakeAnimeMatchEngine {
+        async fn match_candidates(
+            &self,
+            request: crate::anime_matching::AnimeMatchRequest,
+        ) -> Result<crate::anime_matching::AnimeMatchResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            *self.observed_paths.lock().unwrap() = request
+                .candidates
+                .iter()
+                .flat_map(|candidate| candidate.files.iter().map(|file| file.path.clone()))
+                .collect();
+            if matches!(self.behavior, FakeAnimeMatchBehavior::EngineError) {
+                bail!("local anime worker unavailable");
+            }
+            if matches!(self.behavior, FakeAnimeMatchBehavior::EngineTimeout) {
+                bail!("local anime worker request timed out");
+            }
+            let candidate = request
+                .candidates
+                .first()
+                .context("fake matcher requires one candidate")?;
+            let target_key = request
+                .target
+                .wanted_target_keys
+                .first()
+                .context("fake matcher requires one target")?
+                .clone();
+            if matches!(self.behavior, FakeAnimeMatchBehavior::Empty) {
+                return Ok(crate::anime_matching::AnimeMatchResponse {
+                    schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                    matches: Vec::new(),
+                });
+            }
+            let selected_file_key = if matches!(self.behavior, FakeAnimeMatchBehavior::UnknownFile)
+            {
+                "candidate-0-file-unknown".to_string()
+            } else {
+                candidate
+                    .files
+                    .first()
+                    .context("fake matcher requires one real file")?
+                    .file_key
+                    .clone()
+            };
+            Ok(crate::anime_matching::AnimeMatchResponse {
+                schema_version: if matches!(self.behavior, FakeAnimeMatchBehavior::InvalidOutput) {
+                    ANIME_MATCH_SCHEMA_VERSION + 1
+                } else {
+                    ANIME_MATCH_SCHEMA_VERSION
+                },
+                matches: vec![crate::anime_matching::AnimeCandidateMatch {
+                    candidate_key: candidate.candidate_key.clone(),
+                    matched_target_keys: vec![target_key],
+                    audio_profile: if matches!(self.behavior, FakeAnimeMatchBehavior::MatchSubbed) {
+                        AnimeMatchAudioProfile::Subbed
+                    } else {
+                        AnimeMatchAudioProfile::DualAudio
+                    },
+                    selected_file_keys: Some(vec![selected_file_key]),
+                }],
+            })
+        }
+    }
+
+    fn fake_debrid_series_files() -> Vec<DebridRemoteFile> {
+        vec![
+            DebridRemoteFile {
+                provider_file_id: "file-1".to_string(),
+                file_index: Some(0),
+                path: "Show/Season 01/Show.S01E01.mkv".to_string(),
+                basename: "Show.S01E01.mkv".to_string(),
+                size_bytes: Some(1024),
+                selectable: true,
+                selected: Some(false),
+                raw: None,
+            },
+            DebridRemoteFile {
+                provider_file_id: "file-2".to_string(),
+                file_index: Some(1),
+                path: "Show/Season 01/Show.S01E02.mkv".to_string(),
+                basename: "Show.S01E02.mkv".to_string(),
+                size_bytes: Some(1024),
+                selectable: true,
+                selected: Some(false),
+                raw: None,
+            },
+        ]
+    }
+
+    fn fake_ready_anime_file() -> DebridRemoteFile {
+        DebridRemoteFile {
+            provider_file_id: "ready-anime-file-1".to_string(),
+            file_index: Some(1),
+            path: "Ready Replay Anime/Ready.Replay.Anime.S01E01.1080p.WEB-DL.mkv".to_string(),
+            basename: "Ready.Replay.Anime.S01E01.1080p.WEB-DL.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }
+    }
+
     impl FakeDebridAdapter {
         fn new() -> Self {
             Self {
                 state: Arc::new(Mutex::new(FakeDebridState::default())),
+                fail_submit: false,
+                force_failed_submit_status: false,
+                fail_inspect: false,
+                force_failed_inspection: false,
                 fail_select: false,
+                fail_unrestrict: false,
+                fail_delete: false,
+                template_files: fake_debrid_series_files(),
+            }
+        }
+
+        fn failing_inspect() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeDebridState::default())),
+                fail_submit: false,
+                force_failed_submit_status: false,
+                fail_inspect: true,
+                force_failed_inspection: false,
+                fail_select: false,
+                fail_unrestrict: false,
+                fail_delete: false,
+                template_files: fake_debrid_series_files(),
             }
         }
 
         fn failing_select() -> Self {
             Self {
                 state: Arc::new(Mutex::new(FakeDebridState::default())),
+                fail_submit: false,
+                force_failed_submit_status: false,
+                fail_inspect: false,
+                force_failed_inspection: false,
                 fail_select: true,
+                fail_unrestrict: false,
+                fail_delete: false,
+                template_files: fake_debrid_series_files(),
+            }
+        }
+
+        fn with_files(files: Vec<DebridRemoteFile>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeDebridState::default())),
+                fail_submit: false,
+                force_failed_submit_status: false,
+                fail_inspect: false,
+                force_failed_inspection: false,
+                fail_select: false,
+                fail_unrestrict: false,
+                fail_delete: false,
+                template_files: files,
+            }
+        }
+
+        fn failing_submit() -> Self {
+            Self {
+                fail_submit: true,
+                ..Self::new()
+            }
+        }
+
+        fn failed_submit_status() -> Self {
+            Self {
+                force_failed_submit_status: true,
+                ..Self::new()
+            }
+        }
+
+        fn failed_inspection() -> Self {
+            Self {
+                force_failed_inspection: true,
+                ..Self::new()
+            }
+        }
+
+        fn failing_delete() -> Self {
+            Self {
+                fail_delete: true,
+                ..Self::failed_inspection()
+            }
+        }
+
+        fn failing_unrestrict() -> Self {
+            Self {
+                fail_unrestrict: true,
+                ..Self::new()
             }
         }
 
@@ -14079,6 +18158,363 @@ mod tests {
             .await?;
         }
         Ok(subscription_id)
+    }
+
+    async fn create_anime_subscription_with_target(
+        pool: &sqlx::AnyPool,
+        title: &str,
+        target_title: &str,
+        target_key: &str,
+        season_number: i32,
+        episode_number: i32,
+        absolute_episode_number: i32,
+    ) -> Result<Uuid> {
+        let subscription_id = Uuid::new_v4();
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_subscriptions (
+                subscription_id, media_type, title, normalized_title, request_scope,
+                monitor_policy, route_policy, release_delay_seconds, metadata_refresh_after,
+                candidate_search_after, status, active
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $9, $10)",
+        )
+        .bind(subscription_id.to_string())
+        .bind("anime")
+        .bind(title)
+        .bind(title.trim().to_ascii_lowercase())
+        .bind("episode")
+        .bind("all_missing")
+        .bind("debrid_first")
+        .bind(0_i64)
+        .bind("active")
+        .bind(true)
+        .execute(pool)
+        .await?;
+        let anilist_season_id = format!("test-anilist-{season_number}");
+        sqlx::query::<sqlx::Any>(
+            "INSERT INTO acquisition_targets (
+                target_id, subscription_id, target_key, media_type, title,
+                season_number, episode_number, absolute_episode_number, metadata_json, state
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(subscription_id.to_string())
+        .bind(target_key)
+        .bind("anime")
+        .bind(target_title)
+        .bind(season_number)
+        .bind(episode_number)
+        .bind(absolute_episode_number)
+        .bind(
+            json!({
+                "graphFingerprint": format!("alm7-test:{subscription_id}"),
+                "targetCanonicalKey": format!("anilist:{anilist_season_id}:{episode_number}"),
+                "anilistSeasonId": anilist_season_id,
+                "aliases": [title, target_title],
+                "scopedAliases": [{
+                    "display": target_title,
+                    "source": "anilist_season_title",
+                    "language": "en",
+                    "seasonNumber": season_number,
+                    "anilistSeasonId": format!("test-anilist-{season_number}")
+                }]
+            })
+            .to_string(),
+        )
+        .bind("pending")
+        .execute(pool)
+        .await?;
+        Ok(subscription_id)
+    }
+
+    #[derive(Debug, Clone)]
+    struct OwnedAnimeDebridSelectionFixture {
+        job_id: Uuid,
+        release_id: Uuid,
+        target_id: Uuid,
+        remote_release_id: String,
+        provider_file_id: String,
+    }
+
+    async fn setup_owned_ready_anime_debrid_selection(
+        pool: &sqlx::AnyPool,
+        adapter: &FakeDebridAdapter,
+        fingerprint: &str,
+    ) -> Result<OwnedAnimeDebridSelectionFixture> {
+        let (provider_id, instance_id) = create_provider_refs(pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            pool,
+            "Ready Replay Anime",
+            "Ready Replay Anime",
+            "S01E01",
+            1,
+            1,
+            1,
+        )
+        .await?;
+        let target = list_subscription_targets(pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("owned Ready anime target")?;
+        let source = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=Ready.Replay.Anime.S01E01";
+        let job_id = submit_debrid_with_adapter(
+            pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("Ready Replay Anime S01E01"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Ready Replay Anime".to_string(),
+                    release_title: "Ready.Replay.Anime.S01E01.1080p.WEB-DL".to_string(),
+                    info_hash: Some("7777777777777777777777777777777777777777".to_string()),
+                    fingerprint: Some(fingerprint.to_string()),
+                    score: Some(100.0),
+                    selected_candidate: Some(json!({
+                        "title": "Ready.Replay.Anime.S01E01.1080p.WEB-DL",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "submissionBookkeeping": { "status": "pending" }
+                    })),
+                }),
+            },
+            adapter,
+        )
+        .await?;
+        let job = load_debrid_job(pool, job_id)
+            .await?
+            .context("owned Ready anime Debrid job")?;
+        let release_id = job.release_id.context("owned Ready anime release id")?;
+        let release = get_release(pool, release_id)
+            .await?
+            .context("owned Ready anime release")?;
+        let remote_file = adapter
+            .template_files
+            .first()
+            .context("owned Ready anime fixture requires one provider file")?;
+        let mut file = test_release_file(
+            release.release_id,
+            &remote_file.provider_file_id,
+            &remote_file.path,
+            true,
+        );
+        file.file_index = remote_file.file_index;
+        file.size_bytes = remote_file.size_bytes.and_then(u64_to_i64);
+        file.parsed_title = Some("Ready Replay Anime".to_string());
+        file.parsed_season_number = Some(1);
+        file.parsed_episode_number = Some(1);
+        file.parsed_episode_end_number = Some(1);
+        file.parsed_absolute_episode_number = Some(1);
+        file.parsed_absolute_episode_end_number = Some(1);
+        let file = insert_test_release_file(pool, &file).await?;
+        let coverage = upsert_release_coverage(
+            pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: None,
+                target_id: target.target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(100.0),
+                reason: Some("owned Ready anime exact mapping".to_string()),
+                state: ReleaseCoverageState::Submitted,
+                verified_by: Some("alm7_owned_ready_anime_fixture".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("owned Ready anime attempt submitted".to_string()),
+                selected_provider_id: Some(provider_id),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: Some(json!({ "fingerprint": fingerprint })),
+                download_id: Some(job_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let decision = DebridFileSelectionDecision {
+            status: DebridSelectionDecisionStatus::Approved,
+            selected_file_ids: vec![remote_file.provider_file_id.clone()],
+            skipped_file_ids: Vec::new(),
+            provider_selection_ids: vec![remote_file.provider_file_id.clone()],
+            target_file_selections: vec![DebridTargetFileSelection {
+                target_id: target.target_id,
+                provider_file_id: remote_file.provider_file_id.clone(),
+            }],
+            review_reasons: Vec::new(),
+            policy_version: DEBRID_SELECTION_POLICY_VERSION.to_string(),
+            coverage_fingerprint: format!("sha256:{fingerprint}"),
+            select_all: false,
+            select_all_approved: true,
+        };
+        assert!(
+            persist_debrid_selection_decision(
+                pool,
+                job_id,
+                &release,
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&coverage),
+                &decision,
+            )
+            .await?,
+            "owned Ready anime selection intent must commit"
+        );
+        // Simulate the acquisition writer completing its internal submission
+        // barrier before the worker replays provider selection.
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET selected_candidate_json = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2",
+        )
+        .bind(
+            json!({
+                "title": "Ready.Replay.Anime.S01E01.1080p.WEB-DL",
+                "source": source,
+                "sourceKind": "magnet"
+            })
+            .to_string(),
+        )
+        .bind(release.release_id.to_string())
+        .execute(pool)
+        .await?;
+
+        let ready = get_release(pool, release.release_id)
+            .await?
+            .context("persisted Ready anime release")?;
+        assert_eq!(ready.state, AcquisitionReleaseState::Ready);
+        Ok(OwnedAnimeDebridSelectionFixture {
+            job_id,
+            release_id: release.release_id,
+            target_id: target.target_id,
+            remote_release_id: job
+                .remote_release_id
+                .context("owned Ready anime remote release id")?,
+            provider_file_id: remote_file.provider_file_id.clone(),
+        })
+    }
+
+    fn anime_automatic_evidence_has_review_semantics(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => object.iter().any(|(key, value)| {
+                key.to_ascii_lowercase().contains("review")
+                    || anime_automatic_evidence_has_review_semantics(value)
+            }),
+            Value::Array(values) => values
+                .iter()
+                .any(anime_automatic_evidence_has_review_semantics),
+            Value::String(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                normalized == "review"
+                    || normalized == "review_required"
+                    || normalized.contains("requires_review")
+                    || normalized.contains("requires review")
+                    || normalized.contains("_review")
+                    || normalized.contains("waiting for review")
+            }
+            _ => false,
+        }
+    }
+
+    fn anime_evidence_has_nonempty_review_outcome(value: &Value) -> bool {
+        fn has_content(value: &Value) -> bool {
+            match value {
+                Value::Null => false,
+                Value::Bool(value) => *value,
+                Value::Number(_) => true,
+                Value::String(value) => !value.trim().is_empty(),
+                Value::Array(values) => values.iter().any(has_content),
+                Value::Object(object) => object.values().any(has_content),
+            }
+        }
+
+        match value {
+            Value::Object(object) => object.iter().any(|(key, value)| {
+                let normalized_key = key.trim().to_ascii_lowercase();
+                let is_review_outcome_key = matches!(
+                    normalized_key.as_str(),
+                    "review"
+                        | "reviewreason"
+                        | "reviewreasons"
+                        | "review_reason"
+                        | "review_reasons"
+                        | "reviewrequired"
+                        | "review_required"
+                        | "requiresreview"
+                        | "requires_review"
+                );
+                (is_review_outcome_key && has_content(value))
+                    || anime_evidence_has_nonempty_review_outcome(value)
+            }),
+            Value::Array(values) => values
+                .iter()
+                .any(anime_evidence_has_nonempty_review_outcome),
+            Value::String(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                normalized == "review"
+                    || normalized == "review_required"
+                    || normalized.contains("requires_review")
+                    || normalized.contains("requires review")
+                    || normalized.contains("waiting for review")
+            }
+            _ => false,
+        }
+    }
+
+    async fn assert_no_anime_review_lane_artifacts(
+        pool: &sqlx::AnyPool,
+        release: &AcquisitionRelease,
+    ) -> Result<()> {
+        let subscription_id = release
+            .subscription_id
+            .context("anime automatic-retry subscription")?;
+        let review_releases = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*)
+             FROM acquisition_releases
+             WHERE subscription_id = $1
+               AND state = 'review_required'",
+        )
+        .bind(subscription_id.to_string())
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            review_releases, 0,
+            "automatic anime retry must not create a review release artifact"
+        );
+
+        let review_audits = sqlx::query_scalar::<sqlx::Any, i64>(
+            "SELECT COUNT(*)
+             FROM acquisition_audit_events
+             WHERE subscription_id = $1
+               AND (
+                   event_type IN (
+                       'review_candidate_created',
+                       'inspect_requested',
+                       'manual_approval',
+                       'manual_rejection'
+                   )
+                   OR state = 'review_required'
+               )",
+        )
+        .bind(subscription_id.to_string())
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            review_audits, 0,
+            "automatic anime retry must not emit a review-lane audit event"
+        );
+        Ok(())
     }
 
     async fn create_movie_subscription_with_target(
@@ -15602,6 +20038,9 @@ mod tests {
         }
 
         async fn submit_magnet(&self, magnet: &str) -> Result<DebridRemoteRelease> {
+            if self.fail_submit {
+                bail!("fake provider submission failed with retry_or_review");
+            }
             let mut state = self.state.lock().unwrap();
             state.next_id += 1;
             let remote_release_id = format!("fake-release-{}", state.next_id);
@@ -15609,36 +20048,26 @@ mod tests {
                 provider_implementation: self.implementation().to_string(),
                 remote_release_id: remote_release_id.clone(),
                 display_name: Some(magnet.to_string()),
-                status: DebridReleaseStatus::WaitingFiles,
-                raw_status: Some("waiting_files".to_string()),
+                status: if self.force_failed_submit_status {
+                    DebridReleaseStatus::Failed
+                } else {
+                    DebridReleaseStatus::WaitingFiles
+                },
+                raw_status: Some(
+                    if self.force_failed_submit_status {
+                        "provider_failed"
+                    } else {
+                        "waiting_files"
+                    }
+                    .to_string(),
+                ),
                 raw: None,
             };
             state.releases.insert(
                 remote_release_id.clone(),
                 FakeDebridRelease {
                     release: release.clone(),
-                    files: vec![
-                        DebridRemoteFile {
-                            provider_file_id: "file-1".to_string(),
-                            file_index: Some(0),
-                            path: "Show/Season 01/Show.S01E01.mkv".to_string(),
-                            basename: "Show.S01E01.mkv".to_string(),
-                            size_bytes: Some(1024),
-                            selectable: true,
-                            selected: Some(false),
-                            raw: None,
-                        },
-                        DebridRemoteFile {
-                            provider_file_id: "file-2".to_string(),
-                            file_index: Some(1),
-                            path: "Show/Season 01/Show.S01E02.mkv".to_string(),
-                            basename: "Show.S01E02.mkv".to_string(),
-                            size_bytes: Some(1024),
-                            selectable: true,
-                            selected: Some(false),
-                            raw: None,
-                        },
-                    ],
+                    files: self.template_files.clone(),
                     selected_file_ids: Vec::new(),
                 },
             );
@@ -15649,12 +20078,17 @@ mod tests {
             &self,
             remote_release_id: &str,
         ) -> Result<DebridReleaseInspection> {
+            if self.fail_inspect {
+                bail!("fake provider inspection failed with review_required");
+            }
             let state = self.state.lock().unwrap();
             let release = state
                 .releases
                 .get(remote_release_id)
                 .ok_or_else(|| anyhow!("fake release not found"))?;
-            let status = if release.selected_file_ids.is_empty() {
+            let status = if self.force_failed_inspection {
+                DebridReleaseStatus::Failed
+            } else if release.selected_file_ids.is_empty() {
                 DebridReleaseStatus::WaitingFiles
             } else {
                 DebridReleaseStatus::Selected
@@ -15684,6 +20118,9 @@ mod tests {
         }
 
         async fn unrestrict_hoster(&self, link: &str) -> Result<DebridResolvedLink> {
+            if self.fail_unrestrict {
+                bail!("fake provider unrestrict failed during materialization");
+            }
             Ok(DebridResolvedLink {
                 provider_file_id: None,
                 url: link.to_string(),
@@ -15701,13 +20138,14 @@ mod tests {
         }
 
         async fn delete_release(&self, remote_release_id: &str) -> Result<bool> {
-            Ok(self
-                .state
-                .lock()
-                .unwrap()
-                .releases
-                .remove(remote_release_id)
-                .is_some())
+            if self.fail_delete {
+                bail!("fake provider cleanup failed with review_required");
+            }
+            let mut state = self.state.lock().unwrap();
+            state
+                .deleted_release_ids
+                .push(remote_release_id.to_string());
+            Ok(state.releases.remove(remote_release_id).is_some())
         }
     }
 
@@ -16346,27 +20784,67 @@ mod tests {
     #[tokio::test]
     async fn debrid_selection_persistence_attaches_fallback_file_to_coverage() -> Result<()> {
         let database = setup_db().await?;
-        let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
-        let target_id = sqlx::query_scalar::<sqlx::Any, String>(
-            "SELECT target_id FROM acquisition_targets
-             WHERE subscription_id = $1 AND target_key = 'S01E01'
-             LIMIT 1",
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Fullmetal Alchemist Brotherhood",
+            "Fullmetal Alchemist Brotherhood",
+            "S01E01",
+            1,
+            1,
+            1,
         )
-        .bind(subscription_id.to_string())
-        .fetch_one(&database.pool)
-        .await
-        .context("loading test S01E01 target")?;
-        let target_id = Uuid::parse_str(&target_id).context("parsing test S01E01 target id")?;
-        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
-        release.subscription_id = Some(subscription_id);
-        release.source_provider_id = None;
-        release.selected_provider_id = None;
-        release.media_type = MediaType::Anime;
-        release.resolver_kind = ReleaseResolverKind::AnimeShokoStyle;
-        release.release_title =
-            "Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist Bluray-1080p Remux.mkv"
-                .to_string();
-        let release = insert_test_release(&database.pool, &release).await?;
+        .await?;
+        let target_id = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("loading test S01E01 anime target")?
+            .target_id;
+        let source = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Fullmetal.Alchemist.Brotherhood.S01E01";
+        let adapter = FakeDebridAdapter::new();
+        let job_id = submit_debrid_with_adapter(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("Fullmetal Alchemist Brotherhood S01E01"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Fullmetal Alchemist Brotherhood".to_string(),
+                    release_title: "Fullmetal Alchemist - Brotherhood - S01E01 - Fullmetal Alchemist Bluray-1080p Remux.mkv".to_string(),
+                    info_hash: Some(
+                        "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    ),
+                    fingerprint: Some(format!(
+                        "debrid-fallback-file-persistence-{}",
+                        Uuid::new_v4()
+                    )),
+                    score: Some(112.0),
+                    selected_candidate: Some(json!({
+                        "submissionBookkeeping": { "status": "pending" }
+                    })),
+                }),
+            },
+            &adapter,
+        )
+        .await?;
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("owned anime Debrid job")?;
+        let release = get_release(
+            &database.pool,
+            job.release_id.context("owned anime Debrid release id")?,
+        )
+        .await?
+        .context("owned anime Debrid release")?;
         let mut file = test_release_file(
             release.release_id,
             "42",
@@ -16409,15 +20887,18 @@ mod tests {
             select_all_approved: true,
         };
 
-        persist_debrid_selection_decision(
-            &database.pool,
-            Uuid::new_v4(),
-            &release,
-            std::slice::from_ref(&file),
-            std::slice::from_ref(&coverage),
-            &decision,
-        )
-        .await?;
+        assert!(
+            persist_debrid_selection_decision(
+                &database.pool,
+                job_id,
+                &release,
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&coverage),
+                &decision,
+            )
+            .await?,
+            "the exact active anime Debrid attempt must own the atomic selection commit"
+        );
 
         let updated = list_release_coverage(&database.pool, release.release_id).await?;
         assert_eq!(updated.len(), 1);
@@ -16439,10 +20920,28 @@ mod tests {
             "Show/Season 01/Show.S01E01.mkv",
             true,
         );
-        let files = vec![file.clone()];
         let coverage = vec![test_coverage(release.release_id, file.release_file_id)];
         let inspection = test_debrid_inspection(false, Vec::new(), Vec::new(), None);
 
+        let all_media_decision = decide_debrid_file_selection(
+            &release,
+            std::slice::from_ref(&file),
+            &coverage,
+            &inspection,
+        );
+        assert_eq!(
+            all_media_decision.status,
+            DebridSelectionDecisionStatus::Approved,
+            "an exact all-media mapping needs no provider selection operation"
+        );
+
+        let unselected = test_release_file(
+            release.release_id,
+            "file-2",
+            "Show/Season 01/Show.S01E02.mkv",
+            true,
+        );
+        let files = vec![file, unselected];
         let decision = decide_debrid_file_selection(&release, &files, &coverage, &inspection);
 
         assert_eq!(
@@ -16596,7 +21095,7 @@ mod tests {
     }
 
     #[test]
-    fn debrid_selection_policy_user_override_infers_anime_target_file_mapping() {
+    fn alm7_debrid_selection_policy_ignores_legacy_anime_user_override() {
         let mut release =
             test_debrid_release(ReleaseKind::SeasonPack, ReleaseConfidence::ReviewRequired);
         release.media_type = MediaType::Anime;
@@ -16688,16 +21187,18 @@ mod tests {
 
         let decision = decide_debrid_file_selection(&release, &files, &coverage, &inspection);
 
-        assert_eq!(decision.status, DebridSelectionDecisionStatus::Approved);
-        assert_eq!(decision.provider_selection_ids, vec!["42".to_string()]);
         assert_eq!(
-            decision.target_file_selections,
-            vec![DebridTargetFileSelection {
-                target_id,
-                provider_file_id: "42".to_string(),
-            }]
+            decision.status,
+            DebridSelectionDecisionStatus::ReviewRequired
         );
-        assert!(decision.review_reasons.is_empty());
+        assert!(decision.provider_selection_ids.is_empty());
+        assert!(decision.target_file_selections.is_empty());
+        assert!(
+            decision
+                .review_reasons
+                .contains(&"coverage_not_high_confidence".to_string())
+        );
+        assert_ne!(decision.coverage_fingerprint, "sha256:user-approved-fmab");
     }
 
     #[test]
@@ -19028,6 +23529,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alm7_anime_staging_error_recovers_without_review_failure_evidence() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let adapter = FakeDebridAdapter::failing_inspect();
+        let source = "magnet:?xt=urn:btih:abababababababababababababababababababab";
+        let fingerprint = "alm7-anime-staging-error";
+
+        let error = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("[Group] Tokyo Ghoul Root A - 01"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Tokyo Ghoul".to_string(),
+                    release_title: "[Group] Tokyo Ghoul Root A - 01".to_string(),
+                    info_hash: None,
+                    fingerprint: Some(fingerprint.to_string()),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "[Group] Tokyo Ghoul Root A - 01",
+                        "source": source,
+                        "sourceKind": "magnet"
+                    })),
+                }),
+            },
+            &AnimeMatchingService::disabled(),
+            &adapter,
+        )
+        .await
+        .expect_err("provider inspection should fail");
+        assert!(error.to_string().contains("review_required"));
+
+        let release = crate::acquisition::release_resolution::store::get_release_by_fingerprint(
+            &database.pool,
+            DEFAULT_ROUTE_OWNER_ID,
+            "test.source",
+            fingerprint,
+        )
+        .await?
+        .context("anime staging-error release should persist")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        let coverage_plan = release
+            .coverage_plan
+            .as_ref()
+            .context("anime staging-error evidence should persist")?;
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticResolutionError/status")
+                .and_then(Value::as_str),
+            Some("retryable")
+        );
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticRetry/status")
+                .and_then(Value::as_str),
+            Some("scheduled")
+        );
+        assert!(
+            coverage_plan
+                .pointer("/debridFailure/responsePolicy")
+                .is_none()
+        );
+        assert!(
+            coverage_plan
+                .pointer("/debridFailure/fallbackState")
+                .is_none()
+        );
+        assert!(!anime_automatic_evidence_has_review_semantics(
+            coverage_plan
+        ));
+
+        let job_id = release
+            .download_id
+            .as_deref()
+            .context("anime staging-error job id")?
+            .parse::<Uuid>()?;
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("anime staging-error job should persist")?;
+        assert_eq!(job.status, "failed");
+        assert_ne!(job.status, "review_required");
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("anime staging-error target should persist")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.next_search_after.is_some());
+        assert!(adapter.state.lock().unwrap().releases.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn staged_debrid_submit_selects_exact_file_ids_without_select_all() -> Result<()> {
         let database = setup_db().await?;
         let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
@@ -19174,6 +23787,2473 @@ mod tests {
         assert_eq!(
             fake_release.selected_file_ids,
             vec!["file-1".to_string(), "file-2".to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_anime_provider_submit_failure_retries_without_review_evidence() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Submit Failure Anime",
+            "Submit Failure Anime",
+            "S01E01",
+            1,
+            1,
+            1,
+        )
+        .await?;
+        let targets = list_subscription_targets(&database.pool, subscription_id).await?;
+        let source = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fingerprint = "alm7-anime-submit-failure";
+        let result = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("Submit.Failure.Anime.01"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Submit Failure Anime".to_string(),
+                    release_title: "Submit.Failure.Anime.01".to_string(),
+                    info_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                    fingerprint: Some(fingerprint.to_string()),
+                    score: Some(90.0),
+                    selected_candidate: Some(json!({
+                        "title": "Submit.Failure.Anime.01",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "requestScopeEvidence": {
+                            "targetIds": [targets[0].target_id],
+                            "targetKeys": [targets[0].target_key.clone()]
+                        }
+                    })),
+                }),
+            },
+            &AnimeMatchingService::disabled(),
+            &FakeDebridAdapter::failing_submit(),
+        )
+        .await;
+        assert!(result.is_err());
+        let release = crate::acquisition::release_resolution::store::get_release_by_fingerprint(
+            &database.pool,
+            DEFAULT_ROUTE_OWNER_ID,
+            "test.source",
+            fingerprint,
+        )
+        .await?
+        .context("anime provider-submit failure release")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        let coverage_plan = release
+            .coverage_plan
+            .as_ref()
+            .context("automatic retry evidence")?;
+        assert!(!anime_automatic_evidence_has_review_semantics(
+            coverage_plan
+        ));
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticRetry/reason")
+                .and_then(Value::as_str),
+            Some("anime_debrid_provider_submit_error")
+        );
+        let jobs = crate::acquisition::release_resolution::store::list_release_jobs(
+            &database.pool,
+            release.release_id,
+        )
+        .await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, ReleaseJobState::Failed);
+        assert!(!jobs[0].active);
+        let target = get_target(&database.pool, targets[0].target_id)
+            .await?
+            .context("automatic retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.next_search_after.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_bookkeeping_barrier_and_failed_inspection_survive_restart() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("bookkeeping-barrier target")?;
+        let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+            provider_file_id: "actual-file-42".to_string(),
+            file_index: Some(42),
+            path: "Tokyo Ghoul Root A/[Group] TGRA - 13.mkv".to_string(),
+            basename: "[Group] TGRA - 13.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }]);
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::MatchFirst);
+        let source = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777";
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("[Group] TGRA - 13"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Tokyo Ghoul".to_string(),
+                    release_title: "[Group] TGRA - 13".to_string(),
+                    info_hash: None,
+                    fingerprint: Some(format!("alm7-debrid-bookkeeping-{}", Uuid::new_v4())),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "[Group] TGRA - 13",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "submissionBookkeeping": {
+                            "status": "pending",
+                            "policyVersion": "acquisition-broker-bookkeeping-v1"
+                        },
+                        "requestScopeEvidence": {
+                            "targetIds": [target.target_id],
+                            "targetKeys": [target.target_key.clone()]
+                        }
+                    })),
+                }),
+            },
+            &engine.service(),
+            &adapter,
+        )
+        .await?;
+
+        let staged_job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("bookkeeping-barrier job")?;
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(staged_job.selected_file_ids.is_empty());
+        let remote_release_id = staged_job
+            .remote_release_id
+            .clone()
+            .context("bookkeeping-barrier remote release")?;
+        assert!(
+            adapter
+                .state
+                .lock()
+                .unwrap()
+                .releases
+                .get(&remote_release_id)
+                .context("fake remote release")?
+                .selected_file_ids
+                .is_empty()
+        );
+
+        // Simulate a provider failure and process death immediately after the
+        // inspection write, before the retry consumer runs.
+        let mut failed_inspection = adapter.inspect_release(&remote_release_id).await?;
+        failed_inspection.release.status = DebridReleaseStatus::Failed;
+        failed_inspection.release.raw_status = Some("provider_failed_after_submit".to_string());
+        update_debrid_job_from_inspection(&database.pool, job_id, &failed_inspection).await?;
+        let pending_job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("atomic retry-pending job")?;
+        assert_eq!(pending_job.status, "anime_retry_pending");
+        let retry = anime_debrid_retry_disposition_from_job(&pending_job)
+            .context("atomic failed-inspection retry marker")?;
+        assert!(
+            list_active_debrid_jobs(&database.pool, 10)
+                .await?
+                .iter()
+                .any(|job| job.job_id == job_id),
+            "a restart must rediscover the durable retry-pending job"
+        );
+
+        let release = get_release(
+            &database.pool,
+            pending_job.release_id.context("retry-pending release id")?,
+        )
+        .await?
+        .context("retry-pending release")?;
+        persist_anime_debrid_retry_with_adapter(
+            &database.pool,
+            &adapter,
+            job_id,
+            &release,
+            &remote_release_id,
+            &failed_inspection.release.provider_implementation,
+            &retry,
+        )
+        .await?;
+
+        let consumed_job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("consumed retry job")?;
+        assert_eq!(consumed_job.status, "failed");
+        assert!(anime_debrid_retry_disposition_from_job(&consumed_job).is_none());
+        assert_eq!(
+            consumed_job
+                .provider_status
+                .as_ref()
+                .and_then(|status| status.pointer("/animeAutomaticRetryConsumed/status"))
+                .and_then(Value::as_str),
+            Some("consumed")
+        );
+        assert!(
+            list_active_debrid_jobs(&database.pool, 10)
+                .await?
+                .iter()
+                .all(|job| job.job_id != job_id),
+            "consumed failed jobs must not wake forever"
+        );
+        let failed_release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("failed automatic-retry release")?;
+        assert_eq!(failed_release.state, AcquisitionReleaseState::Failed);
+        assert_ne!(
+            failed_release.state,
+            AcquisitionReleaseState::ReviewRequired
+        );
+        let target = get_target(&database.pool, target.target_id)
+            .await?
+            .context("automatic retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_failed_submit_status_waits_for_bookkeeping_then_retries() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Provider Failed Anime",
+            "Provider Failed Anime",
+            "S01E01",
+            1,
+            1,
+            1,
+        )
+        .await?;
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("failed-submit target")?;
+        let adapter = FakeDebridAdapter::failed_submit_status();
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::MatchFirst);
+        let source = "magnet:?xt=urn:btih:8888888888888888888888888888888888888888";
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("Provider.Failed.Anime.01"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Provider Failed Anime".to_string(),
+                    release_title: "Provider.Failed.Anime.01".to_string(),
+                    info_hash: None,
+                    fingerprint: Some(format!("alm7-failed-submit-{}", Uuid::new_v4())),
+                    score: Some(90.0),
+                    selected_candidate: Some(json!({
+                        "title": "Provider.Failed.Anime.01",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "submissionBookkeeping": {
+                            "status": "pending",
+                            "policyVersion": "acquisition-broker-bookkeeping-v1"
+                        },
+                        "requestScopeEvidence": {
+                            "targetIds": [target.target_id],
+                            "targetKeys": [target.target_key.clone()]
+                        }
+                    })),
+                }),
+            },
+            &engine.service(),
+            &adapter,
+        )
+        .await?;
+
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("failed-submit job")?;
+        assert_eq!(job.status, "anime_retry_pending");
+        assert_eq!(job.remote_release_status.as_deref(), Some("failed"));
+        assert!(anime_debrid_retry_disposition_from_job(&job).is_none());
+        let release = get_release(
+            &database.pool,
+            job.release_id.context("failed-submit release id")?,
+        )
+        .await?
+        .context("failed-submit release")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Staging);
+        assert!(debrid_release_bookkeeping_pending(&release));
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            !stage_deferred_anime_debrid_provider_failure_if_ready(&database.pool, &job).await?
+        );
+
+        let mut selected_candidate = release
+            .selected_candidate
+            .clone()
+            .context("failed-submit candidate evidence")?;
+        selected_candidate
+            .as_object_mut()
+            .context("failed-submit candidate object")?
+            .insert(
+                "submissionBookkeeping".to_string(),
+                json!({
+                    "status": "complete",
+                    "policyVersion": "acquisition-broker-bookkeeping-v1"
+                }),
+            );
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET selected_candidate_json = $1, updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $2",
+        )
+        .bind(serde_json::to_string(&selected_candidate)?)
+        .bind(release.release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        assert!(stage_deferred_anime_debrid_provider_failure_if_ready(&database.pool, &job).await?);
+        let marked = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("marked failed-submit job")?;
+        let retry = anime_debrid_retry_disposition_from_job(&marked)
+            .context("failed-submit automatic retry marker")?;
+        let release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("completed-bookkeeping failed-submit release")?;
+        let remote_release_id = marked
+            .remote_release_id
+            .as_deref()
+            .context("failed-submit remote release")?;
+        persist_anime_debrid_retry_with_adapter(
+            &database.pool,
+            &adapter,
+            job_id,
+            &release,
+            remote_release_id,
+            adapter.implementation(),
+            &retry,
+        )
+        .await?;
+
+        let consumed = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("consumed failed-submit job")?;
+        assert_eq!(consumed.status, "failed");
+        assert!(anime_debrid_retry_disposition_from_job(&consumed).is_none());
+        assert!(adapter.state.lock().unwrap().releases.is_empty());
+        let failed_release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("terminal failed-submit release")?;
+        assert_eq!(failed_release.state, AcquisitionReleaseState::Failed);
+        assert_ne!(
+            failed_release.state,
+            AcquisitionReleaseState::ReviewRequired
+        );
+        let target = get_target(&database.pool, target.target_id)
+            .await?
+            .context("failed-submit retry target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.next_search_after.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_anime_provider_failed_status_cleans_up_and_never_requests_review() -> Result<()> {
+        for (index, adapter) in [
+            FakeDebridAdapter::failed_inspection(),
+            FakeDebridAdapter::failing_delete(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let database = setup_db().await?;
+            let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+            let subscription_id = create_anime_subscription_with_target(
+                &database.pool,
+                "Provider Failed Anime",
+                "Provider Failed Anime",
+                "S01E01",
+                1,
+                1,
+                1,
+            )
+            .await?;
+            let targets = list_subscription_targets(&database.pool, subscription_id).await?;
+            let source = format!("magnet:?xt=urn:btih:{:040x}", 0xbb_u128 + index as u128);
+            let fingerprint = format!("alm7-anime-provider-failed-{index}");
+            let job_id = submit_debrid_with_adapter_and_anime_matching(
+                &database.pool,
+                provider_id,
+                instance_id,
+                &source,
+                DebridSubmitOptions {
+                    owner_id: "test.source",
+                    category: Some("anime"),
+                    name: Some("Provider.Failed.Anime.01"),
+                    paused: false,
+                    release_context: Some(DebridReleaseSubmitContext {
+                        subscription_id: Some(subscription_id),
+                        source_provider_id: Some(provider_id),
+                        source_extension_id: "test.source".to_string(),
+                        media_type: MediaType::Anime,
+                        title: "Provider Failed Anime".to_string(),
+                        release_title: "Provider.Failed.Anime.01".to_string(),
+                        info_hash: None,
+                        fingerprint: Some(fingerprint),
+                        score: Some(90.0),
+                        selected_candidate: Some(json!({
+                            "title": "Provider.Failed.Anime.01",
+                            "source": source,
+                            "sourceKind": "magnet",
+                            "requestScopeEvidence": {
+                                "targetIds": [targets[0].target_id],
+                                "targetKeys": [targets[0].target_key.clone()]
+                            }
+                        })),
+                    }),
+                },
+                &AnimeMatchingService::disabled(),
+                &adapter,
+            )
+            .await?;
+            let job = load_debrid_job(&database.pool, job_id)
+                .await?
+                .context("provider-failed anime job")?;
+            assert_eq!(job.status, "failed");
+            let release = get_release(
+                &database.pool,
+                job.release_id.context("provider-failed anime release id")?,
+            )
+            .await?
+            .context("provider-failed anime release")?;
+            assert_eq!(release.state, AcquisitionReleaseState::Failed);
+            let coverage_plan = release
+                .coverage_plan
+                .as_ref()
+                .context("provider-failed automatic retry evidence")?;
+            assert!(!anime_automatic_evidence_has_review_semantics(
+                coverage_plan
+            ));
+            assert_eq!(
+                coverage_plan
+                    .pointer("/automaticRetry/reason")
+                    .and_then(Value::as_str),
+                Some("anime_debrid_provider_failed")
+            );
+            let cleanup_status = coverage_plan
+                .pointer("/automaticRetry/providerCleanup/status")
+                .and_then(Value::as_str);
+            assert_eq!(
+                cleanup_status,
+                Some(if index == 0 {
+                    "deleted"
+                } else {
+                    "delete_failed"
+                })
+            );
+            let target = get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("provider-failed retry target")?;
+            assert_eq!(target.state, AcquisitionTargetState::Pending);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_real_file_model_match_selects_exact_provider_file_automatically()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_subscriptions SET quality_profile_json = $1 WHERE subscription_id = $2",
+        )
+        .bind(
+            json!({
+                "animeAudioPreference": {
+                    "mode": "require_dub_review",
+                    "language": "en"
+                }
+            })
+            .to_string(),
+        )
+        .bind(subscription_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let actual_path = "Tokyo Ghoul Root A/[Group] TGRA - 13 [Dual Audio].mkv";
+        let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+            provider_file_id: "actual-file-42".to_string(),
+            file_index: Some(42),
+            path: actual_path.to_string(),
+            basename: "[Group] TGRA - 13 [Dual Audio].mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }]);
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::MatchFirst);
+        let service = engine.service();
+        let source = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("[Group] TGRA - 13 [Dual Audio]"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Tokyo Ghoul".to_string(),
+                    release_title: "[Group] TGRA - 13 [Dual Audio]".to_string(),
+                    info_hash: None,
+                    fingerprint: Some("alm7-model-success".to_string()),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "[Group] TGRA - 13 [Dual Audio]",
+                        "source": source,
+                        "sourceKind": "magnet",
+                        "supportedRoutes": [DEBRID_DEFAULT_LOGICAL_ID],
+                        "defaultRoute": DEBRID_DEFAULT_LOGICAL_ID
+                    })),
+                }),
+            },
+            &service,
+            &adapter,
+        )
+        .await?;
+
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            engine.observed_paths.lock().unwrap().as_slice(),
+            [actual_path]
+        );
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 model-assisted Debrid job should load")?;
+        assert_eq!(job.selected_file_ids, vec!["actual-file-42".to_string()]);
+        assert_eq!(job.status, "debrid_downloading");
+        assert_ne!(job.status, "review_required");
+
+        let release = get_release(&database.pool, job.release_id.context("release id")?)
+            .await?
+            .context("ALM-7 model-assisted release should load")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Downloading);
+        assert_eq!(release.confidence, ReleaseConfidence::High);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/source"))
+                .and_then(Value::as_str),
+            Some("local_model")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/modelAudioProfile"))
+                .and_then(Value::as_str),
+            Some("dual_audio")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/modelAudioAssessment/state"))
+                .and_then(Value::as_str),
+            Some("match")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| {
+                    plan.pointer("/modelAudioAssessment/requiredPreferenceSatisfied")
+                })
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].state, ReleaseCoverageState::Selected);
+        assert_eq!(
+            coverage[0].verified_by.as_deref(),
+            Some("alm7_debrid_local_model_file_list")
+        );
+        assert_eq!(
+            adapter
+                .state
+                .lock()
+                .unwrap()
+                .releases
+                .get("fake-release-1")
+                .context("fake release")?
+                .selected_file_ids,
+            vec!["actual-file-42".to_string()]
+        );
+        assert!(
+            transition_anime_debrid_runtime_if_owned(
+                &database.pool,
+                job_id,
+                AnimeDebridRuntimeTransition::Materializing,
+                None,
+            )
+            .await?,
+            "the current exact attempt must own the materialization handoff"
+        );
+        assert!(
+            transition_anime_debrid_runtime_if_owned(
+                &database.pool,
+                job_id,
+                AnimeDebridRuntimeTransition::Completed,
+                Some("/library/Tokyo Ghoul Root A/S02E01.mkv"),
+            )
+            .await?,
+            "the current materializing attempt must own completion"
+        );
+        let completed_job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("completed ALM-7 Debrid job should load")?;
+        assert_eq!(completed_job.status, "completed");
+        assert_eq!(completed_job.progress, Some(1.0));
+        assert_eq!(
+            completed_job.local_path.as_deref(),
+            Some("/library/Tokyo Ghoul Root A/S02E01.mkv")
+        );
+        let completed_release = get_release(
+            &database.pool,
+            completed_job.release_id.context("completed release id")?,
+        )
+        .await?
+        .context("completed ALM-7 release should load")?;
+        assert_eq!(completed_release.state, AcquisitionReleaseState::Completed);
+        let completed_download_id = completed_job.job_id.to_string();
+        let completed_release_job =
+            crate::acquisition::release_resolution::store::list_release_jobs(
+                &database.pool,
+                completed_release.release_id,
+            )
+            .await?
+            .into_iter()
+            .find(|release_job| {
+                release_job.download_id.as_deref() == Some(completed_download_id.as_str())
+            })
+            .context("completed ALM-7 release job should load")?;
+        assert_eq!(completed_release_job.state, ReleaseJobState::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_scopes_targets_and_requires_exact_plan_coverage() -> Result<()> {
+        let database = setup_db().await?;
+        let subscription_id = create_series_subscription_with_targets(&database.pool).await?;
+        let mut targets = list_subscription_targets(&database.pool, subscription_id).await?;
+        assert_eq!(targets.len(), 2);
+        let release_id = Uuid::new_v4();
+        let mut covered = test_coverage(release_id, Uuid::new_v4());
+        covered.target_id = targets[0].target_id;
+        let mut rejected = test_coverage(release_id, Uuid::new_v4());
+        rejected.target_id = targets[1].target_id;
+        rejected.state = ReleaseCoverageState::Rejected;
+        let mut release = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+
+        let scoped =
+            debrid_release_scoped_targets(&release, &targets, &[covered, rejected.clone()], &[]);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].target_id, targets[0].target_id);
+        assert_eq!(
+            debrid_release_scoped_targets(&release, &targets, &[rejected.clone()], &[]).len(),
+            0,
+            "rejected coverage must not broaden a future retry to the whole subscription"
+        );
+        release.selected_candidate = Some(json!({
+            "requestScopeEvidence": {
+                "targetIds": [targets[1].target_id],
+                "targetKeys": [targets[1].target_key.clone()]
+            }
+        }));
+        let evidence_scoped =
+            debrid_release_scoped_targets(&release, &targets, &[rejected.clone()], &[]);
+        assert_eq!(
+            evidence_scoped
+                .iter()
+                .map(|target| target.target_id)
+                .collect::<Vec<_>>(),
+            vec![targets[1].target_id]
+        );
+        release.selected_candidate = Some(json!({
+            "requestScopeEvidence": {
+                "targetIds": [targets[0].target_id, targets[1].target_id],
+                "targetKeys": [targets[0].target_key.clone()]
+            }
+        }));
+        assert!(
+            debrid_release_scoped_targets(&release, &targets, &[], &[]).is_empty(),
+            "partially overlapping Debrid ID/key scope must fail closed"
+        );
+        release.selected_candidate = Some(json!({
+            "requestScopeEvidence": {
+                "targetIds": [targets[1].target_id],
+                "targetKeys": [targets[1].target_key.clone()]
+            }
+        }));
+        let mut outside_scope = test_coverage(release_id, Uuid::new_v4());
+        outside_scope.target_id = targets[0].target_id;
+        assert!(
+            debrid_release_scoped_targets(&release, &targets, &[outside_scope], &[]).is_empty(),
+            "coverage outside authoritative Debrid request scope must fail closed"
+        );
+        release.selected_candidate = None;
+        let bound_scoped = debrid_release_scoped_targets(
+            &release,
+            &targets,
+            &[rejected.clone()],
+            &[targets[0].target_id],
+        );
+        assert_eq!(bound_scoped.len(), 1);
+        assert_eq!(bound_scoped[0].target_id, targets[0].target_id);
+        assert_eq!(
+            debrid_release_scoped_targets(&release, &targets[..1], &[rejected], &[]).len(),
+            1,
+            "a sole subscription target is the only safe context-free fallback"
+        );
+
+        let selected_file_key = "provider-file-1".to_string();
+        let plan = AnimeFileCoveragePlan {
+            resolver_kind: ReleaseResolverKind::AnimeShokoStyle,
+            resolver_version: "alm7-test".to_string(),
+            release_kind: ReleaseKind::Single,
+            confidence: ReleaseConfidence::High,
+            requires_file_list: false,
+            requires_file_selection: false,
+            selected_file_keys: vec![selected_file_key.clone()],
+            entries: vec![
+                crate::acquisition::release_resolution::anime::AnimeFileCoverageEntry {
+                    target_key: targets[0].target_key.clone(),
+                    canonical_key: None,
+                    release_file_key: Some(selected_file_key.clone()),
+                    file_id: Some(selected_file_key.clone()),
+                    file_index: Some(1),
+                    path: Some("Show.S01E01.mkv".to_string()),
+                    coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                    confidence: ReleaseConfidence::High,
+                    score: Some(100.0),
+                    reason: "alm7_test".to_string(),
+                    state: ReleaseCoverageState::Planned,
+                },
+            ],
+            review_reasons: Vec::new(),
+            rejection_reasons: Vec::new(),
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: selected_file_key.clone(),
+            file_id: Some(selected_file_key),
+            file_index: Some(1),
+            path: "Show.S01E01.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+        }];
+        let capabilities = test_debrid_inspection(true, Vec::new(), Vec::new(), None).capabilities;
+        assert!(!anime_plan_ready_for_automatic_selection(
+            &plan,
+            &files,
+            &capabilities,
+            &targets,
+        ));
+        assert!(anime_plan_ready_for_automatic_selection(
+            &plan,
+            &files,
+            &capabilities,
+            &scoped,
+        ));
+        let mut implicit_selection_capabilities = capabilities.clone();
+        implicit_selection_capabilities.supports_file_selection = false;
+        assert!(
+            anime_plan_ready_for_automatic_selection(
+                &plan,
+                &files,
+                &implicit_selection_capabilities,
+                &scoped,
+            ),
+            "an exact one-media-file mapping needs no provider selection operation"
+        );
+        let mut overfetching_files = files.clone();
+        overfetching_files.push(AnimeReleaseFileInput {
+            file_key: "provider-file-2".to_string(),
+            file_id: Some("provider-file-2".to_string()),
+            file_index: Some(2),
+            path: "Show.S01E02.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+        });
+        assert!(
+            !anime_plan_ready_for_automatic_selection(
+                &plan,
+                &overfetching_files,
+                &implicit_selection_capabilities,
+                &scoped,
+            ),
+            "excluding provider media still requires file-selection capability"
+        );
+
+        targets[0].metadata = Some(json!({ "graphFingerprint": "graph-a" }));
+        targets[1].metadata = Some(json!({ "graphFingerprint": "graph-b" }));
+        assert!(
+            anime_scoring_context_from_release(&release, &targets)
+                .graph_fingerprint
+                .is_none(),
+            "conflicting scoped graph identities must fail closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_model_failure_keeps_exact_deterministic_fallback_automatic() -> Result<()>
+    {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let actual_path = "Tokyo Ghoul Root A/[Group] TGRA - 13.mkv";
+        let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+            provider_file_id: "actual-file-42".to_string(),
+            file_index: Some(42),
+            path: actual_path.to_string(),
+            basename: "[Group] TGRA - 13.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }]);
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::EngineError);
+        let service = engine.service();
+        let source = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222";
+
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("[Group] TGRA - 13"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Tokyo Ghoul".to_string(),
+                    release_title: "[Group] TGRA - 13".to_string(),
+                    info_hash: None,
+                    fingerprint: Some("alm7-model-failure".to_string()),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "[Group] TGRA - 13",
+                        "source": source,
+                        "sourceKind": "magnet"
+                    })),
+                }),
+            },
+            &service,
+            &adapter,
+        )
+        .await?;
+
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            engine.observed_paths.lock().unwrap().as_slice(),
+            [actual_path]
+        );
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 fallback Debrid job should load")?;
+        let automatic_retry = anime_debrid_retry_disposition_from_job(&job)
+            .context("ALM-7 immediate submit should stage its automatic retry disposition")?;
+        assert!(!automatic_retry.suppress_automatic_rediscovery);
+        stage_anime_debrid_retry_disposition(&database.pool, job_id, &automatic_retry).await?;
+        let restaged_job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 restaged Debrid job")?;
+        assert_eq!(
+            anime_debrid_retry_disposition_from_job(&restaged_job),
+            Some(automatic_retry.clone()),
+            "the durable immediate-submit disposition must be idempotent"
+        );
+        assert!(job.selected_file_ids.is_empty());
+        assert_ne!(job.status, "review_required");
+        assert!(job.selection_error.is_none());
+
+        let release = get_release(&database.pool, job.release_id.context("release id")?)
+            .await?
+            .context("ALM-7 fallback release should load")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Staging);
+        assert_ne!(release.state, AcquisitionReleaseState::ReviewRequired);
+        assert!(
+            !release
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/source"))
+                .and_then(Value::as_str),
+            Some("deterministic_fallback")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/reason"))
+                .and_then(Value::as_str),
+            Some("engine_error")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticResolution/status"))
+                .and_then(Value::as_str),
+            Some("pending")
+        );
+        assert!(
+            adapter
+                .state
+                .lock()
+                .unwrap()
+                .releases
+                .get("fake-release-1")
+                .context("fake release")?
+                .selected_file_ids
+                .is_empty()
+        );
+
+        // The synchronous submit path intentionally leaves the release staged
+        // until automation has persisted its submission bookkeeping. The
+        // materializer then rejects this one unsafe candidate and returns the
+        // scoped target to the normal scheduler instead of invoking the model
+        // again on every Debrid poll.
+        let inspection = adapter.inspect_release("fake-release-1").await?;
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("ALM-7 target")?;
+        update_target_state(
+            &database.pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("test Debrid submission".to_string()),
+                selected_provider_id: Some(provider_id),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: Some(json!({ "title": "[Group] TGRA - 13" })),
+                download_id: Some(job_id.to_string()),
+                import_event_id: None,
+                next_search_after: None,
+                increment_search_attempts: false,
+            },
+        )
+        .await?;
+        let retry_started_at = chrono::Utc::now();
+        persist_anime_debrid_retry_with_adapter(
+            &database.pool,
+            &adapter,
+            job_id,
+            &release,
+            &inspection.release.remote_release_id,
+            &inspection.release.provider_implementation,
+            &automatic_retry,
+        )
+        .await?;
+
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 retried Debrid job")?;
+        assert_eq!(job.status, "failed");
+        assert_ne!(job.status, "review_required");
+        let release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("ALM-7 rejected release")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Failed);
+        assert_ne!(release.state, AcquisitionReleaseState::ReviewRequired);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/status"))
+                .and_then(Value::as_str),
+            Some("scheduled")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| { plan.pointer("/retrySuppression/suppressAutomaticRediscovery") })
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/retrySuppression/status"))
+                .and_then(Value::as_str),
+            Some("retryable")
+        );
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/providerCleanup/status"))
+                .and_then(Value::as_str),
+            Some("deleted")
+        );
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("ALM-7 reset target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(
+            target
+                .next_search_after
+                .is_some_and(|retry_at| retry_at > retry_started_at)
+        );
+        assert!(target.selected_provider_id.is_none());
+        assert!(target.selected_route_logical_id.is_none());
+        assert!(target.selected_candidate.is_none());
+        assert!(target.download_id.is_none());
+        assert!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/debridFailure/responsePolicy"))
+                .is_none()
+        );
+        assert!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/debridFailure/fallbackState"))
+                .is_none()
+        );
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            !adapter
+                .state
+                .lock()
+                .unwrap()
+                .releases
+                .contains_key("fake-release-1")
+        );
+
+        // A crash may replay the disposition after remote cleanup or target
+        // reset. Every persistence step remains idempotent, and terminalizing
+        // the provider job last makes such a replay safe.
+        persist_anime_debrid_retry(
+            &database.pool,
+            job_id,
+            &release,
+            &inspection.release.remote_release_id,
+            &automatic_retry,
+            json!({
+                "status": "adapter_unavailable",
+                "deleted": false,
+                "error": "simulated provider removal after restart"
+            }),
+        )
+        .await?;
+        let replayed_release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("ALM-7 replayed release")?;
+        assert_eq!(replayed_release.state, AcquisitionReleaseState::Failed);
+        assert_eq!(
+            replayed_release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticRetry/providerCleanup/status"))
+                .and_then(Value::as_str),
+            Some("adapter_unavailable")
+        );
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_fallback_matrix_persists_one_zero_review_retry_decision() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let cases = [
+            (
+                "disabled",
+                None,
+                AnimeMatchFallbackReason::EngineUnavailable,
+            ),
+            (
+                "timeout",
+                Some(FakeAnimeMatchBehavior::EngineTimeout),
+                AnimeMatchFallbackReason::EngineError,
+            ),
+            (
+                "empty",
+                Some(FakeAnimeMatchBehavior::Empty),
+                AnimeMatchFallbackReason::EmptyModelMatches,
+            ),
+            (
+                "invalid_output",
+                Some(FakeAnimeMatchBehavior::InvalidOutput),
+                AnimeMatchFallbackReason::InvalidModelResponse,
+            ),
+            (
+                "invalid_reference",
+                Some(FakeAnimeMatchBehavior::UnknownFile),
+                AnimeMatchFallbackReason::InvalidModelResponse,
+            ),
+        ];
+
+        for (index, (label, behavior, expected_reason)) in cases.into_iter().enumerate() {
+            let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+                provider_file_id: "actual-file-42".to_string(),
+                file_index: Some(42),
+                path: "Tokyo Ghoul Root A/[Group] TGRA - 13.mkv".to_string(),
+                basename: "[Group] TGRA - 13.mkv".to_string(),
+                size_bytes: Some(2_048),
+                selectable: true,
+                selected: Some(false),
+                raw: None,
+            }]);
+            let engine = behavior.map(FakeAnimeMatchEngine::new);
+            let service = engine
+                .as_ref()
+                .map(FakeAnimeMatchEngine::service)
+                .unwrap_or_else(AnimeMatchingService::disabled);
+            let info_hash = format!("{:040x}", index + 10);
+            let source = format!("magnet:?xt=urn:btih:{info_hash}");
+            let job_id = submit_debrid_with_adapter_and_anime_matching(
+                &database.pool,
+                provider_id,
+                instance_id,
+                &source,
+                DebridSubmitOptions {
+                    owner_id: "test.source",
+                    category: Some("anime"),
+                    name: Some("[Group] TGRA - 13"),
+                    paused: false,
+                    release_context: Some(DebridReleaseSubmitContext {
+                        subscription_id: Some(subscription_id),
+                        source_provider_id: Some(provider_id),
+                        source_extension_id: "test.source".to_string(),
+                        media_type: MediaType::Anime,
+                        title: "Tokyo Ghoul".to_string(),
+                        release_title: "[Group] TGRA - 13".to_string(),
+                        info_hash: Some(info_hash),
+                        fingerprint: Some(format!("alm7-fallback-{label}")),
+                        score: Some(95.0),
+                        selected_candidate: Some(json!({
+                            "title": "[Group] TGRA - 13",
+                            "source": source.clone(),
+                            "sourceKind": "magnet"
+                        })),
+                    }),
+                },
+                &service,
+                &adapter,
+            )
+            .await?;
+
+            if let Some(engine) = engine.as_ref() {
+                assert_eq!(
+                    engine.calls.load(AtomicOrdering::SeqCst),
+                    1,
+                    "{label} should invoke the model exactly once"
+                );
+            }
+            let job = load_debrid_job(&database.pool, job_id)
+                .await?
+                .with_context(|| format!("{label} Debrid job"))?;
+            let retry = anime_debrid_retry_disposition_from_job(&job)
+                .with_context(|| format!("{label} durable retry disposition"))?;
+            assert!(!retry.suppress_automatic_rediscovery, "{label}");
+            let release = get_release(&database.pool, job.release_id.context("release id")?)
+                .await?
+                .with_context(|| format!("{label} release"))?;
+            assert_eq!(release.state, AcquisitionReleaseState::Staging, "{label}");
+            assert_ne!(
+                release.state,
+                AcquisitionReleaseState::ReviewRequired,
+                "{label}"
+            );
+            let release_plan = release.coverage_plan.as_ref().context("release plan")?;
+            let retry_plan = retry.coverage_plan.as_ref().context("retry plan")?;
+            let expected_reason = serde_json::to_value(expected_reason)?;
+            assert_eq!(
+                release_plan
+                    .pointer("/animeMatchAssist/reason")
+                    .and_then(Value::as_str),
+                expected_reason.as_str(),
+                "{label}"
+            );
+            assert_eq!(
+                retry_plan.pointer("/anime"),
+                release_plan.pointer("/anime"),
+                "{label} must durably preserve the exact deterministic fallback"
+            );
+            assert!(!anime_automatic_evidence_has_review_semantics(release_plan));
+            assert!(!anime_automatic_evidence_has_review_semantics(retry_plan));
+            assert!(
+                list_release_coverage(&database.pool, release.release_id)
+                    .await?
+                    .iter()
+                    .all(|entry| entry.state != ReleaseCoverageState::ReviewRequired),
+                "{label}"
+            );
+
+            let remote_release_id = job
+                .remote_release_id
+                .as_deref()
+                .context("remote release id")?;
+            persist_anime_debrid_retry_with_adapter(
+                &database.pool,
+                &adapter,
+                job_id,
+                &release,
+                remote_release_id,
+                adapter.implementation(),
+                &retry,
+            )
+            .await?;
+            let release = get_release(&database.pool, release.release_id)
+                .await?
+                .context("terminal retry release")?;
+            assert_eq!(release.state, AcquisitionReleaseState::Failed, "{label}");
+            assert_eq!(
+                release
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| plan.pointer("/retrySuppression/status"))
+                    .and_then(Value::as_str),
+                Some("retryable"),
+                "{label}"
+            );
+            assert_eq!(
+                release
+                    .coverage_plan
+                    .as_ref()
+                    .and_then(|plan| {
+                        plan.pointer("/retrySuppression/suppressAutomaticRediscovery")
+                    })
+                    .and_then(Value::as_bool),
+                Some(false),
+                "{label}"
+            );
+            assert!(!anime_automatic_evidence_has_review_semantics(
+                release.coverage_plan.as_ref().context("terminal plan")?
+            ));
+            assert_eq!(
+                engine
+                    .as_ref()
+                    .map(|engine| engine.calls.load(AtomicOrdering::SeqCst))
+                    .unwrap_or(0),
+                usize::from(behavior.is_some()),
+                "{label} must not invoke the model again while consuming retry"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alm7_debrid_retry_suppression_distinguishes_runtime_from_candidate_failures() {
+        let provenance = |reason| AnimeMatchAssistProvenance {
+            source: AnimeMatchAssistSource::DeterministicFallback,
+            result: AnimeMatchAssistResult::Fallback,
+            matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+            request_fingerprint: None,
+            reason: Some(reason),
+            detail: None,
+            runtime: None,
+            latency_ms: 0,
+        };
+        for reason in [
+            AnimeMatchFallbackReason::EngineUnavailable,
+            AnimeMatchFallbackReason::EngineError,
+            AnimeMatchFallbackReason::InvalidRequest,
+            AnimeMatchFallbackReason::InvalidModelResponse,
+            AnimeMatchFallbackReason::EmptyModelMatches,
+            AnimeMatchFallbackReason::CoverageValidationFailed,
+        ] {
+            assert!(!anime_debrid_retry_suppresses_rediscovery(&provenance(
+                reason
+            )));
+        }
+        assert!(anime_debrid_retry_suppresses_rediscovery(
+            &AnimeMatchAssistProvenance {
+                source: AnimeMatchAssistSource::LocalModel,
+                result: AnimeMatchAssistResult::Matched,
+                matcher_schema_version: ANIME_MATCH_SCHEMA_VERSION,
+                request_fingerprint: None,
+                reason: None,
+                detail: None,
+                runtime: None,
+                latency_ms: 0,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_ready_selection_replays_provider_application_after_restart() -> Result<()>
+    {
+        let selected = vec!["provider-file-42".to_string()];
+        assert!(debrid_provider_selection_needs_application(
+            &selected,
+            AcquisitionReleaseState::Ready,
+        ));
+        assert!(!debrid_provider_selection_needs_application(
+            &selected,
+            AcquisitionReleaseState::Staging,
+        ));
+        assert!(debrid_provider_selection_needs_application(
+            &[],
+            AcquisitionReleaseState::Staging,
+        ));
+
+        let mut inspection = test_debrid_inspection(
+            true,
+            Vec::new(),
+            Vec::new(),
+            Some(DebridFileSelection {
+                mode: DebridFileSelectionMode::BeforeTransfer,
+                selected_file_ids: selected.clone(),
+                skipped_file_ids: Vec::new(),
+            }),
+        );
+        assert!(debrid_inspection_confirms_provider_selection_applied(
+            &inspection,
+            &selected,
+        ));
+        inspection
+            .selection
+            .as_mut()
+            .expect("selection")
+            .selected_file_ids = vec!["different-file".to_string()];
+        assert!(!debrid_inspection_confirms_provider_selection_applied(
+            &inspection,
+            &selected,
+        ));
+        inspection.selection = None;
+        inspection.release.status = DebridReleaseStatus::Transferring;
+        assert!(debrid_inspection_confirms_provider_selection_applied(
+            &inspection,
+            &selected,
+        ));
+
+        let database = setup_db().await?;
+        let adapter = FakeDebridAdapter::with_files(vec![fake_ready_anime_file()]);
+        let fixture = setup_owned_ready_anime_debrid_selection(
+            &database.pool,
+            &adapter,
+            "alm7-ready-selection-provider-replay",
+        )
+        .await?;
+        let job = load_debrid_job(&database.pool, fixture.job_id)
+            .await?
+            .context("persisted Ready replay job")?;
+        let release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .context("persisted Ready replay release")?;
+        let inspection = adapter.inspect_release(&fixture.remote_release_id).await?;
+        assert_eq!(inspection.release.status, DebridReleaseStatus::WaitingFiles);
+        assert!(
+            inspection
+                .selection
+                .as_ref()
+                .is_none_or(|selection| selection.selected_file_ids.is_empty())
+        );
+
+        assert!(
+            replay_ready_anime_debrid_provider_selection(
+                &database.pool,
+                &adapter,
+                &job,
+                &release,
+                &inspection,
+            )
+            .await?
+        );
+
+        let fake_state = adapter.state.lock().unwrap();
+        let provider_release = fake_state
+            .releases
+            .get(&fixture.remote_release_id)
+            .context("replayed provider release")?;
+        assert_eq!(
+            provider_release.selected_file_ids,
+            vec![fixture.provider_file_id.clone()],
+            "the worker must issue the persisted exact provider selection"
+        );
+        drop(fake_state);
+        let applied_release = get_release(&database.pool, fixture.release_id)
+            .await?
+            .context("provider-applied anime release")?;
+        assert_eq!(applied_release.state, AcquisitionReleaseState::Downloading);
+        assert_eq!(
+            applied_release.state_reason.as_deref(),
+            Some("Debrid provider accepted deterministic file selection.")
+        );
+        let applied_job = load_debrid_job(&database.pool, fixture.job_id)
+            .await?
+            .context("provider-applied anime job")?;
+        assert_eq!(applied_job.status, "debrid_downloading");
+        assert_ne!(applied_job.status, "review_required");
+        let release_jobs = crate::acquisition::release_resolution::store::list_release_jobs(
+            &database.pool,
+            fixture.release_id,
+        )
+        .await?;
+        assert_eq!(release_jobs.len(), 1);
+        assert_eq!(release_jobs[0].state, ReleaseJobState::Downloading);
+        assert!(release_jobs[0].active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_anime_ready_select_files_failure_retries_without_review() -> Result<()> {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let mut adapter = FakeDebridAdapter::with_files(vec![fake_ready_anime_file()]);
+        adapter.fail_select = true;
+        let fixture = setup_owned_ready_anime_debrid_selection(
+            &state.db_pool,
+            &adapter,
+            "alm7-ready-select-files-failure",
+        )
+        .await?;
+        let job = load_debrid_job(&state.db_pool, fixture.job_id)
+            .await?
+            .context("Ready selection-failure job")?;
+        let release = get_release(&state.db_pool, fixture.release_id)
+            .await?
+            .context("Ready selection-failure release")?;
+        let inspection = adapter.inspect_release(&fixture.remote_release_id).await?;
+        let error = replay_ready_anime_debrid_provider_selection(
+            &state.db_pool,
+            &adapter,
+            &job,
+            &release,
+            &inspection,
+        )
+        .await
+        .expect_err("provider selection replay should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("replaying persisted anime Debrid selection")
+        );
+
+        handle_debrid_job_processing_result(&state, &store, &job, Err(error)).await?;
+
+        let failed_job = load_debrid_job(&state.db_pool, fixture.job_id)
+            .await?
+            .context("automatic selection-failure job")?;
+        assert_eq!(failed_job.status, "failed");
+        assert_ne!(failed_job.status, "review_required");
+        assert!(failed_job.selection_error.is_none());
+        let failed_release = get_release(&state.db_pool, fixture.release_id)
+            .await?
+            .context("automatic selection-failure release")?;
+        assert_eq!(failed_release.state, AcquisitionReleaseState::Failed);
+        let coverage_plan = failed_release
+            .coverage_plan
+            .as_ref()
+            .context("automatic selection-failure evidence")?;
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticResolutionError/reason")
+                .and_then(Value::as_str),
+            Some("anime_debrid_worker_error")
+        );
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticRetry/status")
+                .and_then(Value::as_str),
+            Some("scheduled")
+        );
+        assert!(!anime_evidence_has_nonempty_review_outcome(coverage_plan));
+        assert!(
+            !failed_release
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        assert_no_anime_review_lane_artifacts(&state.db_pool, &failed_release).await?;
+        let release_jobs = crate::acquisition::release_resolution::store::list_release_jobs(
+            &state.db_pool,
+            fixture.release_id,
+        )
+        .await?;
+        assert_eq!(release_jobs.len(), 1);
+        assert_eq!(release_jobs[0].state, ReleaseJobState::Failed);
+        assert!(!release_jobs[0].active);
+        assert!(
+            !release_jobs[0]
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        let target = get_target(&state.db_pool, fixture.target_id)
+            .await?
+            .context("automatic selection-failure target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.download_id.is_none());
+        assert!(target.next_search_after.is_some());
+        let coverage = list_release_coverage(&state.db_pool, fixture.release_id).await?;
+        assert!(
+            coverage
+                .iter()
+                .all(|entry| entry.state == ReleaseCoverageState::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_anime_materialization_error_handler_retries_without_review() -> Result<()> {
+        let state = setup_debrid_test_state().await?;
+        let store = ExtensionStore::new(&state.db_pool);
+        let selection_adapter = FakeDebridAdapter::with_files(vec![fake_ready_anime_file()]);
+        let fixture = setup_owned_ready_anime_debrid_selection(
+            &state.db_pool,
+            &selection_adapter,
+            "alm7-materialization-processing-failure",
+        )
+        .await?;
+        let ready_job = load_debrid_job(&state.db_pool, fixture.job_id)
+            .await?
+            .context("materialization Ready job")?;
+        let ready_release = get_release(&state.db_pool, fixture.release_id)
+            .await?
+            .context("materialization Ready release")?;
+        let inspection = selection_adapter
+            .inspect_release(&fixture.remote_release_id)
+            .await?;
+        assert!(
+            replay_ready_anime_debrid_provider_selection(
+                &state.db_pool,
+                &selection_adapter,
+                &ready_job,
+                &ready_release,
+                &inspection,
+            )
+            .await?
+        );
+        let job = load_debrid_job(&state.db_pool, fixture.job_id)
+            .await?
+            .context("provider-selected materialization job")?;
+        assert_eq!(job.status, "debrid_downloading");
+        assert!(!job.links.is_empty());
+        let paths = RuntimePaths::from_roots(
+            &state.settings.extensions.storage_root,
+            &state.settings.library.local_root,
+        );
+        let materialization_adapter = FakeDebridAdapter::failing_unrestrict();
+        let error = materialize_debrid_links(&state, &materialization_adapter, &paths, &job)
+            .await
+            .expect_err("provider unrestrict should fail during materialization");
+        assert!(error.to_string().contains("unrestrict failed"));
+
+        handle_debrid_job_processing_result(&state, &store, &job, Err(error)).await?;
+
+        let failed_job = load_debrid_job(&state.db_pool, fixture.job_id)
+            .await?
+            .context("automatic materialization-failure job")?;
+        assert_eq!(failed_job.status, "failed");
+        assert_ne!(failed_job.status, "review_required");
+        let failed_release = get_release(&state.db_pool, fixture.release_id)
+            .await?
+            .context("automatic materialization-failure release")?;
+        assert_eq!(failed_release.state, AcquisitionReleaseState::Failed);
+        let coverage_plan = failed_release
+            .coverage_plan
+            .as_ref()
+            .context("automatic materialization-failure evidence")?;
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticResolutionError/reason")
+                .and_then(Value::as_str),
+            Some("anime_debrid_worker_error")
+        );
+        assert_eq!(
+            coverage_plan
+                .pointer("/automaticRetry/status")
+                .and_then(Value::as_str),
+            Some("scheduled")
+        );
+        assert!(!anime_evidence_has_nonempty_review_outcome(coverage_plan));
+        assert!(
+            !failed_release
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        assert_no_anime_review_lane_artifacts(&state.db_pool, &failed_release).await?;
+        let release_jobs = crate::acquisition::release_resolution::store::list_release_jobs(
+            &state.db_pool,
+            fixture.release_id,
+        )
+        .await?;
+        assert_eq!(release_jobs.len(), 1);
+        assert_eq!(release_jobs[0].state, ReleaseJobState::Failed);
+        assert!(!release_jobs[0].active);
+        assert!(
+            !release_jobs[0]
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        let target = get_target(&state.db_pool, fixture.target_id)
+            .await?
+            .context("automatic materialization-failure target")?;
+        assert_eq!(target.state, AcquisitionTargetState::Pending);
+        assert!(target.download_id.is_none());
+        assert!(target.next_search_after.is_some());
+        let coverage = list_release_coverage(&state.db_pool, fixture.release_id).await?;
+        assert!(
+            coverage
+                .iter()
+                .all(|entry| entry.state == ReleaseCoverageState::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_stale_inspection_cannot_resurrect_retry_or_regress_provider_state()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let job_id = Uuid::new_v4();
+        insert_debrid_job(
+            &database.pool,
+            &DebridDownloadJob {
+                job_id,
+                provider_id,
+                instance_id,
+                owner_id: "test.source".to_string(),
+                source: "magnet:?xt=urn:btih:9999999999999999999999999999999999999999".to_string(),
+                source_kind: "magnet".to_string(),
+                category: Some("anime".to_string()),
+                display_name: Some("Stale Inspection Anime".to_string()),
+                remote_torrent_id: Some("fake-release-1".to_string()),
+                remote_download_id: None,
+                provider_implementation: Some("fake_debrid".to_string()),
+                remote_release_id: Some("fake-release-1".to_string()),
+                remote_release_status: Some("failed".to_string()),
+                provider_capabilities: None,
+                provider_status: Some(json!({
+                    "animeAutomaticRetryConsumed": { "status": "consumed" },
+                    "sentinel": "must-survive-stale-inspection"
+                })),
+                selection_mode: Some("before_transfer".to_string()),
+                selected_file_ids: Vec::new(),
+                skipped_file_ids: Vec::new(),
+                selection_error: None,
+                release_id: None,
+                status: "anime_retry_pending".to_string(),
+                local_path: None,
+                links: Vec::new(),
+                progress: Some(0.0),
+                downloaded_bytes: Some(0),
+                total_bytes: None,
+                download_rate_bps: None,
+                last_error: None,
+            },
+        )
+        .await?;
+        let stale = test_debrid_inspection(true, Vec::new(), Vec::new(), None);
+        assert!(!update_debrid_job_from_inspection(&database.pool, job_id, &stale).await?);
+        let preserved = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("preserved retry-pending job")?;
+        assert_eq!(preserved.status, "anime_retry_pending");
+        assert_eq!(
+            preserved
+                .provider_status
+                .as_ref()
+                .and_then(|status| status.get("sentinel"))
+                .and_then(Value::as_str),
+            Some("must-survive-stale-inspection")
+        );
+
+        sqlx::query::<sqlx::Any>(
+            "UPDATE debrid_download_jobs
+             SET status = 'debrid_downloaded', remote_release_status = 'downloaded'
+             WHERE job_id = $1",
+        )
+        .bind(job_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        assert!(!update_debrid_job_from_inspection(&database.pool, job_id, &stale).await?);
+        let preserved = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("non-regressed downloaded job")?;
+        assert_eq!(
+            preserved.remote_release_status.as_deref(),
+            Some("downloaded")
+        );
+        assert_eq!(preserved.status, "debrid_downloaded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_delayed_retry_does_not_clobber_newer_attempt() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let target = list_subscription_targets(&database.pool, subscription_id)
+            .await?
+            .into_iter()
+            .next()
+            .context("stale-retry target")?;
+        let job_a_id = Uuid::new_v4();
+        let job_b_id = Uuid::new_v4();
+        let job_a_string = job_a_id.to_string();
+        let job_b_string = job_b_id.to_string();
+
+        let mut release_a = test_debrid_release(ReleaseKind::Single, ReleaseConfidence::High);
+        release_a.subscription_id = Some(subscription_id);
+        release_a.source_provider_id = Some(provider_id);
+        release_a.media_type = MediaType::Anime;
+        release_a.title = "Tokyo Ghoul".to_string();
+        release_a.release_title = "[Group] Tokyo Ghoul Root A - 01".to_string();
+        release_a.fingerprint = format!("alm7-debrid-attempt-claim-{}", Uuid::new_v4());
+        release_a.selected_provider_id = Some(provider_id);
+        release_a.download_id = Some(job_a_string.clone());
+        release_a.remote_release_id = Some("remote-a".to_string());
+        release_a.state = AcquisitionReleaseState::Submitted;
+        release_a.coverage_plan = Some(json!({ "attempt": "a" }));
+        let release_a = insert_test_release(&database.pool, &release_a).await?;
+
+        let job_a = DebridDownloadJob {
+            job_id: job_a_id,
+            provider_id,
+            instance_id,
+            owner_id: "test.source".to_string(),
+            source: release_a.source.clone(),
+            source_kind: "magnet".to_string(),
+            category: Some("anime".to_string()),
+            display_name: Some(release_a.release_title.clone()),
+            remote_torrent_id: Some("remote-a".to_string()),
+            remote_download_id: None,
+            provider_implementation: Some("fake_debrid".to_string()),
+            remote_release_id: Some("remote-a".to_string()),
+            remote_release_status: Some("submitted".to_string()),
+            provider_capabilities: None,
+            provider_status: None,
+            selection_mode: Some("before_transfer".to_string()),
+            selected_file_ids: vec!["file-a".to_string()],
+            skipped_file_ids: Vec::new(),
+            selection_error: None,
+            release_id: Some(release_a.release_id),
+            status: "submitted".to_string(),
+            local_path: None,
+            links: Vec::new(),
+            progress: Some(0.0),
+            downloaded_bytes: Some(0),
+            total_bytes: Some(2_048),
+            download_rate_bps: None,
+            last_error: None,
+        };
+        insert_debrid_job(&database.pool, &job_a).await?;
+        upsert_debrid_release_job(
+            &database.pool,
+            &release_a,
+            provider_id,
+            job_a_id,
+            Some("remote-a"),
+            ReleaseJobState::Submitted,
+            "attempt A submitted",
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("attempt A submitted".to_string()),
+                selected_provider_id: Some(provider_id),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: Some(json!({ "attempt": "a" })),
+                download_id: Some(job_a_string.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut file = test_release_file(
+            release_a.release_id,
+            "file-a",
+            "Tokyo Ghoul Root A/[Group] Tokyo Ghoul Root A - 01.mkv",
+            true,
+        );
+        file.selected = Some(true);
+        let file = insert_test_release_file(&database.pool, &file).await?;
+        let coverage = upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release_a.release_id,
+                release_file_id: Some(file.release_file_id),
+                target_id: target.target_id,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(100.0),
+                reason: Some("attempt A exact mapping".to_string()),
+                state: ReleaseCoverageState::Selected,
+                verified_by: Some("attempt_a".to_string()),
+            },
+        )
+        .await?;
+        let retry = AnimeDebridAutomaticRetry {
+            target_ids: vec![target.target_id],
+            reason_code: "anime_debrid_delayed_attempt_a".to_string(),
+            suppress_automatic_rediscovery: false,
+            coverage_plan: Some(json!({ "attempt": "a-retry" })),
+        };
+        stage_anime_debrid_retry_disposition(&database.pool, job_a_id, &retry).await?;
+
+        // The scheduler completed a newer bind before delayed job A resumed.
+        // Every shared record now belongs to B.
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_jobs
+             SET state = 'cancelled', active = 0, completed_at = CURRENT_TIMESTAMP
+             WHERE release_id = $1 AND download_id = $2",
+        )
+        .bind(release_a.release_id.to_string())
+        .bind(&job_a_string)
+        .execute(&database.pool)
+        .await?;
+        let attempt_b_plan = json!({
+            "attempt": "b",
+            "sentinel": "must-survive-stale-attempt-a"
+        });
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_releases
+             SET download_id = $1,
+                 remote_release_id = 'remote-b',
+                 state = 'submitted',
+                 state_reason = 'attempt B submitted',
+                 coverage_plan_json = $2,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE release_id = $3",
+        )
+        .bind(&job_b_string)
+        .bind(attempt_b_plan.to_string())
+        .bind(release_a.release_id.to_string())
+        .execute(&database.pool)
+        .await?;
+        let release_b = get_release(&database.pool, release_a.release_id)
+            .await?
+            .context("attempt B release")?;
+        upsert_debrid_release_job(
+            &database.pool,
+            &release_b,
+            provider_id,
+            job_b_id,
+            Some("remote-b"),
+            ReleaseJobState::Submitted,
+            "attempt B submitted",
+        )
+        .await?;
+        let mut job_b = job_a.clone();
+        job_b.job_id = job_b_id;
+        job_b.remote_torrent_id = Some("remote-b".to_string());
+        job_b.remote_release_id = Some("remote-b".to_string());
+        job_b.provider_status = Some(json!({ "attempt": "b" }));
+        insert_debrid_job(&database.pool, &job_b).await?;
+        update_target_state(
+            &database.pool,
+            target.target_id,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Submitted,
+                state_reason: Some("attempt B submitted".to_string()),
+                selected_provider_id: Some(provider_id),
+                selected_route_logical_id: Some(DEBRID_DEFAULT_LOGICAL_ID.to_string()),
+                selected_candidate: Some(json!({ "attempt": "b" })),
+                download_id: Some(job_b_string.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        update_release_file_selected(&database.pool, file.release_file_id, true).await?;
+        update_release_coverage_review_state(
+            &database.pool,
+            coverage.coverage_id,
+            ReleaseCoverageState::Selected,
+            Some("attempt B exact mapping".to_string()),
+            Some("attempt_b".to_string()),
+        )
+        .await?;
+
+        let mut stale_inspection = test_debrid_inspection(
+            true,
+            vec![DebridRemoteFile {
+                provider_file_id: "stale-file-a".to_string(),
+                file_index: Some(99),
+                path: "Tokyo Ghoul Root A/Stale.Attempt.A.01.mkv".to_string(),
+                basename: "Stale.Attempt.A.01.mkv".to_string(),
+                size_bytes: Some(4_096),
+                selectable: true,
+                selected: Some(true),
+                raw: None,
+            }],
+            Vec::new(),
+            None,
+        );
+        stale_inspection.release.remote_release_id = "remote-a".to_string();
+        let mut stale_refinement = refinement_from_debrid_status(DebridReleaseStatus::WaitingFiles);
+        stale_refinement.state = AcquisitionReleaseState::Ready;
+        stale_refinement.coverage_plan = Some(json!({ "attempt": "stale-a-refinement" }));
+        assert!(
+            commit_anime_debrid_refinement_if_owned(
+                &database.pool,
+                &release_a,
+                provider_id,
+                job_a_id,
+                &stale_inspection,
+                &stale_refinement,
+                stale_refinement.coverage_plan.clone(),
+            )
+            .await?
+            .is_none(),
+            "stale attempt A must not commit provider files or release state over B"
+        );
+        let stale_decision = DebridFileSelectionDecision {
+            status: DebridSelectionDecisionStatus::Approved,
+            selected_file_ids: vec!["file-a".to_string()],
+            skipped_file_ids: Vec::new(),
+            provider_selection_ids: vec!["file-a".to_string()],
+            target_file_selections: vec![DebridTargetFileSelection {
+                target_id: target.target_id,
+                provider_file_id: "file-a".to_string(),
+            }],
+            review_reasons: Vec::new(),
+            policy_version: DEBRID_SELECTION_POLICY_VERSION.to_string(),
+            coverage_fingerprint: "sha256:stale-a".to_string(),
+            select_all: false,
+            select_all_approved: true,
+        };
+        assert!(
+            !persist_debrid_selection_decision(
+                &database.pool,
+                job_a_id,
+                &release_a,
+                std::slice::from_ref(&file),
+                std::slice::from_ref(&coverage),
+                &stale_decision,
+            )
+            .await?,
+            "stale attempt A must not resurrect its selection intent"
+        );
+        stale_inspection.release.status = DebridReleaseStatus::Selected;
+        assert!(
+            !mark_debrid_selection_applied(
+                &database.pool,
+                &release_a,
+                job_a_id,
+                &stale_inspection,
+            )
+            .await?,
+            "stale attempt A must not apply provider selection over B"
+        );
+        assert!(
+            !transition_anime_debrid_runtime_if_owned(
+                &database.pool,
+                job_a_id,
+                AnimeDebridRuntimeTransition::Materializing,
+                None,
+            )
+            .await?,
+            "stale attempt A must not enter materialization over B"
+        );
+
+        let stale_adapter = FakeDebridAdapter::new();
+        persist_anime_debrid_retry_with_adapter(
+            &database.pool,
+            &stale_adapter,
+            job_a_id,
+            &release_a,
+            "remote-a",
+            stale_adapter.implementation(),
+            &retry,
+        )
+        .await?;
+        assert!(
+            stale_adapter
+                .state
+                .lock()
+                .unwrap()
+                .deleted_release_ids
+                .is_empty(),
+            "ownership must be claimed before any stale remote delete"
+        );
+
+        persist_anime_debrid_retry(
+            &database.pool,
+            job_a_id,
+            &release_a,
+            "remote-a",
+            &retry,
+            json!({ "status": "deleted_late", "deleted": true }),
+        )
+        .await?;
+
+        let release_after = get_release(&database.pool, release_a.release_id)
+            .await?
+            .context("release after stale retry")?;
+        assert_eq!(release_after.state, AcquisitionReleaseState::Submitted);
+        assert_eq!(
+            release_after.download_id.as_deref(),
+            Some(job_b_string.as_str())
+        );
+        assert_eq!(release_after.coverage_plan, Some(attempt_b_plan));
+        let target_after = get_target(&database.pool, target.target_id)
+            .await?
+            .context("target after stale retry")?;
+        assert_eq!(target_after.state, AcquisitionTargetState::Submitted);
+        assert_eq!(
+            target_after.download_id.as_deref(),
+            Some(job_b_string.as_str())
+        );
+        assert_eq!(
+            target_after
+                .selected_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.get("attempt"))
+                .and_then(Value::as_str),
+            Some("b")
+        );
+        let files_after = list_release_files(&database.pool, release_a.release_id).await?;
+        assert_eq!(files_after.len(), 1);
+        assert_eq!(files_after[0].selected, Some(true));
+        let coverage_after = list_release_coverage(&database.pool, release_a.release_id).await?;
+        assert_eq!(coverage_after.len(), 1);
+        assert_eq!(coverage_after[0].state, ReleaseCoverageState::Selected);
+        assert_eq!(coverage_after[0].verified_by.as_deref(), Some("attempt_b"));
+        let release_jobs = crate::acquisition::release_resolution::store::list_release_jobs(
+            &database.pool,
+            release_a.release_id,
+        )
+        .await?;
+        let release_job_b = release_jobs
+            .iter()
+            .find(|job| job.download_id.as_deref() == Some(job_b_string.as_str()))
+            .context("attempt B release job")?;
+        assert!(release_job_b.active);
+        assert_eq!(release_job_b.state, ReleaseJobState::Submitted);
+        let provider_job_b = load_debrid_job(&database.pool, job_b_id)
+            .await?
+            .context("attempt B provider job")?;
+        assert_eq!(provider_job_b.status, "submitted");
+        assert_eq!(
+            provider_job_b.provider_status,
+            Some(json!({ "attempt": "b" }))
+        );
+        let provider_job_a = load_debrid_job(&database.pool, job_a_id)
+            .await?
+            .context("attempt A provider job")?;
+        assert_eq!(provider_job_a.status, "failed");
+        assert!(anime_debrid_retry_disposition_from_job(&provider_job_a).is_none());
+        assert_eq!(
+            provider_job_a
+                .provider_status
+                .as_ref()
+                .and_then(|status| status.pointer("/animeAutomaticRetryConsumed/status"))
+                .and_then(Value::as_str),
+            Some("consumed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_required_audio_mismatch_stays_automatic_without_selection() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, _) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_subscriptions SET quality_profile_json = $1 WHERE subscription_id = $2",
+        )
+        .bind(
+            json!({
+                "animeAudioPreference": {
+                    "mode": "require_dub_review",
+                    "language": "en"
+                }
+            })
+            .to_string(),
+        )
+        .bind(subscription_id.to_string())
+        .execute(&database.pool)
+        .await?;
+
+        let mut release = test_debrid_release(ReleaseKind::Unknown, ReleaseConfidence::Low);
+        release.subscription_id = Some(subscription_id);
+        release.source_provider_id = Some(provider_id);
+        release.selected_provider_id = Some(provider_id);
+        release.media_type = MediaType::Anime;
+        release.title = "Tokyo Ghoul".to_string();
+        release.release_title = "[Group] TGRA - 13 [Subbed]".to_string();
+        release.resolver_kind = ReleaseResolverKind::AnimeShokoStyle;
+        release.selected_candidate = Some(json!({
+            "title": release.release_title.clone(),
+            "source": release.source.clone(),
+            "sourceKind": "magnet"
+        }));
+        let release = insert_test_release(&database.pool, &release).await?;
+        let inspection = test_debrid_inspection(
+            true,
+            vec![DebridRemoteFile {
+                provider_file_id: "actual-file-42".to_string(),
+                file_index: Some(42),
+                path: "Tokyo Ghoul Root A/[Group] TGRA - 13 [Subbed].mkv".to_string(),
+                basename: "[Group] TGRA - 13 [Subbed].mkv".to_string(),
+                size_bytes: Some(2_048),
+                selectable: true,
+                selected: Some(false),
+                raw: None,
+            }],
+            Vec::new(),
+            None,
+        );
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::MatchSubbed);
+        let service = engine.service();
+        let options = DebridSubmitOptions {
+            owner_id: "test.source",
+            category: Some("anime"),
+            name: Some("[Group] TGRA - 13 [Subbed]"),
+            paused: false,
+            release_context: None,
+        };
+
+        let refinement = persist_debrid_file_list_and_refine_coverage(
+            &database.pool,
+            &release,
+            &options,
+            &inspection,
+            &service,
+        )
+        .await?;
+
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(refinement.state, AcquisitionReleaseState::Staging);
+        assert_eq!(refinement.job_state, ReleaseJobState::Staging);
+        assert!(!refinement.apply_file_selection_policy);
+        assert!(
+            refinement
+                .automatic_retry
+                .as_ref()
+                .is_some_and(|retry| retry.suppress_automatic_rediscovery)
+        );
+        assert!(
+            !refinement
+                .state_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("review")
+        );
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/modelAudioProfile"))
+                .and_then(Value::as_str),
+            Some("subbed")
+        );
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/modelAudioAssessment/state"))
+                .and_then(Value::as_str),
+            Some("mismatch")
+        );
+        assert_eq!(
+            refinement
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/automaticResolution/requiredAudioSatisfied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_invalid_model_file_reference_is_rejected_before_coverage_override()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Tokyo Ghoul",
+            "Tokyo Ghoul Root A",
+            "S02E01",
+            2,
+            1,
+            13,
+        )
+        .await?;
+        let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+            provider_file_id: "actual-file-42".to_string(),
+            file_index: Some(42),
+            path: "Tokyo Ghoul Root A/[Group] TGRA - 13.mkv".to_string(),
+            basename: "[Group] TGRA - 13.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }]);
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::UnknownFile);
+        let service = engine.service();
+        let source = "magnet:?xt=urn:btih:3333333333333333333333333333333333333333";
+
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("[Group] TGRA - 13"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Tokyo Ghoul".to_string(),
+                    release_title: "[Group] TGRA - 13".to_string(),
+                    info_hash: None,
+                    fingerprint: Some("alm7-invalid-model-file".to_string()),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "[Group] TGRA - 13",
+                        "source": source,
+                        "sourceKind": "magnet"
+                    })),
+                }),
+            },
+            &service,
+            &adapter,
+        )
+        .await?;
+
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 invalid-model Debrid job should load")?;
+        assert!(job.selected_file_ids.is_empty());
+        assert_ne!(job.status, "review_required");
+        let release = get_release(&database.pool, job.release_id.context("release id")?)
+            .await?
+            .context("ALM-7 invalid-model release should load")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Staging);
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/reason"))
+                .and_then(Value::as_str),
+            Some("invalid_model_response")
+        );
+        assert!(
+            list_release_coverage(&database.pool, release.release_id)
+                .await?
+                .iter()
+                .all(|entry| entry.verified_by.as_deref()
+                    != Some("alm7_debrid_local_model_file_list"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn alm7_debrid_definitive_anime_uses_zero_model_calls() -> Result<()> {
+        let database = setup_db().await?;
+        let (provider_id, instance_id) = create_provider_refs(&database.pool).await?;
+        let subscription_id = create_anime_subscription_with_target(
+            &database.pool,
+            "Naruto",
+            "Naruto",
+            "S01E01",
+            1,
+            1,
+            1,
+        )
+        .await?;
+        let adapter = FakeDebridAdapter::with_files(vec![DebridRemoteFile {
+            provider_file_id: "naruto-1".to_string(),
+            file_index: Some(1),
+            path: "Naruto/Naruto.S01E01.1080p.WEB-DL.mkv".to_string(),
+            basename: "Naruto.S01E01.1080p.WEB-DL.mkv".to_string(),
+            size_bytes: Some(2_048),
+            selectable: true,
+            selected: Some(false),
+            raw: None,
+        }]);
+        let engine = FakeAnimeMatchEngine::new(FakeAnimeMatchBehavior::EngineError);
+        let service = engine.service();
+        let source = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444";
+
+        let job_id = submit_debrid_with_adapter_and_anime_matching(
+            &database.pool,
+            provider_id,
+            instance_id,
+            source,
+            DebridSubmitOptions {
+                owner_id: "test.source",
+                category: Some("anime"),
+                name: Some("Naruto.S01E01.1080p.WEB-DL"),
+                paused: false,
+                release_context: Some(DebridReleaseSubmitContext {
+                    subscription_id: Some(subscription_id),
+                    source_provider_id: Some(provider_id),
+                    source_extension_id: "test.source".to_string(),
+                    media_type: MediaType::Anime,
+                    title: "Naruto".to_string(),
+                    release_title: "Naruto.S01E01.1080p.WEB-DL".to_string(),
+                    info_hash: None,
+                    fingerprint: Some("alm7-deterministic-fast-path".to_string()),
+                    score: Some(95.0),
+                    selected_candidate: Some(json!({
+                        "title": "Naruto.S01E01.1080p.WEB-DL",
+                        "source": source,
+                        "sourceKind": "magnet"
+                    })),
+                }),
+            },
+            &service,
+            &adapter,
+        )
+        .await?;
+
+        assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 0);
+        let job = load_debrid_job(&database.pool, job_id)
+            .await?
+            .context("ALM-7 deterministic Debrid job should load")?;
+        assert_eq!(job.selected_file_ids, vec!["naruto-1".to_string()]);
+        let release = get_release(&database.pool, job.release_id.context("release id")?)
+            .await?
+            .context("ALM-7 deterministic release should load")?;
+        assert_eq!(
+            release
+                .coverage_plan
+                .as_ref()
+                .and_then(|plan| plan.pointer("/animeMatchAssist/source"))
+                .and_then(Value::as_str),
+            Some("deterministic_fast_path")
         );
         Ok(())
     }

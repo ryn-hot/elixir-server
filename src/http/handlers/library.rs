@@ -33,8 +33,7 @@ use crate::{
     library::{
         ensure_series_episode_catalog_from_local_metadata,
         managed_episode_tombstone_matches_series, match_managed_episode_tombstone,
-        match_managed_ingest_intent, normalize_managed_intent_title,
-        run_full_scan_with_metadata_and_linkers,
+        match_managed_ingest_intent, normalize_managed_intent_title, run_extension_scan,
     },
     media::owner_release::{
         MediaOwnerReleaseRequest, OwnerReleaseAction, OwnerReleaseEpisodeScope,
@@ -266,24 +265,9 @@ pub async fn scan(
     State(state): State<AppState>,
     Query(params): Query<ScanQuery>,
 ) -> ApiResult<Json<&'static str>> {
-    let candidates = state
-        .extensions
-        .scan_all_with_db(&state.db_pool, &state.settings.library.sonarr, None)
+    run_extension_scan(&state, params.force_metadata, params.force_reclassify)
         .await
         .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
-    run_full_scan_with_metadata_and_linkers(
-        &state.db_pool,
-        Some(&state.metadata),
-        Some(&state.linkers),
-        Some(&state.settings.classifier),
-        Some(&state.artwork),
-        candidates,
-        params.force_metadata,
-        params.force_reclassify,
-        state.settings.library.hash_dedupe_enabled,
-    )
-    .await
-    .map_err(|e| crate::http::error::ApiError::internal(e.to_string()))?;
     Ok(Json("ok"))
 }
 

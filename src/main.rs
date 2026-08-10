@@ -36,8 +36,9 @@ use elixir_server::http::handlers::extensions::{
     InstallPolicy, install_internal_extension_from_dir, resume_prism_certification_jobs,
 };
 use elixir_server::http::router;
-use elixir_server::library::LinkerService;
-use elixir_server::library::start_periodic_scan;
+use elixir_server::library::{
+    LinkerService, run_extension_scan, start_anime_library_repair_loop, start_periodic_scan,
+};
 use elixir_server::media_interactions::start_media_segment_job_worker_loop_until_shutdown;
 use elixir_server::metadata::MetadataService;
 use elixir_server::network::{start_mdns, wan::start_wan_tasks};
@@ -47,11 +48,11 @@ use elixir_server::orchestrator::planner::{build_provider_endpoint, stable_provi
 use elixir_server::orchestrator::reconcile::ReconcileConfig;
 use elixir_server::playback::{
     hardware::{
-        HardwareDetectionConfig, HardwarePreference, collect_host_hardware_inventory,
-        host_hardware_fingerprint, load_or_detect_hardware_capabilities,
+        HardwareDetectionConfig, HardwarePreference, host_hardware_fingerprint,
+        load_or_detect_hardware_capabilities_for_inventory,
     },
     performance::{
-        collect_playback_host_identity,
+        collect_playback_host_identity_for_inventory,
         seed_playback_performance_envelopes_from_certification_artifacts,
     },
     start_session_cleanup,
@@ -281,11 +282,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Live session lifecycle shutdown exceeded its deadline");
         }
     }
-    serve_result.context("server error")?;
+    // The managed local model owns a native child process. Stop it before
+    // tearing down playback so no worker can outlive the server lifecycle.
+    state.anime_inference.shutdown().await;
 
     // Clean up any lingering transcodes/temp files on shutdown.
     state.transcodes.stop_all().await;
 
+    serve_result.context("server error")?;
     tracing::info!("Elixir server shutdown complete");
     Ok(())
 }
@@ -295,6 +299,33 @@ async fn start_post_listener_background_tasks(
     reconcile_config: ReconcileConfig,
     shutdown: CancellationToken,
 ) {
+    let anime_inference = state.anime_inference.clone();
+    let anime_inference_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        anime_inference
+            .run_background(anime_inference_shutdown)
+            .await;
+    });
+
+    let anime_library_repair_state = state.clone();
+    let anime_library_repair_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        // Build the startup repair snapshot only after the initial scan has
+        // committed. The repair loop folds this scan's notification into its
+        // startup pass while retaining notifications that arrive after the
+        // startup pass begins.
+        if !anime_library_repair_shutdown.is_cancelled()
+            && let Err(error) = run_extension_scan(&anime_library_repair_state, false, false).await
+        {
+            tracing::warn!(
+                error = %error,
+                "initial library scan failed before anime repair; repair will continue"
+            );
+        }
+        start_anime_library_repair_loop(anime_library_repair_state, anime_library_repair_shutdown)
+            .await;
+    });
+
     start_playback_host_identity_warmup(state.clone());
     start_playback_hardware_readiness_warmup(state.clone());
 
@@ -434,7 +465,8 @@ async fn start_post_listener_background_tasks(
 
 fn start_playback_host_identity_warmup(state: AppState) {
     tokio::spawn(async move {
-        let identity = collect_playback_host_identity().await;
+        let inventory = state.host_hardware_inventory.get_or_collect().await;
+        let identity = collect_playback_host_identity_for_inventory(&inventory);
         let host_fingerprint = identity.host_fingerprint.clone();
         *state.playback_host_fingerprint.write().await = Some(host_fingerprint.clone());
         if !state
@@ -483,9 +515,15 @@ fn start_playback_hardware_readiness_warmup(state: AppState) {
         let config = HardwareDetectionConfig {
             preference: HardwarePreference::parse(&state.settings.playback.hardware_acceleration),
         };
-        match load_or_detect_hardware_capabilities(&state.db_pool, &config).await {
+        let inventory = state.host_hardware_inventory.get_or_collect().await;
+        match load_or_detect_hardware_capabilities_for_inventory(
+            &state.db_pool,
+            &config,
+            inventory.clone(),
+        )
+        .await
+        {
             Ok(capabilities) => {
-                let inventory = collect_host_hardware_inventory().await;
                 let host_fingerprint = host_hardware_fingerprint(&inventory);
                 let available_apis = capabilities.available_apis.clone();
                 *state.hardware_capabilities.write().await = Some(capabilities);
