@@ -551,14 +551,6 @@ fn compile_case(source: BlueprintCase) -> Result<CompiledCase> {
     let deterministic = deterministic_baseline(&input)
         .with_context(|| format!("running deterministic baseline for {}", source.case_id))?;
     let deterministic_final_plan = final_plan_for_resolution(&input.request, &deterministic)?;
-    if expected_final_plan.disposition == QualificationDisposition::NoMatch {
-        ensure!(
-            deterministic_final_plan == expected_final_plan,
-            "case {} expected no_match is unreachable because model failure preserves deterministic baseline {:?}",
-            source.case_id,
-            deterministic_final_plan
-        );
-    }
     let deterministic_easy = deterministic_union_state(&input.request, &deterministic)
         == DeterministicMatchState::Definitive
         && deterministic_final_plan == expected_final_plan;
@@ -1704,18 +1696,19 @@ mod tests {
     }
 
     #[test]
-    fn no_match_gold_rejects_a_deterministic_false_match() {
+    fn no_match_gold_is_independent_of_the_deterministic_baseline() -> Result<()> {
         let mut source = test_case();
         source.expected_final_plan = BlueprintExpectedFinalPlan {
             disposition: QualificationDisposition::NoMatch,
             candidate_plans: Vec::new(),
         };
-        let error = compile_case(source).expect_err("unreachable no-match gold");
-        assert!(
-            error
-                .to_string()
-                .contains("expected no_match is unreachable")
+        let compiled = compile_case(source)?;
+        assert_eq!(
+            compiled.case.expected_final_plan.disposition,
+            QualificationDisposition::NoMatch
         );
+        assert!(!compiled.case.deterministic_easy);
+        Ok(())
     }
 
     #[test]
@@ -1728,10 +1721,7 @@ mod tests {
                 source.request_id = format!("compiler-test-{index:03}");
                 source.provenance.source_record_id = format!("animetosho:{index}");
                 if invalid_indexes.contains(&index) {
-                    source.expected_final_plan = BlueprintExpectedFinalPlan {
-                        disposition: QualificationDisposition::NoMatch,
-                        candidate_plans: Vec::new(),
-                    };
+                    source.request.candidates.clear();
                 }
                 source
             })

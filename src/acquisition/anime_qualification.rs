@@ -12,7 +12,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,7 +32,6 @@ use crate::{
             acquisition_anime_deterministic_state, acquisition_candidate_language_evidence,
             acquisition_candidate_parse_facts, acquisition_match_context,
             acquisition_model_audio_profile_evidence, bind_exact_single_anime_provider_file,
-            model_derived_anime_coverage_plans_with_selection_resolver,
             selectable_anime_media_file,
         },
         automation::synthetic_stream_candidate_requires_manual_review,
@@ -55,9 +54,8 @@ use crate::{
         ANIME_MATCH_RESPONSE_SCHEMA_REVISION, ANIME_MATCH_SAMPLING_REVISION,
         ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeDeterministicResult,
         AnimeExecutionBackend, AnimeInferenceBundleManifest, AnimeKvCacheType,
-        AnimeMatchAssistResult, AnimeMatchAssistSource, AnimeMatchAudioPreference,
-        AnimeMatchAudioPreferenceMode, AnimeMatchAudioProfile, AnimeMatchBatchInput,
-        AnimeMatchCandidateInput, AnimeMatchEngine, AnimeMatchEngineOutput,
+        AnimeMatchAssistResult, AnimeMatchAudioPreference, AnimeMatchAudioPreferenceMode,
+        AnimeMatchAudioProfile, AnimeMatchBatchInput, AnimeMatchCandidateInput, AnimeMatchEngine,
         AnimeMatchFallbackReason, AnimeMatchFileInput, AnimeMatchRequest, AnimeMatchResponse,
         AnimeMatchSourceMap, AnimeMatchingService, AnimeRuntimeArtifactManifest,
         AnimeRuntimeBackend, AnimeRuntimeProbeResult, AnimeRuntimeProfile, DeterministicMatchState,
@@ -76,7 +74,7 @@ const EXPECTED_CASE_COUNT: usize = 520;
 const QUALIFICATION_CORPUS_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
-const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v2";
+const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v3-model-only";
 const SHA256_PREFIX: &str = "sha256:";
 const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const LOCAL_MODEL_CONTRACT_SOURCE: &str = include_str!("../anime_matching/local_model.rs");
@@ -363,60 +361,6 @@ struct QualificationFileSource {
 type QualificationPreparedRequest =
     PreparedAnimeMatchRequest<QualificationCandidateSource, QualificationFileSource>;
 
-#[derive(Debug, Clone)]
-struct RecordedModelCall {
-    response: Option<AnimeMatchResponse>,
-}
-
-#[derive(Clone)]
-struct RecordingEngine {
-    inner: Arc<dyn AnimeMatchEngine>,
-    last_call: Arc<Mutex<Option<RecordedModelCall>>>,
-}
-
-impl RecordingEngine {
-    fn new(inner: Arc<dyn AnimeMatchEngine>) -> Self {
-        Self {
-            inner,
-            last_call: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn take(&self) -> Result<Option<RecordedModelCall>> {
-        Ok(self
-            .last_call
-            .lock()
-            .map_err(|_| anyhow!("qualification model recorder mutex was poisoned"))?
-            .take())
-    }
-}
-
-#[async_trait]
-impl AnimeMatchEngine for RecordingEngine {
-    async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
-        Ok(self
-            .match_candidates_with_provenance(request)
-            .await?
-            .response)
-    }
-
-    async fn match_candidates_with_provenance(
-        &self,
-        request: AnimeMatchRequest,
-    ) -> Result<AnimeMatchEngineOutput> {
-        let result = self.inner.match_candidates_with_provenance(request).await;
-        let recorded = RecordedModelCall {
-            response: result.as_ref().ok().map(|output| output.response.clone()),
-        };
-        *self
-            .last_call
-            .lock()
-            .map_err(|_| anyhow!("qualification model recorder mutex was poisoned"))? =
-            Some(recorded);
-        result
-    }
-}
-
 #[derive(Clone)]
 enum InjectedEngine {
     Error(&'static str),
@@ -496,17 +440,7 @@ pub async fn run_anime_inference_qualification(
         .prime()
         .await
         .context("priming exact qualification worker")?;
-    let recording = RecordingEngine::new(Arc::new(engine.clone()));
-    let service = AnimeMatchingService::with_engine(Arc::new(recording.clone()));
-
-    let result = run_cases(
-        &corpus,
-        &identity,
-        selected_case_ids.as_ref(),
-        &service,
-        &recording,
-    )
-    .await;
+    let result = run_cases(&corpus, &identity, selected_case_ids.as_ref(), &engine).await;
     engine.shutdown().await;
     drop(runtime_extraction);
     let cases = result?;
@@ -531,8 +465,7 @@ async fn run_cases(
     corpus: &QualificationCorpus,
     identity: &QualificationIdentity,
     selected_case_ids: Option<&BTreeSet<String>>,
-    service: &AnimeMatchingService,
-    recording: &RecordingEngine,
+    engine: &dyn AnimeMatchEngine,
 ) -> Result<Vec<QualificationCaseOutput>> {
     let base_seed = identity.candidate_order_seeds[0];
     let permutation_seed = identity.candidate_order_seeds[1];
@@ -554,47 +487,16 @@ async fn run_cases(
         validate_case_input(case, &input)?;
         let baseline_resolution = deterministic_baseline(&input)?;
         let baseline = final_plan_for_resolution(&input.request, &baseline_resolution)?;
-        let state = deterministic_union_state(&input.request, &baseline_resolution);
 
-        let main = run_model_observation(
-            &input,
-            &baseline_resolution,
-            state,
-            base_seed,
-            base_seed,
-            service,
-            recording,
-        )
-        .await
-        .with_context(|| format!("running qualification case {}", case.case_id))?;
+        let main = run_model_observation(&input, base_seed, base_seed, engine)
+            .await
+            .with_context(|| format!("running qualification case {}", case.case_id))?;
         let stability_runs = if case.stability_subset {
             let mut values = Vec::with_capacity(4);
             for _ in 0..3 {
-                values.push(
-                    run_model_observation(
-                        &input,
-                        &baseline_resolution,
-                        state,
-                        base_seed,
-                        base_seed,
-                        service,
-                        recording,
-                    )
-                    .await?,
-                );
+                values.push(run_model_observation(&input, base_seed, base_seed, engine).await?);
             }
-            values.push(
-                run_model_observation(
-                    &input,
-                    &baseline_resolution,
-                    state,
-                    permutation_seed,
-                    base_seed,
-                    service,
-                    recording,
-                )
-                .await?,
-            );
+            values.push(run_model_observation(&input, permutation_seed, base_seed, engine).await?);
             values
         } else {
             Vec::new()
@@ -633,17 +535,10 @@ async fn run_cases(
 
 async fn run_model_observation(
     input: &QualificationCaseInput,
-    baseline: &QualificationResolutionState,
-    state: DeterministicMatchState,
     order_seed: u64,
     base_seed: u64,
-    service: &AnimeMatchingService,
-    recording: &RecordingEngine,
+    engine: &dyn AnimeMatchEngine,
 ) -> Result<QualificationObservation> {
-    ensure!(
-        recording.take()?.is_none(),
-        "stale model observation was present"
-    );
     let ordered_request = ordered_request(&input.request, order_seed, base_seed);
     let candidate_order = ordered_request
         .candidates
@@ -656,72 +551,32 @@ async fn run_model_observation(
         ordered_request,
         &input.acquisition_candidates,
     )?;
-    let validation_prepared = prepare_stable_request(
-        &input.request,
-        prepared.request().clone(),
-        &input.acquisition_candidates,
-    )?;
-    let context = &input.scoring_context;
-    let candidates = &input.acquisition_candidates;
     let preference = language_preference(&input.request.target.audio_preference);
-    let route_context = &input.route_context;
-    let outcome = service
-        .match_prepared_or_fallback(
-            AnimeDeterministicResult {
-                value: baseline.clone(),
-                state,
-            },
-            prepared,
-            |deterministic, request, matches, source_map| {
-                accepted_model_resolution(
-                    deterministic,
-                    request,
-                    context,
-                    candidates,
-                    &preference,
-                    route_context,
-                    matches,
-                    source_map,
-                )
-            },
-        )
-        .await;
-    let recorded = recording.take()?;
-    let response = recorded.and_then(|call| call.response);
-    let reference_validation_passed = response.as_ref().is_some_and(|response| {
-        validate_anime_match_response(&validation_prepared, response).is_ok()
-    });
-    let model_output = response
-        .map(|response| serde_json::to_value(response).expect("anime response is serializable"))
-        .unwrap_or(JsonValue::Null);
-    let model_decision = if outcome.provenance.result == AnimeMatchAssistResult::Matched {
-        "accepted"
-    } else {
-        "fallback"
-    }
-    .to_string();
-    let fallback_reason = if model_decision == "accepted" {
-        None
-    } else if outcome.provenance.source == AnimeMatchAssistSource::DeterministicFastPath {
-        Some("deterministic_fast_path".to_string())
-    } else {
-        Some(fallback_reason_name(
-            outcome
-                .provenance
-                .reason
-                .unwrap_or(AnimeMatchFallbackReason::EngineError),
-        ))
-    };
+    let engine_output = engine
+        .match_candidates_with_provenance(prepared.request().clone())
+        .await
+        .context("qualification model inference failed")?;
+    let response = engine_output.response;
+    validate_anime_match_response(&prepared, &response)
+        .context("qualification model returned an invalid response")?;
+    let model_output = serde_json::to_value(&response).expect("anime response is serializable");
+    let resolution = model_only_resolution(
+        input.acquisition_candidates.len(),
+        &preference,
+        &response.matches,
+        prepared.source_map(),
+    )?;
+    let final_plan = final_plan_for_resolution(&input.request, &resolution)?;
     Ok(QualificationObservation {
         order_seed,
         candidate_order,
         request_fingerprint,
-        model_decision,
-        fallback_reason,
+        model_decision: "accepted".to_string(),
+        fallback_reason: None,
         model_output_sha256: canonical_json_fingerprint(&model_output)?,
         model_output,
-        reference_validation_passed,
-        final_plan: final_plan_for_resolution(&input.request, &outcome.value)?,
+        reference_validation_passed: true,
+        final_plan,
     })
 }
 
@@ -814,60 +669,28 @@ async fn run_failure_injections(
     Ok(plans)
 }
 
-fn accepted_model_resolution(
-    deterministic: &QualificationResolutionState,
-    request: &AnimeMatchRequest,
-    context: &AnimeCandidateScoringContext,
-    candidates: &[AcquisitionCandidate],
+fn model_only_resolution(
+    candidate_count: usize,
     preference: &AcquisitionLanguagePreference,
-    route_context: &QualificationRouteContext,
     matches: &[AnimeCandidateMatch],
     source_map: &AnimeMatchSourceMap<QualificationCandidateSource, QualificationFileSource>,
 ) -> Result<QualificationResolutionState> {
-    let acquisition_source_map = acquisition_source_map(request, candidates, source_map)?;
-    let selection_support = file_selection_support_by_candidate_index(
-        request,
-        candidates.len(),
-        route_context,
-        source_map,
-    )?;
-    let model_plans = model_derived_anime_coverage_plans_with_selection_resolver(
-        request,
-        context,
-        candidates,
-        matches,
-        &acquisition_source_map,
-        |candidate_index, _| selection_support[candidate_index],
-    )?;
-    ensure!(
-        model_plans.len() == matches.len(),
-        "model coverage planner changed match cardinality"
-    );
-    let mut resolution = deterministic.clone();
-    for (matched, model_plan) in matches.iter().zip(model_plans) {
+    let mut resolution = QualificationResolutionState {
+        candidate_plans: vec![None; candidate_count],
+        saw_partial_or_ambiguous: false,
+    };
+    for matched in matches {
         let source = source_map
             .candidate_source(&matched.candidate_key)
             .ok_or_else(|| anyhow!("model match lacks qualification candidate source"))?;
         ensure!(
-            source.candidate_index == model_plan.candidate_index,
-            "model coverage candidate source changed across adapters"
-        );
-        ensure!(
-            acquisition_anime_deterministic_state(&model_plan.plan)
-                == DeterministicMatchState::Definitive,
-            "model coverage did not pass the automatic coverage gate"
+            source.candidate_index < candidate_count,
+            "model match candidate source is outside the qualification input"
         );
         let assessment = assess_language_preference(
             preference,
             MediaType::Anime,
             &acquisition_model_audio_profile_evidence(matched.audio_profile),
-        );
-        ensure!(
-            required_language_satisfied(preference, &assessment)
-                && !synthetic_stream_candidate_requires_manual_review(
-                    &candidates[source.candidate_index],
-                ),
-            "model coverage did not satisfy the required audio and route policy"
         );
         resolution.saw_partial_or_ambiguous = true;
         resolution.candidate_plans[source.candidate_index] =
@@ -1597,13 +1420,6 @@ fn plan_field_matches(
         }
         PlanField::CandidatePlans => left.candidate_plans == right.candidate_plans,
     }
-}
-
-fn fallback_reason_name(reason: AnimeMatchFallbackReason) -> String {
-    serde_json::to_value(reason)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "engine_error".to_string())
 }
 
 fn validate_case_selection(
