@@ -39,9 +39,10 @@ use crate::metrics::{
 };
 
 use super::{
-    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile, AnimeMatchEngine,
-    AnimeMatchEngineOutput, AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance,
-    hardware::InferenceBackend, prime_request,
+    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile,
+    AnimeMatchContextTarget, AnimeMatchEngine, AnimeMatchEngineOutput, AnimeMatchRequest,
+    AnimeMatchResponse, AnimeMatchRuntimeProvenance, AnimeMatchSeasonContext,
+    anime_match_alias_equivalence_key, hardware::InferenceBackend, prime_request,
 };
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -68,10 +69,20 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v12-target-aware-resolution";
-pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v5-semantic";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v13-direct-target-match";
+pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v6-direct";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
+
+const DIRECT_MATCH_PROMPT: &str = r#"Choose which anime candidates cover the exact wanted target.
+
+`target` is the requested movie, special, season, range, or episode. Each `seasons` item owns its aliases and episode coordinates; `episodes[].wanted` is the output target index. `release` and file `name` are raw names. Candidate and file `index` values are output indexes.
+
+Use English, romaji, Japanese, and alternate titles plus seasonal and absolute numbering. Different sequel names can be seasons of one franchise: for example Tokyo Ghoul Root A is season 2, Tokyo Ghoul:re is season 3, and Tokyo Ghoul:re 2 is season 4. Do not require literal SxxExx when an alias or absolute number resolves the target. Ranges cover every episode in the range. Movies, specials, OVAs, samples, NCOP, and NCED do not cover normal episodes.
+
+For `require`, audio evidence must match `audio.accepted`; `require_dub` accepts dubbed or dual-audio. `any`, `prefer`, and `prefer_dub` never reject an otherwise correct title match. For packs, select only the file indexes that cover the returned wanted indexes.
+
+Return the best compatible mappings. Return empty only when no candidate covers the target. JSON only: {\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
 
 const SEMANTIC_RESOLVER_PROMPT: &str = r#"Match one raw anime release title or file path against the structured wanted query.
 
@@ -899,23 +910,7 @@ impl LocalModelEngine {
             inference_phase,
             profile,
             &self.inner.shutdown,
-            async {
-                execute_semantic_resolution(
-                    &self.inner.http,
-                    address,
-                    request,
-                    "release",
-                    &request
-                        .candidates
-                        .first()
-                        .ok_or_else(|| anyhow!("prime request has no candidate"))?
-                        .title,
-                    None,
-                    profile,
-                    false,
-                )
-                .await
-            },
+            resolve_direct_request(&self.inner.http, address, request, profile),
         );
         let completion = match timeout_at(prime_deadline, completion).await {
             Ok(AdmissionMonitored::Completed(result)) => result,
@@ -1117,7 +1112,7 @@ impl LocalModelEngine {
             LocalModelAdmissionPhase::ProbeInference,
             profile,
             &self.inner.shutdown,
-            resolve_semantic_request(&self.inner.http, address, request, profile, false),
+            resolve_direct_request(&self.inner.http, address, request, profile),
         );
         let monitored = match timeout_at(request_deadline, completion).await {
             Ok(monitored) => monitored,
@@ -2006,14 +2001,7 @@ impl LocalModelEngine {
             "local model worker exited before inference"
         );
         let address = worker.address;
-        let response = resolve_semantic_request(
-            &self.inner.http,
-            address,
-            request,
-            profile,
-            self.inner.publish_runtime_metrics,
-        )
-        .await?;
+        let response = resolve_direct_request(&self.inner.http, address, request, profile).await?;
         let resident_rss_bytes = match slot.worker.as_ref() {
             Some(worker) => worker_rss_bytes(&worker.child).await,
             None => None,
@@ -2072,7 +2060,6 @@ impl AnimeMatchEngine for LocalModelEngine {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn build_chat_request(
     request: &AnimeMatchRequest,
     profile: &LocalModelRuntimeProfile,
@@ -2083,16 +2070,383 @@ fn build_chat_request(
         request.schema_version
     );
     ensure!(
+        !request.target.wanted_target_keys.is_empty(),
+        "anime match request has no wanted targets"
+    );
+    ensure!(
         !request.candidates.is_empty(),
         "anime match request has no candidates"
     );
-    build_semantic_chat_request(
-        request,
-        "release",
-        &request.candidates[0].title,
-        None,
-        profile,
-    )
+    let response_bounds = compact_response_bounds(request, profile.max_output_tokens as usize)?;
+    let request_json = serde_json::to_string(&compact_direct_request(request)?)
+        .context("encoding direct anime match request")?;
+    Ok(json!({
+        "model": profile.model_id,
+        "messages": [
+            {"role": "system", "content": DIRECT_MATCH_PROMPT},
+            {"role": "user", "content": request_json}
+        ],
+        "max_tokens": profile.max_output_tokens,
+        "temperature": profile.sampling.temperature,
+        "top_p": profile.sampling.top_p,
+        "top_k": profile.sampling.top_k,
+        "min_p": profile.sampling.min_p,
+        "seed": profile.sampling.seed,
+        "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "grammar": compact_response_grammar(request, response_bounds.maximum_mappings)?
+    }))
+}
+
+fn compact_direct_request(request: &AnimeMatchRequest) -> Result<Value> {
+    let mut target = serde_json::Map::new();
+    target.insert(
+        "title".to_string(),
+        Value::String(request.target.canonical_title.clone()),
+    );
+    target.insert(
+        "scope".to_string(),
+        serde_json::to_value(request.target.scope).context("encoding anime target scope")?,
+    );
+    if let Some(season) = request.target.season_number {
+        target.insert("season".to_string(), json!(season));
+    }
+    if !request.target.episode_numbers.is_empty() {
+        target.insert(
+            "episodes".to_string(),
+            json!(request.target.episode_numbers),
+        );
+    }
+    if !request.target.absolute_episode_numbers.is_empty() {
+        target.insert(
+            "absolute".to_string(),
+            json!(request.target.absolute_episode_numbers),
+        );
+    }
+    let audio = &request.target.audio_preference;
+    let mut compact_audio = serde_json::Map::new();
+    compact_audio.insert(
+        "mode".to_string(),
+        serde_json::to_value(audio.mode).context("encoding anime audio mode")?,
+    );
+    insert_non_empty_strings(&mut compact_audio, "languages", &audio.languages);
+    insert_non_empty_strings(&mut compact_audio, "subtitles", &audio.subtitle_languages);
+    insert_non_empty_strings(&mut compact_audio, "accepted", &audio.accepted_profiles);
+    target.insert("audio".to_string(), Value::Object(compact_audio));
+
+    let wanted_slots = request
+        .target
+        .wanted_target_keys
+        .iter()
+        .enumerate()
+        .map(|(slot, key)| (key.as_str(), slot))
+        .collect::<BTreeMap<_, _>>();
+    let seasons = request
+        .context
+        .seasons
+        .iter()
+        .filter_map(|season| {
+            let episodes = compact_context_targets(season, &wanted_slots);
+            if episodes.is_empty() {
+                return None;
+            }
+            let mut compact_season = serde_json::Map::new();
+            compact_season.insert("season".to_string(), json!(season.season_number));
+            let aliases = compact_season_aliases(season, &request.target.canonical_title);
+            insert_non_empty_strings(&mut compact_season, "aliases", &aliases);
+            compact_season.insert("episodes".to_string(), Value::Array(episodes));
+            Some(Value::Object(compact_season))
+        })
+        .collect::<Vec<_>>();
+
+    let candidates = request
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(candidate_index, candidate)| {
+            let mut compact = serde_json::Map::new();
+            compact.insert("index".to_string(), json!(candidate_index));
+            compact.insert(
+                "release".to_string(),
+                Value::String(candidate.title.clone()),
+            );
+            if !candidate.files.is_empty() {
+                compact.insert(
+                    "files".to_string(),
+                    Value::Array(
+                        candidate
+                            .files
+                            .iter()
+                            .enumerate()
+                            .map(|(file_index, file)| {
+                                json!({"index": file_index, "name": file.path})
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            Value::Object(compact)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "target": target,
+        "seasons": seasons,
+        "candidates": candidates,
+    }))
+}
+
+fn compact_season_aliases(season: &AnimeMatchSeasonContext, canonical_title: &str) -> Vec<String> {
+    let canonical_key = anime_match_alias_equivalence_key(canonical_title);
+    let mut seen = BTreeSet::new();
+    let mut aliases = Vec::new();
+    for alias in &season.aliases {
+        let value = alias.value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let key = anime_match_alias_equivalence_key(value);
+        if key.is_empty() || key == canonical_key || !seen.insert(key) {
+            continue;
+        }
+        aliases.push(value.to_string());
+    }
+    aliases
+}
+
+fn compact_context_targets(
+    season: &AnimeMatchSeasonContext,
+    wanted_slots: &BTreeMap<&str, usize>,
+) -> Vec<Value> {
+    let wanted_indices = season
+        .targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| {
+            wanted_slots
+                .contains_key(target.target_key.as_str())
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if wanted_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut included = wanted_indices.iter().copied().collect::<BTreeSet<_>>();
+    for wanted_index in wanted_indices {
+        let wanted = &season.targets[wanted_index];
+        if wanted.episode_number.is_none() || wanted.absolute_episode_number.is_none() {
+            if wanted_index > 0 {
+                included.insert(wanted_index - 1);
+            }
+            if wanted_index + 1 < season.targets.len() {
+                included.insert(wanted_index + 1);
+            }
+        }
+        for (index, target) in season.targets.iter().enumerate() {
+            let seasonal_collision = wanted
+                .episode_number
+                .zip(target.episode_number)
+                .is_some_and(|(left, right)| left == right);
+            let absolute_collision = wanted
+                .absolute_episode_number
+                .zip(target.absolute_episode_number)
+                .is_some_and(|(left, right)| left == right);
+            if index != wanted_index && (seasonal_collision || absolute_collision) {
+                included.insert(index);
+            }
+        }
+    }
+
+    included
+        .into_iter()
+        .filter_map(|index| season.targets.get(index))
+        .filter_map(|target| compact_context_target(target, wanted_slots))
+        .collect()
+}
+
+fn compact_context_target(
+    target: &AnimeMatchContextTarget,
+    wanted_slots: &BTreeMap<&str, usize>,
+) -> Option<Value> {
+    let mut compact = serde_json::Map::new();
+    if !target.title.is_empty() {
+        compact.insert("title".to_string(), Value::String(target.title.clone()));
+    }
+    if let Some(number) = target.episode_number {
+        compact.insert("episode".to_string(), json!(number));
+    }
+    if let Some(number) = target.absolute_episode_number {
+        compact.insert("absolute".to_string(), json!(number));
+    }
+    if let Some(slot) = wanted_slots.get(target.target_key.as_str()) {
+        compact.insert("wanted".to_string(), json!(slot));
+    }
+    (!compact.is_empty()).then_some(Value::Object(compact))
+}
+
+fn insert_non_empty_strings(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    values: &[String],
+) {
+    if !values.is_empty() {
+        object.insert(
+            key.to_string(),
+            Value::Array(values.iter().cloned().map(Value::String).collect()),
+        );
+    }
+}
+
+fn compact_response_grammar(
+    request: &AnimeMatchRequest,
+    maximum_mappings: usize,
+) -> Result<String> {
+    ensure!(
+        !request.target.wanted_target_keys.is_empty(),
+        "cannot build compact response grammar without wanted targets"
+    );
+    ensure!(
+        !request.candidates.is_empty(),
+        "cannot build compact response grammar without candidates"
+    );
+    ensure!(
+        (1..=request.candidates.len()).contains(&maximum_mappings),
+        "compact response mapping bound is outside the candidate cardinality"
+    );
+
+    let mapping_names = (0..request.candidates.len())
+        .map(|index| format!("mapping{index}"))
+        .collect::<Vec<_>>();
+    let mut rules =
+        vec!["root ::= \"{\\\"m\\\":[]}\" | \"{\\\"m\\\":[\" mappings \"]}\"".to_string()];
+    rules.push(format!(
+        "mappings ::= {}",
+        finite_sequence_choices("mapping", maximum_mappings)
+    ));
+    rules.push(format!("mapping ::= {}", mapping_names.join(" | ")));
+    rules.push(format!(
+        "target ::= {}",
+        grammar_integer_choices(request.target.wanted_target_keys.len())
+    ));
+    rules.push(format!(
+        "targets ::= {}",
+        finite_sequence_choices("target", request.target.wanted_target_keys.len())
+    ));
+
+    for (candidate_index, candidate) in request.candidates.iter().enumerate() {
+        let mapping = if candidate.files.is_empty() {
+            format!("\"[{candidate_index},[\" targets \"],[]]\"")
+        } else {
+            rules.push(format!(
+                "file{candidate_index} ::= {}",
+                grammar_integer_choices(candidate.files.len())
+            ));
+            rules.push(format!(
+                "files{candidate_index} ::= {}",
+                finite_sequence_choices(&format!("file{candidate_index}"), candidate.files.len())
+            ));
+            format!("\"[{candidate_index},[\" targets \"],[\" files{candidate_index} \"]]\"")
+        };
+        rules.push(format!("mapping{candidate_index} ::= {mapping}"));
+    }
+    Ok(rules.join("\n") + "\n")
+}
+
+fn finite_sequence_choices(symbol: &str, maximum: usize) -> String {
+    (1..=maximum)
+        .map(|count| vec![symbol; count].join(" \",\" "))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn grammar_integer_choices(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("\"{index}\""))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactResponseBounds {
+    maximum_mappings: usize,
+    maximum_response_bytes: usize,
+}
+
+fn compact_response_bounds(
+    request: &AnimeMatchRequest,
+    output_token_cap: usize,
+) -> Result<CompactResponseBounds> {
+    ensure!(
+        !request.target.wanted_target_keys.is_empty(),
+        "cannot bound compact response without wanted targets"
+    );
+    ensure!(
+        !request.candidates.is_empty(),
+        "cannot bound compact response without candidates"
+    );
+    let longest_mapping_bytes = maximum_compact_mapping_bytes(request)?;
+    let minimum_response_bytes = maximum_compact_response_bytes(1, longest_mapping_bytes)?;
+    let mut bounds = None;
+    for mapping_count in 1..=request.candidates.len() {
+        let response_bytes = maximum_compact_response_bytes(mapping_count, longest_mapping_bytes)?;
+        if response_bytes > output_token_cap {
+            break;
+        }
+        bounds = Some(CompactResponseBounds {
+            maximum_mappings: mapping_count,
+            maximum_response_bytes: response_bytes,
+        });
+    }
+    bounds.ok_or_else(|| {
+        anyhow!(
+            "one bounded anime match mapping can require {} ASCII bytes but the profile reserves only {output_token_cap} output tokens",
+            minimum_response_bytes
+        )
+    })
+}
+
+fn maximum_compact_mapping_bytes(request: &AnimeMatchRequest) -> Result<usize> {
+    let target_count = request.target.wanted_target_keys.len();
+    ensure!(
+        target_count > 0,
+        "cannot bound response without wanted targets"
+    );
+    let target_list_bytes =
+        maximum_index_sequence_bytes(target_count, (target_count - 1).to_string().len())?;
+    let mut longest = 0usize;
+    for (candidate_index, candidate) in request.candidates.iter().enumerate() {
+        let file_list_bytes = if candidate.files.is_empty() {
+            0
+        } else {
+            maximum_index_sequence_bytes(
+                candidate.files.len(),
+                (candidate.files.len() - 1).to_string().len(),
+            )?
+        };
+        let mapping_bytes = 8usize
+            .checked_add(candidate_index.to_string().len())
+            .and_then(|value| value.checked_add(target_list_bytes))
+            .and_then(|value| value.checked_add(file_list_bytes))
+            .ok_or_else(|| anyhow!("compact response byte bound overflow"))?;
+        longest = longest.max(mapping_bytes);
+    }
+    ensure!(longest > 0, "cannot bound response without candidates");
+    Ok(longest)
+}
+
+fn maximum_compact_response_bytes(mapping_count: usize, mapping_bytes: usize) -> Result<usize> {
+    maximum_index_sequence_bytes(mapping_count, mapping_bytes)?
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("compact response byte bound overflow"))
+}
+
+fn maximum_index_sequence_bytes(count: usize, element_width: usize) -> Result<usize> {
+    ensure!(count > 0, "cannot bound an empty compact sequence");
+    count
+        .checked_mul(element_width)
+        .and_then(|value| value.checked_add(count - 1))
+        .ok_or_else(|| anyhow!("compact response byte bound overflow"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2891,6 +3245,190 @@ struct ChatCompletionChoice {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactAnimeMatchResponse {
+    m: Vec<CompactCandidateMapping>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactCandidateMapping(usize, Vec<usize>, Vec<usize>);
+
+async fn resolve_direct_request(
+    client: &Client,
+    address: SocketAddr,
+    request: &AnimeMatchRequest,
+    profile: &LocalModelRuntimeProfile,
+) -> Result<LocalModelCompletion> {
+    let body = build_chat_request(request, profile)?;
+    let input_tokens = count_input_tokens(client, address, &body).await?;
+    enforce_context_gate(input_tokens, profile)?;
+    request_direct_completion(client, address, &body, request, profile.max_output_tokens).await
+}
+
+async fn request_direct_completion(
+    client: &Client,
+    address: SocketAddr,
+    body: &Value,
+    request: &AnimeMatchRequest,
+    output_token_cap: u32,
+) -> Result<LocalModelCompletion> {
+    let mut operation = MetricOperation::new("chat_completion");
+    let url = loopback_url(address, "/v1/chat/completions")?;
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .context("calling llama-server chat completion endpoint")?;
+    let bytes = bounded_response_bytes(response, "chat-completion").await?;
+    let mut envelope: ChatCompletionResponse =
+        serde_json::from_slice(&bytes).context("decoding llama-server chat response")?;
+    ensure!(
+        envelope.choices.len() == 1,
+        "llama-server returned {} choices instead of one",
+        envelope.choices.len()
+    );
+    let content = envelope.choices.remove(0).message.content;
+    ensure!(
+        !content.trim().is_empty(),
+        "llama-server returned empty model content"
+    );
+    let response = decode_compact_response(content.trim(), request, output_token_cap)?;
+    operation.succeed();
+    Ok(LocalModelCompletion {
+        response,
+        prompt_tokens: envelope.usage.as_ref().map(|usage| usage.prompt_tokens),
+        generated_tokens: envelope.usage.as_ref().map(|usage| usage.completion_tokens),
+        prompt_time_ms: envelope
+            .timings
+            .as_ref()
+            .and_then(|timings| finite_positive_millis(timings.prompt_ms)),
+        generation_time_ms: envelope
+            .timings
+            .as_ref()
+            .and_then(|timings| finite_positive_millis(timings.predicted_ms)),
+    })
+}
+
+fn decode_compact_response(
+    content: &str,
+    request: &AnimeMatchRequest,
+    output_token_cap: u32,
+) -> Result<AnimeMatchResponse> {
+    let compact: CompactAnimeMatchResponse = serde_json::from_str(content)
+        .context("decoding grammar-constrained compact anime match response")?;
+    let response_bounds = compact_response_bounds(request, output_token_cap as usize)?;
+    ensure!(
+        compact.m.len() <= response_bounds.maximum_mappings,
+        "compact response exceeds grammar mapping cardinality"
+    );
+    let mut matches = Vec::with_capacity(compact.m.len());
+    let mut seen_candidates = BTreeSet::new();
+    for CompactCandidateMapping(candidate_slot, target_slots, file_slots) in compact.m {
+        ensure!(
+            seen_candidates.insert(candidate_slot),
+            "compact response repeats candidate slot {candidate_slot}"
+        );
+        ensure!(
+            !target_slots.is_empty(),
+            "compact candidate slot {candidate_slot} accepted without targets"
+        );
+        let candidate = request
+            .candidates
+            .get(candidate_slot)
+            .ok_or_else(|| anyhow!("compact response candidate slot is out of bounds"))?;
+        ensure!(
+            target_slots.len() <= request.target.wanted_target_keys.len(),
+            "compact candidate slot {candidate_slot} exceeds target cardinality"
+        );
+        ensure!(
+            file_slots.len() <= candidate.files.len(),
+            "compact candidate slot {candidate_slot} exceeds file cardinality"
+        );
+        ensure!(
+            candidate.files.is_empty() || !file_slots.is_empty(),
+            "compact candidate slot {candidate_slot} accepted an inventoried candidate without selecting files"
+        );
+        ensure!(
+            !candidate.files.is_empty() || file_slots.is_empty(),
+            "compact candidate slot {candidate_slot} selected files for a fileless candidate"
+        );
+
+        let mut seen_targets = BTreeSet::new();
+        let matched_target_keys = target_slots
+            .into_iter()
+            .map(|target_slot| {
+                ensure!(
+                    seen_targets.insert(target_slot),
+                    "compact candidate slot {candidate_slot} repeats target slot {target_slot}"
+                );
+                request
+                    .target
+                    .wanted_target_keys
+                    .get(target_slot)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compact candidate slot {candidate_slot} references unknown target slot {target_slot}"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut seen_files = BTreeSet::new();
+        let selected_file_keys = file_slots
+            .into_iter()
+            .map(|file_slot| {
+                ensure!(
+                    seen_files.insert(file_slot),
+                    "compact candidate slot {candidate_slot} repeats local file slot {file_slot}"
+                );
+                candidate
+                    .files
+                    .get(file_slot)
+                    .map(|file| file.file_key.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "compact candidate slot {candidate_slot} references unknown local file slot {file_slot}"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        matches.push(AnimeCandidateMatch {
+            candidate_key: candidate.candidate_key.clone(),
+            matched_target_keys,
+            audio_profile: candidate_audio_profile(&candidate.parse_facts),
+            selected_file_keys: (!selected_file_keys.is_empty()).then_some(selected_file_keys),
+        });
+    }
+
+    Ok(AnimeMatchResponse {
+        schema_version: ANIME_MATCH_SCHEMA_VERSION,
+        matches,
+    })
+}
+
+fn candidate_audio_profile(facts: &super::AnimeMatchParseFacts) -> AnimeMatchAudioProfile {
+    for (evidence, profile) in [
+        ("dual_audio", AnimeMatchAudioProfile::DualAudio),
+        ("dubbed", AnimeMatchAudioProfile::Dubbed),
+        ("en_audio", AnimeMatchAudioProfile::EnAudio),
+        ("ja_audio_en_subs", AnimeMatchAudioProfile::JaAudioEnSubs),
+        ("subbed", AnimeMatchAudioProfile::Subbed),
+    ] {
+        if facts
+            .audio_profiles
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(evidence))
+        {
+            return profile;
+        }
+    }
+    AnimeMatchAudioProfile::Unknown
 }
 
 async fn request_structured_completion<T: DeserializeOwned>(
@@ -4439,7 +4977,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_v12_resolver_receives_wanted_target_raw_release_and_entity_alternatives() {
+    fn alm9_v13_direct_matcher_receives_target_context_and_candidates() {
         let mut request = request();
         request.context.seasons.insert(
             0,
@@ -4463,73 +5001,77 @@ mod tests {
                 }],
             },
         );
-        let body = build_chat_request(&request, &profile()).expect("semantic release request");
+        let body = build_chat_request(&request, &profile()).expect("direct match request");
         let user: Value = serde_json::from_str(
             body.pointer("/messages/1/content")
                 .and_then(Value::as_str)
-                .expect("semantic user JSON"),
+                .expect("direct user JSON"),
         )
-        .expect("semantic user object");
+        .expect("direct user object");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v12-target-aware-resolution"
+            "anime-match-v13-direct-target-match"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
-            "anime-match-response-v5-semantic"
+            "anime-match-response-v6-direct"
         );
-        assert_eq!(user["kind"], json!("release"));
-        assert_eq!(user["raw"], json!("Tokyo Ghoul Root A - 01"));
+        assert_eq!(user.pointer("/target/title"), Some(&json!("Tokyo Ghoul")));
+        assert_eq!(user.pointer("/target/season"), Some(&json!(2)));
+        assert_eq!(user.pointer("/target/audio/mode"), Some(&json!("any")));
+        assert_eq!(user.pointer("/seasons/0/season"), Some(&json!(2)));
         assert_eq!(
-            user.pointer("/context/entities/0/id"),
-            Some(&json!("22319"))
-        );
-        assert_eq!(
-            user.pointer("/context/entities/1/id"),
-            Some(&json!("27899"))
+            user.pointer("/seasons/0/episodes/0/wanted"),
+            Some(&json!(0))
         );
         assert_eq!(
-            user.pointer("/wanted/episodes/0/key"),
-            Some(&json!("S02E01"))
+            user.pointer("/candidates/0/release"),
+            Some(&json!("Tokyo Ghoul Root A - 01"))
         );
-        assert_eq!(user.pointer("/wanted/audio/mode"), Some(&json!("any")));
-        let encoded = serde_json::to_string(&user).expect("semantic user JSON");
+        let encoded = serde_json::to_string(&user).expect("direct user JSON");
         assert!(!encoded.contains("candidate-0"));
         assert!(!encoded.contains("parseFacts"));
-        let grammar = body["grammar"].as_str().expect("semantic grammar");
-        for entity in ["22319", "27899", "other", "unknown"] {
-            assert!(grammar.contains(entity), "grammar omitted entity {entity}");
-        }
-        assert!(!grammar.contains("candidate"));
+        assert!(!encoded.contains("22319"));
+        let grammar = body["grammar"].as_str().expect("direct grammar");
+        assert!(grammar.contains("mapping0"));
+        assert!(grammar.contains("file0"));
         let prompt = body["messages"][0]["content"]
             .as_str()
-            .expect("semantic prompt");
+            .expect("direct prompt");
         for rule in [
-            "`wanted` is the exact movie, special, season, range, or episode being requested",
-            "Do not copy numbers from context",
-            "Root A belongs to its own season entity",
-            "A file named `01-02` covers both 1 and 2",
+            "Choose which anime candidates cover the exact wanted target",
+            "English, romaji, Japanese",
+            "Tokyo Ghoul Root A is season 2",
+            "Return empty only when no candidate covers the target",
         ] {
-            assert!(prompt.contains(rule), "missing semantic rule: {rule}");
+            assert!(prompt.contains(rule), "missing direct rule: {rule}");
         }
-        assert!(!body["grammar"].as_str().unwrap().contains("\\\"n\\\""));
+    }
 
-        let file_body = build_semantic_chat_request(
-            &request,
-            "file",
-            "01.mkv",
-            Some("Tokyo Ghoul Root A Complete"),
-            &profile(),
-        )
-        .expect("semantic file request");
-        let file_user: Value = serde_json::from_str(
-            file_body["messages"][1]["content"]
-                .as_str()
-                .expect("semantic file user JSON"),
-        )
-        .expect("semantic file user object");
-        assert_eq!(file_user["raw"], json!("01.mkv"));
-        assert_eq!(file_user["release"], json!("Tokyo Ghoul Root A Complete"));
+    #[test]
+    fn alm9_v13_direct_response_expands_only_request_local_references() {
+        let request = request();
+        let response = decode_compact_response("{\"m\":[[0,[0],[0]]]}", &request, 256)
+            .expect("valid direct mapping");
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].candidate_key, "candidate-0");
+        assert_eq!(response.matches[0].matched_target_keys, ["S02E01"]);
+        assert_eq!(
+            response.matches[0].selected_file_keys,
+            Some(vec!["candidate-0-file-0".to_string()])
+        );
+
+        for invalid in [
+            "{\"m\":[[1,[0],[0]]]}",
+            "{\"m\":[[0,[1],[0]]]}",
+            "{\"m\":[[0,[0],[1]]]}",
+            "{\"m\":[[0,[0,0],[0]]]}",
+        ] {
+            assert!(
+                decode_compact_response(invalid, &request, 256).is_err(),
+                "invalid direct mapping was accepted: {invalid}"
+            );
+        }
     }
 
     #[test]
