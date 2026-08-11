@@ -692,9 +692,14 @@ fn model_only_resolution(
             MediaType::Anime,
             &acquisition_model_audio_profile_evidence(matched.audio_profile),
         );
+        if required_language_is_hard_mismatch(preference, &assessment) {
+            continue;
+        }
         resolution.saw_partial_or_ambiguous = true;
-        resolution.candidate_plans[source.candidate_index] =
-            Some(candidate_plan_for_model_match(matched, &assessment));
+        if required_language_satisfied(preference, &assessment) {
+            resolution.candidate_plans[source.candidate_index] =
+                Some(candidate_plan_for_model_match(matched, &assessment));
+        }
     }
     Ok(resolution)
 }
@@ -2664,6 +2669,39 @@ mod tests {
             diff.mismatched_fields,
             vec!["disposition", "candidatePlans"]
         );
+    }
+
+    #[test]
+    fn alm9_model_only_resolution_rejects_required_audio_mismatches() -> Result<()> {
+        let mut request = request();
+        request.target.audio_preference.mode = AnimeMatchAudioPreferenceMode::Require;
+        request.target.audio_preference.accepted_profiles = vec!["dubbed".to_string()];
+        let preference = language_preference(&request.target.audio_preference);
+        let source_map = AnimeMatchSourceMap::new(
+            BTreeMap::from([(
+                "candidate-0".to_string(),
+                QualificationCandidateSource { candidate_index: 0 },
+            )]),
+            BTreeMap::new(),
+        );
+        let resolution = model_only_resolution(
+            1,
+            &preference,
+            &[AnimeCandidateMatch {
+                candidate_key: "candidate-0".to_string(),
+                matched_target_keys: vec!["S02E01".to_string()],
+                audio_profile: AnimeMatchAudioProfile::DualAudio,
+                selected_file_keys: None,
+            }],
+            &source_map,
+        )?;
+        assert!(resolution.candidate_plans.iter().all(Option::is_none));
+        assert!(!resolution.saw_partial_or_ambiguous);
+        assert_eq!(
+            final_plan_for_resolution(&request, &resolution)?.disposition,
+            QualificationDisposition::NoMatch
+        );
+        Ok(())
     }
 
     #[test]

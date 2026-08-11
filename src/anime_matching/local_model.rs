@@ -71,22 +71,20 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v8-raw-release-evidence";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v9-owned-alias-evidence";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const SYSTEM_PROMPT: &str = r#"Match anime releases exactly.
+const SYSTEM_PROMPT: &str = r#"Match anime releases to wanted episodes exactly.
 
-`seasons` own aliases; `episodes[].wanted` is the output wanted index. Candidate/file array positions are output indices; `release` is raw. Missing facts are unknown, never agreement.
+Each `seasons` item owns its aliases and episodes; `episodes[].wanted` is the output wanted index. `release` and file `name` are raw. Candidate/file `index` values are output indices. Missing means unknown.
 
-For each candidate, title must be `target.title` or a target-season alias. All known season, episode/absolute, kind, file, and required-audio facts must agree. Reject unrelated titles, any conflict, special/movie for episode scope, and a generic franchise title lacking target-season or absolute proof when target season >1. Index is not evidence.
+Use owning aliases with episode/absolute coordinates to translate anime season, part, cour, and absolute numbering. Owning aliases outrank `target.title`. Reject unrelated titles, unexplained coordinate conflicts, specials/movies for normal episodes, and generic franchise titles without season or absolute proof. Index is not evidence.
 
-For require, `audio.accepted` is an allow-list; missing/unaccepted audio rejects. require_dub needs dual_audio/dubbed. any permits unknown; prefer never rejects.
+For require, `audio.accepted` is exact; missing/unaccepted audio rejects. require_dub accepts dual_audio/dubbed. any permits unknown; prefer never rejects. A multi-episode file cannot satisfy a subset. In packs select only wanted files; omit extras, samples, NCOP, and NCED.
 
-E15 vs candidate E16 => {"m":[]}. Pack wanted 0=E1,1=E2 with candidate 0 files [E1,E2,special] => {"m":[[0,[0,1],[0,1]]]}.
-
-JSON only, best-first: {"m":[[candidate index,[wanted indices],[file indices]],...]}. Sole inventoried file=0 when omitted; fileless=[]. Preserve wanted/file order; none={"m":[]}."#;
+JSON only, best-first: {"m":[[candidate index,[wanted indices],[file indices]],...]}. Preserve wanted/file order; fileless=[]. None={"m":[]}."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2175,7 +2173,6 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
                 return None;
             }
             let mut compact_season = serde_json::Map::new();
-            compact_season.insert("season".to_string(), json!(season.season_number));
             let aliases = compact_season_aliases(season, &request.target.canonical_title);
             insert_non_empty_strings(&mut compact_season, "aliases", &aliases);
             compact_season.insert("episodes".to_string(), Value::Array(episodes));
@@ -3932,7 +3929,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v8-raw-release-evidence"
+            "anime-match-v9-owned-alias-evidence"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
@@ -3960,11 +3957,11 @@ mod tests {
         assert_eq!(
             compact.pointer("/candidates/0/files/0"),
             Some(&json!({
-                "title": "Tokyo Ghoul Root A",
-                "absolute": [1],
+                "index": 0,
+                "name": "Tokyo Ghoul Root A - 01.mkv",
             }))
         );
-        assert!(compact.pointer("/candidates/0/index").is_none());
+        assert_eq!(compact.pointer("/candidates/0/index"), Some(&json!(0)));
         assert_eq!(
             compact.pointer("/candidates/0/release"),
             Some(&json!("Tokyo Ghoul Root A - 01"))
@@ -4131,6 +4128,7 @@ mod tests {
         let compact = compact_request(&request).expect("season-owned aliases");
         let seasons = compact["seasons"].as_array().expect("compact seasons");
         assert_eq!(seasons.len(), 1);
+        assert!(compact.pointer("/seasons/0/season").is_none());
         assert_eq!(
             compact.pointer("/seasons/0/aliases"),
             Some(&json!([
