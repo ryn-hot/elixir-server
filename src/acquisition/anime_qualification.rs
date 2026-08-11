@@ -2149,7 +2149,7 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
     let prompt = source_between(
         source,
         "const DIRECT_MATCH_PROMPT: &str = r#\"",
-        "\nconst SEMANTIC_RESOLVER_PROMPT",
+        "\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]",
         "direct prompt",
     )?;
     let prompt_builder = source_between(
@@ -2161,13 +2161,13 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
     let response_schema = source_between(
         source,
         "fn compact_response_grammar(",
-        "\n#[derive(Debug, Clone, Copy, Serialize",
+        "\n#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct InputTokenResponse",
         "direct response grammar and bounds",
     )?;
     let response_execution = source_between(
         source,
         "#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct CompactAnimeMatchResponse {",
-        "\nasync fn request_structured_completion",
+        "\nfn finite_positive_millis(",
         "direct response decoding and validation",
     )?;
     let sampling = source_between(
