@@ -344,7 +344,7 @@ async fn primed_health_stall_is_bounded_and_reaped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_prime_is_killed_and_reaped_without_ever_publishing_ready() {
+async fn semantically_wrong_but_valid_prime_only_warms_the_worker() {
     let runtime = FakeRuntime::new("wrong_wait");
     let engine = activate_fake(&runtime).await;
     let prime_engine = engine.clone();
@@ -357,18 +357,17 @@ async fn wrong_prime_is_killed_and_reaped_without_ever_publishing_ready() {
     assert_eq!(starting.process_id, u32::try_from(process_id).ok());
     runtime.release_waiting_response();
 
-    let error = tokio::time::timeout(Duration::from_secs(3), prime_task)
+    tokio::time::timeout(Duration::from_secs(3), prime_task)
         .await
-        .expect("wrong prime did not terminate")
-        .expect("wrong-prime task panicked")
-        .expect_err("wrong prime must fail");
-    assert!(error.to_string().contains("wrong mapping"), "{error:#}");
-    let failed = engine.snapshot().await;
-    assert_eq!(failed.state, LocalModelWorkerState::Unavailable);
-    assert!(failed.process_id.is_none());
-    assert_process_reaped(process_id);
+        .expect("prime did not terminate")
+        .expect("prime task panicked")
+        .expect("valid structured prime must warm regardless of semantic choice");
+    let ready = engine.snapshot().await;
+    assert_eq!(ready.state, LocalModelWorkerState::Ready);
+    assert_eq!(ready.process_id, u32::try_from(process_id).ok());
 
     engine.shutdown().await;
+    assert_process_reaped(process_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

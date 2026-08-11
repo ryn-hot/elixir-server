@@ -1,5 +1,6 @@
-//! Fixed production-shaped requests and exact expected responses used to
-//! prime and probe the local anime-matching worker.
+//! Fixed production-shaped requests used to prime and probe the local
+//! anime-matching worker. Exact expected responses are retained for corpus and
+//! certification assertions, never hardware-profile selection.
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
@@ -29,11 +30,11 @@ pub(crate) fn prime_request() -> Result<AnimeMatchRequest> {
     Ok(priming)
 }
 
-/// Return two fixed, production-shaped requests used to admit a local runtime
+/// Return two fixed, production-shaped requests used to exercise a local runtime
 /// profile. The first primes a newly loaded worker; the second is distinct, so
 /// only their shared production prefix is reusable and the measurement cannot
-/// pass through exact user-prompt reuse. Both remain part of the frozen
-/// physical-certification corpus.
+/// pass through exact user-prompt reuse. Semantic capability is scored by the
+/// frozen corpus. Both remain part of the physical-certification corpus.
 pub(crate) fn smoke_requests() -> Result<[AnimeMatchRequest; 2]> {
     let corpus: ProfileProbeRequestCorpus =
         serde_json::from_slice(PROFILE_PROBE_REQUEST_CORPUS_BYTES)
@@ -63,10 +64,12 @@ pub(crate) fn smoke_requests() -> Result<[AnimeMatchRequest; 2]> {
 }
 
 /// Validate the exact response required from the shared priming request.
+#[cfg(test)]
 pub(crate) fn prime_response_passed(response: &AnimeMatchResponse) -> bool {
     profile_probe_response_passed(PROFILE_PROBE_PRIMING_REQUEST_ID, response)
 }
 
+#[cfg(test)]
 pub(crate) fn smoke_responses_passed(
     priming_response: &AnimeMatchResponse,
     response: &AnimeMatchResponse,

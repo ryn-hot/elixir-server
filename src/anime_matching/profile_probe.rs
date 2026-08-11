@@ -42,7 +42,7 @@ use super::{
 
 use super::{
     certification::{read_strict_json, runtime_id, verify_artifact},
-    prime::{smoke_requests, smoke_responses_passed},
+    prime::smoke_requests,
 };
 
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct AnimeInferenceProfileProbeConfig {
     pub output_path: PathBuf,
 }
 
-/// Generates one model-capable, sealed profile from the production envelope
+/// Generates one execution-capable, sealed profile from the production envelope
 /// selector and production llama.cpp worker path. A deterministic-only result
 /// is an error and no output is created.
 pub async fn run_anime_inference_profile_probe(
@@ -400,8 +400,7 @@ impl ReleaseEnvelopeProbe<'_> {
         });
         Ok(InferenceProbeMeasurement {
             worker_ready: measured.worker_ready,
-            smoke_match_passed: measured.smoke_match_passed
-                && smoke_responses_passed(&measured.priming_response, &measured.response),
+            smoke_match_passed: measured.smoke_match_passed,
             load_time_ms: measured.load_time_ms,
             warm_latency_ms: measured.warm_latency_ms,
             peak_rss_bytes: measured.peak_rss_bytes.unwrap_or(0),

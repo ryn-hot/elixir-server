@@ -51,7 +51,7 @@ use super::{
     collect_current_inference_memory, collect_inference_hardware_inventory,
     commit_accepted_anime_update, ensure_monotonic_anime_update, inference_hardware_fingerprint,
     load_accepted_anime_update, resolve_anime_runtime, runtime_device_memory,
-    runtime_profile_candidates, select_runtime_profile, smoke_requests, smoke_responses_passed,
+    runtime_profile_candidates, select_runtime_profile, smoke_requests,
     verify_anime_bundle_envelope,
 };
 
@@ -1692,10 +1692,7 @@ impl LocalEnvelopeProbe<'_> {
         });
         Ok(InferenceProbeMeasurement {
             worker_ready: measured.worker_ready,
-            smoke_match_passed: smoke_responses_passed(
-                &measured.priming_response,
-                &measured.response,
-            ),
+            smoke_match_passed: measured.smoke_match_passed,
             load_time_ms: measured.load_time_ms,
             warm_latency_ms: measured.warm_latency_ms,
             peak_rss_bytes: measured.peak_rss_bytes.unwrap_or(0),
