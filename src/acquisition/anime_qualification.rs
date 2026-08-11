@@ -78,7 +78,7 @@ const EXPECTED_CASE_COUNT: usize = 520;
 const QUALIFICATION_CORPUS_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
-const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v4-production-plan";
+const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v3-model-only";
 const SHA256_PREFIX: &str = "sha256:";
 const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const LOCAL_MODEL_CONTRACT_SOURCE: &str = include_str!("../anime_matching/local_model.rs");
@@ -640,15 +640,32 @@ async fn run_model_observation(
         coverage.len() == response.matches.len(),
         "production coverage result count differs from validated model matches"
     );
-    for (mapped, matched) in coverage.into_iter().zip(&response.matches) {
+    for mapped in &coverage {
         let assessment = assess_language_preference(
             &preference,
             MediaType::Anime,
             &acquisition_model_audio_profile_evidence(mapped.audio_profile),
         );
         if required_language_is_hard_mismatch(&preference, &assessment) {
-            continue;
+            return Ok(QualificationObservation {
+                order_seed,
+                candidate_order,
+                request_fingerprint,
+                model_decision: "fallback".to_string(),
+                fallback_reason: Some("audio_policy_failed".to_string()),
+                model_output,
+                model_output_sha256,
+                reference_validation_passed: true,
+                final_plan: baseline.clone(),
+            });
         }
+    }
+    for (mapped, matched) in coverage.into_iter().zip(&response.matches) {
+        let assessment = assess_language_preference(
+            &preference,
+            MediaType::Anime,
+            &acquisition_model_audio_profile_evidence(mapped.audio_profile),
+        );
         resolution.saw_partial_or_ambiguous = true;
         if required_language_satisfied(&preference, &assessment) {
             resolution.candidate_plans[mapped.candidate_index] = Some(
