@@ -151,7 +151,7 @@ impl FakeRuntime {
     fn profile(&self) -> LocalModelRuntimeProfile {
         LocalModelRuntimeProfile {
             bundle_version: "2026.08.lifecycle-test".to_string(),
-            model_id: "qwen3.5-2b".to_string(),
+            model_id: "qwen3-4b-instruct-2507".to_string(),
             model_revision: "fixture-model-r1".to_string(),
             worker_revision: "fixture-worker-r1".to_string(),
             backend: "cpu".to_string(),

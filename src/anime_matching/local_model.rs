@@ -51,12 +51,16 @@ use super::{
 const LOOPBACK_HOST: &str = "127.0.0.1";
 const V1_CONTEXT_TOKENS: u32 = 4_096;
 const V1_PARALLEL: u32 = 1;
-const REQUEST_DEADLINE: Duration = Duration::from_secs(8);
-// Priming is an internal cold-start operation. User work falls back
-// deterministically while it runs, so the minimum Intel profile can use the
-// full cold-start envelope without weakening the eight-second request bound.
-const PRIME_DEADLINE: Duration = Duration::from_secs(30);
-const COLD_READINESS_DEADLINE: Duration = Duration::from_secs(30);
+// Difficult anime resolution is background work where correctness dominates
+// latency. This is a failure boundary, not a performance target: playback can
+// defer/restart the work within this envelope and deterministic fallback is
+// used only after the model genuinely cannot complete.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30 * 60);
+// Priming is an internal cold-start operation. It remains separately bounded
+// so a cold worker cannot consume the full correctness envelope before the
+// actual match begins.
+const PRIME_DEADLINE: Duration = Duration::from_secs(5 * 60);
+const COLD_READINESS_DEADLINE: Duration = Duration::from_secs(2 * 60);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BACKGROUND_TICK: Duration = Duration::from_secs(1);
@@ -294,8 +298,9 @@ pub enum LocalModelAdmissionPhase {
 }
 
 /// Hook used by the host hardware/resource service. Returning an error causes
-/// immediate deterministic fallback. An inference-phase rejection also unloads
-/// the worker so streaming and transcoding keep priority.
+/// work to defer within the production correctness deadline. An in-flight
+/// inference rejection unloads the worker so streaming and transcoding keep
+/// priority; production matching resumes automatically when resources return.
 pub trait LocalModelAdmission: Send + Sync {
     fn admit(
         &self,
@@ -1391,7 +1396,7 @@ impl LocalModelEngine {
     }
 
     pub async fn snapshot(&self) -> LocalModelSnapshot {
-        // Health must never queue behind an eight-second completion while the
+        // Health must never queue behind a long-running completion while the
         // worker mutex is held. Refresh opportunistically and otherwise return
         // the last observation maintained by lifecycle transitions.
         if let Ok(slot) = self.inner.worker.try_lock() {
@@ -1737,8 +1742,77 @@ impl LocalModelEngine {
         &self,
         request: AnimeMatchRequest,
     ) -> Result<(AnimeMatchEngineOutput, LocalModelCompletion)> {
-        self.infer_measured_with_deadline(request, REQUEST_DEADLINE)
-            .await
+        let final_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
+        let mut resuming_after_resource_preemption = false;
+        loop {
+            ensure!(
+                !self.inner.shutdown.is_cancelled(),
+                "local model engine is shut down"
+            );
+            let profile = self.active_profile().await?;
+            self.wait_for_inference_admission(&profile, final_deadline)
+                .await?;
+
+            let (ready, crashed) = self.primed_worker_status(&profile).await?;
+            if !ready {
+                if crashed
+                    || (self.inner.restart_used.load(Ordering::Acquire)
+                        && !resuming_after_resource_preemption)
+                {
+                    let remaining =
+                        final_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    return self.infer_measured_with_deadline(request, remaining).await;
+                }
+                match timeout_at(final_deadline, self.prime()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if resource_admission_deferred(&error) => continue,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => bail!("local model request deadline exceeded"),
+                }
+            }
+
+            let remaining = final_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("local model request deadline exceeded");
+            }
+            match self
+                .infer_measured_with_deadline(request.clone(), remaining)
+                .await
+            {
+                Err(error) if resource_admission_deferred(&error) => {
+                    resuming_after_resource_preemption = true;
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn wait_for_inference_admission(
+        &self,
+        profile: &LocalModelRuntimeProfile,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        loop {
+            if self
+                .inner
+                .admission
+                .admit(LocalModelAdmissionPhase::Inference, profile)
+                .is_ok()
+            {
+                return Ok(());
+            }
+            inference_event("resource_admission", "waiting");
+            tokio::select! {
+                _ = self.inner.shutdown.cancelled() => {
+                    bail!("local model engine is shutting down");
+                }
+                _ = sleep(ADMISSION_POLL_INTERVAL) => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("local model request deadline exceeded while waiting for resources");
+                }
+            }
+        }
     }
 
     async fn infer_measured_with_deadline(
@@ -1989,6 +2063,14 @@ impl LocalModelEngine {
             }
         }
     }
+}
+
+fn resource_admission_deferred(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<InFlightAdmissionRejected>().is_some()
+            || cause.to_string().contains("resource admission")
+            || cause.to_string().contains("admission was revoked")
+    })
 }
 
 #[async_trait]
@@ -3694,11 +3776,11 @@ mod tests {
     }
 
     const ALM9_NATIVE_LLAMA_SERVER_ENV: &str = "ELIXIR_ALM9_LLAMA_SERVER_PATH";
-    const ALM9_NATIVE_QWEN_MODEL_ENV: &str = "ELIXIR_ALM9_QWEN35_2B_Q4_K_M_PATH";
+    const ALM9_NATIVE_QWEN_MODEL_ENV: &str = "ELIXIR_ALM9_QWEN3_4B_INSTRUCT_2507_Q4_K_M_PATH";
     const ALM9_NATIVE_LLAMA_SERVER_SHA256: &str =
         "11e02e3fd6c0ce1c770e79b8d9ccf5670a69d26c6252dfbfd55cb9caf22b95b7";
     const ALM9_NATIVE_QWEN_MODEL_SHA256: &str =
-        "880c00b721b5a7c2f9358e1aa7c4b828477fe4da56dc9264bfbadc903a9dba30";
+        "2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e";
 
     fn alm9_native_release_path(variable: &str) -> Result<PathBuf> {
         let value = std::env::var_os(variable).ok_or_else(|| {
@@ -3719,8 +3801,9 @@ mod tests {
     ) -> LocalModelRuntimeProfile {
         LocalModelRuntimeProfile {
             bundle_version: "alm9-native-release-probe-v1".to_string(),
-            model_id: "Qwen/Qwen3.5-2B".to_string(),
-            model_revision: "15852e8c16360a2fea060d615a32b45270f8a8fc".to_string(),
+            model_id: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+            model_revision: "validation-ae44f08e1392f39c0e474af10c3ff8355c8b6688-q4-k-m"
+                .to_string(),
             worker_revision: "llama.cpp-b9637-aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3".to_string(),
             backend: "cpu".to_string(),
             profile_fingerprint:
@@ -3737,7 +3820,7 @@ mod tests {
             batch_threads: 8,
             gpu_layers: 0,
             kv_cache_type: "f16".to_string(),
-            peak_rss_bytes: 2 * 1024 * 1024 * 1024,
+            peak_rss_bytes: 4 * 1024 * 1024 * 1024,
             idle_unload_seconds: 300,
             sampling: LocalModelSamplingProfile::default(),
         }
@@ -3981,10 +4064,10 @@ mod tests {
     }
 
     #[test]
-    fn alm9_cold_start_allowances_do_not_weaken_the_request_deadline() {
-        assert_eq!(COLD_READINESS_DEADLINE, Duration::from_secs(30));
-        assert_eq!(PRIME_DEADLINE, Duration::from_secs(30));
-        assert_eq!(REQUEST_DEADLINE, Duration::from_secs(8));
+    fn alm9_correctness_deadline_retains_separate_cold_start_allowances() {
+        assert_eq!(COLD_READINESS_DEADLINE, Duration::from_secs(2 * 60));
+        assert_eq!(PRIME_DEADLINE, Duration::from_secs(5 * 60));
+        assert_eq!(REQUEST_DEADLINE, Duration::from_secs(30 * 60));
     }
 
     #[test]
@@ -4706,7 +4789,7 @@ mod tests {
     /// artifact paths below, loads a 1.2 GiB model, and exercises real CPU
     /// inference. Ordinary tests and the product expose no switch for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires ELIXIR_ALM9_LLAMA_SERVER_PATH and ELIXIR_ALM9_QWEN35_2B_Q4_K_M_PATH"]
+    #[ignore = "requires ELIXIR_ALM9_LLAMA_SERVER_PATH and ELIXIR_ALM9_QWEN3_4B_INSTRUCT_2507_Q4_K_M_PATH"]
     async fn alm9_native_qwen35_cpu_production_protocol_release_probe() {
         let result = async {
             let worker_path = alm9_native_release_path(ALM9_NATIVE_LLAMA_SERVER_ENV)?;
@@ -4717,7 +4800,7 @@ mod tests {
             );
             ensure!(
                 alm9_native_sha256(&model_path).await? == ALM9_NATIVE_QWEN_MODEL_SHA256,
-                "native release probe model bytes do not match the official Qwen3.5-2B Q4_K_M artifact"
+                "native release probe model bytes do not match the pinned Qwen3-4B-Instruct-2507 Q4_K_M validation artifact"
             );
             let profile = alm9_native_cpu_profile(worker_path, model_path);
             profile.validate_contract()?;
@@ -4731,11 +4814,11 @@ mod tests {
                 "native probe must use the qualified f16/256 output profile"
             );
             ensure!(
-                REQUEST_DEADLINE == Duration::from_secs(8),
-                "native probe must exercise the qualified production deadline"
+                REQUEST_DEADLINE == Duration::from_secs(30 * 60),
+                "native probe must exercise the correctness-first production deadline"
             );
             ensure!(
-                PRIME_DEADLINE == Duration::from_secs(30),
+                PRIME_DEADLINE == Duration::from_secs(5 * 60),
                 "native probe must keep priming inside the cold-start envelope"
             );
 
@@ -4897,7 +4980,7 @@ mod tests {
             );
             ensure!(
                 alm9_native_sha256(&model_path).await? == ALM9_NATIVE_QWEN_MODEL_SHA256,
-                "native diagnostic model bytes do not match the official Qwen3.5-2B Q4_K_M artifact"
+                "native diagnostic model bytes do not match the pinned Qwen3-4B-Instruct-2507 Q4_K_M validation artifact"
             );
             let corpus: Value = serde_json::from_slice(
                 &tokio::fs::read(&corpus_path)
@@ -4986,7 +5069,7 @@ mod tests {
 
     #[test]
     fn alm6_restart_budget_resets_only_after_a_successful_completion() {
-        let engine = LocalModelEngine::allow_all().expect("engine");
+        let engine = LocalModelEngine::allow_all_for_probe().expect("engine");
         assert!(engine.claim_restart(), "first crash gets one restart");
         assert!(
             !engine.claim_restart(),
@@ -5482,9 +5565,10 @@ server.serve_forever()
             .process_id
             .expect("ready worker process id");
 
+        let request_deadline = Duration::from_secs(1);
         let request_started = Instant::now();
         let error = engine
-            .match_candidates(request())
+            .match_with_deadline_for_certification(request(), request_deadline)
             .await
             .expect_err("stalled generation must return deterministic fallback error");
         let request_elapsed = request_started.elapsed();
@@ -5495,11 +5579,11 @@ server.serve_forever()
             "unexpected stalled-generation failure: {error:#}"
         );
         assert!(
-            request_elapsed >= REQUEST_DEADLINE.saturating_sub(Duration::from_millis(250)),
+            request_elapsed >= request_deadline.saturating_sub(Duration::from_millis(250)),
             "generation returned before its absolute deadline: {request_elapsed:?}"
         );
         assert!(
-            request_elapsed <= REQUEST_DEADLINE + PROCESS_STOP_GRACE + Duration::from_secs(2),
+            request_elapsed <= request_deadline + PROCESS_STOP_GRACE + Duration::from_secs(2),
             "generation timeout and worker teardown exceeded their bound: {request_elapsed:?}"
         );
 
@@ -5692,7 +5776,7 @@ server.serve_forever()
             .await
             .expect("probe activation");
         let error = engine
-            .match_candidates(request())
+            .match_with_deadline_for_certification(request(), Duration::from_millis(100))
             .await
             .expect_err("pressure must defer inference");
         assert!(error.to_string().contains("resource admission"));

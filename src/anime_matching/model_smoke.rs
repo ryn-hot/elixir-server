@@ -41,9 +41,9 @@ const CONTRACT_BYTES: &str = include_str!("fixtures/model-smoke-contract-v1.json
 const REQUEST_CORPUS_BYTES: &[u8] = include_bytes!("fixtures/hardware-certification-requests.json");
 const FROZEN_QUALIFICATION_STATUS: &str = "frozen-qualification-inputs";
 const EXPECTED_QUANTIZATION: &str = "Q4_K_M";
-const EXPECTED_GGUF_ARCHITECTURE: &str = "qwen35";
+const EXPECTED_GGUF_ARCHITECTURE: &str = "qwen3";
 const EXPECTED_GGUF_FILE_TYPE: u64 = 15;
-const EXPECTED_GGUF_BLOCK_COUNT: u64 = 24;
+const EXPECTED_GGUF_BLOCK_COUNT: u64 = 36;
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_GGUF_METADATA_ENTRIES: u64 = 1_000_000;
 const MAX_GGUF_ARRAY_ITEMS: u64 = 5_000_000;
@@ -671,7 +671,9 @@ fn validate_source_lock(
         .and_then(JsonValue::as_array)
         .ok_or_else(|| anyhow!("model source lock primary files must be an array"))?;
     let tokenizer_sha256 = source_file_sha(files, "tokenizer.json")?;
-    let template_sha256 = source_file_sha(files, "chat_template.jinja")?;
+    // Qwen3-4B-Instruct-2507 stores its immutable chat template inside the
+    // official tokenizer_config.json rather than as a separate Jinja file.
+    let template_sha256 = source_file_sha(files, "tokenizer_config.json")?;
     ensure!(
         tokenizer_sha256 == contract.source_tokenizer_sha256
             && template_sha256 == contract.source_template_sha256,
@@ -1033,11 +1035,11 @@ fn read_gguf_identity(path: &Path) -> Result<GgufIdentity> {
                 ensure!(file_type.is_none(), "duplicate GGUF file-type metadata");
                 file_type = Some(read_gguf_unsigned(&mut file, value_type)?);
             }
-            "qwen35.block_count" => {
+            "qwen3.block_count" => {
                 ensure!(block_count.is_none(), "duplicate GGUF block-count metadata");
                 block_count = Some(read_gguf_unsigned(&mut file, value_type)?);
             }
-            "qwen35.nextn_predict_layers" => {
+            "qwen3.nextn_predict_layers" => {
                 ensure!(
                     !nextn_predict_layers_present,
                     "duplicate GGUF nextn metadata"
@@ -1074,7 +1076,7 @@ fn validate_release_gguf_identity(identity: &GgufIdentity) -> Result<()> {
             && identity.file_type == EXPECTED_GGUF_FILE_TYPE
             && identity.block_count == EXPECTED_GGUF_BLOCK_COUNT
             && !identity.nextn_predict_layers_present,
-        "GGUF metadata is not the pinned text-only Qwen3.5-2B Q4_K_M contract"
+        "GGUF metadata is not the pinned text-only Qwen3-4B-Instruct-2507 Q4_K_M contract"
     );
     Ok(())
 }
@@ -1416,18 +1418,18 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_release_metadata_requires_24_blocks_and_no_nextn_layers() {
+    fn qwen3_release_metadata_requires_36_blocks_and_no_nextn_layers() {
         let accepted = GgufIdentity {
-            architecture: "qwen35".into(),
+            architecture: "qwen3".into(),
             file_type: 15,
-            block_count: 24,
+            block_count: 36,
             nextn_predict_layers_present: false,
         };
         validate_release_gguf_identity(&accepted).unwrap();
 
         for rejected in [
             GgufIdentity {
-                architecture: "qwen3".into(),
+                architecture: "qwen35".into(),
                 ..accepted.clone()
             },
             GgufIdentity {
@@ -1435,7 +1437,7 @@ mod tests {
                 ..accepted.clone()
             },
             GgufIdentity {
-                block_count: 25,
+                block_count: 37,
                 ..accepted.clone()
             },
             GgufIdentity {
@@ -1448,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn gguf_reader_detects_qwen35_nextn_metadata() {
+    fn gguf_reader_detects_qwen3_nextn_metadata() {
         fn push_key(bytes: &mut Vec<u8>, key: &str, value_type: u32) {
             bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
             bytes.extend_from_slice(key.as_bytes());
@@ -1462,14 +1464,14 @@ mod tests {
             bytes.extend_from_slice(&1_u64.to_le_bytes());
             bytes.extend_from_slice(&(if include_nextn { 4_u64 } else { 3_u64 }).to_le_bytes());
             push_key(&mut bytes, "general.architecture", 8);
-            bytes.extend_from_slice(&6_u64.to_le_bytes());
-            bytes.extend_from_slice(b"qwen35");
+            bytes.extend_from_slice(&5_u64.to_le_bytes());
+            bytes.extend_from_slice(b"qwen3");
             push_key(&mut bytes, "general.file_type", 4);
             bytes.extend_from_slice(&15_u32.to_le_bytes());
-            push_key(&mut bytes, "qwen35.block_count", 4);
-            bytes.extend_from_slice(&24_u32.to_le_bytes());
+            push_key(&mut bytes, "qwen3.block_count", 4);
+            bytes.extend_from_slice(&36_u32.to_le_bytes());
             if include_nextn {
-                push_key(&mut bytes, "qwen35.nextn_predict_layers", 4);
+                push_key(&mut bytes, "qwen3.nextn_predict_layers", 4);
                 bytes.extend_from_slice(&1_u32.to_le_bytes());
             }
             bytes

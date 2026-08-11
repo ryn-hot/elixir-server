@@ -46,9 +46,9 @@ pub const MAX_PROBE_DETAIL_BYTES: usize = 512;
 const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const RESOURCE_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-const PROBE_LOAD_ALLOWANCE: Duration = Duration::from_secs(30);
-const PROBE_PRIME_ALLOWANCE: Duration = Duration::from_secs(30);
-const PROBE_REQUEST_ALLOWANCE: Duration = Duration::from_secs(8);
+const PROBE_LOAD_ALLOWANCE: Duration = Duration::from_secs(2 * 60);
+const PROBE_PRIME_ALLOWANCE: Duration = Duration::from_secs(5 * 60);
+const PROBE_REQUEST_ALLOWANCE: Duration = Duration::from_secs(30 * 60);
 const PROBE_FINALIZATION_ALLOWANCE: Duration = Duration::from_secs(10);
 const PROBE_SCHEDULER_JITTER_ALLOWANCE: Duration = Duration::from_secs(4);
 
@@ -336,7 +336,10 @@ impl Default for InferenceProbeLimits {
                 .saturating_add(PROBE_FINALIZATION_ALLOWANCE)
                 .saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE),
             maximum_load_time: PROBE_LOAD_ALLOWANCE,
-            maximum_warm_latency: Duration::from_secs(5),
+            // Correctness determines model eligibility. Latency is retained as
+            // hardware-routing evidence and rejected only at the same generous
+            // final failure boundary used by production matching.
+            maximum_warm_latency: PROBE_REQUEST_ALLOWANCE,
             maximum_worker_rss_bytes: FOUR_GIB,
             minimum_available_system_bytes: MIN_AVAILABLE_SYSTEM_MEMORY_BYTES,
             minimum_available_device_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
@@ -3731,14 +3734,14 @@ mod tests {
     #[test]
     fn alm6_default_probe_wrapper_exceeds_phase_deadlines_and_cleanup() {
         let limits = InferenceProbeLimits::default();
-        assert_eq!(PROBE_LOAD_ALLOWANCE, Duration::from_secs(30));
+        assert_eq!(PROBE_LOAD_ALLOWANCE, Duration::from_secs(2 * 60));
         assert_eq!(limits.maximum_load_time, PROBE_LOAD_ALLOWANCE);
-        assert_eq!(PROBE_PRIME_ALLOWANCE, Duration::from_secs(30));
-        assert_eq!(PROBE_REQUEST_ALLOWANCE, Duration::from_secs(8));
+        assert_eq!(PROBE_PRIME_ALLOWANCE, Duration::from_secs(5 * 60));
+        assert_eq!(PROBE_REQUEST_ALLOWANCE, Duration::from_secs(30 * 60));
         assert_eq!(PROBE_FINALIZATION_ALLOWANCE, Duration::from_secs(10));
         assert_eq!(PROBE_SCHEDULER_JITTER_ALLOWANCE, Duration::from_secs(4));
-        assert_eq!(limits.maximum_warm_latency, Duration::from_secs(5));
-        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(82));
+        assert_eq!(limits.maximum_warm_latency, Duration::from_secs(30 * 60));
+        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(2_234));
         let required = limits
             .maximum_load_time
             .saturating_add(PROBE_PRIME_ALLOWANCE)
