@@ -71,7 +71,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v9-owned-alias-evidence";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v10-exact-file-coverage";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -82,7 +82,7 @@ Each `seasons` item owns its aliases and episodes; `episodes[].wanted` is the ou
 
 Use owning aliases with episode/absolute coordinates to translate anime season, part, cour, and absolute numbering. Owning aliases outrank `target.title`. Reject unrelated titles, unexplained coordinate conflicts, specials/movies for normal episodes, and generic franchise titles without season or absolute proof. Index is not evidence.
 
-For require, `audio.accepted` is exact; missing/unaccepted audio rejects. require_dub accepts dual_audio/dubbed. any permits unknown; prefer never rejects. A multi-episode file cannot satisfy a subset. In packs select only wanted files; omit extras, samples, NCOP, and NCED.
+For require, `audio.accepted` is exact; missing/unaccepted audio rejects. require_dub accepts dual_audio/dubbed. any permits unknown; prefer never rejects. A multi-episode file cannot satisfy a subset: wanted E1 with file `01-02` means no match. In packs select only wanted files; omit extras, samples, NCOP, and NCED.
 
 JSON only, best-first: {"m":[[candidate index,[wanted indices],[file indices]],...]}. Preserve wanted/file order; fileless=[]. None={"m":[]}."#;
 
@@ -3929,7 +3929,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v9-owned-alias-evidence"
+            "anime-match-v10-exact-file-coverage"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
