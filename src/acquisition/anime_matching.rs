@@ -602,6 +602,9 @@ fn model_derived_coverage_shape(
             binding: ModelTargetFileBinding::Positional,
         });
     }
+    if parsed_release_kind == ReleaseKind::MultiEpisode && target_count == 1 {
+        bail!("a parsed range cannot collapse to one target");
+    }
     if target_count > 1 && selected_file_count == 1 {
         if parsed_release_kind != ReleaseKind::MultiEpisode {
             bail!("one file may cover multiple targets only for a parsed non-pack range");
@@ -3683,3 +3686,12 @@ mod tests {
         );
     }
 }
+    #[test]
+    fn alm9_model_range_cannot_collapse_to_one_target_with_inventory() {
+        assert!(
+            model_derived_coverage_shape(ReleaseKind::MultiEpisode, 1, 1, 1)
+                .expect_err("partial range must be rejected")
+                .to_string()
+                .contains("cannot collapse")
+        );
+    }
