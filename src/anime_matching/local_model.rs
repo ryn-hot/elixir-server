@@ -68,18 +68,18 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v11-canonical-resolution";
-pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v4-semantic";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v12-target-aware-resolution";
+pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v5-semantic";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const SEMANTIC_RESOLVER_PROMPT: &str = r#"Resolve one raw anime release title or file path into canonical metadata facts.
+const SEMANTIC_RESOLVER_PROMPT: &str = r#"Match one raw anime release title or file path against the structured wanted query.
 
-`franchise` is shared context only. `entities` are independent alternatives. Each entity owns its unambiguous aliases, canonical season number, and coordinate examples. No entity or episode is preferred and the wanted download is deliberately not identified. Use only release evidence in `raw`; context explains aliases and seasonal/absolute numbering but is not evidence that a value appears in `raw`. For `kind=file`, `release` may establish the work or pack, but the file `raw` must establish its own coordinate and kind. A franchise-only title never proves a specific entity.
+`wanted` is the exact movie, special, season, range, or episode being requested. `context.entities` maps the franchise's independent anime entries, aliases, seasons, episode titles, and seasonal/absolute coordinates. Use the wanted query to focus the decision, then use evidence in `raw` to decide whether the release covers it. For `kind=file`, `release` may establish the work or pack while the file `raw` establishes its own episode coordinate and media kind. A generic franchise-only title does not identify a season when multiple entities are possible.
 
-Return `resolved` only when one listed entity is unambiguous. Return `other` when `raw` clearly names another work, season, special, movie, or extra. Return `conflict` when title, season, kind, or coordinates disagree. Return `unknown` when evidence is insufficient. Never guess a listed entity from a generic franchise title.
+Return `resolved` only when `raw` identifies one listed entity and is compatible with at least one wanted coordinate, or when an identified pack covers the wanted scope. Return `other` when `raw` clearly names another work, season, special, movie, extra, or non-wanted episode. Return `conflict` when title, season, kind, or coordinates disagree. Return `unknown` only when the available title evidence is genuinely insufficient.
 
-`p` is seasonal episode numbers, `a` is absolute episode numbers, and `n` states which interpretation the raw value supports. Do not copy numbers from context. Ranges list every covered number. A range containing an episode is valid coverage for that episode. `k` is episode, multi_episode, pack, movie, special, ova, extra, or unknown. `u` is observed audio evidence only; never infer missing audio.
+`p` is the sorted list of seasonal episode numbers and `a` is the sorted list of absolute episode numbers supported by the raw title. Leave either list empty when that numbering form is not supported. Do not copy numbers from context. Ranges list every covered number. A range containing a wanted episode is valid coverage. `k` is episode, multi_episode, pack, movie, special, ova, extra, or unknown. `u` is observed audio evidence only; never infer missing audio.
 
 Examples: Root A belongs to its own season entity, not a later Tokyo Ghoul season. `E16` does not resolve to `E15`. An OVA or NCOP is not a normal episode. A file named `01-02` covers both 1 and 2.
 
@@ -93,7 +93,7 @@ Audio modes `any`, `prefer`, and `prefer_dub` are not requirements and never rej
 
 Do not repair the proposal and do not choose another candidate. Return only the constrained JSON object."#;
 
-const SEMANTIC_CACHE_SCHEMA_VERSION: u32 = 1;
+const SEMANTIC_CACHE_SCHEMA_VERSION: u32 = 2;
 const SEMANTIC_CACHE_MAX_MEMORY_ENTRIES: usize = 4_096;
 const SEMANTIC_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024;
 const SEMANTIC_CACHE_MAX_DISK_ENTRIES: usize = 16_384;
@@ -2106,16 +2106,6 @@ enum SemanticResolutionStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum SemanticNumbering {
-    Seasonal,
-    Absolute,
-    Both,
-    None,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 enum SemanticReleaseKind {
     Episode,
     MultiEpisode,
@@ -2134,8 +2124,6 @@ struct SemanticResolution {
     status: SemanticResolutionStatus,
     #[serde(rename = "e")]
     entity_id: String,
-    #[serde(rename = "n")]
-    numbering: SemanticNumbering,
     #[serde(rename = "p")]
     seasonal_episodes: Vec<i32>,
     #[serde(rename = "a")]
@@ -2254,6 +2242,7 @@ fn build_semantic_chat_request(
     if let Some(parent_release) = parent_release.filter(|value| !value.trim().is_empty()) {
         user.insert("release".to_string(), json!(parent_release));
     }
+    user.insert("wanted".to_string(), compact_wanted_target(request)?);
     user.insert("context".to_string(), compact_semantic_context(request)?);
     build_structured_chat_request(
         SEMANTIC_RESOLVER_PROMPT,
@@ -2701,10 +2690,9 @@ fn semantic_resolution_grammar(request: &AnimeMatchRequest) -> Result<String> {
         .collect::<Vec<_>>()
         .join(" | ");
     let mut rules = vec![
-        "root ::= \"{\\\"s\\\":\" status \",\\\"e\\\":\" entity \",\\\"n\\\":\" numbering \",\\\"p\\\":[\" integers? \"],\\\"a\\\":[\" integers? \"],\\\"k\\\":\" kind \",\\\"u\\\":\" audio \"}\"".to_string(),
+        "root ::= \"{\\\"s\\\":\" status \",\\\"e\\\":\" entity \",\\\"p\\\":[\" integers? \"],\\\"a\\\":[\" integers? \"],\\\"k\\\":\" kind \",\\\"u\\\":\" audio \"}\"".to_string(),
         "status ::= \"\\\"resolved\\\"\" | \"\\\"other\\\"\" | \"\\\"conflict\\\"\" | \"\\\"unknown\\\"\"".to_string(),
         format!("entity ::= {entity_choices}"),
-        "numbering ::= \"\\\"seasonal\\\"\" | \"\\\"absolute\\\"\" | \"\\\"both\\\"\" | \"\\\"none\\\"\" | \"\\\"unknown\\\"\"".to_string(),
         "integers ::= integer (\",\" integer)*".to_string(),
         "integer ::= \"0\" | [1-9] [0-9]? [0-9]? [0-9]? [0-9]? [0-9]?".to_string(),
         "kind ::= \"\\\"episode\\\"\" | \"\\\"multi_episode\\\"\" | \"\\\"pack\\\"\" | \"\\\"movie\\\"\" | \"\\\"special\\\"\" | \"\\\"ova\\\"\" | \"\\\"extra\\\"\" | \"\\\"unknown\\\"\"".to_string(),
@@ -2742,24 +2730,6 @@ fn validate_semantic_resolution(
             values.windows(2).all(|pair| pair[0] < pair[1]),
             "semantic {label} coordinates are not strictly ordered"
         );
-    }
-    match resolution.numbering {
-        SemanticNumbering::Seasonal => ensure!(
-            !resolution.seasonal_episodes.is_empty() && resolution.absolute_episodes.is_empty(),
-            "seasonal semantic resolution has inconsistent coordinate fields"
-        ),
-        SemanticNumbering::Absolute => ensure!(
-            resolution.seasonal_episodes.is_empty() && !resolution.absolute_episodes.is_empty(),
-            "absolute semantic resolution has inconsistent coordinate fields"
-        ),
-        SemanticNumbering::Both => ensure!(
-            !resolution.seasonal_episodes.is_empty() && !resolution.absolute_episodes.is_empty(),
-            "dual semantic resolution omitted a coordinate field"
-        ),
-        SemanticNumbering::None | SemanticNumbering::Unknown => ensure!(
-            resolution.seasonal_episodes.is_empty() && resolution.absolute_episodes.is_empty(),
-            "numberless semantic resolution returned coordinates"
-        ),
     }
     if resolution.status == SemanticResolutionStatus::Resolved {
         ensure!(
@@ -4469,7 +4439,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_v11_resolver_receives_one_raw_release_and_all_entity_alternatives() {
+    fn alm9_v12_resolver_receives_wanted_target_raw_release_and_entity_alternatives() {
         let mut request = request();
         request.context.seasons.insert(
             0,
@@ -4502,11 +4472,11 @@ mod tests {
         .expect("semantic user object");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v11-canonical-resolution"
+            "anime-match-v12-target-aware-resolution"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
-            "anime-match-response-v4-semantic"
+            "anime-match-response-v5-semantic"
         );
         assert_eq!(user["kind"], json!("release"));
         assert_eq!(user["raw"], json!("Tokyo Ghoul Root A - 01"));
@@ -4518,8 +4488,12 @@ mod tests {
             user.pointer("/context/entities/1/id"),
             Some(&json!("27899"))
         );
+        assert_eq!(
+            user.pointer("/wanted/episodes/0/key"),
+            Some(&json!("S02E01"))
+        );
+        assert_eq!(user.pointer("/wanted/audio/mode"), Some(&json!("any")));
         let encoded = serde_json::to_string(&user).expect("semantic user JSON");
-        assert!(!encoded.contains("wanted"));
         assert!(!encoded.contains("candidate-0"));
         assert!(!encoded.contains("parseFacts"));
         let grammar = body["grammar"].as_str().expect("semantic grammar");
@@ -4531,13 +4505,14 @@ mod tests {
             .as_str()
             .expect("semantic prompt");
         for rule in [
-            "No entity or episode is preferred",
+            "`wanted` is the exact movie, special, season, range, or episode being requested",
             "Do not copy numbers from context",
             "Root A belongs to its own season entity",
             "A file named `01-02` covers both 1 and 2",
         ] {
             assert!(prompt.contains(rule), "missing semantic rule: {rule}");
         }
+        assert!(!body["grammar"].as_str().unwrap().contains("\\\"n\\\""));
 
         let file_body = build_semantic_chat_request(
             &request,
@@ -4622,12 +4597,11 @@ mod tests {
     }
 
     #[test]
-    fn alm9_v11_semantic_coordinates_join_to_canonical_targets_without_regex() {
+    fn alm9_v12_semantic_coordinates_join_to_canonical_targets_without_regex() {
         let request = multi_target_request();
         let resolved = SemanticResolution {
             status: SemanticResolutionStatus::Resolved,
             entity_id: "27899".to_string(),
-            numbering: SemanticNumbering::Seasonal,
             seasonal_episodes: vec![1, 2],
             absolute_episodes: Vec::new(),
             kind: SemanticReleaseKind::MultiEpisode,
@@ -4653,7 +4627,6 @@ mod tests {
         assert!(semantic_resolution_target_keys(&request, &wrong_entity, false).is_empty());
 
         let pack = SemanticResolution {
-            numbering: SemanticNumbering::None,
             seasonal_episodes: Vec::new(),
             kind: SemanticReleaseKind::Pack,
             ..resolved
@@ -4666,12 +4639,11 @@ mod tests {
     }
 
     #[test]
-    fn alm9_v11_semantic_response_validation_rejects_hallucinated_shapes() {
+    fn alm9_v12_semantic_response_validation_rejects_hallucinated_shapes() {
         let request = request();
         let valid = SemanticResolution {
             status: SemanticResolutionStatus::Resolved,
             entity_id: "27899".to_string(),
-            numbering: SemanticNumbering::Both,
             seasonal_episodes: vec![1],
             absolute_episodes: vec![13],
             kind: SemanticReleaseKind::Episode,
@@ -4687,11 +4659,6 @@ mod tests {
                 seasonal_episodes: vec![2, 1],
                 ..valid.clone()
             },
-            SemanticResolution {
-                numbering: SemanticNumbering::Seasonal,
-                absolute_episodes: vec![13],
-                ..valid.clone()
-            },
         ] {
             assert!(validate_semantic_resolution(&request, &invalid).is_err());
         }
@@ -4703,7 +4670,6 @@ mod tests {
         let release = SemanticResolution {
             status: SemanticResolutionStatus::Resolved,
             entity_id: "27899".to_string(),
-            numbering: SemanticNumbering::Seasonal,
             seasonal_episodes: vec![1],
             absolute_episodes: Vec::new(),
             kind: SemanticReleaseKind::Episode,
@@ -4745,7 +4711,6 @@ mod tests {
         let resolution = |audio_profile| SemanticResolution {
             status: SemanticResolutionStatus::Resolved,
             entity_id: "27899".to_string(),
-            numbering: SemanticNumbering::Seasonal,
             seasonal_episodes: vec![1],
             absolute_episodes: Vec::new(),
             kind: SemanticReleaseKind::Episode,
@@ -4786,7 +4751,6 @@ mod tests {
         let payload = SemanticCachePayload::Resolution(SemanticResolution {
             status: SemanticResolutionStatus::Resolved,
             entity_id: "27899".to_string(),
-            numbering: SemanticNumbering::Seasonal,
             seasonal_episodes: vec![1],
             absolute_episodes: Vec::new(),
             kind: SemanticReleaseKind::Episode,
