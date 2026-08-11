@@ -32,13 +32,14 @@ use crate::{
             acquisition_anime_deterministic_state, acquisition_candidate_language_evidence,
             acquisition_candidate_parse_facts, acquisition_match_context,
             acquisition_model_audio_profile_evidence, bind_exact_single_anime_provider_file,
+            model_derived_anime_coverage_plans_with_selection_resolver,
             selectable_anime_media_file,
         },
         automation::synthetic_stream_candidate_requires_manual_review,
         language_policy::{
-            AcquisitionLanguagePreference, CandidateLanguageEvidence, LanguagePreferenceAssessment,
-            LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule, LanguagePreferenceMode,
-            UnknownLanguagePolicy, assess_language_preference,
+            AcquisitionLanguagePreference, LanguagePreferenceAssessment,
+            LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule,
+            LanguagePreferenceMode, UnknownLanguagePolicy, assess_language_preference,
         },
         release_resolution::{
             anime::{
@@ -68,6 +69,9 @@ use crate::{
     http::handlers::acquisition_sources::AcquisitionCandidate,
     playback::hardware::collect_host_hardware_inventory,
 };
+
+#[cfg(test)]
+use crate::acquisition::language_policy::CandidateLanguageEvidence;
 
 const MAX_QUALIFICATION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const EXPECTED_CASE_COUNT: usize = 520;
@@ -560,12 +564,53 @@ async fn run_model_observation(
     validate_anime_match_response(&prepared, &response)
         .context("qualification model returned an invalid response")?;
     let model_output = serde_json::to_value(&response).expect("anime response is serializable");
-    let resolution = model_only_resolution(
-        input.acquisition_candidates.len(),
-        &preference,
-        &response.matches,
+    let acquisition_sources = acquisition_source_map(
+        prepared.request(),
+        &input.acquisition_candidates,
         prepared.source_map(),
     )?;
+    let selection_support = file_selection_support_by_candidate_index(
+        prepared.request(),
+        input.acquisition_candidates.len(),
+        &input.route_context,
+        prepared.source_map(),
+    )?;
+    let coverage = model_derived_anime_coverage_plans_with_selection_resolver(
+        prepared.request(),
+        &input.scoring_context,
+        &input.acquisition_candidates,
+        &response.matches,
+        &acquisition_sources,
+        |candidate_index, _| selection_support[candidate_index],
+    )
+    .context("qualification model response cannot produce safe production coverage")?;
+    let mut resolution = QualificationResolutionState {
+        candidate_plans: vec![None; input.acquisition_candidates.len()],
+        saw_partial_or_ambiguous: false,
+    };
+    for mapped in coverage {
+        let assessment = assess_language_preference(
+            &preference,
+            MediaType::Anime,
+            &acquisition_model_audio_profile_evidence(mapped.audio_profile),
+        );
+        if required_language_is_hard_mismatch(&preference, &assessment) {
+            continue;
+        }
+        resolution.saw_partial_or_ambiguous = true;
+        if required_language_satisfied(&preference, &assessment) {
+            let candidate_key = input
+                .request
+                .candidates
+                .get(mapped.candidate_index)
+                .ok_or_else(|| anyhow!("model coverage candidate index is out of bounds"))?
+                .candidate_key
+                .as_str();
+            resolution.candidate_plans[mapped.candidate_index] = Some(
+                candidate_plan_for_coverage(candidate_key, &mapped.plan, &assessment),
+            );
+        }
+    }
     let final_plan = final_plan_for_resolution(&input.request, &resolution)?;
     Ok(QualificationObservation {
         order_seed,
@@ -669,6 +714,7 @@ async fn run_failure_injections(
     Ok(plans)
 }
 
+#[cfg(test)]
 fn model_only_resolution(
     candidate_count: usize,
     preference: &AcquisitionLanguagePreference,
@@ -834,6 +880,7 @@ fn candidate_plan_for_coverage(
     }
 }
 
+#[cfg(test)]
 fn candidate_plan_for_model_match(
     matched: &AnimeCandidateMatch,
     assessment: &LanguagePreferenceAssessment,
