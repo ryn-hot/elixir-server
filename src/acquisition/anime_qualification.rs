@@ -492,15 +492,20 @@ async fn run_cases(
         let baseline_resolution = deterministic_baseline(&input)?;
         let baseline = final_plan_for_resolution(&input.request, &baseline_resolution)?;
 
-        let main = run_model_observation(&input, base_seed, base_seed, engine)
+        let main = run_model_observation(&input, &baseline, base_seed, base_seed, engine)
             .await
             .with_context(|| format!("running qualification case {}", case.case_id))?;
         let stability_runs = if case.stability_subset {
             let mut values = Vec::with_capacity(4);
             for _ in 0..3 {
-                values.push(run_model_observation(&input, base_seed, base_seed, engine).await?);
+                values.push(
+                    run_model_observation(&input, &baseline, base_seed, base_seed, engine).await?,
+                );
             }
-            values.push(run_model_observation(&input, permutation_seed, base_seed, engine).await?);
+            values.push(
+                run_model_observation(&input, &baseline, permutation_seed, base_seed, engine)
+                    .await?,
+            );
             values
         } else {
             Vec::new()
@@ -539,6 +544,7 @@ async fn run_cases(
 
 async fn run_model_observation(
     input: &QualificationCaseInput,
+    baseline: &QualificationFinalPlan,
     order_seed: u64,
     base_seed: u64,
     engine: &dyn AnimeMatchEngine,
@@ -556,14 +562,42 @@ async fn run_model_observation(
         &input.acquisition_candidates,
     )?;
     let preference = language_preference(&input.request.target.audio_preference);
-    let engine_output = engine
+    let engine_output = match engine
         .match_candidates_with_provenance(prepared.request().clone())
         .await
-        .context("qualification model inference failed")?;
+    {
+        Ok(output) => output,
+        Err(_) => {
+            let model_output = serde_json::json!({"qualificationInferenceError": true});
+            return Ok(QualificationObservation {
+                order_seed,
+                candidate_order,
+                request_fingerprint,
+                model_decision: "fallback".to_string(),
+                fallback_reason: Some("engine_error".to_string()),
+                model_output_sha256: canonical_json_fingerprint(&model_output)?,
+                model_output,
+                reference_validation_passed: false,
+                final_plan: baseline.clone(),
+            });
+        }
+    };
     let response = engine_output.response;
-    validate_anime_match_response(&prepared, &response)
-        .context("qualification model returned an invalid response")?;
     let model_output = serde_json::to_value(&response).expect("anime response is serializable");
+    let model_output_sha256 = canonical_json_fingerprint(&model_output)?;
+    if validate_anime_match_response(&prepared, &response).is_err() {
+        return Ok(QualificationObservation {
+            order_seed,
+            candidate_order,
+            request_fingerprint,
+            model_decision: "fallback".to_string(),
+            fallback_reason: Some("invalid_model_response".to_string()),
+            model_output,
+            model_output_sha256,
+            reference_validation_passed: false,
+            final_plan: baseline.clone(),
+        });
+    }
     let acquisition_sources = acquisition_source_map(
         prepared.request(),
         &input.acquisition_candidates,
@@ -575,15 +609,29 @@ async fn run_model_observation(
         &input.route_context,
         prepared.source_map(),
     )?;
-    let coverage = model_derived_anime_coverage_plans_with_selection_resolver(
+    let coverage = match model_derived_anime_coverage_plans_with_selection_resolver(
         prepared.request(),
         &input.scoring_context,
         &input.acquisition_candidates,
         &response.matches,
         &acquisition_sources,
         |candidate_index, _| selection_support[candidate_index],
-    )
-    .context("qualification model response cannot produce safe production coverage")?;
+    ) {
+        Ok(coverage) => coverage,
+        Err(_) => {
+            return Ok(QualificationObservation {
+                order_seed,
+                candidate_order,
+                request_fingerprint,
+                model_decision: "fallback".to_string(),
+                fallback_reason: Some("coverage_validation_failed".to_string()),
+                model_output,
+                model_output_sha256,
+                reference_validation_passed: true,
+                final_plan: baseline.clone(),
+            });
+        }
+    };
     let mut resolution = QualificationResolutionState {
         candidate_plans: vec![None; input.acquisition_candidates.len()],
         saw_partial_or_ambiguous: false,
@@ -618,7 +666,7 @@ async fn run_model_observation(
         request_fingerprint,
         model_decision: "accepted".to_string(),
         fallback_reason: None,
-        model_output_sha256: canonical_json_fingerprint(&model_output)?,
+        model_output_sha256,
         model_output,
         reference_validation_passed: true,
         final_plan,
