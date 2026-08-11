@@ -33,7 +33,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    acquisition::release_resolution::{anime::parse_anime_release_title, models::AnimeEpisodeType},
     metrics::{
         ANIME_INFERENCE_EVENTS, ANIME_INFERENCE_OPERATION_DURATION, ANIME_INFERENCE_QUEUE_DEPTH,
         ANIME_INFERENCE_RUNTIME_STATE, ANIME_INFERENCE_WORKER_RSS_BYTES,
@@ -41,8 +40,8 @@ use crate::{
 };
 
 use super::{
-    ANIME_MATCH_MAX_CANDIDATES, ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch,
-    AnimeMatchAudioProfile, AnimeMatchCandidate, AnimeMatchContextTarget, AnimeMatchEngine,
+    ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile,
+    AnimeMatchContextTarget, AnimeMatchEngine,
     AnimeMatchEngineOutput, AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance,
     AnimeMatchSeasonContext, anime_match_alias_equivalence_key, hardware::InferenceBackend,
     prime_request,
@@ -2187,49 +2186,29 @@ fn compact_request(request: &AnimeMatchRequest) -> Result<Value> {
     let candidates = request
         .candidates
         .iter()
-        .map(|candidate| {
+        .enumerate()
+        .map(|(candidate_index, candidate)| {
             let mut compact = serde_json::Map::new();
-            // The raw release is always present so the model can recover when
-            // deterministic parse facts are incomplete or misleading.
+            compact.insert("index".to_string(), json!(candidate_index));
             compact.insert(
                 "release".to_string(),
                 Value::String(candidate.title.clone()),
             );
-            let facts = &candidate.parse_facts;
-            let lacks_core_parse_facts = facts.title_candidates.is_empty()
-                || (facts.episode_numbers.is_empty() && facts.absolute_episode_numbers.is_empty());
-            let sole_file_repeats_release = candidate
-                .files
-                .first()
-                .is_some_and(|file| file.path == candidate.title);
-            if candidate.files.len() > 1
-                || (candidate.files.len() == 1
-                    && lacks_core_parse_facts
-                    && !sole_file_repeats_release)
-            {
+            if !candidate.files.is_empty() {
                 compact.insert(
                     "files".to_string(),
                     Value::Array(
                         candidate
                             .files
                             .iter()
-                            .map(|file| compact_file(&file.path))
+                            .enumerate()
+                            .map(|(file_index, file)| {
+                                json!({"index": file_index, "name": file.path})
+                            })
                             .collect(),
                     ),
                 );
             }
-            let semantic_titles = compact_candidate_titles(request, candidate);
-            insert_non_empty_strings(&mut compact, "titles", &semantic_titles);
-            insert_non_empty_i32s(&mut compact, "seasons", &facts.season_numbers);
-            insert_non_empty_i32s(&mut compact, "episodes", &facts.episode_numbers);
-            insert_non_empty_i32s(&mut compact, "absolute", &facts.absolute_episode_numbers);
-            if let Some(kind) = facts.release_kind.as_ref().filter(|kind| !kind.is_empty()) {
-                compact.insert("kind".to_string(), Value::String(kind.clone()));
-            }
-            if let Some(batch) = facts.batch_kind.as_ref().filter(|batch| !batch.is_empty()) {
-                compact.insert("batch".to_string(), Value::String(batch.clone()));
-            }
-            insert_non_empty_strings(&mut compact, "audio", &facts.audio_profiles);
             Value::Object(compact)
         })
         .collect::<Vec<_>>();
@@ -2341,137 +2320,6 @@ fn compact_context_target(
     (!compact.is_empty()).then_some(Value::Object(compact))
 }
 
-fn compact_candidate_titles(
-    request: &AnimeMatchRequest,
-    candidate: &AnimeMatchCandidate,
-) -> Vec<String> {
-    let known_title_keys = std::iter::once(request.target.canonical_title.as_str())
-        .chain(
-            request
-                .context
-                .seasons
-                .iter()
-                .flat_map(|season| season.aliases.iter().map(|alias| alias.value.as_str())),
-        )
-        .map(anime_match_alias_equivalence_key)
-        .filter(|key| !key.is_empty())
-        .collect::<BTreeSet<_>>();
-    let raw_key = anime_match_alias_equivalence_key(&candidate.title);
-    let mut seen = BTreeSet::new();
-    let mut ranked = candidate
-        .parse_facts
-        .title_candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(index, title)| {
-            let title = title.trim();
-            let key = anime_match_alias_equivalence_key(title);
-            if title.is_empty() || key.is_empty() || key == raw_key || !seen.insert(key.clone()) {
-                return None;
-            }
-            let exact_context_title = known_title_keys.contains(&key);
-            let normalized_artifact = title
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric())
-                && title
-                    .chars()
-                    .any(|character| character.is_ascii_alphabetic());
-            Some((
-                (
-                    !exact_context_title,
-                    normalized_artifact,
-                    title.chars().count(),
-                    index,
-                ),
-                title.to_string(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.0.cmp(&right.0));
-    let Some((_, primary)) = ranked.first() else {
-        return Vec::new();
-    };
-    let primary_is_japanese = contains_japanese_script(primary);
-    let mut selected = vec![primary.clone()];
-    if let Some((_, alternate)) = ranked.iter().skip(1).find(|(_, title)| {
-        contains_japanese_script(title) != primary_is_japanese
-            && known_title_keys.contains(&anime_match_alias_equivalence_key(title))
-    }) {
-        selected.push(alternate.clone());
-    }
-    selected
-}
-
-fn contains_japanese_script(value: &str) -> bool {
-    value.chars().any(|character| {
-        matches!(
-            character,
-            '\u{3040}'..='\u{30ff}'
-                | '\u{31f0}'..='\u{31ff}'
-                | '\u{3400}'..='\u{4dbf}'
-                | '\u{4e00}'..='\u{9fff}'
-                | '\u{f900}'..='\u{faff}'
-        )
-    })
-}
-
-fn compact_file(path: &str) -> Value {
-    let parsed = parse_anime_release_title(path);
-    let mut compact = serde_json::Map::new();
-    if let Some(title) = parsed
-        .series_title
-        .as_ref()
-        .filter(|title| !title.is_empty())
-    {
-        compact.insert("title".to_string(), Value::String(title.clone()));
-    }
-    if let Some(season) = parsed.season_number {
-        compact.insert("season".to_string(), json!(season));
-    }
-    insert_non_empty_i32s(&mut compact, "episodes", &parsed.episode_numbers);
-    insert_non_empty_i32s(&mut compact, "absolute", &parsed.absolute_episode_numbers);
-    if parsed.episode_type != AnimeEpisodeType::Normal {
-        compact.insert(
-            "kind".to_string(),
-            Value::String(parsed.episode_type.as_str().to_string()),
-        );
-    }
-    if let Ok(batch) = serde_json::to_value(parsed.batch_kind)
-        && batch != Value::String("single".to_string())
-    {
-        compact.insert("batch".to_string(), batch);
-    }
-    let mut audio = parsed.audio_languages;
-    if parsed.quality.dual_audio {
-        audio.push("dual_audio".to_string());
-    }
-    audio.sort();
-    audio.dedup();
-    insert_non_empty_strings(&mut compact, "audio", &audio);
-
-    let components = path
-        .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    if components.len() > 1 {
-        compact.insert(
-            "folder".to_string(),
-            Value::String(components[..components.len() - 1].join("/")),
-        );
-    }
-    let has_coordinate = parsed.season_number.is_some()
-        || !parsed.episode_numbers.is_empty()
-        || !parsed.absolute_episode_numbers.is_empty()
-        || parsed.episode_type != AnimeEpisodeType::Normal;
-    if parsed.series_title.is_none() || !has_coordinate {
-        compact.insert(
-            "name".to_string(),
-            Value::String(components.last().copied().unwrap_or(path).to_string()),
-        );
-    }
-    Value::Object(compact)
-}
-
 fn insert_non_empty_strings(
     object: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -2482,12 +2330,6 @@ fn insert_non_empty_strings(
             key.to_string(),
             Value::Array(values.iter().cloned().map(Value::String).collect()),
         );
-    }
-}
-
-fn insert_non_empty_i32s(object: &mut serde_json::Map<String, Value>, key: &str, values: &[i32]) {
-    if !values.is_empty() {
-        object.insert(key.to_string(), json!(values));
     }
 }
 
@@ -3692,10 +3534,10 @@ mod lifecycle_tests;
 mod tests {
     use super::*;
     use crate::anime_matching::{
-        AnimeMatchAlias, AnimeMatchAliasKind, AnimeMatchAudioPreference, AnimeMatchCandidate,
-        AnimeMatchContext, AnimeMatchContextTarget, AnimeMatchFile, AnimeMatchMediaType,
-        AnimeMatchParseFacts, AnimeMatchScope, AnimeMatchSeasonContext, AnimeMatchTarget,
-        smoke_requests,
+        ANIME_MATCH_MAX_CANDIDATES, AnimeMatchAlias, AnimeMatchAliasKind,
+        AnimeMatchAudioPreference, AnimeMatchCandidate, AnimeMatchContext,
+        AnimeMatchContextTarget, AnimeMatchFile, AnimeMatchMediaType, AnimeMatchParseFacts,
+        AnimeMatchScope, AnimeMatchSeasonContext, AnimeMatchTarget, smoke_requests,
     };
     use sha2::{Digest, Sha256};
 
@@ -4177,7 +4019,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_semantic_request_elides_empty_facts_and_implicit_single_file_path() {
+    fn alm9_semantic_request_uses_raw_release_and_explicit_file_indexes() {
         let mut request = request();
         request.candidates[0].parse_facts.title_candidates = vec!["Tokyo Ghoul Root A".to_string()];
         request.candidates[0].parse_facts.episode_numbers = vec![1];
@@ -4186,19 +4028,19 @@ mod tests {
             .pointer("/candidates/0")
             .and_then(Value::as_object)
             .expect("candidate object");
-        assert!(!candidate.contains_key("index"));
+        assert_eq!(candidate.get("index"), Some(&json!(0)));
         assert_eq!(
             candidate.get("release"),
             Some(&json!("Tokyo Ghoul Root A - 01"))
         );
         assert_eq!(
-            candidate.get("titles"),
-            Some(&json!(["Tokyo Ghoul Root A"]))
+            candidate.get("files"),
+            Some(&json!([{"index": 0, "name": "Tokyo Ghoul Root A - 01.mkv"}]))
         );
-        assert_eq!(candidate.get("episodes"), Some(&json!([1])));
         for omitted in [
-            "files",
+            "titles",
             "seasons",
+            "episodes",
             "absolute",
             "kind",
             "batch",
@@ -4219,34 +4061,30 @@ mod tests {
         assert_eq!(
             compact_pack.pointer("/candidates/0/files"),
             Some(&json!([
-                {"title": "Tokyo Ghoul Root A", "absolute": [1]},
-                {"title": "Tokyo Ghoul Root A", "absolute": [2]},
+                {"index": 0, "name": "Tokyo Ghoul Root A - 01.mkv"},
+                {"index": 1, "name": "Tokyo Ghoul Root A - 02.mkv"},
             ]))
         );
         assert!(compact_pack.pointer("/candidates/1/files").is_none());
     }
 
     #[test]
-    fn alm9_compact_single_file_deduplicates_release_and_nested_path() {
+    fn alm9_compact_single_file_keeps_exact_raw_paths() {
         let mut repeated = request();
         repeated.candidates[0].files[0].path = repeated.candidates[0].title.clone();
-        assert!(
+        assert_eq!(
             compact_request(&repeated)
                 .expect("repeated singleton")
-                .pointer("/candidates/0/files")
-                .is_none()
+                .pointer("/candidates/0/files/0"),
+            Some(&json!({"index": 0, "name": "Tokyo Ghoul Root A - 01"}))
         );
 
         let mut nested = request();
         nested.candidates[0].files[0].path = "Extras/000.mkv".to_string();
         let compact = compact_request(&nested).expect("nested singleton");
         assert_eq!(
-            compact.pointer("/candidates/0/files/0/folder"),
-            Some(&json!("Extras"))
-        );
-        assert_eq!(
-            compact.pointer("/candidates/0/files/0/name"),
-            Some(&json!("000.mkv"))
+            compact.pointer("/candidates/0/files/0"),
+            Some(&json!({"index": 0, "name": "Extras/000.mkv"}))
         );
     }
 
