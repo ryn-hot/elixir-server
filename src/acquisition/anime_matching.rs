@@ -17,7 +17,7 @@ use crate::{
                 ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeBatchKind, AnimeCandidateInput,
                 AnimeCandidateScoringContext, AnimeFileCoverageEntry, AnimeFileCoveragePlan,
                 AnimeReleaseFileInput, AnimeScopedAlias, anime_coverage_kind,
-                anime_release_kind_for_coverage, parse_anime_release_title, score_anime_candidate,
+                parse_anime_release_title, score_anime_candidate,
             },
             models::{ReleaseConfidence, ReleaseCoverageState, ReleaseKind, ReleaseResolverKind},
         },
@@ -462,8 +462,6 @@ fn model_derived_anime_coverage_plan(
             .collect::<Result<Vec<_>>>()?,
     };
 
-    let parsed = parse_anime_release_title(&candidate.title);
-    let parsed_release_kind = anime_release_kind_for_coverage(&parsed);
     let selected_file_indexes = selected_files
         .iter()
         .map(|selected| selected.candidate_file_index)
@@ -502,8 +500,12 @@ fn model_derived_anime_coverage_plan(
     }
 
     let shape = model_derived_coverage_shape(
-        parsed_release_kind,
         targets.len(),
+        targets
+            .iter()
+            .filter_map(|target| target.season_number)
+            .collect::<BTreeSet<_>>()
+            .len(),
         selected_files.len(),
         media_file_indexes.len(),
     )?;
@@ -539,7 +541,7 @@ struct ModelSelectedAnimeFile {
 enum ModelTargetFileBinding {
     None,
     SharedMultiEpisode,
-    Positional,
+    CanonicalOneToOne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,43 +551,26 @@ struct ModelDerivedCoverageShape {
 }
 
 fn model_derived_coverage_shape(
-    parsed_release_kind: ReleaseKind,
     target_count: usize,
+    target_season_count: usize,
     selected_file_count: usize,
     media_file_count: usize,
 ) -> Result<ModelDerivedCoverageShape> {
     if target_count == 0 {
         bail!("model mapping must cover at least one target");
     }
-    let parsed_pack = matches!(
-        parsed_release_kind,
-        ReleaseKind::SeasonPack | ReleaseKind::MultiSeasonPack | ReleaseKind::SeriesPack
-    );
-
     if media_file_count == 0 {
         if selected_file_count != 0 {
             bail!("model mapping selected files without a candidate media inventory");
         }
-        if parsed_pack {
-            bail!("pack model mapping requires a real file inventory and explicit selection");
-        }
-        if parsed_release_kind == ReleaseKind::Unknown {
-            bail!("unknown model mapping requires a real file inventory and explicit selection");
-        }
-        if target_count > 1 {
-            if parsed_release_kind != ReleaseKind::MultiEpisode {
-                bail!("multi-target model mapping without files requires a parsed non-pack range");
-            }
-            return Ok(ModelDerivedCoverageShape {
-                release_kind: ReleaseKind::MultiEpisode,
-                binding: ModelTargetFileBinding::None,
-            });
-        }
-        if parsed_release_kind == ReleaseKind::MultiEpisode {
-            bail!("a parsed range cannot collapse to one target without explicit file selection");
-        }
         return Ok(ModelDerivedCoverageShape {
-            release_kind: ReleaseKind::Single,
+            release_kind: if target_season_count > 1 {
+                ReleaseKind::MultiSeasonPack
+            } else if target_count > 1 {
+                ReleaseKind::MultiEpisode
+            } else {
+                ReleaseKind::Single
+            },
             binding: ModelTargetFileBinding::None,
         });
     }
@@ -593,35 +578,25 @@ fn model_derived_coverage_shape(
     if selected_file_count == 0 {
         bail!("inventoried model mapping requires explicit selected files");
     }
-    if parsed_pack {
-        if selected_file_count != target_count {
-            bail!("inventoried pack mappings require one selected file per target");
-        }
-        return Ok(ModelDerivedCoverageShape {
-            release_kind: parsed_release_kind,
-            binding: ModelTargetFileBinding::Positional,
-        });
-    }
     if target_count > 1 && selected_file_count == 1 {
-        if parsed_release_kind != ReleaseKind::MultiEpisode {
-            bail!("one file may cover multiple targets only for a parsed non-pack range");
-        }
         return Ok(ModelDerivedCoverageShape {
             release_kind: ReleaseKind::MultiEpisode,
             binding: ModelTargetFileBinding::SharedMultiEpisode,
         });
     }
     if selected_file_count != target_count {
-        bail!("model target and selected-file counts do not define a safe positional mapping");
+        bail!("model target and selected-file counts do not define a safe one-to-one mapping");
     }
 
     Ok(ModelDerivedCoverageShape {
-        release_kind: if parsed_release_kind == ReleaseKind::MultiEpisode || target_count > 1 {
-            ReleaseKind::MultiEpisode
+        release_kind: if target_season_count > 1 {
+            ReleaseKind::MultiSeasonPack
+        } else if media_file_count > 1 || target_count > 1 {
+            ReleaseKind::SeasonPack
         } else {
             ReleaseKind::Single
         },
-        binding: ModelTargetFileBinding::Positional,
+        binding: ModelTargetFileBinding::CanonicalOneToOne,
     })
 }
 
@@ -638,7 +613,7 @@ fn model_derived_coverage_entries(
             let selected_file = match binding {
                 ModelTargetFileBinding::None => None,
                 ModelTargetFileBinding::SharedMultiEpisode => selected_files.first(),
-                ModelTargetFileBinding::Positional => selected_files.get(target_index),
+                ModelTargetFileBinding::CanonicalOneToOne => selected_files.get(target_index),
             };
             AnimeFileCoverageEntry {
                 target_key: target.target_key.clone(),
@@ -655,7 +630,9 @@ fn model_derived_coverage_entries(
                     ModelTargetFileBinding::SharedMultiEpisode => {
                         "local_model_shared_multi_episode_file"
                     }
-                    ModelTargetFileBinding::Positional => "local_model_positional_target_file",
+                    ModelTargetFileBinding::CanonicalOneToOne => {
+                        "local_model_canonical_target_file"
+                    }
                 }
                 .to_string(),
                 state: ReleaseCoverageState::Planned,
@@ -718,7 +695,7 @@ fn acquisition_match_scope(scope: AcquisitionRequestScope) -> AnimeMatchScope {
     }
 }
 
-/// Assess the exact parser-derived audio profile carried by a model-selected
+/// Assess the exact semantic audio profile carried by a model-selected
 /// candidate against the same effective anime preference used by acquisition.
 /// The boolean is the automatic-selection gate: RequireReview is satisfied
 /// only by a positive evidence match.
@@ -1463,8 +1440,8 @@ mod tests {
         acquisition::{
             release_resolution::anime::{
                 AnimeCandidateInput, AnimeCandidateTarget, AnimeCoverageOptions,
-                AnimeReleaseFileInput, AnimeScopedAlias, plan_anime_file_coverage,
-                plan_anime_file_coverage_with_options,
+                AnimeReleaseFileInput, AnimeScopedAlias, anime_release_kind_for_coverage,
+                plan_anime_file_coverage, plan_anime_file_coverage_with_options,
             },
             release_resolution::models::ReleaseCoverageKind,
             subscriptions::{
@@ -2450,7 +2427,7 @@ mod tests {
         assert!(
             plan.entries
                 .iter()
-                .all(|entry| entry.reason == "local_model_positional_target_file")
+                .all(|entry| entry.reason == "local_model_canonical_target_file")
         );
         Ok(())
     }
@@ -2787,16 +2764,14 @@ mod tests {
 
     #[test]
     fn alm7_model_path_accepts_multi_season_and_complete_series_file_lists() -> Result<()> {
-        for (release_title, expected_kind, expected_coverage_kind) in [
+        for (release_title, parser_kind) in [
             (
                 "Example Anime S01-S02 1080p WEB-DL",
                 ReleaseKind::MultiSeasonPack,
-                ReleaseCoverageKind::MultiSeasonPack,
             ),
             (
                 "Example Anime Complete Series 1080p WEB-DL",
                 ReleaseKind::SeriesPack,
-                ReleaseCoverageKind::SeriesPack,
             ),
         ] {
             let subscription = tokyo_ghoul_subscription();
@@ -2855,7 +2830,7 @@ mod tests {
             }];
             assert_eq!(
                 anime_release_kind_for_coverage(&parse_anime_release_title(release_title)),
-                expected_kind
+                parser_kind
             );
             let prepared =
                 AnimeMatchingService::prepare_request(acquisition_anime_match_batch_input(
@@ -2888,20 +2863,20 @@ mod tests {
                 prepared.source_map(),
             )?;
             let plan = &plans[0].plan;
-            assert_eq!(plan.release_kind, expected_kind);
+            assert_eq!(plan.release_kind, ReleaseKind::MultiSeasonPack);
             assert_eq!(plan.entries.len(), targets.len());
             assert_eq!(plan.selected_file_keys.len(), targets.len());
             assert!(plan.entries.iter().all(|entry| {
-                entry.coverage_kind == expected_coverage_kind
+                entry.coverage_kind == ReleaseCoverageKind::MultiSeasonPack
                     && entry.release_file_key.is_some()
-                    && entry.reason == "local_model_positional_target_file"
+                    && entry.reason == "local_model_canonical_target_file"
             }));
         }
         Ok(())
     }
 
     #[test]
-    fn alm7_unknown_release_without_inventory_is_rejected() -> Result<()> {
+    fn alm7_verified_fileless_mapping_does_not_depend_on_parser_kind() -> Result<()> {
         let subscription = tokyo_ghoul_subscription();
         let target = tokyo_ghoul_target(&subscription);
         let context = tokyo_ghoul_context();
@@ -2930,16 +2905,19 @@ mod tests {
             selected_file_keys: None,
         };
 
-        assert!(
-            model_derived_anime_coverage_plans(
-                prepared.request(),
-                &context,
-                &candidates,
-                subscription.route_policy,
-                &[matched],
-                prepared.source_map(),
-            )
-            .is_err()
+        let plans = model_derived_anime_coverage_plans(
+            prepared.request(),
+            &context,
+            &candidates,
+            subscription.route_policy,
+            &[matched],
+            prepared.source_map(),
+        )?;
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan.release_kind, ReleaseKind::Single);
+        assert_eq!(
+            plans[0].plan.entries[0].reason,
+            "local_model_canonical_target"
         );
         Ok(())
     }
@@ -2994,10 +2972,14 @@ mod tests {
                 ..candidate("Tokyo Ghoul Root A - 01", "private:single")
             },
             AcquisitionCandidate {
-                files: Vec::new(),
+                files: vec![selectable_media_file(
+                    "missing-model-selection",
+                    1,
+                    "Tokyo Ghoul Root A - 01.mkv",
+                )],
                 ..candidate(
                     "Tokyo Ghoul Root A Complete Series",
-                    "private:pack-without-files",
+                    "private:inventoried-without-selection",
                 )
             },
         ];
@@ -3207,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn alm5_model_range_cannot_collapse_to_one_wanted_episode() -> Result<()> {
+    fn alm7_verified_range_can_cover_one_wanted_episode_without_regex_rejection() -> Result<()> {
         let subscription = tokyo_ghoul_subscription();
         let target = tokyo_ghoul_target(&subscription);
         let mut context = tokyo_ghoul_context();
@@ -3248,18 +3230,17 @@ mod tests {
             anime_release_kind_for_coverage(&parse_anime_release_title(&candidates[0].title)),
             ReleaseKind::MultiEpisode
         );
-        assert!(
-            model_derived_anime_coverage_plans(
-                prepared.request(),
-                &context,
-                &candidates,
-                subscription.route_policy,
-                &[matched],
-                prepared.source_map(),
-            )
-            .is_err(),
-            "the full deterministic range must not be collapsed to one model-selected target"
-        );
+        let plans = model_derived_anime_coverage_plans(
+            prepared.request(),
+            &context,
+            &candidates,
+            subscription.route_policy,
+            &[matched],
+            prepared.source_map(),
+        )?;
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan.entries[0].target_key, "S02E01");
+        assert_eq!(plans[0].plan.release_kind, ReleaseKind::Single);
         Ok(())
     }
 

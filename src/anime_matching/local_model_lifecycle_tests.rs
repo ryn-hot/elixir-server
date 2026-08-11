@@ -49,8 +49,9 @@ def stop(_signal, _frame):
     os._exit(0)
 
 
-VALID = b'{"choices":[{"message":{"content":"{\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
-WRONG = b'{"choices":[{"message":{"content":"{\\"m\\":[]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
+VALID = b'{"choices":[{"message":{"content":"{\\"s\\":\\"resolved\\",\\"e\\":\\"27899\\",\\"n\\":\\"seasonal\\",\\"p\\":[1],\\"a\\":[],\\"k\\":\\"episode\\",\\"u\\":\\"dual_audio\\"}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
+WRONG = b'{"choices":[{"message":{"content":"{\\"s\\":\\"unknown\\",\\"e\\":\\"unknown\\",\\"n\\":\\"unknown\\",\\"p\\":[],\\"a\\":[],\\"k\\":\\"unknown\\",\\"u\\":\\"unknown\\"}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
+INVALID = b'{"choices":[{"message":{"content":"{\\"invalid\\":true}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -100,7 +101,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.01)
             self.reply(200, WRONG)
             return
-        if MODE == "wrong" or (MODE == "restart" and SPAWN_NUMBER > 1):
+        if MODE == "restart" and SPAWN_NUMBER > 1:
+            self.reply(200, INVALID)
+            return
+        if MODE == "wrong":
             self.reply(200, WRONG)
             return
         self.reply(200, VALID)

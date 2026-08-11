@@ -38,8 +38,8 @@ use crate::{
         automation::synthetic_stream_candidate_requires_manual_review,
         language_policy::{
             AcquisitionLanguagePreference, LanguagePreferenceAssessment,
-            LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule,
-            LanguagePreferenceMode, UnknownLanguagePolicy, assess_language_preference,
+            LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule, LanguagePreferenceMode,
+            UnknownLanguagePolicy, assess_language_preference,
         },
         release_resolution::{
             anime::{
@@ -78,7 +78,7 @@ const EXPECTED_CASE_COUNT: usize = 520;
 const QUALIFICATION_CORPUS_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
-const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v3-model-only";
+const QUALIFICATION_SCORER_REVISION: &str = "alm9-qualification-v4-semantic-errata";
 const SHA256_PREFIX: &str = "sha256:";
 const FILE_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const LOCAL_MODEL_CONTRACT_SOURCE: &str = include_str!("../anime_matching/local_model.rs");
@@ -2146,35 +2146,35 @@ fn compiled_matcher_contract_fingerprints() -> Result<(String, String, String)> 
 fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String)> {
     let normalized_source = source.replace("\r\n", "\n");
     let source = normalized_source.as_str();
-    let prompt = source_between(
+    let prompts = source_between(
         source,
-        "const SYSTEM_PROMPT: &str = r#\"",
-        "\"#;",
-        "system prompt",
+        "const SEMANTIC_RESOLVER_PROMPT: &str = r#\"",
+        "\nconst SEMANTIC_CACHE_SCHEMA_VERSION",
+        "semantic prompts",
     )?;
     let prompt_builder = source_between(
         source,
         "fn build_chat_request(",
-        "\nfn compact_response_grammar(",
+        "\nfn semantic_cache_key(",
         "prompt builder",
     )?;
-    let response_schema = source_between(
+    let semantic_schema = source_between(
         source,
-        "fn compact_response_grammar(",
+        "enum SemanticResolutionStatus {",
+        "\nfn semantic_cache_key(",
+        "semantic response types",
+    )?;
+    let response_validation = source_between(
+        source,
+        "fn compact_semantic_context(",
         "\n#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct InputTokenResponse",
-        "response schema",
+        "semantic response grammar and validation",
     )?;
-    let response_wire = source_between(
+    let response_execution = source_between(
         source,
-        "#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct CompactAnimeMatchResponse",
-        "\nasync fn request_completion(",
-        "response wire",
-    )?;
-    let response_decoder = source_between(
-        source,
-        "fn decode_compact_response(",
+        "async fn request_structured_completion",
         "\nfn finite_positive_millis(",
-        "response decoder",
+        "semantic response execution",
     )?;
     let sampling = source_between(
         source,
@@ -2182,9 +2182,9 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
         "\nimpl LocalModelSamplingProfile {",
         "sampling profile",
     )?;
-    let prompt_contract = format!("{prompt}\n--build-chat-request-source--\n{prompt_builder}");
+    let prompt_contract = format!("{prompts}\n--semantic-request-builders--\n{prompt_builder}");
     let response_contract = format!(
-        "{response_schema}\n--compact-response-wire-source--\n{response_wire}\n--compact-response-decoder-source--\n{response_decoder}"
+        "{semantic_schema}\n--semantic-grammar-validation--\n{response_validation}\n--semantic-response-execution--\n{response_execution}"
     );
     Ok((
         sha256_bytes(prompt_contract.as_bytes()),
@@ -2201,13 +2201,9 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str, label: &str) -> R
     let end_offset = source[content_index..]
         .find(end)
         .ok_or_else(|| anyhow!("compiled local-model source lacks {label} end"))?;
-    if label == "system prompt" {
-        Ok(&source[content_index..content_index + end_offset])
-    } else {
-        // Python's release contract includes the function/impl start marker
-        // in schema and sampling fingerprints, but excludes the prompt marker.
-        Ok(&source[start_index..content_index + end_offset])
-    }
+    // Include start markers in every fingerprint. They carry the contract's
+    // field/function identity and make renamed semantics an explicit revision.
+    Ok(&source[start_index..content_index + end_offset])
 }
 
 fn runtime_identity(runtime_id: &str) -> Result<(&'static str, &'static str, &'static str)> {
