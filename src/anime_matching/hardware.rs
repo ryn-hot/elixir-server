@@ -39,6 +39,7 @@ pub const INFERENCE_HARDWARE_SCHEMA_VERSION: u32 = 1;
 pub const INFERENCE_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 2;
 pub const MIN_AVAILABLE_SYSTEM_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MIN_DEVICE_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_INFERENCE_CPU_THREADS: u32 = 4;
 pub const MAX_INFERENCE_BATCH_THREADS: u32 = 8;
 pub const MAX_RUNTIME_PROFILE_CANDIDATES: usize = 8;
@@ -340,7 +341,7 @@ impl Default for InferenceProbeLimits {
             // hardware-routing evidence and rejected only at the same generous
             // final failure boundary used by production matching.
             maximum_warm_latency: PROBE_REQUEST_ALLOWANCE,
-            maximum_worker_rss_bytes: FOUR_GIB,
+            maximum_worker_rss_bytes: MAX_WORKER_RSS_BYTES,
             minimum_available_system_bytes: MIN_AVAILABLE_SYSTEM_MEMORY_BYTES,
             minimum_available_device_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
         }
@@ -3043,9 +3044,9 @@ mod tests {
             minimum_server_version: "0.1.0".to_string(),
             worker_revision: "llama-cpp-b7000".to_string(),
             model: AnimeModelArtifactManifest {
-                id: "qwen3-4b-instruct-2507".to_string(),
+                id: "qwen3-8b".to_string(),
                 revision: "elixir-q4km-r1".to_string(),
-                upstream_model_id: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
+                upstream_model_id: "Qwen/Qwen3-8B".to_string(),
                 upstream_revision: commit.to_string(),
                 license: "Apache-2.0".to_string(),
                 format: AnimeModelFormat::Gguf,
@@ -3054,7 +3055,7 @@ mod tests {
                 context_tokens: 4_096,
                 max_output_tokens: 256,
                 thinking_mode: AnimeThinkingMode::NonThinkingOnly,
-                chat_template_revision: "qwen3-2507-elixir-v1".to_string(),
+                chat_template_revision: "qwen3-8b-elixir-v1".to_string(),
                 conversion_tool_revision: commit.to_string(),
                 qualification_report_fingerprint: hash.to_string(),
                 url: "https://releases.example/model.gguf".to_string(),

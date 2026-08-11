@@ -3747,7 +3747,7 @@ mod tests {
     fn profile() -> LocalModelRuntimeProfile {
         LocalModelRuntimeProfile {
             bundle_version: "2026.08.1".to_string(),
-            model_id: "qwen3-4b-instruct-2507".to_string(),
+            model_id: "qwen3-8b".to_string(),
             model_revision: "elixir-q4km-r1".to_string(),
             worker_revision: "llama-b123".to_string(),
             backend: "cpu".to_string(),
@@ -3770,11 +3770,11 @@ mod tests {
     }
 
     const ALM9_NATIVE_LLAMA_SERVER_ENV: &str = "ELIXIR_ALM9_LLAMA_SERVER_PATH";
-    const ALM9_NATIVE_QWEN_MODEL_ENV: &str = "ELIXIR_ALM9_QWEN3_4B_INSTRUCT_2507_Q4_K_M_PATH";
+    const ALM9_NATIVE_QWEN_MODEL_ENV: &str = "ELIXIR_ALM9_QWEN3_8B_Q4_K_M_PATH";
     const ALM9_NATIVE_LLAMA_SERVER_SHA256: &str =
         "11e02e3fd6c0ce1c770e79b8d9ccf5670a69d26c6252dfbfd55cb9caf22b95b7";
     const ALM9_NATIVE_QWEN_MODEL_SHA256: &str =
-        "2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e";
+        "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785";
 
     fn alm9_native_release_path(variable: &str) -> Result<PathBuf> {
         let value = std::env::var_os(variable).ok_or_else(|| {
@@ -3795,8 +3795,8 @@ mod tests {
     ) -> LocalModelRuntimeProfile {
         LocalModelRuntimeProfile {
             bundle_version: "alm9-native-release-probe-v1".to_string(),
-            model_id: "Qwen/Qwen3-4B-Instruct-2507".to_string(),
-            model_revision: "validation-ae44f08e1392f39c0e474af10c3ff8355c8b6688-q4-k-m"
+            model_id: "Qwen/Qwen3-8B".to_string(),
+            model_revision: "validation-7c41481f57cb95916b40956ab2f0b139b296d974-q4-k-m"
                 .to_string(),
             worker_revision: "llama.cpp-b9637-aedb2a5e9ca3d4064148bbb919e0ddc0c1b70ab3".to_string(),
             backend: "cpu".to_string(),
@@ -4780,11 +4780,11 @@ mod tests {
 
     /// Release-maintenance probe for the exact official model and packaged
     /// runtime. This deliberately stays ignored: it needs the two explicit
-    /// artifact paths below, loads a 1.2 GiB model, and exercises real CPU
+    /// artifact paths below, loads the 5.03 GB validation model, and exercises real CPU
     /// inference. Ordinary tests and the product expose no switch for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires ELIXIR_ALM9_LLAMA_SERVER_PATH and ELIXIR_ALM9_QWEN3_4B_INSTRUCT_2507_Q4_K_M_PATH"]
-    async fn alm9_native_qwen35_cpu_production_protocol_release_probe() {
+    #[ignore = "requires ELIXIR_ALM9_LLAMA_SERVER_PATH and ELIXIR_ALM9_QWEN3_8B_Q4_K_M_PATH"]
+    async fn alm9_native_qwen3_8b_cpu_production_protocol_release_probe() {
         let result = async {
             let worker_path = alm9_native_release_path(ALM9_NATIVE_LLAMA_SERVER_ENV)?;
             let model_path = alm9_native_release_path(ALM9_NATIVE_QWEN_MODEL_ENV)?;
@@ -4794,7 +4794,7 @@ mod tests {
             );
             ensure!(
                 alm9_native_sha256(&model_path).await? == ALM9_NATIVE_QWEN_MODEL_SHA256,
-                "native release probe model bytes do not match the pinned Qwen3-4B-Instruct-2507 Q4_K_M validation artifact"
+                "native release probe model bytes do not match the pinned Qwen3-8B Q4_K_M validation artifact"
             );
             let profile = alm9_native_cpu_profile(worker_path, model_path);
             profile.validate_contract()?;
@@ -4963,7 +4963,7 @@ mod tests {
     /// timeout can be separated into prompt-evaluation and generation cost.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the ALM-9 native artifacts and ELIXIR_ALM9_CORPUS_PATH"]
-    async fn alm9_native_qwen35_cpu_frozen_case_latency_diagnostic() {
+    async fn alm9_native_qwen3_8b_cpu_frozen_case_latency_diagnostic() {
         let result = async {
             let worker_path = alm9_native_release_path(ALM9_NATIVE_LLAMA_SERVER_ENV)?;
             let model_path = alm9_native_release_path(ALM9_NATIVE_QWEN_MODEL_ENV)?;
@@ -4974,7 +4974,7 @@ mod tests {
             );
             ensure!(
                 alm9_native_sha256(&model_path).await? == ALM9_NATIVE_QWEN_MODEL_SHA256,
-                "native diagnostic model bytes do not match the pinned Qwen3-4B-Instruct-2507 Q4_K_M validation artifact"
+                "native diagnostic model bytes do not match the pinned Qwen3-8B Q4_K_M validation artifact"
             );
             let corpus: Value = serde_json::from_slice(
                 &tokio::fs::read(&corpus_path)

@@ -671,7 +671,7 @@ fn validate_source_lock(
         .and_then(JsonValue::as_array)
         .ok_or_else(|| anyhow!("model source lock primary files must be an array"))?;
     let tokenizer_sha256 = source_file_sha(files, "tokenizer.json")?;
-    // Qwen3-4B-Instruct-2507 stores its immutable chat template inside the
+    // Qwen3-8B stores its immutable chat template inside the
     // official tokenizer_config.json rather than as a separate Jinja file.
     let template_sha256 = source_file_sha(files, "tokenizer_config.json")?;
     ensure!(
@@ -1076,7 +1076,7 @@ fn validate_release_gguf_identity(identity: &GgufIdentity) -> Result<()> {
             && identity.file_type == EXPECTED_GGUF_FILE_TYPE
             && identity.block_count == EXPECTED_GGUF_BLOCK_COUNT
             && !identity.nextn_predict_layers_present,
-        "GGUF metadata is not the pinned text-only Qwen3-4B-Instruct-2507 Q4_K_M contract"
+        "GGUF metadata is not the pinned text-only Qwen3-8B Q4_K_M contract"
     );
     Ok(())
 }
@@ -1356,7 +1356,11 @@ mod tests {
         let identity = validate_source_lock(&lock, &contract).unwrap();
         assert_eq!(
             identity.tokenizer_sha256,
-            "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+            "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        );
+        assert_eq!(
+            identity.template_sha256,
+            "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
         );
         assert_eq!(contract.tokenizer_cases.len(), 16);
         assert_eq!(contract.chat_template_cases.len(), 4);

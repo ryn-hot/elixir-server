@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "status": "frozen",
-  "modelId": "Qwen/Qwen3-4B-Instruct-2507",
-  "modelRevision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "modelId": "Qwen/Qwen3-8B",
+  "modelRevision": "b968826d9c46dd6066d109eabc6255188de91218",
   "sourceTokenizerSha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
-  "sourceTemplateSha256": "a62ff0a2472a0fa1b8eaabcb57c59b58afa42a22831dc141400b6e0cf2b65ce3",
+  "sourceTemplateSha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
   "tokenizerCases": [
     {
       "text": "Tokyo Ghoul Root A S02E01 1080p WEB-DL Dual Audio",
@@ -77,13 +77,13 @@
         {"role": "system", "content": "Return JSON only."},
         {"role": "user", "content": "Match Tokyo Ghoul Root A episode 1."}
       ],
-      "expectedPrompt": "<|im_start|>system\nReturn JSON only.<|im_end|>\n<|im_start|>user\nMatch Tokyo Ghoul Root A episode 1.<|im_end|>\n<|im_start|>assistant\n"
+      "expectedPrompt": "<|im_start|>system\nReturn JSON only.<|im_end|>\n<|im_start|>user\nMatch Tokyo Ghoul Root A episode 1.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     },
     {
       "messages": [
         {"role": "user", "content": "東京喰種√A を season 2 episode 1 に照合してください。"}
       ],
-      "expectedPrompt": "<|im_start|>user\n東京喰種√A を season 2 episode 1 に照合してください。<|im_end|>\n<|im_start|>assistant\n"
+      "expectedPrompt": "<|im_start|>user\n東京喰種√A を season 2 episode 1 に照合してください。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     },
     {
       "messages": [
@@ -92,14 +92,14 @@
         {"role": "assistant", "content": "{\"schemaVersion\":1,\"matches\":[]}"},
         {"role": "user", "content": "Try the next candidate."}
       ],
-      "expectedPrompt": "<|im_start|>system\nYou match anime candidates.<|im_end|>\n<|im_start|>user\nCandidate is dual audio; target requires dubbed.<|im_end|>\n<|im_start|>assistant\n{\"schemaVersion\":1,\"matches\":[]}<|im_end|>\n<|im_start|>user\nTry the next candidate.<|im_end|>\n<|im_start|>assistant\n"
+      "expectedPrompt": "<|im_start|>system\nYou match anime candidates.<|im_end|>\n<|im_start|>user\nCandidate is dual audio; target requires dubbed.<|im_end|>\n<|im_start|>assistant\n{\"schemaVersion\":1,\"matches\":[]}<|im_end|>\n<|im_start|>user\nTry the next candidate.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     },
     {
       "messages": [
         {"role": "system", "content": "Output one compact JSON object."},
         {"role": "user", "content": "Map absolute episode 25 to season/episode numbering."}
       ],
-      "expectedPrompt": "<|im_start|>system\nOutput one compact JSON object.<|im_end|>\n<|im_start|>user\nMap absolute episode 25 to season/episode numbering.<|im_end|>\n<|im_start|>assistant\n"
+      "expectedPrompt": "<|im_start|>system\nOutput one compact JSON object.<|im_end|>\n<|im_start|>user\nMap absolute episode 25 to season/episode numbering.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     }
   ]
 }

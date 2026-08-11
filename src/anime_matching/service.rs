@@ -1396,7 +1396,7 @@ mod tests {
     async fn alm6_success_preserves_the_invocation_runtime_provenance() {
         let expected_runtime = AnimeMatchRuntimeProvenance {
             bundle_version: "2026.08.1".to_string(),
-            model_id: "qwen3-4b-instruct-2507".to_string(),
+            model_id: "qwen3-8b".to_string(),
             model_revision: "elixir-q4km-r1".to_string(),
             worker_revision: "llama-b9637".to_string(),
             backend: "metal_cpu".to_string(),
