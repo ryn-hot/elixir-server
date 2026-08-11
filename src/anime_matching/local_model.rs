@@ -71,7 +71,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v7-intel-compact-exact";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v8-raw-release-evidence";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v3";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -3932,7 +3932,7 @@ mod tests {
         .expect("compact request JSON");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v7-intel-compact-exact"
+            "anime-match-v8-raw-release-evidence"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
