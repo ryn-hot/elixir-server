@@ -561,7 +561,6 @@ async fn run_model_observation(
         .context("qualification model returned an invalid response")?;
     let model_output = serde_json::to_value(&response).expect("anime response is serializable");
     let resolution = model_only_resolution(
-        &input.request,
         input.acquisition_candidates.len(),
         &preference,
         &response.matches,
@@ -671,7 +670,6 @@ async fn run_failure_injections(
 }
 
 fn model_only_resolution(
-    request: &AnimeMatchRequest,
     candidate_count: usize,
     preference: &AcquisitionLanguagePreference,
     matches: &[AnimeCandidateMatch],
@@ -689,23 +687,6 @@ fn model_only_resolution(
             source.candidate_index < candidate_count,
             "model match candidate source is outside the qualification input"
         );
-        let candidate = request
-            .candidates
-            .get(source.candidate_index)
-            .ok_or_else(|| anyhow!("model match candidate source is outside the request"))?;
-        let parsed_episode_count = candidate
-            .parse_facts
-            .episode_numbers
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len();
-        if candidate.files.len() == 1
-            && parsed_episode_count > 1
-            && matched.matched_target_keys.len() < parsed_episode_count
-        {
-            continue;
-        }
         let assessment = assess_language_preference(
             preference,
             MediaType::Anime,
@@ -2704,7 +2685,6 @@ mod tests {
             BTreeMap::new(),
         );
         let resolution = model_only_resolution(
-            &request,
             1,
             &preference,
             &[AnimeCandidateMatch {
