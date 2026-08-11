@@ -636,7 +636,11 @@ async fn run_model_observation(
         candidate_plans: vec![None; input.acquisition_candidates.len()],
         saw_partial_or_ambiguous: false,
     };
-    for mapped in coverage {
+    ensure!(
+        coverage.len() == response.matches.len(),
+        "production coverage result count differs from validated model matches"
+    );
+    for (mapped, matched) in coverage.into_iter().zip(&response.matches) {
         let assessment = assess_language_preference(
             &preference,
             MediaType::Anime,
@@ -647,15 +651,8 @@ async fn run_model_observation(
         }
         resolution.saw_partial_or_ambiguous = true;
         if required_language_satisfied(&preference, &assessment) {
-            let candidate_key = input
-                .request
-                .candidates
-                .get(mapped.candidate_index)
-                .ok_or_else(|| anyhow!("model coverage candidate index is out of bounds"))?
-                .candidate_key
-                .as_str();
             resolution.candidate_plans[mapped.candidate_index] = Some(
-                candidate_plan_for_coverage(candidate_key, &mapped.plan, &assessment),
+                candidate_plan_for_model_coverage(matched, &mapped.plan, &assessment)?,
             );
         }
     }
@@ -926,6 +923,39 @@ fn candidate_plan_for_coverage(
         audio_eligibility: audio_eligibility(assessment),
         coverage,
     }
+}
+
+fn candidate_plan_for_model_coverage(
+    matched: &AnimeCandidateMatch,
+    plan: &AnimeFileCoveragePlan,
+    assessment: &LanguagePreferenceAssessment,
+) -> Result<QualificationCandidatePlan> {
+    let file_keys = matched.selected_file_keys.clone().unwrap_or_default();
+    ensure!(
+        file_keys.is_empty() || file_keys.len() == 1 || file_keys.len() == plan.entries.len(),
+        "production coverage cannot be represented with request-local file keys"
+    );
+    let coverage = plan
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| QualificationCoverageEntry {
+            target_key: entry.target_key.clone(),
+            file_key: if file_keys.len() == 1 {
+                file_keys.first().cloned()
+            } else {
+                file_keys.get(index).cloned()
+            },
+            status: QualificationCoverageStatus::Covered,
+        })
+        .collect::<Vec<_>>();
+    Ok(QualificationCandidatePlan {
+        candidate_key: matched.candidate_key.clone(),
+        target_keys: unique_strings(plan.entries.iter().map(|entry| entry.target_key.clone())),
+        file_keys,
+        audio_eligibility: audio_eligibility(assessment),
+        coverage,
+    })
 }
 
 #[cfg(test)]
