@@ -68,20 +68,24 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v13-direct-target-match";
-pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v6-direct";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v14-candidate-checklist";
+pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v7-checklist";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
-const DIRECT_MATCH_PROMPT: &str = r#"Choose which anime candidates cover the exact wanted target.
+const DIRECT_MATCH_PROMPT: &str = r#"Check every anime candidate against the exact wanted target.
 
 `target` is the requested movie, special, season, range, or episode. Each `seasons` item owns its aliases and episode coordinates; `episodes[].wanted` is the output target index. `release` and file `name` are raw names. Candidate and file `index` values are output indexes.
 
 Use English, romaji, Japanese, and alternate titles plus seasonal and absolute numbering. Different sequel names can be seasons of one franchise: for example Tokyo Ghoul Root A is season 2, Tokyo Ghoul:re is season 3, and Tokyo Ghoul:re 2 is season 4. Do not require literal SxxExx when an alias or absolute number resolves the target. Ranges cover every episode in the range. Movies, specials, OVAs, samples, NCOP, and NCED do not cover normal episodes.
 
+First output one `d` decision for every candidate in input order: 0 means contradicted or wrong, 1 means ambiguous or missing affirmative evidence, and 2 means the raw release/files affirmatively identify the wanted title or owned alias, season, episode/range, and media kind. The target metadata is reference context, not evidence that a candidate matches. An unrelated title is always 0. The same episode number with the wrong title, the same franchise with the wrong season, and an off-by-one episode are always 0. An exact match can occur at any candidate index. Only candidates rated 2 may appear in `m`, and every candidate rated 2 must appear once.
+
 For `require`, audio evidence must match `audio.accepted`; `require_dub` accepts dubbed or dual-audio. `any`, `prefer`, and `prefer_dub` never reject an otherwise correct title match. For packs, select only the file indexes that cover the returned wanted indexes.
 
-Return the best compatible mappings. Return empty only when no candidate covers the target. JSON only: {\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
+Example: target Example Show season 2 episode 3; candidates are `Other Show S02E03`, `Example Show S01E03`, and `Example Show: Return - 03`, where Return is the season-2 alias. The result decisions are `[0,0,2]` and only candidate 2 is mapped. If every candidate is an unrelated title, wrong season, or wrong episode, all decisions are 0 and mappings are empty.
+
+JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2116,14 +2120,16 @@ fn compact_direct_request(request: &AnimeMatchRequest) -> Result<Value> {
         .iter()
         .filter_map(|season| {
             let episodes = compact_context_targets(season, &wanted_slots);
-            if episodes.is_empty() {
+            let aliases = compact_season_aliases(season, &request.target.canonical_title);
+            if episodes.is_empty() && aliases.is_empty() {
                 return None;
             }
             let mut compact_season = serde_json::Map::new();
             compact_season.insert("season".to_string(), json!(season.season_number));
-            let aliases = compact_season_aliases(season, &request.target.canonical_title);
             insert_non_empty_strings(&mut compact_season, "aliases", &aliases);
-            compact_season.insert("episodes".to_string(), Value::Array(episodes));
+            if !episodes.is_empty() {
+                compact_season.insert("episodes".to_string(), Value::Array(episodes));
+            }
             Some(Value::Object(compact_season))
         })
         .collect::<Vec<_>>();
@@ -2287,8 +2293,13 @@ fn compact_response_grammar(
     let mapping_names = (0..request.candidates.len())
         .map(|index| format!("mapping{index}"))
         .collect::<Vec<_>>();
-    let mut rules =
-        vec!["root ::= \"{\\\"m\\\":[]}\" | \"{\\\"m\\\":[\" mappings \"]}\"".to_string()];
+    let decisions = vec!["decision"; request.candidates.len()].join(" \",\" ");
+    let mut rules = vec![
+        "root ::= \"{\\\"d\\\":[\" decisions \"],\\\"m\\\":[]}\" | \"{\\\"d\\\":[\" decisions \"],\\\"m\\\":[\" mappings \"]}\""
+            .to_string(),
+        format!("decisions ::= {decisions}"),
+        "decision ::= \"0\" | \"1\" | \"2\"".to_string(),
+    ];
     rules.push(format!(
         "mappings ::= {}",
         finite_sequence_choices("mapping", maximum_mappings)
@@ -2355,10 +2366,15 @@ fn compact_response_bounds(
         "cannot bound compact response without candidates"
     );
     let longest_mapping_bytes = maximum_compact_mapping_bytes(request)?;
-    let minimum_response_bytes = maximum_compact_response_bytes(1, longest_mapping_bytes)?;
+    let minimum_response_bytes =
+        maximum_compact_response_bytes(request.candidates.len(), 1, longest_mapping_bytes)?;
     let mut bounds = None;
     for mapping_count in 1..=request.candidates.len() {
-        let response_bytes = maximum_compact_response_bytes(mapping_count, longest_mapping_bytes)?;
+        let response_bytes = maximum_compact_response_bytes(
+            request.candidates.len(),
+            mapping_count,
+            longest_mapping_bytes,
+        )?;
         if response_bytes > output_token_cap {
             break;
         }
@@ -2404,9 +2420,15 @@ fn maximum_compact_mapping_bytes(request: &AnimeMatchRequest) -> Result<usize> {
     Ok(longest)
 }
 
-fn maximum_compact_response_bytes(mapping_count: usize, mapping_bytes: usize) -> Result<usize> {
+fn maximum_compact_response_bytes(
+    decision_count: usize,
+    mapping_count: usize,
+    mapping_bytes: usize,
+) -> Result<usize> {
+    let decisions = maximum_index_sequence_bytes(decision_count, 1)?;
     maximum_index_sequence_bytes(mapping_count, mapping_bytes)?
-        .checked_add(8)
+        .checked_add(decisions)
+        .and_then(|value| value.checked_add(15))
         .ok_or_else(|| anyhow!("compact response byte bound overflow"))
 }
 
@@ -2560,6 +2582,7 @@ struct ChatCompletionMessage {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactAnimeMatchResponse {
+    d: Vec<u8>,
     m: Vec<CompactCandidateMapping>,
 }
 
@@ -2632,15 +2655,33 @@ fn decode_compact_response(
         .context("decoding grammar-constrained compact anime match response")?;
     let response_bounds = compact_response_bounds(request, output_token_cap as usize)?;
     ensure!(
+        compact.d.len() == request.candidates.len(),
+        "compact response decision cardinality differs from candidate cardinality"
+    );
+    ensure!(
+        compact.d.iter().all(|decision| *decision <= 2),
+        "compact response contains an unknown candidate decision"
+    );
+    ensure!(
         compact.m.len() <= response_bounds.maximum_mappings,
         "compact response exceeds grammar mapping cardinality"
     );
+    let exact_candidates = compact
+        .d
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_slot, decision)| (*decision == 2).then_some(candidate_slot))
+        .collect::<BTreeSet<_>>();
     let mut matches = Vec::with_capacity(compact.m.len());
     let mut seen_candidates = BTreeSet::new();
     for CompactCandidateMapping(candidate_slot, target_slots, file_slots) in compact.m {
         ensure!(
             seen_candidates.insert(candidate_slot),
             "compact response repeats candidate slot {candidate_slot}"
+        );
+        ensure!(
+            exact_candidates.contains(&candidate_slot),
+            "compact response maps candidate slot {candidate_slot} without an exact decision"
         );
         ensure!(
             !target_slots.is_empty(),
@@ -2715,6 +2756,10 @@ fn decode_compact_response(
             selected_file_keys: (!selected_file_keys.is_empty()).then_some(selected_file_keys),
         });
     }
+    ensure!(
+        seen_candidates == exact_candidates,
+        "compact response decisions and mappings disagree"
+    );
 
     Ok(AnimeMatchResponse {
         schema_version: ANIME_MATCH_SCHEMA_VERSION,
@@ -3830,18 +3875,19 @@ mod tests {
         .expect("direct user object");
         assert_eq!(
             ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v13-direct-target-match"
+            "anime-match-v14-candidate-checklist"
         );
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
-            "anime-match-response-v6-direct"
+            "anime-match-response-v7-checklist"
         );
         assert_eq!(user.pointer("/target/title"), Some(&json!("Tokyo Ghoul")));
         assert_eq!(user.pointer("/target/season"), Some(&json!(2)));
         assert_eq!(user.pointer("/target/audio/mode"), Some(&json!("any")));
-        assert_eq!(user.pointer("/seasons/0/season"), Some(&json!(2)));
+        assert_eq!(user.pointer("/seasons/0/season"), Some(&json!(1)));
+        assert_eq!(user.pointer("/seasons/1/season"), Some(&json!(2)));
         assert_eq!(
-            user.pointer("/seasons/0/episodes/0/wanted"),
+            user.pointer("/seasons/1/episodes/0/wanted"),
             Some(&json!(0))
         );
         assert_eq!(
@@ -3853,25 +3899,28 @@ mod tests {
         assert!(!encoded.contains("parseFacts"));
         assert!(!encoded.contains("22319"));
         let grammar = body["grammar"].as_str().expect("direct grammar");
+        assert!(grammar.contains("decisions ::="));
+        assert!(grammar.contains("decision ::= \"0\" | \"1\" | \"2\""));
         assert!(grammar.contains("mapping0"));
         assert!(grammar.contains("file0"));
         let prompt = body["messages"][0]["content"]
             .as_str()
             .expect("direct prompt");
         for rule in [
-            "Choose which anime candidates cover the exact wanted target",
+            "Check every anime candidate against the exact wanted target",
             "English, romaji, Japanese",
             "Tokyo Ghoul Root A is season 2",
-            "Return empty only when no candidate covers the target",
+            "An unrelated title is always 0",
+            "An exact match can occur at any candidate index",
         ] {
             assert!(prompt.contains(rule), "missing direct rule: {rule}");
         }
     }
 
     #[test]
-    fn alm9_v13_direct_response_expands_only_request_local_references() {
+    fn alm9_v14_checklist_response_expands_only_request_local_references() {
         let request = request();
-        let response = decode_compact_response("{\"m\":[[0,[0],[0]]]}", &request, 256)
+        let response = decode_compact_response("{\"d\":[2],\"m\":[[0,[0],[0]]]}", &request, 256)
             .expect("valid direct mapping");
         assert_eq!(response.matches.len(), 1);
         assert_eq!(response.matches[0].candidate_key, "candidate-0");
@@ -3882,10 +3931,14 @@ mod tests {
         );
 
         for invalid in [
-            "{\"m\":[[1,[0],[0]]]}",
-            "{\"m\":[[0,[1],[0]]]}",
-            "{\"m\":[[0,[0],[1]]]}",
-            "{\"m\":[[0,[0,0],[0]]]}",
+            "{\"d\":[],\"m\":[]}",
+            "{\"d\":[3],\"m\":[]}",
+            "{\"d\":[0],\"m\":[[0,[0],[0]]]}",
+            "{\"d\":[2],\"m\":[]}",
+            "{\"d\":[2],\"m\":[[1,[0],[0]]]}",
+            "{\"d\":[2],\"m\":[[0,[1],[0]]]}",
+            "{\"d\":[2],\"m\":[[0,[0],[1]]]}",
+            "{\"d\":[2],\"m\":[[0,[0,0],[0]]]}",
         ] {
             assert!(
                 decode_compact_response(invalid, &request, 256).is_err(),
@@ -4028,13 +4081,15 @@ mod tests {
                     .ok_or_else(|| anyhow!("native request omitted constrained grammar"))?;
                 ensure!(grammar.contains("root ::="), "native request omitted root rule");
                 ensure!(
-                    grammar.contains("entity ::=") && grammar.contains("integer ::="),
+                    grammar.contains("decisions ::=")
+                        && grammar.contains("decision ::= \"0\" | \"1\" | \"2\"")
+                        && grammar.contains("mapping0 ::="),
                     "native request {} omitted constrained grammar rules",
                     request.request_id
                 );
                 ensure!(
-                    !grammar.contains("mapping0") && !grammar.contains("candidate"),
-                    "native request {} retained the positional mapping wire",
+                    !grammar.contains("entity") && !grammar.contains("integer"),
+                    "native request {} retained the obsolete semantic wire",
                     request.request_id
                 );
                 ensure!(
@@ -4417,7 +4472,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             record(f"chat-{chat_calls}")
             time.sleep(0.6 if chat_calls == 1 else 0.02)
             json.loads(raw_body)
-            content = '{"m":[[0,[0],[0]]]}'
+            content = '{"d":[2],"m":[[0,[0],[0]]]}'
             payload = json.dumps({
                 "choices": [{"message": {"content": content}}],
                 "usage": {"prompt_tokens": 32, "completion_tokens": 14},
@@ -4687,7 +4742,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if chat_calls == 1:
                 self.reply(
                     200,
-                    b'{"choices":[{"message":{"content":"{\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
+                    b'{"choices":[{"message":{"content":"{\\"d\\":[2],\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
                 )
             else:
                 while True:
