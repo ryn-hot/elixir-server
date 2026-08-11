@@ -2146,35 +2146,29 @@ fn compiled_matcher_contract_fingerprints() -> Result<(String, String, String)> 
 fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String)> {
     let normalized_source = source.replace("\r\n", "\n");
     let source = normalized_source.as_str();
-    let prompts = source_between(
+    let prompt = source_between(
         source,
-        "const SEMANTIC_RESOLVER_PROMPT: &str = r#\"",
-        "\nconst SEMANTIC_CACHE_SCHEMA_VERSION",
-        "semantic prompts",
+        "const DIRECT_MATCH_PROMPT: &str = r#\"",
+        "\nconst SEMANTIC_RESOLVER_PROMPT",
+        "direct prompt",
     )?;
     let prompt_builder = source_between(
         source,
         "fn build_chat_request(",
-        "\nfn semantic_cache_key(",
-        "prompt builder",
+        "\nfn compact_response_grammar(",
+        "direct prompt builder",
     )?;
-    let semantic_schema = source_between(
+    let response_schema = source_between(
         source,
-        "enum SemanticResolutionStatus {",
-        "\nfn semantic_cache_key(",
-        "semantic response types",
-    )?;
-    let response_validation = source_between(
-        source,
-        "fn compact_semantic_context(",
-        "\n#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct InputTokenResponse",
-        "semantic response grammar and validation",
+        "fn compact_response_grammar(",
+        "\n#[derive(Debug, Clone, Copy, Serialize",
+        "direct response grammar and bounds",
     )?;
     let response_execution = source_between(
         source,
-        "async fn request_structured_completion",
-        "\nfn finite_positive_millis(",
-        "semantic response execution",
+        "#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct CompactAnimeMatchResponse {",
+        "\nasync fn request_structured_completion",
+        "direct response decoding and validation",
     )?;
     let sampling = source_between(
         source,
@@ -2182,10 +2176,9 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
         "\nimpl LocalModelSamplingProfile {",
         "sampling profile",
     )?;
-    let prompt_contract = format!("{prompts}\n--semantic-request-builders--\n{prompt_builder}");
-    let response_contract = format!(
-        "{semantic_schema}\n--semantic-grammar-validation--\n{response_validation}\n--semantic-response-execution--\n{response_execution}"
-    );
+    let prompt_contract = format!("{prompt}\n--direct-request-builder--\n{prompt_builder}");
+    let response_contract =
+        format!("{response_schema}\n--direct-response-execution--\n{response_execution}");
     Ok((
         sha256_bytes(prompt_contract.as_bytes()),
         sha256_bytes(response_contract.as_bytes()),
