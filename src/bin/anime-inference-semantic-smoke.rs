@@ -70,8 +70,14 @@ fn parse_arguments(
 }
 
 fn required_path(arguments: &BTreeMap<String, PathBuf>, name: &str) -> Result<PathBuf> {
-    arguments
+    let path = arguments
         .get(name)
         .cloned()
-        .with_context(|| format!("missing {name}; {USAGE}"))
+        .with_context(|| format!("missing {name}; {USAGE}"))?;
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .context("reading the current directory")?
+        .join(path))
 }
