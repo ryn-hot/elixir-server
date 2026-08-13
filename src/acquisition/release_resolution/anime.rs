@@ -418,6 +418,38 @@ pub struct AnimeCoverageOptions {
     pub file_selection_supported: bool,
 }
 
+/// Canonical, server-authored interpretation selected by the local model.
+/// This is evidence for the existing resolver, not a model-authored match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimeSemanticCandidateEvidence {
+    pub season_number: i32,
+    pub anilist_season_id: Option<String>,
+    pub aliases: Vec<String>,
+    pub numbering: AnimeSemanticNumberingEvidence,
+    pub media_kind: AnimeSemanticMediaKindEvidence,
+    pub episode_numbers: Vec<i32>,
+    pub absolute_episode_numbers: Vec<i32>,
+    pub target_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimeSemanticNumberingEvidence {
+    Seasonal,
+    Absolute,
+    EntityOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimeSemanticMediaKindEvidence {
+    Episode,
+    Range,
+    SeasonPack,
+    SeriesPack,
+    Movie,
+    Special,
+    Ova,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeCandidateTargetMatch {
@@ -1691,7 +1723,7 @@ pub fn reconcile_anime_graph(
         .intersection(&sonarr_absolute_keys)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let exact_scoped_alias_match = alias_matches.first().is_some_and(|alias| {
+    let exact_scoped_alias_match = alias_matches.iter().any(|alias| {
         alias.kind == AnimeAliasMatchKind::Exact
             && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
     });
@@ -1785,6 +1817,7 @@ pub fn reconcile_anime_graph(
 
     if target_matches.is_empty()
         && (!parsed.episode_numbers.is_empty() || !parsed.absolute_episode_numbers.is_empty())
+        && outcome != AnimeReconciliationOutcome::TrueContradiction
     {
         outcome = AnimeReconciliationOutcome::Unexplainable;
         rejection_reasons.push("graph_reconciliation_unexplainable".to_string());
@@ -1850,6 +1883,33 @@ pub fn score_anime_candidate(
     let parsed = parse_anime_release_title(&candidate.title);
     let alias_table = build_anime_alias_table(context);
     let alias_matches = match_anime_aliases(&alias_table, &parsed);
+    score_anime_candidate_from_parsed(context, candidate, parsed, alias_matches)
+}
+
+/// Re-run the normal resolver with one bounded semantic interpretation. Any
+/// invalid interpretation is ignored by returning `None`; callers retain the
+/// exact deterministic result they already had.
+pub fn score_anime_candidate_with_semantic_evidence(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeCandidateScore> {
+    let (scoped_context, parsed, alias_matches) =
+        semantic_scoring_inputs(context, candidate, evidence)?;
+    Some(score_anime_candidate_from_parsed(
+        &scoped_context,
+        candidate,
+        parsed,
+        alias_matches,
+    ))
+}
+
+fn score_anime_candidate_from_parsed(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    parsed: AnimeParsedRelease,
+    alias_matches: Vec<AnimeAliasMatch>,
+) -> AnimeCandidateScore {
     let reconciliation = reconcile_anime_graph(context, &parsed, &alias_matches);
     let target_matches = reconciliation.target_matches.clone();
 
@@ -1928,6 +1988,210 @@ pub fn score_anime_candidate(
         review_reasons,
         rejection_reasons,
     }
+}
+
+fn semantic_scoring_inputs(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<(
+    AnimeCandidateScoringContext,
+    AnimeParsedRelease,
+    Vec<AnimeAliasMatch>,
+)> {
+    if evidence.season_number < 0 || evidence.aliases.iter().all(|alias| alias.trim().is_empty()) {
+        return None;
+    }
+
+    let selected_keys = evidence
+        .target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected_keys.len() != evidence.target_keys.len() {
+        return None;
+    }
+    if !selected_keys.is_empty()
+        && selected_keys.iter().any(|key| {
+            !context
+                .targets
+                .iter()
+                .any(|target| target.target_key == *key)
+        })
+    {
+        return None;
+    }
+
+    let mut parsed = parse_anime_release_title(&candidate.title);
+    if let Some((explicit_season, explicit_start, explicit_end)) =
+        parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
+    {
+        let explicit_end = explicit_end.unwrap_or(explicit_start);
+        let selected = evidence
+            .episode_numbers
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        match evidence.numbering {
+            AnimeSemanticNumberingEvidence::Seasonal => {
+                if explicit_season != evidence.season_number
+                    || !(explicit_start..=explicit_end).all(|episode| selected.contains(&episode))
+                {
+                    return None;
+                }
+            }
+            AnimeSemanticNumberingEvidence::Absolute => return None,
+            AnimeSemanticNumberingEvidence::EntityOnly => {
+                if explicit_season != evidence.season_number {
+                    return None;
+                }
+            }
+        }
+    }
+
+    match evidence.numbering {
+        AnimeSemanticNumberingEvidence::Seasonal => {
+            if evidence.episode_numbers.is_empty() {
+                return None;
+            }
+            parsed.season_number = Some(evidence.season_number);
+            parsed.episode_numbers = positive_sorted_numbers(&evidence.episode_numbers);
+            parsed.absolute_episode_numbers.clear();
+            parsed.sonarr_facts.season_number = Some(evidence.season_number);
+            parsed.sonarr_facts.episode_numbers = parsed.episode_numbers.clone();
+            parsed.sonarr_facts.absolute_episode_numbers.clear();
+        }
+        AnimeSemanticNumberingEvidence::Absolute => {
+            if evidence.absolute_episode_numbers.is_empty() {
+                return None;
+            }
+            parsed.season_number = Some(evidence.season_number);
+            parsed.episode_numbers.clear();
+            parsed.absolute_episode_numbers =
+                positive_sorted_numbers(&evidence.absolute_episode_numbers);
+            parsed.sonarr_facts.season_number = None;
+            parsed.sonarr_facts.episode_numbers.clear();
+            parsed.sonarr_facts.absolute_episode_numbers = parsed.absolute_episode_numbers.clone();
+        }
+        AnimeSemanticNumberingEvidence::EntityOnly => {
+            parsed.season_number = Some(evidence.season_number);
+            if parsed.sonarr_facts.season_number.is_none() {
+                parsed.sonarr_facts.season_number = Some(evidence.season_number);
+            }
+        }
+    }
+
+    match evidence.media_kind {
+        AnimeSemanticMediaKindEvidence::Episode => {}
+        AnimeSemanticMediaKindEvidence::Range => {
+            parsed.batch_kind = AnimeBatchKind::Range;
+            parsed.sonarr_facts.batch_kind = AnimeBatchKind::Range;
+            parsed.sonarr_facts.release_kind = ReleaseKind::MultiEpisode;
+        }
+        AnimeSemanticMediaKindEvidence::SeasonPack => {
+            parsed.batch_kind = AnimeBatchKind::SeasonPack;
+            parsed.sonarr_facts.batch_kind = AnimeBatchKind::SeasonPack;
+            parsed.sonarr_facts.release_kind = ReleaseKind::SeasonPack;
+        }
+        AnimeSemanticMediaKindEvidence::SeriesPack => {
+            parsed.batch_kind = AnimeBatchKind::CompleteSeries;
+            parsed.sonarr_facts.batch_kind = AnimeBatchKind::CompleteSeries;
+            parsed.sonarr_facts.release_kind = ReleaseKind::SeriesPack;
+        }
+        AnimeSemanticMediaKindEvidence::Movie => {
+            parsed.batch_kind = AnimeBatchKind::Movie;
+            parsed.episode_type = AnimeEpisodeType::Movie;
+        }
+        AnimeSemanticMediaKindEvidence::Special | AnimeSemanticMediaKindEvidence::Ova => {
+            if evidence.season_number != 0 {
+                return None;
+            }
+            parsed.episode_type = AnimeEpisodeType::Special;
+            parsed.sonarr_facts.special = true;
+        }
+    }
+
+    if matches!(
+        evidence.numbering,
+        AnimeSemanticNumberingEvidence::Seasonal | AnimeSemanticNumberingEvidence::Absolute
+    ) {
+        parsed
+            .review_reasons
+            .retain(|reason| reason != "missing_episode_number");
+    }
+    parsed
+        .review_reasons
+        .retain(|reason| reason != "missing_series_title");
+    parsed.confidence = if parsed.review_reasons.is_empty() {
+        ReleaseConfidence::High
+    } else {
+        ReleaseConfidence::ReviewRequired
+    };
+
+    let mut scoped_context = context.clone();
+    if evidence.media_kind != AnimeSemanticMediaKindEvidence::SeriesPack {
+        scoped_context.targets.retain(|target| {
+            if !selected_keys.is_empty() {
+                return selected_keys.contains(target.target_key.as_str());
+            }
+            evidence
+                .anilist_season_id
+                .as_ref()
+                .zip(target.anilist_season_id.as_ref())
+                .is_some_and(|(selected, target)| selected == target)
+                || target.season_number == Some(evidence.season_number)
+        });
+    }
+    if scoped_context.targets.is_empty() {
+        return None;
+    }
+    scoped_context.scoped_aliases.retain(|alias| {
+        evidence
+            .anilist_season_id
+            .as_ref()
+            .zip(alias.anilist_season_id.as_ref())
+            .is_some_and(|(selected, alias)| selected == alias)
+            || alias.season_number == Some(evidence.season_number)
+    });
+    for alias in &evidence.aliases {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            continue;
+        }
+        scoped_context.scoped_aliases.push(AnimeScopedAlias {
+            display: alias.to_string(),
+            source: "semantic_evidence".to_string(),
+            language: None,
+            season_number: Some(evidence.season_number),
+            anilist_season_id: evidence.anilist_season_id.clone(),
+        });
+    }
+
+    let selected_alias = evidence
+        .aliases
+        .iter()
+        .map(|alias| alias.trim())
+        .find(|alias| !alias.is_empty())?;
+    parsed.alt_titles.push(selected_alias.to_string());
+    let alias_table = build_anime_alias_table(&scoped_context);
+    let mut alias_matches = match_anime_aliases(&alias_table, &parsed);
+    alias_matches.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some((scoped_context, parsed, alias_matches))
+}
+
+fn positive_sorted_numbers(numbers: &[i32]) -> Vec<i32> {
+    numbers
+        .iter()
+        .copied()
+        .filter(|number| *number > 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 pub fn anime_parser_diagnostics(
@@ -2113,7 +2377,33 @@ pub fn plan_anime_file_coverage_with_options(
     files: &[AnimeReleaseFileInput],
     options: AnimeCoverageOptions,
 ) -> AnimeFileCoveragePlan {
-    let candidate_score = score_anime_candidate(context, candidate);
+    plan_anime_file_coverage_internal(context, candidate, files, options, None)
+        .expect("deterministic anime coverage does not use semantic evidence")
+}
+
+pub fn plan_anime_file_coverage_with_semantic_evidence(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    options: AnimeCoverageOptions,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeFileCoveragePlan> {
+    plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence))
+}
+
+fn plan_anime_file_coverage_internal(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    options: AnimeCoverageOptions,
+    semantic_evidence: Option<&AnimeSemanticCandidateEvidence>,
+) -> Option<AnimeFileCoveragePlan> {
+    let candidate_score = match semantic_evidence {
+        Some(evidence) => {
+            score_anime_candidate_with_semantic_evidence(context, candidate, evidence)?
+        }
+        None => score_anime_candidate(context, candidate),
+    };
     let release_kind = anime_release_kind_for_coverage(&candidate_score.parsed);
     let coverage_kind = anime_coverage_kind(release_kind);
     let mut review_reasons = candidate_score.review_reasons.clone();
@@ -2146,7 +2436,7 @@ pub fn plan_anime_file_coverage_with_options(
     }
 
     if !rejection_reasons.is_empty() {
-        return anime_file_coverage_plan(
+        return Some(anime_file_coverage_plan(
             release_kind,
             ReleaseConfidence::Low,
             false,
@@ -2154,7 +2444,7 @@ pub fn plan_anime_file_coverage_with_options(
             Vec::new(),
             review_reasons,
             rejection_reasons,
-        );
+        ));
     }
 
     if matches!(
@@ -2186,7 +2476,7 @@ pub fn plan_anime_file_coverage_with_options(
         } else {
             ReleaseConfidence::ReviewRequired
         };
-        return anime_file_coverage_plan(
+        return Some(anime_file_coverage_plan(
             release_kind,
             confidence,
             false,
@@ -2194,7 +2484,7 @@ pub fn plan_anime_file_coverage_with_options(
             entries,
             review_reasons,
             rejection_reasons,
-        );
+        ));
     }
 
     if files.is_empty() {
@@ -2205,7 +2495,7 @@ pub fn plan_anime_file_coverage_with_options(
         ) {
             review_reasons.push("file_selection_required".to_string());
         }
-        return anime_file_coverage_plan(
+        return Some(anime_file_coverage_plan(
             release_kind,
             ReleaseConfidence::ReviewRequired,
             true,
@@ -2216,7 +2506,7 @@ pub fn plan_anime_file_coverage_with_options(
             Vec::new(),
             review_reasons,
             rejection_reasons,
-        );
+        ));
     }
 
     let expected_targets =
@@ -2248,7 +2538,31 @@ pub fn plan_anime_file_coverage_with_options(
             supported_routes: candidate.supported_routes.clone(),
             default_route: candidate.default_route.clone(),
         };
-        let file_score = score_anime_candidate(context, &file_candidate);
+        let file_score = match semantic_evidence {
+            Some(evidence) if evidence.media_kind == AnimeSemanticMediaKindEvidence::SeriesPack => {
+                score_anime_candidate(context, &file_candidate)
+            }
+            Some(evidence) => {
+                let mut entity_evidence = evidence.clone();
+                entity_evidence.numbering = AnimeSemanticNumberingEvidence::EntityOnly;
+                entity_evidence.media_kind = AnimeSemanticMediaKindEvidence::Episode;
+                entity_evidence.episode_numbers.clear();
+                entity_evidence.absolute_episode_numbers.clear();
+                entity_evidence.target_keys.clear();
+                match score_anime_candidate_with_semantic_evidence(
+                    context,
+                    &file_candidate,
+                    &entity_evidence,
+                ) {
+                    Some(score) => score,
+                    None => {
+                        unmapped_media_files.push(file.path.clone());
+                        continue;
+                    }
+                }
+            }
+            None => score_anime_candidate(context, &file_candidate),
+        };
         if file_score.outcome == AnimeMatchOutcome::Rejected
             || file_score.confidence == ReleaseConfidence::ReviewRequired
             || file_score.target_matches.is_empty()
@@ -2351,7 +2665,7 @@ pub fn plan_anime_file_coverage_with_options(
         rejection_reasons,
     );
     plan.selected_file_keys = selected_file_keys.into_iter().collect();
-    plan
+    Some(plan)
 }
 
 pub fn merge_external_ids(target: &mut ExternalIds, source: &ExternalIds) {
@@ -2814,9 +3128,24 @@ fn match_targets_by_alias_scope(
     if scoped_matches.is_empty() {
         return Vec::new();
     }
+    let structured_sxxeyy_season = explicit_sxxeyy_season(parsed);
     let selected_scope = scoped_matches
         .iter()
-        .find(|item| item.kind == AnimeAliasMatchKind::Exact)
+        .find(|item| {
+            item.kind == AnimeAliasMatchKind::Exact
+                && structured_sxxeyy_season.is_some_and(|season| {
+                    item.season_number == Some(season)
+                        || context.targets.iter().any(|target| {
+                            target.season_number == Some(season)
+                                && anime_alias_scope_matches_target(item, target)
+                        })
+                })
+        })
+        .or_else(|| {
+            scoped_matches
+                .iter()
+                .find(|item| item.kind == AnimeAliasMatchKind::Exact)
+        })
         .copied()
         .or_else(|| scoped_matches.first().copied());
     let scoped_matches = selected_scope
@@ -2853,7 +3182,6 @@ fn match_targets_by_alias_scope(
         return Vec::new();
     }
 
-    let structured_sxxeyy_season = explicit_sxxeyy_season(parsed);
     let mut matches = Vec::new();
     for alias in scoped_matches {
         for target in &context.targets {
@@ -2893,30 +3221,43 @@ fn exact_scoped_alias_conflicts_with_structured_season(
     let Some(structured_season) = explicit_sxxeyy_season(parsed) else {
         return false;
     };
-    let Some(alias) = alias_matches.first().filter(|alias| {
-        alias.kind == AnimeAliasMatchKind::Exact
-            && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
-    }) else {
+    let exact_scoped = alias_matches
+        .iter()
+        .filter(|alias| {
+            alias.kind == AnimeAliasMatchKind::Exact
+                && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
+        })
+        .collect::<Vec<_>>();
+    if exact_scoped.is_empty() {
         return false;
-    };
+    }
 
     let scoped_target_seasons = context
         .targets
         .iter()
-        .filter(|target| anime_alias_scope_matches_target(alias, target))
+        .filter(|target| {
+            exact_scoped
+                .iter()
+                .any(|alias| anime_alias_scope_matches_target(alias, target))
+        })
         .filter_map(|target| target.season_number)
         .collect::<BTreeSet<_>>();
     if !scoped_target_seasons.is_empty() {
         return !scoped_target_seasons.contains(&structured_season);
     }
 
-    alias
-        .season_number
-        .is_some_and(|alias_season| alias_season != structured_season)
+    !exact_scoped
+        .iter()
+        .any(|alias| alias.season_number == Some(structured_season))
 }
 
 fn explicit_sxxeyy_season(parsed: &AnimeParsedRelease) -> Option<i32> {
     parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
+        .or_else(|| {
+            parse_sxxeyy_numbers(&normalize_fullwidth_digits(
+                &parsed.sonarr_facts.original_title,
+            ))
+        })
         .map(|(season, _, _)| season)
 }
 
@@ -6679,6 +7020,12 @@ mod tests {
                 .and_then(|alias| alias.season_number),
             Some(2)
         );
+        assert_eq!(
+            score.alias_matches.first().map(|alias| alias.kind),
+            Some(AnimeAliasMatchKind::Exact),
+            "explicit scoped alias fixture must exercise contradiction handling: {:?}",
+            score.alias_matches
+        );
         assert!(
             score.target_matches.is_empty(),
             "a season-two alias must not turn explicit S03E01 into definitive coverage"
@@ -6719,6 +7066,58 @@ mod tests {
             Some("S02E01")
         );
         assert!(score.reconciliation.contradiction_reasons.is_empty());
+    }
+
+    #[test]
+    fn alm9_semantic_evidence_enriches_existing_resolver_without_authoring_a_plan() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Root A - 01 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        let score = score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence)
+            .expect("server-authored evidence must validate");
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(score.confidence, ReleaseConfidence::High);
+        assert_eq!(
+            score
+                .target_matches
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S02E01"]
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_evidence_cannot_override_explicit_sxxeyy_contradiction() {
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(
+                &tokyo_ghoul_scoped_context(),
+                &rr3e_candidate("[Group] Tokyo Ghoul Root A S03E01 [1080p]"),
+                &evidence,
+            )
+            .is_none()
+        );
     }
 
     #[test]

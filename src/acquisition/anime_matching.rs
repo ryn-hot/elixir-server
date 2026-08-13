@@ -16,8 +16,9 @@ use crate::{
             anime::{
                 ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeBatchKind, AnimeCandidateInput,
                 AnimeCandidateScoringContext, AnimeFileCoverageEntry, AnimeFileCoveragePlan,
-                AnimeReleaseFileInput, AnimeScopedAlias, anime_coverage_kind,
-                parse_anime_release_title, score_anime_candidate,
+                AnimeReleaseFileInput, AnimeScopedAlias, AnimeSemanticCandidateEvidence,
+                anime_coverage_kind, parse_anime_release_title, score_anime_candidate,
+                score_anime_candidate_with_semantic_evidence,
             },
             models::{ReleaseConfidence, ReleaseCoverageState, ReleaseKind, ReleaseResolverKind},
         },
@@ -158,10 +159,30 @@ pub(crate) fn acquisition_anime_deterministic_state(
 /// target. This keeps the no-model fast path while preserving provider-file
 /// ownership for later selection and import.
 pub(crate) fn bind_exact_single_anime_provider_file(
+    plan: AnimeFileCoveragePlan,
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+) -> AnimeFileCoveragePlan {
+    bind_exact_single_anime_provider_file_internal(plan, context, candidate, files, None)
+}
+
+pub(crate) fn bind_exact_single_anime_provider_file_with_semantic_evidence(
+    plan: AnimeFileCoveragePlan,
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> AnimeFileCoveragePlan {
+    bind_exact_single_anime_provider_file_internal(plan, context, candidate, files, Some(evidence))
+}
+
+fn bind_exact_single_anime_provider_file_internal(
     mut plan: AnimeFileCoveragePlan,
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
     files: &[AnimeReleaseFileInput],
+    semantic_evidence: Option<&AnimeSemanticCandidateEvidence>,
 ) -> AnimeFileCoveragePlan {
     if plan.release_kind != ReleaseKind::Single
         || plan.confidence != ReleaseConfidence::High
@@ -200,15 +221,25 @@ pub(crate) fn bind_exact_single_anime_provider_file(
         supported_routes: candidate.supported_routes.clone(),
         default_route: candidate.default_route.clone(),
     };
-    let file_score = score_anime_candidate(context, &file_candidate);
-    if file_score.confidence != ReleaseConfidence::High
-        || file_score.target_matches.len() != 1
-        || !file_score.review_reasons.is_empty()
-        || !file_score.rejection_reasons.is_empty()
-        || file_score.target_matches[0].target_key != plan.entries[0].target_key
-    {
+    // File ownership stays deterministic. Prefer the normal basename parser;
+    // semantic evidence may only enrich that same basename and must still
+    // resolve it to the one target already present in the server-owned plan.
+    let deterministic_file_score = score_anime_candidate(context, &file_candidate);
+    let semantic_file_score = semantic_evidence.and_then(|evidence| {
+        score_anime_candidate_with_semantic_evidence(context, &file_candidate, evidence)
+    });
+    let Some(file_score) = std::iter::once(deterministic_file_score)
+        .chain(semantic_file_score)
+        .find(|score| {
+            score.confidence == ReleaseConfidence::High
+                && score.target_matches.len() == 1
+                && score.review_reasons.is_empty()
+                && score.rejection_reasons.is_empty()
+                && score.target_matches[0].target_key == plan.entries[0].target_key
+        })
+    else {
         return plan;
-    }
+    };
 
     let file_target = &file_score.target_matches[0];
     plan.selected_file_keys = vec![file.file_key.clone()];

@@ -39,7 +39,7 @@ use crate::{
 use super::{
     ANIME_MATCH_PROMPT_REVISION, ActiveAnimeBundleDescriptor, AnimeBundleCompatibilityPolicy,
     AnimeBundleStore, AnimeExecutionBackend, AnimeInferenceBundleManifest, AnimeKvCacheType,
-    AnimeMatchEngine, AnimeMatchingService, AnimeRuntimeSelection, InferenceBackend,
+    AnimeMatchingService, AnimeRuntimeSelection, AnimeSemanticEvidenceEngine, InferenceBackend,
     InferenceEnvelopeProbe, InferenceHardwareInventory, InferenceModelEnvelope,
     InferenceProbeError, InferenceProbeLimits, InferenceProbeMeasurement,
     InferenceRuntimeCandidate, LocalModelAdmission, LocalModelAdmissionPhase, LocalModelEngine,
@@ -427,7 +427,9 @@ impl AnimeInferenceService {
         self.engine
             .as_ref()
             .map_or_else(AnimeMatchingService::disabled, |engine| {
-                AnimeMatchingService::with_engine(engine.clone() as Arc<dyn AnimeMatchEngine>)
+                AnimeMatchingService::with_semantic_engine(
+                    engine.clone() as Arc<dyn AnimeSemanticEvidenceEngine>
+                )
             })
     }
 

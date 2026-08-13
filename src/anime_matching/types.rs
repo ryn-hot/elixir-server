@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 pub const ANIME_MATCH_SCHEMA_VERSION: u32 = 1;
+pub const ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 /// Model-only batch bound qualified on the minimum Intel host. Acquisition
 /// may still search and resolve a larger deterministic candidate set; only
 /// the highest-ranked difficult candidates cross the local-model boundary.
@@ -448,6 +449,80 @@ pub enum AnimeMatchAudioProfile {
 pub struct AnimeMatchResponse {
     pub schema_version: u32,
     pub matches: Vec<AnimeCandidateMatch>,
+}
+
+/// The only inference-owned decision in the semantic-evidence path. Every
+/// entity, coordinate, and target key is authored by Elixir before inference;
+/// the model can select one complete interpretation or abstain.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeSemanticMediaKind {
+    Episode,
+    Range,
+    SeasonPack,
+    SeriesPack,
+    Movie,
+    Special,
+    Ova,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeSemanticNumbering {
+    Seasonal,
+    Absolute,
+    EntityOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnimeSemanticEntity {
+    pub index: usize,
+    pub season_number: i32,
+    pub aliases: Vec<String>,
+    /// Private canonical join key. The model selects `index`; it never needs
+    /// or returns provider identity.
+    #[serde(skip)]
+    pub anilist_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnimeSemanticHypothesis {
+    pub index: usize,
+    pub entity_index: usize,
+    pub numbering: AnimeSemanticNumbering,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episode_numbers: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absolute_episode_numbers: Vec<i32>,
+    pub media_kind: AnimeSemanticMediaKind,
+    /// Private canonical join carried through the service but never serialized
+    /// into the model payload. The model sees semantic coordinates, not opaque
+    /// database or request target identifiers.
+    #[serde(skip)]
+    pub target_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnimeSemanticEvidenceRequest {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub candidate_key: String,
+    pub raw: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_release: Option<String>,
+    pub graph_fingerprint: String,
+    pub entities: Vec<AnimeSemanticEntity>,
+    pub hypotheses: Vec<AnimeSemanticHypothesis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnimeSemanticEvidenceResponse {
+    pub schema_version: u32,
+    pub hypothesis_index: Option<usize>,
 }
 
 /// Non-serializable adapter envelope. `source` is retained only inside the

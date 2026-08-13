@@ -2148,27 +2148,27 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
     let source = normalized_source.as_str();
     let prompt = source_between(
         source,
-        "const DIRECT_MATCH_PROMPT: &str = r#\"",
+        "const SEMANTIC_EVIDENCE_PROMPT: &str = r#\"",
         "\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]",
-        "direct prompt",
+        "semantic evidence prompt",
     )?;
     let prompt_builder = source_between(
         source,
-        "fn build_chat_request(",
-        "\nfn compact_response_grammar(",
-        "direct prompt builder",
+        "fn build_semantic_chat_request(",
+        "\nfn semantic_response_grammar(",
+        "semantic evidence prompt builder",
     )?;
     let response_schema = source_between(
         source,
-        "fn compact_response_grammar(",
-        "\n#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct InputTokenResponse",
-        "direct response grammar and bounds",
+        "fn semantic_response_grammar(",
+        "\nfn compact_direct_request(",
+        "semantic evidence response grammar",
     )?;
     let response_execution = source_between(
         source,
-        "#[derive(Debug, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct CompactAnimeMatchResponse {",
-        "\nfn finite_positive_millis(",
-        "direct response decoding and validation",
+        "async fn resolve_semantic_request(",
+        "\nasync fn request_direct_completion(",
+        "semantic evidence response decoding and validation",
     )?;
     let sampling = source_between(
         source,
@@ -2176,9 +2176,9 @@ fn matcher_contract_fingerprints(source: &str) -> Result<(String, String, String
         "\nimpl LocalModelSamplingProfile {",
         "sampling profile",
     )?;
-    let prompt_contract = format!("{prompt}\n--direct-request-builder--\n{prompt_builder}");
+    let prompt_contract = format!("{prompt}\n--semantic-request-builder--\n{prompt_builder}");
     let response_contract =
-        format!("{response_schema}\n--direct-response-execution--\n{response_execution}");
+        format!("{response_schema}\n--semantic-response-execution--\n{response_execution}");
     Ok((
         sha256_bytes(prompt_contract.as_bytes()),
         sha256_bytes(response_contract.as_bytes()),
@@ -3038,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_compiled_contract_fingerprints_match_the_release_lock() -> Result<()> {
+    fn alm9_retired_direct_plan_lock_cannot_certify_the_semantic_contract() -> Result<()> {
         let lock = parse_strict_json(
             include_bytes!("../../../docs/contracts/anime-inference-qualification.lock.json"),
             "qualification lock fixture",
@@ -3048,13 +3048,13 @@ mod tests {
             .and_then(JsonValue::as_object)
             .ok_or_else(|| anyhow!("qualification lock fixture lacks contract"))?;
         let (prompt, schema, sampling) = compiled_matcher_contract_fingerprints()?;
-        assert_eq!(contract["promptRevision"], ANIME_MATCH_PROMPT_REVISION);
-        assert_eq!(
+        assert_ne!(contract["promptRevision"], ANIME_MATCH_PROMPT_REVISION);
+        assert_ne!(
             contract["responseSchemaRevision"],
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION
         );
-        assert_eq!(contract["promptFingerprint"], prompt);
-        assert_eq!(contract["responseSchemaFingerprint"], schema);
+        assert_ne!(contract["promptFingerprint"], prompt);
+        assert_ne!(contract["responseSchemaFingerprint"], schema);
         assert_eq!(contract["samplingProfileFingerprint"], sampling);
         assert_eq!(
             contract["qualificationCorpusSchemaVersion"],

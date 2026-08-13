@@ -20,9 +20,12 @@ use uuid::Uuid;
 use crate::acquisition::{
     anime_matching::{
         acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
-        assess_acquisition_anime_model_audio_profile, assess_acquisition_anime_provider_file_audio,
-        bind_exact_single_anime_provider_file,
-        model_derived_anime_coverage_plans_with_file_selection_support,
+        assess_acquisition_anime_provider_file_audio, bind_exact_single_anime_provider_file,
+        bind_exact_single_anime_provider_file_with_semantic_evidence,
+    },
+    automation::{
+        anime_semantic_candidate_evidence, anime_semantic_media_kinds,
+        mark_anime_semantic_coverage_fallback,
     },
     episode_state::sync_library_episode_acquisition_state_for_target,
     language_policy::LanguagePreferenceAssessmentState,
@@ -31,7 +34,8 @@ use crate::acquisition::{
             AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
             AnimeCoverageOptions, AnimeFileCoveragePlan, AnimeReleaseFileInput, AnimeScopedAlias,
             anime_parser_diagnostics, parse_anime_release_title,
-            plan_anime_file_coverage_with_options, score_anime_candidate,
+            plan_anime_file_coverage_with_options, plan_anime_file_coverage_with_semantic_evidence,
+            score_anime_candidate,
         },
         fingerprint::{
             ReleaseFingerprintInput, build_release_fingerprint, extract_magnet_info_hash,
@@ -63,9 +67,9 @@ use crate::acquisition::{
     },
 };
 use crate::anime_matching::{
-    ANIME_MATCH_SCHEMA_VERSION, AnimeDeterministicResult, AnimeMatchAssistProvenance,
-    AnimeMatchAssistResult, AnimeMatchAssistSource, AnimeMatchAudioProfile,
-    AnimeMatchFallbackReason, AnimeMatchingService, DeterministicMatchState,
+    ANIME_MATCH_SCHEMA_VERSION, AnimeMatchAssistProvenance, AnimeMatchAssistResult,
+    AnimeMatchAssistSource, AnimeMatchAudioProfile, AnimeMatchFallbackReason, AnimeMatchingService,
+    DeterministicMatchState, build_semantic_evidence_request,
 };
 use crate::db::models::{
     ExtensionKind, ExtensionTrustLevel, MediaType, ProviderHealthState, ProviderReadinessPhase,
@@ -7355,6 +7359,7 @@ async fn refine_anime_debrid_coverage(
         model_audio_profile: None,
         model_audio_assessment: None,
         required_audio_satisfied: deterministic_required_audio_satisfied,
+        audio_hard_mismatch: deterministic_audio_hard_mismatch,
     };
 
     let (resolved, match_assist) = if deterministic_state == DeterministicMatchState::Definitive
@@ -7387,79 +7392,118 @@ async fn refine_anime_debrid_coverage(
             &context,
             &acquisition_candidates,
         ) {
-            Ok(batch_input) => {
-                let context_for_model = context.clone();
-                let files_for_validation = files.clone();
-                let capabilities_for_validation = inspection.capabilities.clone();
-                let file_selection_supported = inspection.capabilities.supports_file_selection;
-                let subscription_for_model = subscription.clone();
-                let targets_for_validation = targets.to_vec();
+            Ok(batch_input) => 'semantic: {
+                let prepared = match AnimeMatchingService::prepare_request(batch_input) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        break 'semantic (
+                            deterministic,
+                            anime_match_invalid_request_fallback(error.to_string()),
+                        );
+                    }
+                };
+                let Some(wire_candidate) = prepared.request().candidates.first() else {
+                    unreachable!("validated anime request contains a candidate")
+                };
+                let facts = wire_candidate.parse_facts.clone();
+                let semantic_request = match build_semantic_evidence_request(
+                    prepared.request(),
+                    wire_candidate.candidate_key.clone(),
+                    wire_candidate.title.clone(),
+                    None,
+                    facts.season_numbers.iter().copied(),
+                    facts.episode_numbers.iter().copied(),
+                    facts.absolute_episode_numbers.iter().copied(),
+                    anime_semantic_media_kinds(&wire_candidate.title, &facts),
+                ) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => {
+                        break 'semantic (
+                            deterministic,
+                            anime_match_invalid_request_fallback(
+                                "no bounded semantic hypotheses".to_string(),
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        break 'semantic (
+                            deterministic,
+                            anime_match_invalid_request_fallback(error.to_string()),
+                        );
+                    }
+                };
                 let outcome = anime_matching
-                    .match_or_fallback(
-                        AnimeDeterministicResult {
-                            value: deterministic,
-                            state: DeterministicMatchState::Difficult,
-                        },
-                        batch_input,
-                        move |_deterministic, request, matches, source_map| {
-                            let mut plans =
-                                model_derived_anime_coverage_plans_with_file_selection_support(
-                                request,
-                                &context_for_model,
-                                &acquisition_candidates,
-                                file_selection_supported,
-                                matches,
-                                source_map,
-                            )?;
-                            if plans.len() != 1 || plans[0].candidate_index != 0 {
-                                bail!(
-                                    "Debrid anime model response must resolve the inspected release exactly once"
-                                );
-                            }
-                            let model = plans.remove(0);
-                            let (audio_assessment, required_audio_satisfied) =
-                                assess_acquisition_anime_model_audio_profile(
-                                    &subscription_for_model,
-                                    model.audio_profile,
-                                );
-                            if !required_audio_satisfied {
-                                bail!(
-                                    "Debrid anime model mapping did not satisfy the required audio policy"
-                                );
-                            }
-                            if !anime_plan_ready_for_automatic_selection(
-                                &model.plan,
-                                &files_for_validation,
-                                &capabilities_for_validation,
-                                &targets_for_validation,
-                            ) {
-                                bail!(
-                                    "Debrid anime model mapping did not prove an automatically selectable file set"
-                                );
-                            }
-                            Ok(ResolvedAnimeDebridCoverage {
-                                plan: model.plan,
-                                model_audio_profile: Some(model.audio_profile),
-                                model_audio_assessment: Some(json!({
-                                    "state": audio_assessment.state.as_str(),
-                                    "scoreDelta": audio_assessment.score_delta,
-                                    "matchingAudio": audio_assessment.matching_audio,
-                                    "matchingSubtitles": audio_assessment.matching_subtitles,
-                                    "matchingProfiles": audio_assessment.matching_profiles,
-                                    "desiredAudio": audio_assessment.desired_audio,
-                                    "desiredSubtitles": audio_assessment.desired_subtitles,
-                                    "desiredProfiles": audio_assessment.desired_profiles,
-                                    "evidenceAudio": audio_assessment.evidence_audio,
-                                    "evidenceSubtitles": audio_assessment.evidence_subtitles,
-                                    "evidenceProfiles": audio_assessment.evidence_profiles,
-                                    "requiredPreferenceSatisfied": required_audio_satisfied
-                                })),
-                                required_audio_satisfied,
-                            })
-                        },
-                    )
+                    .select_semantic_hypothesis(semantic_request.clone())
                     .await;
-                (outcome.value, outcome.provenance)
+                let mut provenance = outcome.provenance;
+                let Some(hypothesis) = outcome.hypothesis.as_ref() else {
+                    break 'semantic (deterministic, provenance);
+                };
+                let Some(evidence) =
+                    anime_semantic_candidate_evidence(&semantic_request, hypothesis)
+                else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "selected hypothesis has no canonical entity",
+                    );
+                    break 'semantic (deterministic, provenance);
+                };
+                let semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
+                    &context,
+                    &candidate,
+                    &files,
+                    AnimeCoverageOptions {
+                        file_selection_supported: inspection.capabilities.supports_file_selection,
+                    },
+                    &evidence,
+                )
+                .map(|plan| {
+                    bind_exact_single_anime_provider_file_with_semantic_evidence(
+                        plan, &context, &candidate, &files, &evidence,
+                    )
+                });
+                let Some(semantic_plan) = semantic_plan else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence did not produce deterministic coverage",
+                    );
+                    break 'semantic (deterministic, provenance);
+                };
+                let (assessment, required_audio_satisfied) =
+                    assess_acquisition_anime_provider_file_audio(
+                        subscription,
+                        &acquisition_candidates[0],
+                        &semantic_plan.selected_file_keys,
+                    );
+                let audio_hard_mismatch = !required_audio_satisfied
+                    && assessment.state == LanguagePreferenceAssessmentState::Mismatch;
+                if !required_audio_satisfied
+                    || !anime_plan_ready_for_automatic_selection(
+                        &semantic_plan,
+                        &files,
+                        &inspection.capabilities,
+                        targets,
+                    )
+                {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence failed deterministic coverage or audio policy",
+                    );
+                    let mut fallback = deterministic;
+                    fallback.audio_hard_mismatch |= audio_hard_mismatch;
+                    (fallback, provenance)
+                } else {
+                    (
+                        ResolvedAnimeDebridCoverage {
+                            plan: semantic_plan,
+                            model_audio_profile: None,
+                            model_audio_assessment: None,
+                            required_audio_satisfied,
+                            audio_hard_mismatch,
+                        },
+                        provenance,
+                    )
+                }
             }
             Err(error) => (
                 deterministic,
@@ -7483,6 +7527,7 @@ async fn refine_anime_debrid_coverage(
         model_audio_profile,
         model_audio_assessment,
         required_audio_satisfied,
+        audio_hard_mismatch,
     } = resolved;
     let used_model = match_assist.result == AnimeMatchAssistResult::Matched;
     let ready_for_selection = required_audio_satisfied
@@ -7523,7 +7568,7 @@ async fn refine_anime_debrid_coverage(
                 reason: entry.reason.clone(),
                 state: entry.state,
                 verified_by: if used_model {
-                    "alm7_debrid_local_model_file_list".to_string()
+                    "alm9_debrid_semantic_evidence".to_string()
                 } else {
                     "rr4e_anime_file_list".to_string()
                 },
@@ -7554,8 +7599,8 @@ async fn refine_anime_debrid_coverage(
             .or_else(|| candidate.get("request_scope_evidence"))
             .cloned()
     });
-    let suppress_automatic_rediscovery = deterministic_audio_hard_mismatch
-        || anime_debrid_retry_suppresses_rediscovery(&match_assist);
+    let suppress_automatic_rediscovery =
+        audio_hard_mismatch || anime_debrid_retry_suppresses_rediscovery(&match_assist);
     let mapping_diagnostics = sanitize_anime_automatic_resolution_evidence(json!(review_reasons));
     let coverage_plan = json!({
         "source": "debrid_provider_file_list",
@@ -7626,6 +7671,7 @@ struct ResolvedAnimeDebridCoverage {
     model_audio_profile: Option<AnimeMatchAudioProfile>,
     model_audio_assessment: Option<Value>,
     required_audio_satisfied: bool,
+    audio_hard_mismatch: bool,
 }
 
 fn debrid_anime_deterministic_state(
@@ -17468,71 +17514,47 @@ mod tests {
         }
 
         fn service(&self) -> AnimeMatchingService {
-            AnimeMatchingService::with_engine(Arc::new(self.clone()))
+            AnimeMatchingService::with_semantic_engine(Arc::new(self.clone()))
         }
     }
 
     #[async_trait::async_trait]
-    impl crate::anime_matching::AnimeMatchEngine for FakeAnimeMatchEngine {
-        async fn match_candidates(
+    impl crate::anime_matching::AnimeSemanticEvidenceEngine for FakeAnimeMatchEngine {
+        async fn select_hypothesis(
             &self,
-            request: crate::anime_matching::AnimeMatchRequest,
-        ) -> Result<crate::anime_matching::AnimeMatchResponse> {
+            request: crate::anime_matching::AnimeSemanticEvidenceRequest,
+        ) -> Result<crate::anime_matching::AnimeSemanticEvidenceResponse> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
-            *self.observed_paths.lock().unwrap() = request
-                .candidates
-                .iter()
-                .flat_map(|candidate| candidate.files.iter().map(|file| file.path.clone()))
-                .collect();
+            *self.observed_paths.lock().unwrap() = vec![request.raw.clone()];
             if matches!(self.behavior, FakeAnimeMatchBehavior::EngineError) {
                 bail!("local anime worker unavailable");
             }
             if matches!(self.behavior, FakeAnimeMatchBehavior::EngineTimeout) {
                 bail!("local anime worker request timed out");
             }
-            let candidate = request
-                .candidates
-                .first()
-                .context("fake matcher requires one candidate")?;
-            let target_key = request
-                .target
-                .wanted_target_keys
-                .first()
-                .context("fake matcher requires one target")?
-                .clone();
             if matches!(self.behavior, FakeAnimeMatchBehavior::Empty) {
-                return Ok(crate::anime_matching::AnimeMatchResponse {
-                    schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                    matches: Vec::new(),
+                return Ok(crate::anime_matching::AnimeSemanticEvidenceResponse {
+                    schema_version: crate::anime_matching::ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                    hypothesis_index: None,
                 });
             }
-            let selected_file_key = if matches!(self.behavior, FakeAnimeMatchBehavior::UnknownFile)
-            {
-                "candidate-0-file-unknown".to_string()
+            let hypothesis_index = if matches!(self.behavior, FakeAnimeMatchBehavior::UnknownFile) {
+                usize::MAX
             } else {
-                candidate
-                    .files
-                    .first()
-                    .context("fake matcher requires one real file")?
-                    .file_key
-                    .clone()
+                request
+                    .hypotheses
+                    .iter()
+                    .max_by_key(|hypothesis| hypothesis.target_keys.len())
+                    .map(|hypothesis| hypothesis.index)
+                    .context("fake semantic matcher requires a hypothesis")?
             };
-            Ok(crate::anime_matching::AnimeMatchResponse {
+            Ok(crate::anime_matching::AnimeSemanticEvidenceResponse {
                 schema_version: if matches!(self.behavior, FakeAnimeMatchBehavior::InvalidOutput) {
-                    ANIME_MATCH_SCHEMA_VERSION + 1
+                    crate::anime_matching::ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION + 1
                 } else {
-                    ANIME_MATCH_SCHEMA_VERSION
+                    crate::anime_matching::ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION
                 },
-                matches: vec![crate::anime_matching::AnimeCandidateMatch {
-                    candidate_key: candidate.candidate_key.clone(),
-                    matched_target_keys: vec![target_key],
-                    audio_profile: if matches!(self.behavior, FakeAnimeMatchBehavior::MatchSubbed) {
-                        AnimeMatchAudioProfile::Subbed
-                    } else {
-                        AnimeMatchAudioProfile::DualAudio
-                    },
-                    selected_file_keys: Some(vec![selected_file_key]),
-                }],
+                hypothesis_index: Some(hypothesis_index),
             })
         }
     }
@@ -24391,7 +24413,7 @@ mod tests {
         assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             engine.observed_paths.lock().unwrap().as_slice(),
-            [actual_path]
+            ["[Group] TGRA - 13 [Dual Audio]"]
         );
         let job = load_debrid_job(&database.pool, job_id)
             .await?
@@ -24419,7 +24441,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/modelAudioProfile"))
                 .and_then(Value::as_str),
-            Some("dual_audio")
+            None
         );
         assert_eq!(
             release
@@ -24427,7 +24449,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/modelAudioAssessment/state"))
                 .and_then(Value::as_str),
-            Some("match")
+            None
         );
         assert_eq!(
             release
@@ -24437,14 +24459,14 @@ mod tests {
                     plan.pointer("/modelAudioAssessment/requiredPreferenceSatisfied")
                 })
                 .and_then(Value::as_bool),
-            Some(true)
+            None
         );
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
         assert_eq!(coverage.len(), 1);
         assert_eq!(coverage[0].state, ReleaseCoverageState::Selected);
         assert_eq!(
             coverage[0].verified_by.as_deref(),
-            Some("alm7_debrid_local_model_file_list")
+            Some("alm9_debrid_semantic_evidence")
         );
         assert_eq!(
             adapter
@@ -24738,7 +24760,7 @@ mod tests {
         assert_eq!(engine.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             engine.observed_paths.lock().unwrap().as_slice(),
-            [actual_path]
+            ["[Group] TGRA - 13"]
         );
         let job = load_debrid_job(&database.pool, job_id)
             .await?

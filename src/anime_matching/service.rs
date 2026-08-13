@@ -12,10 +12,14 @@ use thiserror::Error;
 
 use crate::metrics::{ANIME_MATCH_ASSIST_EVENTS, ANIME_MATCH_ASSIST_LATENCY};
 
-use super::types::{
-    ANIME_MATCH_MAX_CANDIDATES, ANIME_MATCH_MAX_REQUEST_BYTES, ANIME_MATCH_SCHEMA_VERSION,
-    AnimeCandidateMatch, AnimeMatchBatchInput, AnimeMatchCandidate, AnimeMatchFile,
-    AnimeMatchRequest, AnimeMatchResponse, AnimeMatchSourceMap, PreparedAnimeMatchRequest,
+use super::{
+    semantic_evidence::{AnimeSemanticEvidenceEngine, validate_semantic_evidence_response},
+    types::{
+        ANIME_MATCH_MAX_CANDIDATES, ANIME_MATCH_MAX_REQUEST_BYTES, ANIME_MATCH_SCHEMA_VERSION,
+        AnimeCandidateMatch, AnimeMatchBatchInput, AnimeMatchCandidate, AnimeMatchFile,
+        AnimeMatchRequest, AnimeMatchResponse, AnimeMatchSourceMap, AnimeSemanticEvidenceRequest,
+        AnimeSemanticHypothesis, PreparedAnimeMatchRequest,
+    },
 };
 
 #[async_trait]
@@ -140,6 +144,18 @@ pub struct AnimeMatchingOutcome<B> {
     pub provenance: AnimeMatchAssistProvenance,
 }
 
+#[derive(Debug)]
+pub struct AnimeSemanticEvidenceOutcome {
+    pub hypothesis: Option<AnimeSemanticHypothesis>,
+    pub provenance: AnimeMatchAssistProvenance,
+}
+
+impl AnimeSemanticEvidenceOutcome {
+    pub fn selected(&self) -> bool {
+        self.hypothesis.is_some()
+    }
+}
+
 impl<B> AnimeMatchingOutcome<B> {
     pub fn used_model(&self) -> bool {
         self.provenance.result == AnimeMatchAssistResult::Matched
@@ -236,16 +252,108 @@ pub enum AnimeMatchValidationError {
 #[derive(Clone, Default)]
 pub struct AnimeMatchingService {
     engine: Option<Arc<dyn AnimeMatchEngine>>,
+    semantic_engine: Option<Arc<dyn AnimeSemanticEvidenceEngine>>,
 }
 
 impl AnimeMatchingService {
     pub fn disabled() -> Self {
-        Self { engine: None }
+        Self {
+            engine: None,
+            semantic_engine: None,
+        }
     }
 
     pub fn with_engine(engine: Arc<dyn AnimeMatchEngine>) -> Self {
         Self {
             engine: Some(engine),
+            semantic_engine: None,
+        }
+    }
+
+    pub fn with_semantic_engine(engine: Arc<dyn AnimeSemanticEvidenceEngine>) -> Self {
+        Self {
+            engine: None,
+            semantic_engine: Some(engine),
+        }
+    }
+
+    pub fn with_engines(
+        engine: Arc<dyn AnimeMatchEngine>,
+        semantic_engine: Arc<dyn AnimeSemanticEvidenceEngine>,
+    ) -> Self {
+        Self {
+            engine: Some(engine),
+            semantic_engine: Some(semantic_engine),
+        }
+    }
+
+    /// Select one server-authored interpretation. `null`, unavailable workers,
+    /// malformed/unknown indexes, and every engine error all mean no evidence;
+    /// callers retain their deterministic result unchanged.
+    pub async fn select_semantic_hypothesis(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> AnimeSemanticEvidenceOutcome {
+        let request_fingerprint = Some(semantic_request_fingerprint(&request));
+        let Some(engine) = self.semantic_engine.as_ref() else {
+            return semantic_fallback(
+                request_fingerprint,
+                AnimeMatchFallbackReason::EngineUnavailable,
+                None,
+                0,
+            );
+        };
+        let started = Instant::now();
+        record_assist_event("semantic_evidence_attempt");
+        let engine_output = match engine
+            .select_hypothesis_with_provenance(request.clone())
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let latency_ms = elapsed_millis(started);
+                record_assist_latency("semantic_engine_error", latency_ms);
+                return semantic_fallback(
+                    request_fingerprint,
+                    AnimeMatchFallbackReason::EngineError,
+                    Some(error.to_string()),
+                    latency_ms,
+                );
+            }
+        };
+        let response = engine_output.response;
+        let runtime = engine_output.runtime;
+        let latency_ms = elapsed_millis(started);
+        match validate_semantic_evidence_response(&request, &response) {
+            Ok(Some(hypothesis)) => {
+                record_assist_event("semantic_evidence_selected");
+                record_assist_latency("semantic_selected", latency_ms);
+                AnimeSemanticEvidenceOutcome {
+                    hypothesis: Some(hypothesis.clone()),
+                    provenance: AnimeMatchAssistProvenance {
+                        source: AnimeMatchAssistSource::LocalModel,
+                        result: AnimeMatchAssistResult::Matched,
+                        matcher_schema_version: response.schema_version,
+                        request_fingerprint,
+                        reason: None,
+                        detail: None,
+                        runtime,
+                        latency_ms,
+                    },
+                }
+            }
+            Ok(None) => semantic_fallback(
+                request_fingerprint,
+                AnimeMatchFallbackReason::EmptyModelMatches,
+                None,
+                latency_ms,
+            ),
+            Err(error) => semantic_fallback(
+                request_fingerprint,
+                AnimeMatchFallbackReason::InvalidModelResponse,
+                Some(error.to_string()),
+                latency_ms,
+            ),
         }
     }
 
@@ -752,6 +860,12 @@ fn anime_match_request_fingerprint(request: &AnimeMatchRequest) -> String {
     blake3::hash(&bytes).to_hex().to_string()
 }
 
+fn semantic_request_fingerprint(request: &AnimeSemanticEvidenceRequest) -> String {
+    let bytes =
+        serde_json::to_vec(request).unwrap_or_else(|_| request.request_id.as_bytes().to_vec());
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -786,6 +900,28 @@ fn fallback_outcome<B>(
             reason: Some(reason),
             detail,
             runtime,
+            latency_ms,
+        },
+    }
+}
+
+fn semantic_fallback(
+    request_fingerprint: Option<String>,
+    reason: AnimeMatchFallbackReason,
+    detail: Option<String>,
+    latency_ms: u64,
+) -> AnimeSemanticEvidenceOutcome {
+    record_assist_event("semantic_no_evidence");
+    AnimeSemanticEvidenceOutcome {
+        hypothesis: None,
+        provenance: AnimeMatchAssistProvenance {
+            source: AnimeMatchAssistSource::DeterministicFallback,
+            result: AnimeMatchAssistResult::Fallback,
+            matcher_schema_version: super::ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+            request_fingerprint,
+            reason: Some(reason),
+            detail,
+            runtime: None,
             latency_ms,
         },
     }

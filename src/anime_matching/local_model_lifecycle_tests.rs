@@ -49,8 +49,8 @@ def stop(_signal, _frame):
     os._exit(0)
 
 
-VALID = b'{"choices":[{"message":{"content":"{\\"s\\":\\"resolved\\",\\"e\\":\\"27899\\",\\"n\\":\\"seasonal\\",\\"p\\":[1],\\"a\\":[],\\"k\\":\\"episode\\",\\"u\\":\\"dual_audio\\"}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
-WRONG = b'{"choices":[{"message":{"content":"{\\"s\\":\\"unknown\\",\\"e\\":\\"unknown\\",\\"n\\":\\"unknown\\",\\"p\\":[],\\"a\\":[],\\"k\\":\\"unknown\\",\\"u\\":\\"unknown\\"}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
+VALID = b'{"choices":[{"message":{"content":"{\\"d\\":[2,0,0,0],\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
+WRONG = b'{"choices":[{"message":{"content":"{\\"d\\":[0,0,0,0],\\"m\\":[]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
 INVALID = b'{"choices":[{"message":{"content":"{\\"invalid\\":true}"}}],"usage":{"prompt_tokens":32,"completion_tokens":4},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}'
 
 

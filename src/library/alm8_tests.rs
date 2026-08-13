@@ -12,8 +12,9 @@ use tempfile::tempdir;
 
 use crate::{
     anime_matching::{
-        ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile, AnimeMatchEngine,
-        AnimeMatchEngineOutput, AnimeMatchRequest, AnimeMatchResponse, AnimeMatchRuntimeProvenance,
+        ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION, AnimeMatchRuntimeProvenance,
+        AnimeSemanticEvidenceEngine, AnimeSemanticEvidenceEngineOutput,
+        AnimeSemanticEvidenceRequest, AnimeSemanticEvidenceResponse,
     },
     config::DatabaseConfig,
     db::Database,
@@ -23,25 +24,29 @@ use crate::{
 #[derive(Clone)]
 struct LibraryMatchEngine {
     calls: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<AnimeMatchRequest>>>,
+    requests: Arc<Mutex<Vec<AnimeSemanticEvidenceRequest>>>,
 }
 
 #[async_trait]
-impl AnimeMatchEngine for LibraryMatchEngine {
-    async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+impl AnimeSemanticEvidenceEngine for LibraryMatchEngine {
+    async fn select_hypothesis(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let hypothesis_index = request
+            .hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis.target_keys.iter().any(|key| key == "S02E01"))
+            .or_else(|| request.hypotheses.first())
+            .map(|hypothesis| hypothesis.index);
         self.requests
             .lock()
             .expect("library model request lock poisoned")
             .push(request);
-        Ok(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![AnimeCandidateMatch {
-                candidate_key: "candidate-0".to_string(),
-                matched_target_keys: vec!["S02E01".to_string()],
-                audio_profile: AnimeMatchAudioProfile::DualAudio,
-                selected_file_keys: Some(vec!["candidate-0-file-0".to_string()]),
-            }],
+        Ok(AnimeSemanticEvidenceResponse {
+            schema_version: 1,
+            hypothesis_index,
         })
     }
 }
@@ -51,71 +56,78 @@ enum ScriptedLibraryReply {
     FirstWantedTarget,
     Empty,
     UnknownTarget,
-    AllWantedTargets,
+    MultipleTargets,
 }
 
 #[derive(Clone)]
 struct ScriptedLibraryMatchEngine {
     calls: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<AnimeMatchRequest>>>,
+    requests: Arc<Mutex<Vec<AnimeSemanticEvidenceRequest>>>,
     reply: ScriptedLibraryReply,
     runtime: Option<AnimeMatchRuntimeProvenance>,
 }
 
 impl ScriptedLibraryMatchEngine {
-    fn response(&self, request: &AnimeMatchRequest) -> AnimeMatchResponse {
-        let target_keys = match self.reply {
+    fn response(&self, request: &AnimeSemanticEvidenceRequest) -> AnimeSemanticEvidenceResponse {
+        let hypothesis_index = match self.reply {
             ScriptedLibraryReply::FirstWantedTarget => request
-                .target
-                .wanted_target_keys
+                .hypotheses
                 .first()
-                .cloned()
-                .into_iter()
-                .collect(),
-            ScriptedLibraryReply::Empty => Vec::new(),
-            ScriptedLibraryReply::UnknownTarget => vec!["S99E99".to_string()],
-            ScriptedLibraryReply::AllWantedTargets => request.target.wanted_target_keys.clone(),
+                .map(|hypothesis| hypothesis.index),
+            ScriptedLibraryReply::Empty => None,
+            ScriptedLibraryReply::UnknownTarget => Some(usize::MAX),
+            ScriptedLibraryReply::MultipleTargets => request
+                .hypotheses
+                .iter()
+                .max_by_key(|hypothesis| hypothesis.target_keys.len())
+                .map(|hypothesis| hypothesis.index),
         };
-        let matches = if matches!(self.reply, ScriptedLibraryReply::Empty) {
-            Vec::new()
-        } else {
-            vec![AnimeCandidateMatch {
-                candidate_key: "candidate-0".to_string(),
-                matched_target_keys: target_keys,
-                audio_profile: AnimeMatchAudioProfile::DualAudio,
-                selected_file_keys: Some(vec!["candidate-0-file-0".to_string()]),
-            }]
-        };
-        AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches,
+        AnimeSemanticEvidenceResponse {
+            schema_version: 1,
+            hypothesis_index,
         }
     }
 
-    fn record_and_respond(&self, request: AnimeMatchRequest) -> AnimeMatchEngineOutput {
+    fn record_and_respond(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> AnimeSemanticEvidenceEngineOutput {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let response = self.response(&request);
         self.requests
             .lock()
             .expect("scripted library model request lock poisoned")
             .push(request);
-        AnimeMatchEngineOutput {
+        AnimeSemanticEvidenceEngineOutput {
             response,
             runtime: self.runtime.clone(),
         }
     }
 }
 
+fn semantic_target_keys(
+    request: &AnimeSemanticEvidenceRequest,
+) -> std::collections::BTreeSet<String> {
+    request
+        .hypotheses
+        .iter()
+        .flat_map(|hypothesis| hypothesis.target_keys.iter().cloned())
+        .collect()
+}
+
 #[async_trait]
-impl AnimeMatchEngine for ScriptedLibraryMatchEngine {
-    async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+impl AnimeSemanticEvidenceEngine for ScriptedLibraryMatchEngine {
+    async fn select_hypothesis(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceResponse> {
         Ok(self.record_and_respond(request).response)
     }
 
-    async fn match_candidates_with_provenance(
+    async fn select_hypothesis_with_provenance(
         &self,
-        request: AnimeMatchRequest,
-    ) -> Result<AnimeMatchEngineOutput> {
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceEngineOutput> {
         Ok(self.record_and_respond(request))
     }
 }
@@ -333,31 +345,34 @@ async fn alm8_unresolved_library_file_uses_model_and_links_one_canonical_episode
     std::fs::write(&path, b"alm8-model-fixture")?;
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(ScriptedLibraryMatchEngine {
-        calls: calls.clone(),
-        requests: requests.clone(),
-        reply: ScriptedLibraryReply::FirstWantedTarget,
-        runtime: Some(AnimeMatchRuntimeProvenance {
-            bundle_version: "2026.08.1".to_string(),
-            model_id: "qwen3-4b-instruct-2507".to_string(),
-            model_revision: "elixir-q4km-r1".to_string(),
-            worker_revision: "llama-server-r1".to_string(),
-            backend: "metal".to_string(),
-            profile_fingerprint: "alm8-profile-fingerprint".to_string(),
-            prompt_revision: "anime-match-v1".to_string(),
-            protocol_version: 1,
-        }),
-    }));
+    let matcher =
+        AnimeMatchingService::with_semantic_engine(Arc::new(ScriptedLibraryMatchEngine {
+            calls: calls.clone(),
+            requests: requests.clone(),
+            reply: ScriptedLibraryReply::FirstWantedTarget,
+            runtime: Some(AnimeMatchRuntimeProvenance {
+                bundle_version: "2026.08.1".to_string(),
+                model_id: "qwen3-4b-instruct-2507".to_string(),
+                model_revision: "elixir-q4km-r1".to_string(),
+                worker_revision: "llama-server-r1".to_string(),
+                backend: "metal".to_string(),
+                profile_fingerprint: "alm8-profile-fingerprint".to_string(),
+                prompt_revision: "anime-match-v1".to_string(),
+                protocol_version: 1,
+            }),
+        }));
 
     scan_with_matcher(&database, &matcher, anime_candidate(&path, None, None)).await?;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let requests = requests.lock().expect("request lock poisoned");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].target.wanted_target_keys, vec!["S02E01"]);
-    assert_eq!(requests[0].candidates.len(), 1);
     assert_eq!(
-        requests[0].candidates[0].files[0].path,
+        semantic_target_keys(&requests[0]),
+        ["S02E01".to_string()].into()
+    );
+    assert_eq!(
+        requests[0].raw,
         "[Group] Tokyo Ghoul Root A - 01 [Dual Audio].mkv"
     );
     drop(requests);
@@ -472,12 +487,13 @@ async fn alm8_model_promotion_merges_into_existing_canonical_series() -> Result<
         .to_string();
     std::fs::write(&path, b"alm8-model-promotion")?;
     let calls = Arc::new(AtomicUsize::new(0));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(ScriptedLibraryMatchEngine {
-        calls: calls.clone(),
-        requests: Arc::new(Mutex::new(Vec::new())),
-        reply: ScriptedLibraryReply::FirstWantedTarget,
-        runtime: None,
-    }));
+    let matcher =
+        AnimeMatchingService::with_semantic_engine(Arc::new(ScriptedLibraryMatchEngine {
+            calls: calls.clone(),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            reply: ScriptedLibraryReply::FirstWantedTarget,
+            runtime: None,
+        }));
     let mut candidate = anime_candidate(&path, None, None);
     candidate.identity.title = "Tokyo Ghoul Root A".to_string();
 
@@ -579,12 +595,13 @@ async fn assert_scripted_model_fallback(
     std::fs::write(&path, b"alm8-scripted-fallback")?;
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(ScriptedLibraryMatchEngine {
-        calls: calls.clone(),
-        requests: requests.clone(),
-        reply,
-        runtime: None,
-    }));
+    let matcher =
+        AnimeMatchingService::with_semantic_engine(Arc::new(ScriptedLibraryMatchEngine {
+            calls: calls.clone(),
+            requests: requests.clone(),
+            reply,
+            runtime: None,
+        }));
 
     scan_with_matcher(
         &database,
@@ -597,7 +614,7 @@ async fn assert_scripted_model_fallback(
     let requests = requests.lock().expect("scripted request lock poisoned");
     assert_eq!(requests.len(), 1);
     assert_eq!(
-        requests[0].target.wanted_target_keys.len(),
+        semantic_target_keys(&requests[0]).len(),
         expected_wanted_target_count
     );
     drop(requests);
@@ -665,9 +682,9 @@ async fn alm8_empty_model_response_is_retryable_and_unattached() -> Result<()> {
 }
 
 #[tokio::test]
-async fn alm8_two_target_model_response_is_retryable_and_unattached() -> Result<()> {
+async fn alm8_multiple_target_model_response_is_retryable_and_unattached() -> Result<()> {
     assert_scripted_model_fallback(
-        ScriptedLibraryReply::AllWantedTargets,
+        ScriptedLibraryReply::MultipleTargets,
         "coverage_validation_failed",
         tokyo_ghoul_root_a_two_episode_mapping(),
         "Tokyo Ghoul Root A Mystery.mkv",
@@ -688,7 +705,7 @@ async fn alm8_definitive_library_fast_path_never_calls_model() -> Result<()> {
         .to_string();
     std::fs::write(&path, b"alm8-fast-path")?;
     let calls = Arc::new(AtomicUsize::new(0));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(LibraryMatchEngine {
+    let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(LibraryMatchEngine {
         calls: calls.clone(),
         requests: Arc::new(Mutex::new(Vec::new())),
     }));
@@ -727,7 +744,7 @@ async fn alm8_mixed_scan_calls_model_only_for_unresolved_files() -> Result<()> {
     std::fs::write(&unresolved_path, b"alm8-mixed-unresolved")?;
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(LibraryMatchEngine {
+    let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(LibraryMatchEngine {
         calls: calls.clone(),
         requests: requests.clone(),
     }));
@@ -745,9 +762,8 @@ async fn alm8_mixed_scan_calls_model_only_for_unresolved_files() -> Result<()> {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let requests = requests.lock().expect("mixed request lock poisoned");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].candidates.len(), 1);
     assert_eq!(
-        requests[0].candidates[0].files[0].path,
+        requests[0].raw,
         "[Group] Tokyo Ghoul Root A - 01 [Dual Audio].mkv"
     );
     drop(requests);
@@ -774,7 +790,7 @@ async fn alm8_successful_model_match_is_idempotent_on_rescan() -> Result<()> {
         .to_string();
     std::fs::write(&path, b"alm8-idempotent-rescan")?;
     let calls = Arc::new(AtomicUsize::new(0));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(LibraryMatchEngine {
+    let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(LibraryMatchEngine {
         calls: calls.clone(),
         requests: Arc::new(Mutex::new(Vec::new())),
     }));
@@ -1149,12 +1165,13 @@ async fn alm8_special_season_model_match_links_s00_without_normalizing_to_s01() 
     std::fs::write(&path, b"alm8-special-season")?;
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(ScriptedLibraryMatchEngine {
-        calls: calls.clone(),
-        requests: requests.clone(),
-        reply: ScriptedLibraryReply::FirstWantedTarget,
-        runtime: None,
-    }));
+    let matcher =
+        AnimeMatchingService::with_semantic_engine(Arc::new(ScriptedLibraryMatchEngine {
+            calls: calls.clone(),
+            requests: requests.clone(),
+            reply: ScriptedLibraryReply::FirstWantedTarget,
+            runtime: None,
+        }));
 
     scan_with_matcher(
         &database,
@@ -1166,7 +1183,10 @@ async fn alm8_special_season_model_match_links_s00_without_normalizing_to_s01() 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let requests = requests.lock().expect("special request lock poisoned");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].target.wanted_target_keys, vec!["S00E01"]);
+    assert_eq!(
+        semantic_target_keys(&requests[0]),
+        ["S00E01".to_string()].into()
+    );
     drop(requests);
     assert_eq!(
         linked_episode(&database.pool, &path).await?,
@@ -1317,7 +1337,7 @@ async fn alm8_authoritative_multi_episode_pack_is_never_collapsed_by_model_match
     let (media_file_id, episode_one_id, episode_two_id) =
         seed_authoritative_two_episode_pack(&database.pool, &path).await?;
     let calls = Arc::new(AtomicUsize::new(0));
-    let matcher = AnimeMatchingService::with_engine(Arc::new(LibraryMatchEngine {
+    let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(LibraryMatchEngine {
         calls: calls.clone(),
         requests: Arc::new(Mutex::new(Vec::new())),
     }));
@@ -1419,7 +1439,7 @@ async fn alm8_episode_link_and_classification_roll_back_as_one_transaction() -> 
                 "animeMatchAssist": {
                     "source": "local_model",
                     "result": "matched",
-                    "matcherSchemaVersion": ANIME_MATCH_SCHEMA_VERSION,
+                    "matcherSchemaVersion": ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
                     "latencyMs": 1
                 }
             })

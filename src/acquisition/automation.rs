@@ -11,7 +11,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde_json::{Value as JsonValue, json};
 use tokio::time::MissedTickBehavior;
@@ -22,8 +22,7 @@ use uuid::Uuid;
 use crate::{
     acquisition::anime_matching::{
         acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
-        assess_acquisition_anime_candidate_audio, assess_acquisition_anime_model_audio_profile,
-        model_derived_anime_coverage_plans,
+        assess_acquisition_anime_candidate_audio,
     },
     acquisition::audit::{
         EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_ROUTE_FALLBACK, NewAcquisitionAuditEvent,
@@ -36,8 +35,11 @@ use crate::{
             AnimeCandidateInput, AnimeCandidateScore, AnimeCandidateScoringContext,
             AnimeCandidateTarget, AnimeCoverageOptions, AnimeFileCoveragePlan,
             AnimeMetadataGraphInput, AnimeReleaseFileInput, AnimeScopedAlias, AnimeSeasonMapping,
-            anime_parser_diagnostics, build_anime_metadata_graph, infer_anizip_season_number,
-            plan_anime_file_coverage_with_options, score_anime_candidate,
+            AnimeSemanticCandidateEvidence, AnimeSemanticMediaKindEvidence,
+            AnimeSemanticNumberingEvidence, anime_parser_diagnostics, build_anime_metadata_graph,
+            infer_anizip_season_number, plan_anime_file_coverage_with_options,
+            plan_anime_file_coverage_with_semantic_evidence, score_anime_candidate,
+            score_anime_candidate_with_semantic_evidence,
         },
         fingerprint::candidate_release_fingerprint,
         models::{
@@ -86,9 +88,10 @@ use crate::{
         update_subscription_external_ids, update_target_state, upsert_subscription_targets,
     },
     anime_matching::{
-        ANIME_MATCH_MAX_CANDIDATES, AnimeDeterministicResult, AnimeMatchAssistProvenance,
-        AnimeMatchAssistResult, AnimeMatchAudioProfile, AnimeMatchFallbackReason,
-        AnimeMatchingService, DeterministicMatchState,
+        AnimeMatchAssistProvenance, AnimeMatchAssistResult, AnimeMatchFallbackReason,
+        AnimeMatchParseFacts, AnimeMatchingService, AnimeSemanticEvidenceRequest,
+        AnimeSemanticHypothesis, AnimeSemanticMediaKind, AnimeSemanticNumbering,
+        DeterministicMatchState, build_semantic_evidence_request,
     },
     db::models::{MediaType, ProviderHealthState},
     debrid::{
@@ -1847,141 +1850,135 @@ async fn build_anime_candidate_release_plans_with_matching(
 
     if !deterministic_is_definitive {
         batch.anime_retryable_unresolved = true;
-        let context = anime_candidate_scoring_context(subscription, representative, &targets);
-        let model_candidate_sources = eligible
-            .iter()
-            .enumerate()
-            .map(|(index, _)| index)
-            .take(ANIME_MATCH_MAX_CANDIDATES)
-            .collect::<Vec<_>>();
-        let candidates = model_candidate_sources
-            .iter()
-            .map(|index| eligible[*index].candidate.clone())
-            .collect::<Vec<_>>();
-        if let Some(context) = context {
-            match acquisition_anime_match_batch_input(
-                format!(
-                    "acquisition:{}:{}",
-                    subscription.subscription_id, representative.target_id
-                ),
-                subscription,
-                &targets,
-                &context,
-                &candidates,
-            ) {
-                Ok(input) => {
-                    let override_context = context.clone();
-                    let override_candidates = candidates.clone();
-                    let override_targets = targets.clone();
-                    let override_candidate_sources = model_candidate_sources.clone();
-                    let override_subscription = subscription.clone();
-                    let route_policy = subscription.route_policy;
-                    let outcome = matching_service
-                        .match_or_fallback(
-                            AnimeDeterministicResult {
-                                value: resolved_coverages,
-                                state: DeterministicMatchState::Difficult,
-                            },
-                            input,
-                            move |deterministic, request, matches, source_map| {
-                                let model_coverages = model_derived_anime_coverage_plans(
-                                    request,
-                                    &override_context,
-                                    &override_candidates,
-                                    route_policy,
-                                    matches,
-                                    source_map,
-                                )?;
-                                let mut resolutions = deterministic.clone();
-                                ensure!(
-                                    !model_coverages.is_empty(),
-                                    "model response produced no acquisition coverage"
-                                );
-                                for (model_rank, model) in model_coverages.into_iter().enumerate() {
-                                    let candidate = override_candidates
-                                        .get(model.candidate_index)
-                                        .ok_or_else(|| {
-                                            anyhow!(
-                                                "model coverage candidate index is out of bounds"
-                                            )
-                                        })?;
-                                    let analysis = model_anime_candidate_coverage_analysis(
-                                        candidate,
-                                        &override_targets,
-                                        model.plan,
-                                        model.audio_profile,
-                                        model_rank,
-                                        &override_subscription,
-                                    )?;
-                                    ensure!(
-                                        anime_coverage_is_automatic(
-                                            &analysis,
-                                            candidate,
-                                            &override_subscription,
-                                        ),
-                                        "model mapping was rejected by automatic acquisition policy"
-                                    );
-                                    let resolution_index = override_candidate_sources
-                                        .get(model.candidate_index)
-                                        .copied()
-                                        .ok_or_else(|| {
-                                            anyhow!("model candidate source index is out of bounds")
-                                        })?;
-                                    resolutions[resolution_index] = Some(analysis);
-                                }
-                                Ok(resolutions)
-                            },
-                        )
-                        .await;
-                    let used_model = outcome.provenance.result == AnimeMatchAssistResult::Matched;
-                    let provenance = outcome.provenance.clone();
-                    resolved_coverages = outcome.value;
-                    if used_model {
-                        for coverage in resolved_coverages.iter_mut().flatten().filter(|coverage| {
-                            coverage
-                                .selection
-                                .candidate
-                                .raw
-                                .as_ref()
-                                .and_then(|raw| raw.pointer("/serverEvidence/modelMapping"))
-                                .is_some()
-                        }) {
-                            attach_anime_match_assist_provenance(
-                                &mut coverage.selection.candidate,
-                                &provenance,
-                            );
-                        }
-                    } else {
-                        for coverage in resolved_coverages.iter_mut().flatten() {
-                            attach_anime_match_assist_provenance(
-                                &mut coverage.selection.candidate,
-                                &provenance,
-                            );
-                        }
-                        debug!(
-                            subscription_id = %subscription.subscription_id,
-                            target_id = %representative.target_id,
-                            reason = ?provenance.reason,
-                            detail = provenance.detail.as_deref().unwrap_or_default(),
-                            "local anime matching fell back to deterministic acquisition analysis"
-                        );
+        if let Some(context) =
+            anime_candidate_scoring_context(subscription, representative, &targets)
+        {
+            for (candidate_index, item) in eligible.iter().enumerate() {
+                if resolved_coverages[candidate_index]
+                    .as_ref()
+                    .is_some_and(|coverage| {
+                        anime_coverage_is_automatic(coverage, &item.candidate, subscription)
+                    })
+                {
+                    continue;
+                }
+                let input = match acquisition_anime_match_batch_input(
+                    format!(
+                        "acquisition:{}:{}:{candidate_index}",
+                        subscription.subscription_id, representative.target_id
+                    ),
+                    subscription,
+                    &targets,
+                    &context,
+                    std::slice::from_ref(&item.candidate),
+                ) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        debug!(error = %error, "anime semantic request adaptation failed");
+                        continue;
                     }
-                    batch.anime_match_assist = Some(provenance);
-                }
-                Err(err) => {
-                    debug!(
-                        subscription_id = %subscription.subscription_id,
-                        target_id = %representative.target_id,
-                        error = %err,
-                        "anime acquisition context could not be adapted for local matching"
+                };
+                let prepared = match AnimeMatchingService::prepare_request(input) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        debug!(error = %error, "anime semantic request validation failed");
+                        continue;
+                    }
+                };
+                let Some(wire_candidate) = prepared.request().candidates.first() else {
+                    continue;
+                };
+                let parse_facts = wire_candidate.parse_facts.clone();
+                let semantic_request = match build_semantic_evidence_request(
+                    prepared.request(),
+                    wire_candidate.candidate_key.clone(),
+                    wire_candidate.title.clone(),
+                    None,
+                    parse_facts.season_numbers.iter().copied(),
+                    parse_facts.episode_numbers.iter().copied(),
+                    parse_facts.absolute_episode_numbers.iter().copied(),
+                    anime_semantic_media_kinds(&wire_candidate.title, &parse_facts),
+                ) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        debug!(error = %error, "anime semantic hypotheses could not be built");
+                        continue;
+                    }
+                };
+                let outcome = matching_service
+                    .select_semantic_hypothesis(semantic_request.clone())
+                    .await;
+                let mut provenance = outcome.provenance.clone();
+                let Some(hypothesis) = outcome.hypothesis.as_ref() else {
+                    batch.anime_match_assist.get_or_insert(provenance);
+                    continue;
+                };
+                let Some(evidence) =
+                    anime_semantic_candidate_evidence(&semantic_request, hypothesis)
+                else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "selected hypothesis has no valid canonical entity",
                     );
+                    batch.anime_match_assist = Some(provenance);
+                    continue;
+                };
+                let Some(mut analysis) = analyze_anime_candidate_coverage_with_semantic_evidence(
+                    subscription,
+                    representative,
+                    &targets,
+                    &item.candidate,
+                    &evidence,
+                ) else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence did not produce deterministic coverage",
+                    );
+                    batch.anime_match_assist = Some(provenance);
+                    continue;
+                };
+                if !anime_coverage_is_automatic(&analysis, &item.candidate, subscription) {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence failed automatic acquisition policy",
+                    );
+                    batch.anime_match_assist = Some(provenance);
+                    continue;
                 }
+                analysis
+                    .selection
+                    .candidate
+                    .score_badges
+                    .push(CandidateScoreBadge {
+                        label: "Local anime semantic match".to_string(),
+                        detail: Some(format!(
+                            "entity season {}; {:?} numbering",
+                            evidence.season_number, evidence.numbering
+                        )),
+                        score: None,
+                    });
+                upsert_anime_match_server_evidence(
+                    &mut analysis.selection.candidate,
+                    "semanticEvidence",
+                    json!({
+                        "hypothesisIndex": hypothesis.index,
+                        "seasonNumber": evidence.season_number,
+                        "numbering": format!("{:?}", evidence.numbering).to_ascii_lowercase(),
+                    }),
+                );
+                attach_anime_match_assist_provenance(
+                    &mut analysis.selection.candidate,
+                    &provenance,
+                );
+                batch.anime_match_assist = Some(provenance);
+                resolved_coverages[candidate_index] = Some(analysis);
             }
         } else {
             debug!(
                 subscription_id = %subscription.subscription_id,
                 target_id = %representative.target_id,
-                "anime acquisition has no canonical scoring context for local matching"
+                "anime acquisition has no canonical scoring context for semantic matching"
             );
         }
     }
@@ -2049,6 +2046,83 @@ async fn build_anime_candidate_release_plans_with_matching(
         .plans
         .sort_by(|left, right| compare_release_plans(right, left, subscription.route_policy));
     Ok(batch)
+}
+
+pub(crate) fn anime_semantic_media_kinds(
+    raw: &str,
+    facts: &AnimeMatchParseFacts,
+) -> Vec<AnimeSemanticMediaKind> {
+    let kind = match facts.batch_kind.as_deref() {
+        Some("movie") => Some(AnimeSemanticMediaKind::Movie),
+        Some("range") => Some(AnimeSemanticMediaKind::Range),
+        Some("season_pack") => Some(AnimeSemanticMediaKind::SeasonPack),
+        Some("multi_season_pack" | "complete_series") => Some(AnimeSemanticMediaKind::SeriesPack),
+        _ => match facts.release_kind.as_deref() {
+            Some("single") => Some(AnimeSemanticMediaKind::Episode),
+            Some("multi_episode") => Some(AnimeSemanticMediaKind::Range),
+            Some("season_pack") => Some(AnimeSemanticMediaKind::SeasonPack),
+            Some("multi_season_pack" | "series_pack") => Some(AnimeSemanticMediaKind::SeriesPack),
+            _ => None,
+        },
+    };
+    let mut kinds = kind.into_iter().collect::<BTreeSet<_>>();
+    if kinds.is_empty() {
+        kinds.insert(
+            if facts.episode_numbers.len() > 1 || facts.absolute_episode_numbers.len() > 1 {
+                AnimeSemanticMediaKind::Range
+            } else {
+                AnimeSemanticMediaKind::Episode
+            },
+        );
+    }
+    let normalized = raw.to_ascii_lowercase();
+    if normalized.contains("ova") || normalized.contains("oad") {
+        kinds.insert(AnimeSemanticMediaKind::Ova);
+    }
+    if normalized.contains("special") || normalized.contains("sp ") {
+        kinds.insert(AnimeSemanticMediaKind::Special);
+    }
+    kinds.into_iter().collect()
+}
+
+pub(crate) fn anime_semantic_candidate_evidence(
+    request: &AnimeSemanticEvidenceRequest,
+    hypothesis: &AnimeSemanticHypothesis,
+) -> Option<AnimeSemanticCandidateEvidence> {
+    let entity = request.entities.get(hypothesis.entity_index)?;
+    (entity.index == hypothesis.entity_index).then_some(AnimeSemanticCandidateEvidence {
+        season_number: entity.season_number,
+        anilist_season_id: (!entity.anilist_id.trim().is_empty())
+            .then(|| entity.anilist_id.clone()),
+        aliases: entity.aliases.clone(),
+        numbering: match hypothesis.numbering {
+            AnimeSemanticNumbering::Seasonal => AnimeSemanticNumberingEvidence::Seasonal,
+            AnimeSemanticNumbering::Absolute => AnimeSemanticNumberingEvidence::Absolute,
+            AnimeSemanticNumbering::EntityOnly => AnimeSemanticNumberingEvidence::EntityOnly,
+        },
+        media_kind: match hypothesis.media_kind {
+            AnimeSemanticMediaKind::Episode => AnimeSemanticMediaKindEvidence::Episode,
+            AnimeSemanticMediaKind::Range => AnimeSemanticMediaKindEvidence::Range,
+            AnimeSemanticMediaKind::SeasonPack => AnimeSemanticMediaKindEvidence::SeasonPack,
+            AnimeSemanticMediaKind::SeriesPack => AnimeSemanticMediaKindEvidence::SeriesPack,
+            AnimeSemanticMediaKind::Movie => AnimeSemanticMediaKindEvidence::Movie,
+            AnimeSemanticMediaKind::Special => AnimeSemanticMediaKindEvidence::Special,
+            AnimeSemanticMediaKind::Ova => AnimeSemanticMediaKindEvidence::Ova,
+        },
+        episode_numbers: hypothesis.episode_numbers.clone(),
+        absolute_episode_numbers: hypothesis.absolute_episode_numbers.clone(),
+        target_keys: hypothesis.target_keys.clone(),
+    })
+}
+
+pub(crate) fn mark_anime_semantic_coverage_fallback(
+    provenance: &mut AnimeMatchAssistProvenance,
+    detail: &str,
+) {
+    provenance.source = crate::anime_matching::AnimeMatchAssistSource::DeterministicFallback;
+    provenance.result = AnimeMatchAssistResult::Fallback;
+    provenance.reason = Some(AnimeMatchFallbackReason::CoverageValidationFailed);
+    provenance.detail = Some(detail.to_string());
 }
 
 fn anime_coverage_is_automatic(
@@ -2977,6 +3051,43 @@ fn analyze_anime_candidate_coverage(
         return None;
     }
     let score = score_anime_candidate(&context, &input);
+    anime_candidate_coverage_analysis(subscription, candidate, targets, score, plan)
+}
+
+fn analyze_anime_candidate_coverage_with_semantic_evidence(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<CandidateCoverageAnalysis> {
+    let context = anime_candidate_scoring_context(subscription, representative, targets)?;
+    let input = anime_candidate_input(candidate);
+    let files = anime_release_file_inputs(candidate);
+    let plan = plan_anime_file_coverage_with_semantic_evidence(
+        &context,
+        &input,
+        &files,
+        anime_coverage_options_for_candidate(subscription.route_policy, candidate),
+        evidence,
+    )?;
+    if !plan.rejection_reasons.is_empty()
+        || plan.confidence == ReleaseConfidence::ReviewRequired
+        || plan.entries.is_empty()
+    {
+        return None;
+    }
+    let score = score_anime_candidate_with_semantic_evidence(&context, &input, evidence)?;
+    anime_candidate_coverage_analysis(subscription, candidate, targets, score, plan)
+}
+
+fn anime_candidate_coverage_analysis(
+    subscription: &AcquisitionSubscription,
+    candidate: &AcquisitionCandidate,
+    targets: &[AcquisitionTarget],
+    score: AnimeCandidateScore,
+    plan: AnimeFileCoveragePlan,
+) -> Option<CandidateCoverageAnalysis> {
     let target_by_key = targets
         .iter()
         .map(|target| (target.target_key.clone(), target))
@@ -2990,8 +3101,26 @@ fn analyze_anime_candidate_coverage(
         }
     }
     let selected_files = plan.selected_file_keys.len();
+    let mut selection = anime_scored_candidate(candidate, score, Some(plan.clone()));
+    let (language, _) =
+        assess_acquisition_anime_candidate_audio(subscription, &selection.candidate);
+    if language.score_delta != 0.0 {
+        selection.candidate.score = Some(
+            selection
+                .candidate
+                .score
+                .filter(|score| score.is_finite())
+                .unwrap_or_default()
+                + language.score_delta,
+        );
+        selection.candidate.score_badges.push(CandidateScoreBadge {
+            label: "Anime audio preference".to_string(),
+            detail: Some(language.state.as_str().to_string()),
+            score: Some(language.score_delta),
+        });
+    }
     Some(CandidateCoverageAnalysis {
-        selection: anime_scored_candidate(candidate, score, Some(plan.clone())),
+        selection,
         release_kind: plan.release_kind,
         resolver_kind: plan.resolver_kind,
         resolver_version: plan.resolver_version.clone(),
@@ -2999,103 +3128,6 @@ fn analyze_anime_candidate_coverage(
         covered_target_ids,
         covered_target_keys,
         overfetch_count: candidate_media_file_count(&candidate).saturating_sub(selected_files),
-    })
-}
-
-fn model_anime_candidate_coverage_analysis(
-    candidate: &AcquisitionCandidate,
-    targets: &[AcquisitionTarget],
-    plan: AnimeFileCoveragePlan,
-    audio_profile: AnimeMatchAudioProfile,
-    model_rank: usize,
-    subscription: &AcquisitionSubscription,
-) -> Result<CandidateCoverageAnalysis> {
-    if acquisition_anime_deterministic_state(&plan) != DeterministicMatchState::Definitive {
-        bail!("model-derived anime coverage did not pass the automatic coverage gate");
-    }
-    let targets_by_key = targets
-        .iter()
-        .map(|target| (target.target_key.as_str(), target))
-        .collect::<HashMap<_, _>>();
-    let mut covered_target_ids = BTreeSet::new();
-    let mut covered_target_keys = BTreeSet::new();
-    for entry in &plan.entries {
-        let target = targets_by_key
-            .get(entry.target_key.as_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "model-derived anime coverage references unknown target '{}'",
-                    entry.target_key
-                )
-            })?;
-        covered_target_ids.insert(target.target_id);
-        covered_target_keys.insert(target.target_key.clone());
-    }
-    if covered_target_ids.is_empty() {
-        bail!("model-derived anime coverage contains no requested targets");
-    }
-
-    let mut matched_candidate = candidate.clone();
-    let (language_assessment, required_preference_satisfied) =
-        assess_acquisition_anime_model_audio_profile(subscription, audio_profile);
-    if language_assessment.score_delta != 0.0 {
-        matched_candidate.score = Some(
-            matched_candidate
-                .score
-                .filter(|score| score.is_finite())
-                .unwrap_or_default()
-                + language_assessment.score_delta,
-        );
-    }
-    matched_candidate.score_badges.push(CandidateScoreBadge {
-        label: "Local anime match".to_string(),
-        detail: Some(format!(
-            "model mapping rank {}; audio profile {:?}; language policy {}",
-            model_rank + 1,
-            audio_profile,
-            language_assessment.state.as_str(),
-        )),
-        score: Some(language_assessment.score_delta),
-    });
-    upsert_anime_match_server_evidence(
-        &mut matched_candidate,
-        "modelMapping",
-        json!({
-            "rank": model_rank,
-            "audioProfile": audio_profile,
-            "matchedTargetKeys": covered_target_keys,
-            "selectedFileKeys": plan.selected_file_keys,
-            "languagePolicy": {
-                "state": language_assessment.state.as_str(),
-                "scoreDelta": language_assessment.score_delta,
-                "matchingAudio": language_assessment.matching_audio,
-                "matchingSubtitles": language_assessment.matching_subtitles,
-                "matchingProfiles": language_assessment.matching_profiles,
-                "desiredAudio": language_assessment.desired_audio,
-                "desiredSubtitles": language_assessment.desired_subtitles,
-                "desiredProfiles": language_assessment.desired_profiles,
-                "evidenceAudio": language_assessment.evidence_audio,
-                "evidenceSubtitles": language_assessment.evidence_subtitles,
-                "evidenceProfiles": language_assessment.evidence_profiles,
-                "requiredPreferenceSatisfied": required_preference_satisfied,
-            },
-        }),
-    );
-    let selected_files = plan.selected_file_keys.len();
-    Ok(CandidateCoverageAnalysis {
-        selection: CandidateSelection {
-            candidate: matched_candidate,
-            anime_coverage_plan: Some(plan.clone()),
-            tv_coverage_plan: None,
-            movie_coverage_plan: None,
-        },
-        release_kind: plan.release_kind,
-        resolver_kind: plan.resolver_kind,
-        resolver_version: plan.resolver_version.clone(),
-        confidence: plan.confidence,
-        covered_target_ids,
-        covered_target_keys,
-        overfetch_count: candidate_media_file_count(candidate).saturating_sub(selected_files),
     })
 }
 
@@ -10061,8 +10093,8 @@ mod tests {
     };
     use crate::{
         anime_matching::{
-            ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioPreferenceMode,
-            AnimeMatchEngine, AnimeMatchRequest, AnimeMatchResponse,
+            AnimeSemanticEvidenceEngine, AnimeSemanticEvidenceRequest,
+            AnimeSemanticEvidenceResponse,
         },
         artwork::ArtworkService,
         auth::AuthService,
@@ -10094,37 +10126,39 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     #[derive(Clone)]
-    struct RecordingAnimeMatchEngine {
-        requests: Arc<Mutex<Vec<AnimeMatchRequest>>>,
-        outcome: RecordingAnimeMatchOutcome,
+    struct RecordingAnimeSemanticEngine {
+        requests: Arc<Mutex<Vec<AnimeSemanticEvidenceRequest>>>,
+        outcome: RecordingAnimeSemanticOutcome,
     }
 
     #[derive(Clone)]
-    enum RecordingAnimeMatchOutcome {
-        Response(AnimeMatchResponse),
+    enum RecordingAnimeSemanticOutcome {
+        Index(Option<usize>),
         Error(&'static str),
     }
 
-    impl RecordingAnimeMatchEngine {
-        fn response(
-            response: AnimeMatchResponse,
-        ) -> (Arc<Self>, Arc<Mutex<Vec<AnimeMatchRequest>>>) {
+    impl RecordingAnimeSemanticEngine {
+        fn index(
+            index: Option<usize>,
+        ) -> (Arc<Self>, Arc<Mutex<Vec<AnimeSemanticEvidenceRequest>>>) {
             let requests = Arc::new(Mutex::new(Vec::new()));
             (
                 Arc::new(Self {
                     requests: requests.clone(),
-                    outcome: RecordingAnimeMatchOutcome::Response(response),
+                    outcome: RecordingAnimeSemanticOutcome::Index(index),
                 }),
                 requests,
             )
         }
 
-        fn error(message: &'static str) -> (Arc<Self>, Arc<Mutex<Vec<AnimeMatchRequest>>>) {
+        fn error(
+            message: &'static str,
+        ) -> (Arc<Self>, Arc<Mutex<Vec<AnimeSemanticEvidenceRequest>>>) {
             let requests = Arc::new(Mutex::new(Vec::new()));
             (
                 Arc::new(Self {
                     requests: requests.clone(),
-                    outcome: RecordingAnimeMatchOutcome::Error(message),
+                    outcome: RecordingAnimeSemanticOutcome::Error(message),
                 }),
                 requests,
             )
@@ -10132,15 +10166,23 @@ mod tests {
     }
 
     #[async_trait]
-    impl AnimeMatchEngine for RecordingAnimeMatchEngine {
-        async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+    impl AnimeSemanticEvidenceEngine for RecordingAnimeSemanticEngine {
+        async fn select_hypothesis(
+            &self,
+            request: AnimeSemanticEvidenceRequest,
+        ) -> Result<AnimeSemanticEvidenceResponse> {
             self.requests
                 .lock()
-                .expect("anime request recorder poisoned")
+                .expect("anime semantic request recorder poisoned")
                 .push(request);
-            match &self.outcome {
-                RecordingAnimeMatchOutcome::Response(response) => Ok(response.clone()),
-                RecordingAnimeMatchOutcome::Error(message) => Err(anyhow!(*message)),
+            match self.outcome {
+                RecordingAnimeSemanticOutcome::Index(hypothesis_index) => {
+                    Ok(AnimeSemanticEvidenceResponse {
+                        schema_version: 1,
+                        hypothesis_index,
+                    })
+                }
+                RecordingAnimeSemanticOutcome::Error(message) => Err(anyhow!(message)),
             }
         }
     }
@@ -12353,11 +12395,8 @@ mod tests {
                 Some(100),
             )],
         );
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: Vec::new(),
-        });
-        let service = AnimeMatchingService::with_engine(engine);
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(None);
+        let service = AnimeMatchingService::with_semantic_engine(engine);
         let mut governor = empty_queue_governor();
 
         let batch = build_anime_candidate_release_plans_with_matching(
@@ -12417,20 +12456,12 @@ mod tests {
                 Some(100),
             )],
         );
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![AnimeCandidateMatch {
-                candidate_key: "candidate-0".to_string(),
-                matched_target_keys: vec![target.target_key.clone()],
-                audio_profile: AnimeMatchAudioProfile::Subbed,
-                selected_file_keys: None,
-            }],
-        });
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(Some(0));
         let mut governor = empty_queue_governor();
 
         let batch = build_anime_candidate_release_plans_with_matching(
             &database.pool,
-            &AnimeMatchingService::with_engine(engine),
+            &AnimeMatchingService::with_semantic_engine(engine),
             &subscription,
             &response,
             &target,
@@ -12457,7 +12488,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm7_difficult_group_uses_one_scoped_request_and_audio_aware_ordering() -> Result<()> {
+    async fn alm9_difficult_candidates_use_independent_semantic_requests_and_deterministic_audio_ordering()
+    -> Result<()> {
         let database = setup_test_db().await?;
         let subscription = AcquisitionSubscription {
             title: "Tokyo Ghoul".to_string(),
@@ -12480,7 +12512,7 @@ mod tests {
             &["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"],
         );
         let mut dual = candidate(
-            "Mystery.Release.Alpha.1080p",
+            "Root A - 01 [1080p] [Dual Audio]",
             vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
             Some(true),
             Some(50),
@@ -12488,7 +12520,7 @@ mod tests {
         dual.id = Some("dual".to_string());
         let mut subbed = dual.clone();
         subbed.id = Some("subbed".to_string());
-        subbed.title = "Mystery.Release.Beta.1080p".to_string();
+        subbed.title = "Root A - 01 [1080p] [Subbed]".to_string();
         subbed.source = "magnet:?xt=urn:btih:alm7-subbed".to_string();
         let response = candidate_search_response_for_test(
             subscription.source_provider_id.expect("provider id"),
@@ -12496,24 +12528,8 @@ mod tests {
             vec!["anime"],
             vec![dual, subbed],
         );
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![
-                AnimeCandidateMatch {
-                    candidate_key: "candidate-0".to_string(),
-                    matched_target_keys: vec![target.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::DualAudio,
-                    selected_file_keys: None,
-                },
-                AnimeCandidateMatch {
-                    candidate_key: "candidate-1".to_string(),
-                    matched_target_keys: vec![target.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::Subbed,
-                    selected_file_keys: None,
-                },
-            ],
-        });
-        let service = AnimeMatchingService::with_engine(engine);
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(Some(0));
+        let service = AnimeMatchingService::with_semantic_engine(engine);
         let mut governor = empty_queue_governor();
 
         let batch = build_anime_candidate_release_plans_with_matching(
@@ -12528,30 +12544,27 @@ mod tests {
         .await?;
 
         let recorded = requests.lock().expect("request recorder poisoned");
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].target.wanted_target_keys, vec!["S02E01"]);
-        assert_eq!(recorded[0].target.absolute_episode_numbers, vec![13]);
+        assert_eq!(recorded.len(), 2);
         assert_eq!(
-            recorded[0].target.audio_preference.mode,
-            AnimeMatchAudioPreferenceMode::PreferDub
-        );
-        assert_eq!(
-            recorded[0].target.audio_preference.accepted_profiles,
-            vec!["dual_audio", "dubbed", "en_audio"]
-        );
-        assert_eq!(
-            recorded[0]
-                .candidates
+            recorded
                 .iter()
-                .map(|candidate| candidate.title.as_str())
+                .map(|request| request.raw.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Mystery.Release.Alpha.1080p", "Mystery.Release.Beta.1080p"]
+            vec![
+                "Root A - 01 [1080p] [Dual Audio]",
+                "Root A - 01 [1080p] [Subbed]"
+            ]
         );
         assert!(
-            recorded[0].context.seasons[0]
+            recorded[0].entities[0]
                 .aliases
                 .iter()
-                .any(|alias| { alias.value == "Tokyo Ghoul √A" })
+                .any(|alias| alias == "Tokyo Ghoul √A")
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|request| request.candidate_key == "candidate-0")
         );
         drop(recorded);
 
@@ -12589,7 +12602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm9_policy_invalid_second_mapping_rejects_the_entire_model_override() -> Result<()> {
+    async fn alm9_invalid_semantic_selection_preserves_the_deterministic_baseline() -> Result<()> {
         let database = setup_test_db().await?;
         let subscription = AcquisitionSubscription {
             source_provider_id: Some(Uuid::new_v4()),
@@ -12648,28 +12661,12 @@ mod tests {
         assert_eq!(baseline.plans.len(), 1);
         let expected = alm7_batch_canonical_snapshot(&baseline);
 
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![
-                AnimeCandidateMatch {
-                    candidate_key: "candidate-0".to_string(),
-                    matched_target_keys: vec![target_one.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::DualAudio,
-                    selected_file_keys: None,
-                },
-                AnimeCandidateMatch {
-                    candidate_key: "candidate-1".to_string(),
-                    matched_target_keys: vec![target_two.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::Subbed,
-                    selected_file_keys: None,
-                },
-            ],
-        });
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(Some(999));
         let mut governor = empty_queue_governor();
 
         let batch = build_anime_candidate_release_plans_with_matching(
             &database.pool,
-            &AnimeMatchingService::with_engine(engine),
+            &AnimeMatchingService::with_semantic_engine(engine),
             &subscription,
             &response,
             &target_one,
@@ -12694,25 +12691,17 @@ mod tests {
                 .map(|assist| (assist.result, assist.reason)),
             Some((
                 AnimeMatchAssistResult::Fallback,
-                Some(AnimeMatchFallbackReason::CoverageValidationFailed)
+                Some(AnimeMatchFallbackReason::InvalidModelResponse)
             ))
         );
         let retained_candidate = &batch.plans[0].selection.candidate;
-        assert_eq!(
-            retained_candidate
-                .raw
-                .as_ref()
-                .and_then(|raw| raw.pointer("/serverEvidence/animeMatchAssist/source"))
-                .and_then(JsonValue::as_str),
-            Some("deterministic_fallback")
-        );
         assert!(
             retained_candidate
                 .raw
                 .as_ref()
-                .and_then(|raw| raw.pointer("/serverEvidence/modelMapping"))
+                .and_then(|raw| raw.pointer("/serverEvidence/semanticEvidence"))
                 .is_none(),
-            "the valid first mapping must not leak model provenance after the second fails policy"
+            "an invalid semantic selection must not leak into deterministic coverage"
         );
         assert_eq!(
             batch.plans[0].covered_target_keys,
@@ -12722,7 +12711,7 @@ mod tests {
             !batch.plans[0]
                 .covered_target_keys
                 .contains(&target_two.target_key),
-            "the valid first mapping must not contribute partial model coverage"
+            "an invalid semantic selection must not contribute coverage"
         );
         Ok(())
     }
@@ -12818,7 +12807,7 @@ mod tests {
         .await?;
         let target = targets[0].clone();
         let mut opaque = candidate(
-            "Mystery.Release.Alpha.1080p",
+            "Root A - 01 [1080p] [Dual Audio]",
             vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
             Some(true),
             Some(100),
@@ -12830,19 +12819,11 @@ mod tests {
             vec!["anime"],
             vec![opaque],
         );
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![AnimeCandidateMatch {
-                candidate_key: "candidate-0".to_string(),
-                matched_target_keys: vec![target.target_key.clone()],
-                audio_profile: AnimeMatchAudioProfile::DualAudio,
-                selected_file_keys: None,
-            }],
-        });
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(Some(0));
         let mut governor = QueueGovernor::load(&state.db_pool).await?;
         let batch = build_anime_candidate_release_plans_with_matching(
             &state.db_pool,
-            &AnimeMatchingService::with_engine(engine),
+            &AnimeMatchingService::with_semantic_engine(engine),
             &subscription,
             &response,
             &target,
@@ -13175,8 +13156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm7_complete_series_model_file_mapping_persists_exact_multi_season_bindings()
-    -> Result<()> {
+    async fn alm7_complete_series_deterministic_file_mapping_uses_no_model() -> Result<()> {
         let state = setup_test_state().await?;
         let source_provider_id = Uuid::new_v4();
         insert_test_provider_ref(
@@ -13286,7 +13266,13 @@ mod tests {
             .map(|(index, provider_file_id)| AcquisitionCandidateFile {
                 file_id: Some((*provider_file_id).to_string()),
                 file_index: Some(index as i64 + 1),
-                path: format!("opaque-payload-{}.mkv", index + 1),
+                path: [
+                    "Example Anime S01E01.mkv",
+                    "Example Anime S01E02.mkv",
+                    "Example Anime S02E01.mkv",
+                    "Example Anime S02E02.mkv",
+                ][index]
+                    .to_string(),
                 size_bytes: Some(1_000_000),
                 selectable: Some(true),
             })
@@ -13297,26 +13283,11 @@ mod tests {
             vec!["anime"],
             vec![opaque],
         );
-        let (engine, requests) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![AnimeCandidateMatch {
-                candidate_key: "candidate-0".to_string(),
-                matched_target_keys: targets
-                    .iter()
-                    .map(|target| target.target_key.clone())
-                    .collect(),
-                audio_profile: AnimeMatchAudioProfile::JaAudioEnSubs,
-                selected_file_keys: Some(
-                    (0..targets.len())
-                        .map(|index| format!("candidate-0-file-{index}"))
-                        .collect(),
-                ),
-            }],
-        });
+        let (engine, requests) = RecordingAnimeSemanticEngine::index(Some(0));
         let mut governor = QueueGovernor::load(&state.db_pool).await?;
         let batch = build_anime_candidate_release_plans_with_matching(
             &state.db_pool,
-            &AnimeMatchingService::with_engine(engine),
+            &AnimeMatchingService::with_semantic_engine(engine),
             &subscription,
             &response,
             &targets[0],
@@ -13325,37 +13296,27 @@ mod tests {
         )
         .await?;
 
-        let recorded = requests.lock().expect("request recorder poisoned");
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].target.wanted_target_keys.len(), targets.len());
-        assert_eq!(recorded[0].candidates.len(), 1);
-        assert_eq!(
-            recorded[0].candidates[0].files.len(),
-            provider_file_ids.len()
+        assert!(
+            requests
+                .lock()
+                .expect("request recorder poisoned")
+                .is_empty(),
+            "parseable provider basenames must stay on the deterministic fast path"
         );
-        assert_eq!(
-            recorded[0].candidates[0]
-                .files
-                .iter()
-                .map(|file| file.file_key.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "candidate-0-file-0",
-                "candidate-0-file-1",
-                "candidate-0-file-2",
-                "candidate-0-file-3",
-            ]
-        );
-        drop(recorded);
 
-        assert_eq!(batch.plans.len(), 1);
+        assert_eq!(
+            batch.plans.len(),
+            1,
+            "semantic series-pack batch: {batch:?}"
+        );
         assert!(batch.review_candidates.is_empty());
         assert_eq!(
             batch
                 .anime_match_assist
                 .as_ref()
                 .map(|assist| assist.result),
-            Some(AnimeMatchAssistResult::Matched)
+            None,
+            "the batch needs no assist record when every candidate stays deterministic"
         );
         let plan = &batch.plans[0];
         assert_eq!(plan.release_kind, ReleaseKind::SeriesPack);
@@ -13431,7 +13392,7 @@ mod tests {
             Some(download_id_string.clone()),
             route_provider_id,
             Some("real_debrid"),
-            "ALM-7 complete-series model-selected anime release.",
+            "ALM-7 complete-series deterministic anime release.",
             &[],
         )
         .await?;
@@ -13466,7 +13427,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.pointer("/animeMatchAssist/source"))
                 .and_then(JsonValue::as_str),
-            Some("local_model")
+            None
         );
         assert_eq!(
             release
@@ -13993,11 +13954,11 @@ mod tests {
             )],
         );
         let (engine, requests) =
-            RecordingAnimeMatchEngine::error("local model request deadline exceeded");
+            RecordingAnimeSemanticEngine::error("local model request deadline exceeded");
         let mut governor = QueueGovernor::load(&state.db_pool).await?;
         let batch = build_anime_candidate_release_plans_with_matching(
             &state.db_pool,
-            &AnimeMatchingService::with_engine(engine),
+            &AnimeMatchingService::with_semantic_engine(engine),
             &subscription,
             &response,
             &target,
@@ -14168,24 +14129,13 @@ mod tests {
         let expected = alm7_batch_canonical_snapshot(&disabled);
         assert_eq!(disabled.plans.len(), 1);
 
-        let (error_engine, _) = RecordingAnimeMatchEngine::error("model deadline exceeded");
-        let (empty_engine, _) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: Vec::new(),
-        });
-        let (invalid_engine, _) = RecordingAnimeMatchEngine::response(AnimeMatchResponse {
-            schema_version: ANIME_MATCH_SCHEMA_VERSION,
-            matches: vec![AnimeCandidateMatch {
-                candidate_key: "candidate-404".to_string(),
-                matched_target_keys: vec!["S01E02".to_string()],
-                audio_profile: AnimeMatchAudioProfile::Unknown,
-                selected_file_keys: None,
-            }],
-        });
+        let (error_engine, _) = RecordingAnimeSemanticEngine::error("model deadline exceeded");
+        let (empty_engine, _) = RecordingAnimeSemanticEngine::index(None);
+        let (invalid_engine, _) = RecordingAnimeSemanticEngine::index(Some(999));
         let services = [
-            AnimeMatchingService::with_engine(error_engine),
-            AnimeMatchingService::with_engine(empty_engine),
-            AnimeMatchingService::with_engine(invalid_engine),
+            AnimeMatchingService::with_semantic_engine(error_engine),
+            AnimeMatchingService::with_semantic_engine(empty_engine),
+            AnimeMatchingService::with_semantic_engine(invalid_engine),
         ];
         let expected_reasons = [
             AnimeMatchFallbackReason::EngineError,

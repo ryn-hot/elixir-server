@@ -3350,8 +3350,8 @@ mod tests {
 
     use crate::{
         anime_matching::{
-            ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile,
-            AnimeMatchEngine, AnimeMatchRequest, AnimeMatchResponse,
+            ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION, AnimeSemanticEvidenceEngine,
+            AnimeSemanticEvidenceRequest, AnimeSemanticEvidenceResponse,
         },
         config::DatabaseConfig,
         db::{Database, DatabaseDriver},
@@ -3382,23 +3382,21 @@ mod tests {
     }
 
     #[async_trait]
-    impl AnimeMatchEngine for RepairMatchEngine {
-        async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+    impl AnimeSemanticEvidenceEngine for RepairMatchEngine {
+        async fn select_hypothesis(
+            &self,
+            request: AnimeSemanticEvidenceRequest,
+        ) -> Result<AnimeSemanticEvidenceResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let target_key = request
-                .target
-                .wanted_target_keys
-                .first()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("repair fixture received no wanted target"))?;
-            Ok(AnimeMatchResponse {
-                schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                matches: vec![AnimeCandidateMatch {
-                    candidate_key: "candidate-0".to_string(),
-                    matched_target_keys: vec![target_key],
-                    audio_profile: AnimeMatchAudioProfile::Unknown,
-                    selected_file_keys: Some(vec!["candidate-0-file-0".to_string()]),
-                }],
+            let hypothesis_index = request
+                .hypotheses
+                .iter()
+                .find(|hypothesis| hypothesis.target_keys.iter().any(|key| key == "S02E01"))
+                .map(|hypothesis| hypothesis.index)
+                .ok_or_else(|| anyhow::anyhow!("repair fixture received no S02E01 hypothesis"))?;
+            Ok(AnimeSemanticEvidenceResponse {
+                schema_version: ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                hypothesis_index: Some(hypothesis_index),
             })
         }
     }
@@ -3475,57 +3473,47 @@ mod tests {
     }
 
     #[async_trait]
-    impl AnimeMatchEngine for RelationContextRepairMatchEngine {
-        async fn match_candidates(&self, request: AnimeMatchRequest) -> Result<AnimeMatchResponse> {
+    impl AnimeSemanticEvidenceEngine for RelationContextRepairMatchEngine {
+        async fn select_hypothesis(
+            &self,
+            request: AnimeSemanticEvidenceRequest,
+        ) -> Result<AnimeSemanticEvidenceResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let root = request
-                .context
-                .seasons
+                .entities
                 .iter()
-                .find(|season| season.season_number == 1)
+                .find(|entity| entity.season_number == 1)
                 .ok_or_else(|| anyhow::anyhow!("repair request omitted relation-chain season 1"))?;
             ensure!(
                 root.anilist_id == "1001",
                 "repair relation root has the wrong AniList identity"
             );
             let sequel = request
-                .context
-                .seasons
+                .entities
                 .iter()
-                .find(|season| season.season_number == 2)
+                .find(|entity| entity.season_number == 2)
                 .ok_or_else(|| anyhow::anyhow!("repair request omitted relation-chain season 2"))?;
             ensure!(
                 sequel.anilist_id == "1002"
                     && sequel
                         .aliases
                         .iter()
-                        .any(|alias| alias.value == "Tokyo Ghoul Root A"),
+                        .any(|alias| alias == "Tokyo Ghoul Root A"),
                 "repair sequel context omitted the canonical relation alias"
             );
-            let target = sequel
-                .targets
+            let hypothesis = request
+                .hypotheses
                 .iter()
-                .find(|target| {
-                    target.episode_number == Some(1) && target.absolute_episode_number == Some(13)
+                .find(|hypothesis| {
+                    hypothesis.entity_index == sequel.index
+                        && hypothesis.target_keys.iter().any(|key| key == "S02E01")
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!("repair sequel context omitted S02E01/absolute 13")
                 })?;
-            ensure!(
-                request
-                    .target
-                    .wanted_target_keys
-                    .contains(&target.target_key),
-                "repair request did not expose the canonical sequel target to the model"
-            );
-            Ok(AnimeMatchResponse {
-                schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                matches: vec![AnimeCandidateMatch {
-                    candidate_key: "candidate-0".to_string(),
-                    matched_target_keys: vec![target.target_key.clone()],
-                    audio_profile: AnimeMatchAudioProfile::Unknown,
-                    selected_file_keys: Some(vec!["candidate-0-file-0".to_string()]),
-                }],
+            Ok(AnimeSemanticEvidenceResponse {
+                schema_version: ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                hypothesis_index: Some(hypothesis.index),
             })
         }
     }
@@ -5195,7 +5183,7 @@ mod tests {
         )
         .await?;
         let calls = Arc::new(AtomicUsize::new(0));
-        let matcher = AnimeMatchingService::with_engine(Arc::new(RepairMatchEngine {
+        let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(RepairMatchEngine {
             calls: calls.clone(),
         }));
 
@@ -5306,7 +5294,7 @@ mod tests {
         .await?;
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let matcher = AnimeMatchingService::with_engine(Arc::new(RepairMatchEngine {
+        let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(RepairMatchEngine {
             calls: calls.clone(),
         }));
         let classifier = ClassifierPipeline::new();
@@ -5438,10 +5426,11 @@ mod tests {
             .register_hint_parser(Arc::new(TvdbOnlyRepairHintParser { path: path.clone() }))
             .register_identifier_provider(Arc::new(TvdbOnlyRepairIdentifier));
         let model_calls = Arc::new(AtomicUsize::new(0));
-        let matcher =
-            AnimeMatchingService::with_engine(Arc::new(RelationContextRepairMatchEngine {
+        let matcher = AnimeMatchingService::with_semantic_engine(Arc::new(
+            RelationContextRepairMatchEngine {
                 calls: model_calls.clone(),
-            }));
+            },
+        ));
 
         let counts = run_anime_library_repair_iteration_with_anilist(
             &database.pool,

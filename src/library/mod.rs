@@ -33,9 +33,9 @@ use uuid::Uuid;
 
 use crate::{
     anime_matching::{
-        AnimeDeterministicResult, AnimeMatchAssistProvenance, AnimeMatchAudioPreference,
-        AnimeMatchMediaType, AnimeMatchParseFacts, AnimeMatchScope, AnimeMatchTarget,
-        AnimeMatchingService,
+        AnimeMatchAssistProvenance, AnimeMatchAudioPreference, AnimeMatchMediaType,
+        AnimeMatchParseFacts, AnimeMatchScope, AnimeMatchTarget, AnimeMatchingService,
+        AnimeSemanticMediaKind, build_semantic_evidence_request,
     },
     artwork::{
         ArtworkCandidate, ArtworkKind, ArtworkService, extract_anilist_artwork,
@@ -4656,64 +4656,89 @@ async fn resolve_difficult_library_anime_files(
                 continue;
             }
         };
-        let expected_path = file.descriptor.path.clone();
+        let prepared = match AnimeMatchingService::prepare_request(batch) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    path = %file.descriptor.path,
+                    error = %error,
+                    "library anime semantic request validation failed"
+                );
+                continue;
+            }
+        };
+        let Some(wire_candidate) = prepared.request().candidates.first() else {
+            continue;
+        };
+        let facts = wire_candidate.parse_facts.clone();
+        // The library resolver already narrowed the graph to the canonical
+        // coordinates that could explain this file. Preserve those complete
+        // server-authored interpretations even when an earlier parser only
+        // recovered the title (for example `Root A - 01`).
+        let observed_seasons = facts.season_numbers.iter().copied().chain(
+            wanted_targets
+                .iter()
+                .filter_map(|target| target.season_number),
+        );
+        let observed_episodes = facts.episode_numbers.iter().copied().chain(
+            wanted_targets
+                .iter()
+                .filter_map(|target| target.episode_number),
+        );
+        let observed_absolute_episodes = facts.absolute_episode_numbers.iter().copied().chain(
+            wanted_targets
+                .iter()
+                .filter_map(|target| target.absolute_episode_number),
+        );
+        let semantic_request = match build_semantic_evidence_request(
+            prepared.request(),
+            wire_candidate.candidate_key.clone(),
+            wire_candidate.title.clone(),
+            None,
+            observed_seasons,
+            observed_episodes,
+            observed_absolute_episodes,
+            [AnimeSemanticMediaKind::Episode],
+        ) {
+            Ok(Some(request)) => request,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(path = %file.descriptor.path, error = %error, "library anime semantic hypotheses could not be built");
+                continue;
+            }
+        };
+        let canonical_request = prepared.request().clone();
         let outcome = matching_service
-            .match_or_fallback(
-                AnimeDeterministicResult::difficult(LibraryAnimeModelResolution {
-                    numbers: deterministic,
-                    context_season_number: None,
-                    context_anilist_id: None,
-                }),
-                batch,
-                move |_baseline, request, matches, source_map| {
-                    anyhow::ensure!(
-                        matches.len() == 1,
-                        "library anime response must resolve exactly one file candidate"
-                    );
-                    let matched = &matches[0];
-                    anyhow::ensure!(
-                        source_map
-                            .candidate_source(&matched.candidate_key)
-                            .is_some_and(|path| path == &expected_path),
-                        "library anime response selected a different file candidate"
-                    );
-                    anyhow::ensure!(
-                        matched.matched_target_keys.len() == 1,
-                        "library anime response must select exactly one canonical episode"
-                    );
-                    if let Some(selected_file_keys) = matched.selected_file_keys.as_ref() {
-                        anyhow::ensure!(
-                            selected_file_keys.len() == 1
-                                && source_map
-                                    .file_source(&matched.candidate_key, &selected_file_keys[0],)
-                                    .is_some_and(|path| path == &expected_path),
-                            "library anime response selected a different provider file"
-                        );
-                    }
-                    let target_key = &matched.matched_target_keys[0];
-                    let targets = request
-                        .context
-                        .seasons
-                        .iter()
-                        .flat_map(|season| {
-                            season.targets.iter().map(move |target| (season, target))
-                        })
-                        .filter(|(_, target)| &target.target_key == target_key)
-                        .collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        targets.len() == 1,
-                        "library anime response target is not uniquely canonical"
-                    );
-                    let (context_season, target) = targets[0];
-                    let season = target
-                        .season_number
-                        .filter(|number| *number >= 0)
-                        .ok_or_else(|| anyhow::anyhow!("model target has no canonical season"))?;
-                    let episode = target
-                        .episode_number
-                        .filter(|number| *number > 0)
-                        .ok_or_else(|| anyhow::anyhow!("model target has no canonical episode"))?;
-                    Ok(LibraryAnimeModelResolution {
+            .select_semantic_hypothesis(semantic_request)
+            .await;
+        let mut provenance = outcome.provenance.clone();
+        let mut used_model = false;
+        let mut resolved = LibraryAnimeModelResolution {
+            numbers: deterministic,
+            context_season_number: None,
+            context_anilist_id: None,
+        };
+        if let Some(hypothesis) = outcome.hypothesis.as_ref()
+            && hypothesis.target_keys.len() == 1
+            && canonical_request
+                .target
+                .wanted_target_keys
+                .contains(&hypothesis.target_keys[0])
+        {
+            let targets = canonical_request
+                .context
+                .seasons
+                .iter()
+                .flat_map(|season| season.targets.iter().map(move |target| (season, target)))
+                .filter(|(_, target)| target.target_key == hypothesis.target_keys[0])
+                .collect::<Vec<_>>();
+            if targets.len() == 1 {
+                let (context_season, target) = targets[0];
+                if let (Some(season), Some(episode)) = (
+                    target.season_number.filter(|number| *number >= 0),
+                    target.episode_number.filter(|number| *number > 0),
+                ) {
+                    resolved = LibraryAnimeModelResolution {
                         numbers: ResolvedEpisodeNumbers {
                             season: Some(season),
                             episode: Some(episode),
@@ -4723,14 +4748,22 @@ async fn resolve_difficult_library_anime_files(
                         },
                         context_season_number: Some(context_season.season_number),
                         context_anilist_id: Some(context_season.anilist_id.clone()),
-                    })
-                },
-            )
-            .await;
-
-        let used_model = outcome.used_model();
-        let provenance = outcome.provenance.clone();
-        let resolved = outcome.into_value();
+                    };
+                    used_model = true;
+                }
+            }
+        }
+        if outcome.selected() && !used_model {
+            provenance.source =
+                crate::anime_matching::AnimeMatchAssistSource::DeterministicFallback;
+            provenance.result = crate::anime_matching::AnimeMatchAssistResult::Fallback;
+            provenance.reason =
+                Some(crate::anime_matching::AnimeMatchFallbackReason::CoverageValidationFailed);
+            provenance.detail = Some(
+                "semantic hypothesis did not resolve one uniquely wanted canonical episode"
+                    .to_string(),
+            );
+        }
         if let Some(classification) = classification_outcomes.get_mut(&file.descriptor.path) {
             classification.candidates_json = Some(merge_library_anime_match_provenance(
                 classification.candidates_json.as_deref(),

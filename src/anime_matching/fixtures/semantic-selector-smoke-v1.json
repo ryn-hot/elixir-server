@@ -1,0 +1,345 @@
+{
+  "schemaVersion": 1,
+  "status": "frozen-smoke",
+  "cases": [
+    {
+      "caseId": "tokyo-ghoul-root-a-named-episode",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-root-a-named-episode",
+        "candidateKey": "candidate-0",
+        "raw": "[SubsPlease] Tokyo Ghoul Root A - 01 [1080p]",
+        "graphFingerprint": "smoke-tokyo-ghoul-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 2, "entityIndex": 1, "numbering": "absolute", "absoluteEpisodeNumbers": [13], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "tokyo-ghoul-explicit-season-two",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-explicit-season-two",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo.Ghoul.S02E01.1080p.WEB-DL",
+        "graphFingerprint": "smoke-tokyo-ghoul-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "tokyo-ghoul-absolute-thirteen",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-absolute-thirteen",
+        "candidateKey": "candidate-0",
+        "raw": "[Group] Tokyo Ghoul - 13 [BD 1080p]",
+        "graphFingerprint": "smoke-tokyo-ghoul-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "entity_only", "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "absolute", "absoluteEpisodeNumbers": [13], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "tokyo-ghoul-re-second-cour",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-re-second-cour",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo Ghoul re 2nd Season - 03",
+        "graphFingerprint": "smoke-tokyo-ghoul-re-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 3, "aliases": ["Tokyo Ghoul:re", "東京喰種:re"]},
+          {"index": 1, "seasonNumber": 4, "aliases": ["Tokyo Ghoul:re 2nd Season", "Tokyo Ghoul re Part 2", "東京喰種:re 2期"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [3], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [3], "mediaKind": "episode"},
+          {"index": 2, "entityIndex": 1, "numbering": "absolute", "absoluteEpisodeNumbers": [39], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "aot-final-season-part-two",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "aot-final-season-part-two",
+        "candidateKey": "candidate-0",
+        "raw": "Attack on Titan The Final Season Part 2 - 10",
+        "graphFingerprint": "smoke-aot-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 4, "aliases": ["Attack on Titan The Final Season", "Shingeki no Kyojin The Final Season"]},
+          {"index": 1, "seasonNumber": 5, "aliases": ["Attack on Titan The Final Season Part 2", "Shingeki no Kyojin The Final Season Part 2"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [10], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [10], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "aot-final-season-explicit-coordinate",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "aot-final-season-explicit-coordinate",
+        "candidateKey": "candidate-0",
+        "raw": "Attack.on.Titan.S04E17.1080p",
+        "graphFingerprint": "smoke-aot-explicit-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 3, "aliases": ["Attack on Titan Season 3"]},
+          {"index": 1, "seasonNumber": 4, "aliases": ["Attack on Titan", "Attack on Titan The Final Season"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [17], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [17], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "aot-japanese-part-two",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "aot-japanese-part-two",
+        "candidateKey": "candidate-0",
+        "raw": "進撃の巨人 The Final Season Part 2 - 10",
+        "graphFingerprint": "smoke-aot-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 4, "aliases": ["Attack on Titan The Final Season", "進撃の巨人 The Final Season"]},
+          {"index": 1, "seasonNumber": 5, "aliases": ["Attack on Titan The Final Season Part 2", "進撃の巨人 The Final Season Part 2"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [10], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [10], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "one-piece-absolute",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "one-piece-absolute",
+        "candidateKey": "candidate-0",
+        "raw": "[Toei] One Piece - 1095 [1080p]",
+        "graphFingerprint": "smoke-one-piece-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["One Piece", "ワンピース"]},
+          {"index": 1, "seasonNumber": 0, "aliases": ["One Piece Specials"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "absolute", "absoluteEpisodeNumbers": [1095], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1095], "mediaKind": "special"}
+        ]
+      },
+      "expectedHypothesisIndex": 0
+    },
+    {
+      "caseId": "rezero-memory-snow-ova",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "rezero-memory-snow-ova",
+        "candidateKey": "candidate-0",
+        "raw": "Re Zero Memory Snow OVA 1080p BluRay",
+        "graphFingerprint": "smoke-rezero-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Re:ZERO Starting Life in Another World", "Re Zero"]},
+          {"index": 1, "seasonNumber": 0, "aliases": ["Re:ZERO Memory Snow", "Re Zero Memory Snow"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "entity_only", "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "entity_only", "mediaKind": "ova"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "mha-heroes-rising-movie",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "mha-heroes-rising-movie",
+        "candidateKey": "candidate-0",
+        "raw": "Boku no Hero Academia Heroes Rising Movie 1080p",
+        "graphFingerprint": "smoke-mha-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 4, "aliases": ["My Hero Academia Season 4", "Boku no Hero Academia 4"]},
+          {"index": 1, "seasonNumber": 0, "aliases": ["My Hero Academia Heroes Rising", "Boku no Hero Academia the Movie 2 Heroes Rising"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "entity_only", "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "entity_only", "mediaKind": "movie"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "steins-gate-zero-special",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "steins-gate-zero-special",
+        "candidateKey": "candidate-0",
+        "raw": "Steins Gate 0 - 23 beta Special",
+        "graphFingerprint": "smoke-steins-gate-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Steins;Gate 0", "Steins Gate Zero"]},
+          {"index": 1, "seasonNumber": 0, "aliases": ["Steins;Gate 0 23 beta", "Steins Gate 0 Missing Link"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [23], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "entity_only", "mediaKind": "special"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "unrelated-title-null",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "unrelated-title-null",
+        "candidateKey": "candidate-0",
+        "raw": "[Group] Jujutsu Kaisen - 01 [1080p]",
+        "graphFingerprint": "smoke-negative-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": null
+    },
+    {
+      "caseId": "named-sequel-explicit-season-conflict-null",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "named-sequel-explicit-season-conflict-null",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo Ghoul Root A S01E01",
+        "graphFingerprint": "smoke-negative-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": null
+    },
+    {
+      "caseId": "sample-null",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "sample-null",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo Ghoul Root A - 01 SAMPLE.mkv",
+        "graphFingerprint": "smoke-negative-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": null
+    },
+    {
+      "caseId": "creditless-opening-null",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "creditless-opening-null",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo Ghoul Root A NCOP 01 1080p",
+        "graphFingerprint": "smoke-negative-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": null
+    },
+    {
+      "caseId": "off-by-one-null",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "off-by-one-null",
+        "candidateKey": "candidate-0",
+        "raw": "Tokyo Ghoul Root A - 14",
+        "graphFingerprint": "smoke-negative-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 0, "numbering": "absolute", "absoluteEpisodeNumbers": [13], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": null
+    },
+    {
+      "caseId": "tokyo-ghoul-root-a-japanese-alias",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-root-a-japanese-alias",
+        "candidateKey": "candidate-0",
+        "raw": "東京喰種√A - 01",
+        "graphFingerprint": "smoke-tokyo-ghoul-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"},
+          {"index": 1, "entityIndex": 1, "numbering": "seasonal", "episodeNumbers": [1], "mediaKind": "episode"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    },
+    {
+      "caseId": "tokyo-ghoul-root-a-season-pack",
+      "request": {
+        "schemaVersion": 1,
+        "requestId": "tokyo-ghoul-root-a-season-pack",
+        "candidateKey": "candidate-0",
+        "raw": "[Group] Tokyo Ghoul Root A Complete 1080p BluRay",
+        "graphFingerprint": "smoke-tokyo-ghoul-v1",
+        "entities": [
+          {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
+          {"index": 1, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "Tokyo Ghoul √A", "東京喰種√A"]}
+        ],
+        "hypotheses": [
+          {"index": 0, "entityIndex": 0, "numbering": "entity_only", "mediaKind": "season_pack"},
+          {"index": 1, "entityIndex": 1, "numbering": "entity_only", "mediaKind": "season_pack"}
+        ]
+      },
+      "expectedHypothesisIndex": 1
+    }
+  ]
+}

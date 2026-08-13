@@ -41,7 +41,9 @@ use super::{
     ANIME_MATCH_SCHEMA_VERSION, AnimeCandidateMatch, AnimeMatchAudioProfile,
     AnimeMatchContextTarget, AnimeMatchEngine, AnimeMatchEngineOutput, AnimeMatchRequest,
     AnimeMatchResponse, AnimeMatchRuntimeProvenance, AnimeMatchSeasonContext,
-    anime_match_alias_equivalence_key, hardware::InferenceBackend, prime_request,
+    AnimeSemanticEvidenceEngine, AnimeSemanticEvidenceEngineOutput, AnimeSemanticEvidenceRequest,
+    AnimeSemanticEvidenceResponse, anime_match_alias_equivalence_key, hardware::InferenceBackend,
+    prime_request,
 };
 
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -68,8 +70,8 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-match-v14-candidate-checklist";
-pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-match-response-v7-checklist";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v1";
+pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-semantic-evidence-response-v1";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
 
@@ -86,6 +88,12 @@ For `require`, audio evidence must match `audio.accepted`; `require_dub` accepts
 Example: target Example Show season 2 episode 3; candidates are `Other Show S02E03`, `Example Show S01E03`, and `Example Show: Return - 03`, where Return is the season-2 alias. The result decisions are `[0,0,2]` and only candidate 2 is mapped. If every candidate is an unrelated title, wrong season, or wrong episode, all decisions are 0 and mappings are empty.
 
 JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
+
+const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Interpret one raw anime release or filename using only the supplied entities and complete hypotheses.
+
+Each entity owns its aliases. A named sequel, part, cour, arc, movie, special, or OVA may have a title that differs from the franchise title. Seasonal and absolute numbering are different interpretations. Select a hypothesis only when its entity aliases, numbering, and media kind agree with the raw value. Return null for an unrelated title, conflicting season or episode, insufficient evidence, sample, opening, ending, or extra.
+
+Do not invent a title, entity, number, media kind, or hypothesis. Output JSON only: {\"schemaVersion\":1,\"hypothesisIndex\":<supplied integer or null>}."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -440,11 +448,43 @@ pub struct LocalModelContractSmokeMeasurement {
 
 #[derive(Debug)]
 struct LocalModelCompletion {
-    response: AnimeMatchResponse,
+    response: LocalModelResponse,
     prompt_tokens: Option<u64>,
     generated_tokens: Option<u64>,
     prompt_time_ms: Option<u64>,
     generation_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum LocalModelRequest {
+    Match(AnimeMatchRequest),
+    Semantic(AnimeSemanticEvidenceRequest),
+}
+
+#[derive(Debug, Clone)]
+enum LocalModelResponse {
+    Match(AnimeMatchResponse),
+    Semantic(AnimeSemanticEvidenceResponse),
+}
+
+impl LocalModelCompletion {
+    fn match_response(&self) -> Result<&AnimeMatchResponse> {
+        match &self.response {
+            LocalModelResponse::Match(response) => Ok(response),
+            LocalModelResponse::Semantic(_) => {
+                bail!("local model returned semantic evidence to a match request")
+            }
+        }
+    }
+
+    fn semantic_response(&self) -> Result<&AnimeSemanticEvidenceResponse> {
+        match &self.response {
+            LocalModelResponse::Semantic(response) => Ok(response),
+            LocalModelResponse::Match(_) => {
+                bail!("local model returned a match plan to a semantic request")
+            }
+        }
+    }
 }
 
 struct WorkerSlot {
@@ -1056,8 +1096,8 @@ impl LocalModelEngine {
             warm_latency_ms,
             current_rss_bytes,
             peak_rss_bytes,
-            priming_response: priming_completion.response,
-            response: completion.response,
+            priming_response: priming_completion.match_response()?.clone(),
+            response: completion.match_response()?.clone(),
         })
     }
 
@@ -1692,6 +1732,36 @@ impl LocalModelEngine {
         &self,
         request: AnimeMatchRequest,
     ) -> Result<(AnimeMatchEngineOutput, LocalModelCompletion)> {
+        let (completion, runtime) = self
+            .infer_completion_measured(LocalModelRequest::Match(request))
+            .await?;
+        let response = completion.match_response()?.clone();
+        Ok((
+            AnimeMatchEngineOutput {
+                response,
+                runtime: Some(runtime),
+            },
+            completion,
+        ))
+    }
+
+    async fn infer_semantic(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceEngineOutput> {
+        let (completion, runtime) = self
+            .infer_completion_measured(LocalModelRequest::Semantic(request))
+            .await?;
+        Ok(AnimeSemanticEvidenceEngineOutput {
+            response: completion.semantic_response()?.clone(),
+            runtime: Some(runtime),
+        })
+    }
+
+    async fn infer_completion_measured(
+        &self,
+        request: LocalModelRequest,
+    ) -> Result<(LocalModelCompletion, AnimeMatchRuntimeProvenance)> {
         let final_deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
         let mut resuming_after_resource_preemption = false;
         loop {
@@ -1719,7 +1789,9 @@ impl LocalModelEngine {
                 {
                     let remaining =
                         final_deadline.saturating_duration_since(tokio::time::Instant::now());
-                    return self.infer_measured_with_deadline(request, remaining).await;
+                    return self
+                        .infer_completion_with_deadline(request, remaining)
+                        .await;
                 }
                 match timeout_at(final_deadline, self.prime()).await {
                     Ok(Ok(())) => {}
@@ -1734,7 +1806,7 @@ impl LocalModelEngine {
                 bail!("local model request deadline exceeded");
             }
             match self
-                .infer_measured_with_deadline(request.clone(), remaining)
+                .infer_completion_with_deadline(request.clone(), remaining)
                 .await
             {
                 Err(error) if resource_admission_deferred(&error) => {
@@ -1778,6 +1850,24 @@ impl LocalModelEngine {
         request: AnimeMatchRequest,
         request_deadline: Duration,
     ) -> Result<(AnimeMatchEngineOutput, LocalModelCompletion)> {
+        let (completion, runtime) = self
+            .infer_completion_with_deadline(LocalModelRequest::Match(request), request_deadline)
+            .await?;
+        let response = completion.match_response()?.clone();
+        Ok((
+            AnimeMatchEngineOutput {
+                response,
+                runtime: Some(runtime),
+            },
+            completion,
+        ))
+    }
+
+    async fn infer_completion_with_deadline(
+        &self,
+        request: LocalModelRequest,
+        request_deadline: Duration,
+    ) -> Result<(LocalModelCompletion, AnimeMatchRuntimeProvenance)> {
         let mut operation = MetricOperation::new("inference");
         ensure!(
             !self.inner.shutdown.is_cancelled(),
@@ -1854,13 +1944,7 @@ impl LocalModelEngine {
             Ok(Ok(completion)) => {
                 self.mark_successful_completion();
                 operation.succeed();
-                Ok((
-                    AnimeMatchEngineOutput {
-                        response: completion.response.clone(),
-                        runtime: Some(profile.provenance()),
-                    },
-                    completion,
-                ))
+                Ok((completion, profile.provenance()))
             }
             Ok(Err(error)) => {
                 if error.is::<InFlightAdmissionRejected>() {
@@ -1929,7 +2013,7 @@ impl LocalModelEngine {
     async fn infer_once_with_admission_monitor(
         &self,
         profile: &LocalModelRuntimeProfile,
-        request: &AnimeMatchRequest,
+        request: &LocalModelRequest,
     ) -> Result<LocalModelCompletion> {
         let outcome = monitor_inference_admission(
             self.inner.admission.as_ref(),
@@ -1958,7 +2042,7 @@ impl LocalModelEngine {
     async fn infer_once(
         &self,
         profile: &LocalModelRuntimeProfile,
-        request: &AnimeMatchRequest,
+        request: &LocalModelRequest,
     ) -> Result<LocalModelCompletion> {
         let mut slot = self.inner.worker.lock().await;
         let worker = slot
@@ -1974,7 +2058,14 @@ impl LocalModelEngine {
             "local model worker exited before inference"
         );
         let address = worker.address;
-        let response = resolve_direct_request(&self.inner.http, address, request, profile).await?;
+        let response = match request {
+            LocalModelRequest::Match(request) => {
+                resolve_direct_request(&self.inner.http, address, request, profile).await?
+            }
+            LocalModelRequest::Semantic(request) => {
+                resolve_semantic_request(&self.inner.http, address, request, profile).await?
+            }
+        };
         let resident_rss_bytes = match slot.worker.as_ref() {
             Some(worker) => worker_rss_bytes(&worker.child).await,
             None => None,
@@ -2033,6 +2124,23 @@ impl AnimeMatchEngine for LocalModelEngine {
     }
 }
 
+#[async_trait]
+impl AnimeSemanticEvidenceEngine for LocalModelEngine {
+    async fn select_hypothesis(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceResponse> {
+        Ok(self.infer_semantic(request).await?.response)
+    }
+
+    async fn select_hypothesis_with_provenance(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceEngineOutput> {
+        self.infer_semantic(request).await
+    }
+}
+
 fn build_chat_request(
     request: &AnimeMatchRequest,
     profile: &LocalModelRuntimeProfile,
@@ -2069,6 +2177,60 @@ fn build_chat_request(
         "chat_template_kwargs": {"enable_thinking": false},
         "grammar": compact_response_grammar(request, response_bounds.maximum_mappings)?
     }))
+}
+
+fn build_semantic_chat_request(
+    request: &AnimeSemanticEvidenceRequest,
+    profile: &LocalModelRuntimeProfile,
+) -> Result<Value> {
+    ensure!(
+        request.schema_version == super::ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+        "unsupported semantic evidence request schema version {}",
+        request.schema_version
+    );
+    ensure!(
+        !request.entities.is_empty() && !request.hypotheses.is_empty(),
+        "semantic evidence request has no selectable interpretation"
+    );
+    let request_json = serde_json::to_string(&json!({
+        "raw": request.raw,
+        "parentRelease": request.parent_release,
+        "entities": request.entities,
+        "hypotheses": request.hypotheses,
+    }))
+    .context("encoding semantic evidence request")?;
+    Ok(json!({
+        "model": profile.model_id,
+        "messages": [
+            {"role": "system", "content": SEMANTIC_EVIDENCE_PROMPT},
+            {"role": "user", "content": request_json}
+        ],
+        "max_tokens": profile.max_output_tokens,
+        "temperature": profile.sampling.temperature,
+        "top_p": profile.sampling.top_p,
+        "top_k": profile.sampling.top_k,
+        "min_p": profile.sampling.min_p,
+        "seed": profile.sampling.seed,
+        "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "grammar": semantic_response_grammar(request)?
+    }))
+}
+
+fn semantic_response_grammar(request: &AnimeSemanticEvidenceRequest) -> Result<String> {
+    ensure!(
+        !request.hypotheses.is_empty(),
+        "cannot build semantic response grammar without hypotheses"
+    );
+    let indexes = request
+        .hypotheses
+        .iter()
+        .map(|hypothesis| format!("\"{}\"", hypothesis.index))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Ok(format!(
+        "root ::= \"{{\\\"schemaVersion\\\":1,\\\"hypothesisIndex\\\":\" choice \"}}\"\nchoice ::= \"null\" | {indexes}\n"
+    ))
 }
 
 fn compact_direct_request(request: &AnimeMatchRequest) -> Result<Value> {
@@ -2601,6 +2763,64 @@ async fn resolve_direct_request(
     request_direct_completion(client, address, &body, request, profile.max_output_tokens).await
 }
 
+async fn resolve_semantic_request(
+    client: &Client,
+    address: SocketAddr,
+    request: &AnimeSemanticEvidenceRequest,
+    profile: &LocalModelRuntimeProfile,
+) -> Result<LocalModelCompletion> {
+    let body = build_semantic_chat_request(request, profile)?;
+    let input_tokens = count_input_tokens(client, address, &body).await?;
+    enforce_context_gate(input_tokens, profile)?;
+    request_semantic_completion(client, address, &body, request).await
+}
+
+async fn request_semantic_completion(
+    client: &Client,
+    address: SocketAddr,
+    body: &Value,
+    request: &AnimeSemanticEvidenceRequest,
+) -> Result<LocalModelCompletion> {
+    let mut operation = MetricOperation::new("semantic_chat_completion");
+    let url = loopback_url(address, "/v1/chat/completions")?;
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .context("calling llama-server semantic evidence endpoint")?;
+    let bytes = bounded_response_bytes(response, "semantic-chat-completion").await?;
+    let mut envelope: ChatCompletionResponse =
+        serde_json::from_slice(&bytes).context("decoding llama-server semantic chat response")?;
+    ensure!(
+        envelope.choices.len() == 1,
+        "llama-server returned {} semantic choices instead of one",
+        envelope.choices.len()
+    );
+    let content = envelope.choices.remove(0).message.content;
+    ensure!(
+        !content.trim().is_empty(),
+        "llama-server returned empty semantic model content"
+    );
+    let response: AnimeSemanticEvidenceResponse = serde_json::from_str(content.trim())
+        .context("decoding grammar-constrained semantic evidence response")?;
+    super::validate_semantic_evidence_response(request, &response)?;
+    operation.succeed();
+    Ok(LocalModelCompletion {
+        response: LocalModelResponse::Semantic(response),
+        prompt_tokens: envelope.usage.as_ref().map(|usage| usage.prompt_tokens),
+        generated_tokens: envelope.usage.as_ref().map(|usage| usage.completion_tokens),
+        prompt_time_ms: envelope
+            .timings
+            .as_ref()
+            .and_then(|timings| finite_positive_millis(timings.prompt_ms)),
+        generation_time_ms: envelope
+            .timings
+            .as_ref()
+            .and_then(|timings| finite_positive_millis(timings.predicted_ms)),
+    })
+}
+
 async fn request_direct_completion(
     client: &Client,
     address: SocketAddr,
@@ -2632,7 +2852,7 @@ async fn request_direct_completion(
     let response = decode_compact_response(content.trim(), request, output_token_cap)?;
     operation.succeed();
     Ok(LocalModelCompletion {
-        response,
+        response: LocalModelResponse::Match(response),
         prompt_tokens: envelope.usage.as_ref().map(|usage| usage.prompt_tokens),
         generated_tokens: envelope.usage.as_ref().map(|usage| usage.completion_tokens),
         prompt_time_ms: envelope
@@ -3515,7 +3735,7 @@ mod tests {
         AnimeMatchAlias, AnimeMatchAliasKind, AnimeMatchAudioPreference, AnimeMatchCandidate,
         AnimeMatchContext, AnimeMatchContextTarget, AnimeMatchFile, AnimeMatchMediaType,
         AnimeMatchParseFacts, AnimeMatchScope, AnimeMatchSeasonContext, AnimeMatchTarget,
-        smoke_requests,
+        AnimeSemanticMediaKind, build_semantic_evidence_request, smoke_requests,
     };
     use sha2::{Digest, Sha256};
 
@@ -3850,7 +4070,7 @@ mod tests {
                 season_number: 1,
                 anilist_id: "22319".to_string(),
                 aliases: vec![AnimeMatchAlias {
-                    value: "Tokyo Ghoul".to_string(),
+                    value: "Tokyo Ghoul Season 1".to_string(),
                     kind: AnimeMatchAliasKind::English,
                     source: Some("anilist_english".to_string()),
                     language: Some("en".to_string()),
@@ -3873,13 +4093,10 @@ mod tests {
                 .expect("direct user JSON"),
         )
         .expect("direct user object");
-        assert_eq!(
-            ANIME_MATCH_PROMPT_REVISION,
-            "anime-match-v14-candidate-checklist"
-        );
+        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v1");
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
-            "anime-match-response-v7-checklist"
+            "anime-semantic-evidence-response-v1"
         );
         assert_eq!(user.pointer("/target/title"), Some(&json!("Tokyo Ghoul")));
         assert_eq!(user.pointer("/target/season"), Some(&json!(2)));
@@ -3945,6 +4162,40 @@ mod tests {
                 "invalid direct mapping was accepted: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn alm9_semantic_prompt_exposes_only_complete_server_owned_hypotheses() {
+        let request = build_semantic_evidence_request(
+            &request(),
+            "candidate-0",
+            "Tokyo Ghoul Root A - 01",
+            None,
+            [],
+            [1],
+            [13],
+            [AnimeSemanticMediaKind::Episode],
+        )
+        .unwrap()
+        .unwrap();
+        let body = build_semantic_chat_request(&request, &profile()).unwrap();
+        let user: Value = serde_json::from_str(
+            body.pointer("/messages/1/content")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(user["raw"], "Tokyo Ghoul Root A - 01");
+        assert_eq!(user["hypotheses"].as_array().map(Vec::len), Some(2));
+        let encoded = serde_json::to_string(&user).unwrap();
+        assert!(!encoded.contains("S02E01"));
+        assert!(!encoded.contains("candidate-0"));
+        assert!(!encoded.contains("27899"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        let grammar = body["grammar"].as_str().unwrap();
+        assert!(grammar.contains("hypothesisIndex"));
+        assert!(grammar.contains("choice ::= \"null\" | \"0\" | \"1\""));
     }
 
     #[test]
@@ -4472,7 +4723,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             record(f"chat-{chat_calls}")
             time.sleep(0.6 if chat_calls == 1 else 0.02)
             json.loads(raw_body)
-            content = '{"d":[2],"m":[[0,[0],[0]]]}'
+            content = '{"d":[2,0,0,0],"m":[[0,[0],[0]]]}'
             payload = json.dumps({
                 "choices": [{"message": {"content": content}}],
                 "usage": {"prompt_tokens": 32, "completion_tokens": 14},
@@ -4742,7 +4993,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if chat_calls == 1:
                 self.reply(
                     200,
-                    b'{"choices":[{"message":{"content":"{\\"d\\":[2],\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
+                    b'{"choices":[{"message":{"content":"{\\"d\\":[2,0,0,0],\\"m\\":[[0,[0],[0]]]}"}}],"usage":{"prompt_tokens":32,"completion_tokens":14},"timings":{"prompt_ms":10.0,"predicted_ms":10.0}}',
                 )
             else:
                 while True:

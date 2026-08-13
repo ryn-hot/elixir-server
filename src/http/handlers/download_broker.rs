@@ -21,9 +21,12 @@ use uuid::Uuid;
 use crate::{
     acquisition::anime_matching::{
         acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
-        assess_acquisition_anime_model_audio_profile, assess_acquisition_anime_provider_file_audio,
-        bind_exact_single_anime_provider_file,
-        model_derived_anime_coverage_plans_with_file_selection_support,
+        assess_acquisition_anime_provider_file_audio, bind_exact_single_anime_provider_file,
+        bind_exact_single_anime_provider_file_with_semantic_evidence,
+    },
+    acquisition::automation::{
+        anime_semantic_candidate_evidence, anime_semantic_media_kinds,
+        mark_anime_semantic_coverage_fallback,
     },
     acquisition::subscriptions::{
         AcquisitionSubscription, AcquisitionTarget, AcquisitionTargetState,
@@ -37,7 +40,8 @@ use crate::{
                 AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCandidateTarget,
                 AnimeCoverageOptions, AnimeFileCoveragePlan, AnimeReleaseFileInput,
                 AnimeScopedAlias, anime_parser_diagnostics, parse_anime_release_title,
-                plan_anime_file_coverage_with_options, score_anime_candidate,
+                plan_anime_file_coverage_with_options,
+                plan_anime_file_coverage_with_semantic_evidence, score_anime_candidate,
             },
             fingerprint::{ReleaseFingerprintInput, build_release_fingerprint},
             hashing::{HashFileJob, queue_anime_hash_file},
@@ -64,9 +68,9 @@ use crate::{
         stream_materializer::cleanup_http_stream_partial_from_plan,
     },
     anime_matching::{
-        ANIME_MATCH_SCHEMA_VERSION, AnimeDeterministicResult, AnimeMatchAssistProvenance,
-        AnimeMatchAssistResult, AnimeMatchAssistSource, AnimeMatchAudioProfile,
-        AnimeMatchFallbackReason, AnimeMatchingService, DeterministicMatchState,
+        ANIME_MATCH_SCHEMA_VERSION, AnimeMatchAssistProvenance, AnimeMatchAssistResult,
+        AnimeMatchAssistSource, AnimeMatchAudioProfile, AnimeMatchFallbackReason,
+        AnimeMatchingService, DeterministicMatchState, build_semantic_evidence_request,
     },
     db::models::MediaType,
     debrid::{
@@ -3277,6 +3281,7 @@ struct QbittorrentAnimeResolvedCoverage {
     plan: AnimeFileCoveragePlan,
     model_audio: Option<QbittorrentAnimeModelAudioEvidence>,
     required_audio_satisfied: bool,
+    audio_hard_mismatch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3625,6 +3630,7 @@ async fn refine_anime_qbittorrent_coverage(
         plan: deterministic_plan,
         model_audio: None,
         required_audio_satisfied: deterministic_required_audio_satisfied,
+        audio_hard_mismatch: deterministic_audio_hard_mismatch,
     };
     let (resolution, anime_match_assist) = if deterministic_state
         == DeterministicMatchState::Definitive
@@ -3643,64 +3649,117 @@ async fn refine_anime_qbittorrent_coverage(
             &context,
             std::slice::from_ref(&acquisition_candidate),
         ) {
-            Ok(input) => {
-                let override_context = context.clone();
-                let override_candidate = acquisition_candidate.clone();
-                let override_subscription = subscription.clone();
-                let override_targets = targets.to_vec();
+            Ok(input) => 'semantic: {
+                let prepared = match AnimeMatchingService::prepare_request(input) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        break 'semantic (
+                            deterministic_resolution,
+                            Some(anime_invalid_request_fallback_provenance(error.to_string())),
+                        );
+                    }
+                };
+                let Some(wire_candidate) = prepared.request().candidates.first() else {
+                    unreachable!("validated anime request contains a candidate")
+                };
+                let facts = wire_candidate.parse_facts.clone();
+                let semantic_request = build_semantic_evidence_request(
+                    prepared.request(),
+                    wire_candidate.candidate_key.clone(),
+                    wire_candidate.title.clone(),
+                    None,
+                    facts.season_numbers.iter().copied(),
+                    facts.episode_numbers.iter().copied(),
+                    facts.absolute_episode_numbers.iter().copied(),
+                    anime_semantic_media_kinds(&wire_candidate.title, &facts),
+                );
+                let semantic_request = match semantic_request {
+                    Ok(Some(request)) => request,
+                    Ok(None) => {
+                        break 'semantic (
+                            deterministic_resolution,
+                            Some(anime_invalid_request_fallback_provenance(
+                                "no bounded semantic hypotheses".to_string(),
+                            )),
+                        );
+                    }
+                    Err(error) => {
+                        break 'semantic (
+                            deterministic_resolution,
+                            Some(anime_invalid_request_fallback_provenance(error.to_string())),
+                        );
+                    }
+                };
                 let outcome = matching_service
-                    .match_or_fallback(
-                        AnimeDeterministicResult::difficult(deterministic_resolution),
-                        input,
-                        move |_, request, matches, source_map| {
-                            let mut coverages =
-                                model_derived_anime_coverage_plans_with_file_selection_support(
-                                request,
-                                &override_context,
-                                std::slice::from_ref(&override_candidate),
-                                true,
-                                matches,
-                                source_map,
-                            )?;
-                            if coverages.len() != 1 || coverages[0].candidate_index != 0 {
-                                bail!(
-                                    "qBittorrent anime refinement requires exactly one mapping for its staged candidate"
-                                );
-                            }
-                            let model = coverages.remove(0);
-                            let (assessment, required_audio_satisfied) =
-                                assess_acquisition_anime_model_audio_profile(
-                                    &override_subscription,
-                                    model.audio_profile,
-                                );
-                            if !required_audio_satisfied {
-                                bail!(
-                                    "qBittorrent anime model mapping did not satisfy the required audio policy"
-                                );
-                            }
-                            if !anime_qbittorrent_plan_is_automatic(
-                                &model.plan,
-                                &override_targets,
-                            ) {
-                                bail!(
-                                    "qBittorrent anime model mapping did not satisfy automatic coverage policy"
-                                );
-                            }
-                            Ok(QbittorrentAnimeResolvedCoverage {
-                                plan: model.plan,
-                                model_audio: Some(QbittorrentAnimeModelAudioEvidence {
-                                    profile: model.audio_profile,
-                                    policy: qbittorrent_anime_audio_policy_evidence(
-                                        &assessment,
-                                        required_audio_satisfied,
-                                    ),
-                                }),
-                                required_audio_satisfied,
-                            })
-                        },
-                    )
+                    .select_semantic_hypothesis(semantic_request.clone())
                     .await;
-                (outcome.value, Some(outcome.provenance))
+                let mut provenance = outcome.provenance;
+                let Some(hypothesis) = outcome.hypothesis.as_ref() else {
+                    break 'semantic (deterministic_resolution, Some(provenance));
+                };
+                let Some(evidence) =
+                    anime_semantic_candidate_evidence(&semantic_request, hypothesis)
+                else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "selected hypothesis has no canonical entity",
+                    );
+                    break 'semantic (deterministic_resolution, Some(provenance));
+                };
+                let semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
+                    &context,
+                    &candidate,
+                    &file_inputs,
+                    AnimeCoverageOptions {
+                        file_selection_supported: true,
+                    },
+                    &evidence,
+                )
+                .map(|plan| {
+                    bind_exact_single_anime_provider_file_with_semantic_evidence(
+                        plan,
+                        &context,
+                        &candidate,
+                        &file_inputs,
+                        &evidence,
+                    )
+                });
+                let Some(semantic_plan) = semantic_plan else {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence did not produce deterministic coverage",
+                    );
+                    break 'semantic (deterministic_resolution, Some(provenance));
+                };
+                let (assessment, required_audio_satisfied) =
+                    assess_acquisition_anime_provider_file_audio(
+                        subscription,
+                        &acquisition_candidate,
+                        &semantic_plan.selected_file_keys,
+                    );
+                let audio_hard_mismatch = !required_audio_satisfied
+                    && assessment.state == LanguagePreferenceAssessmentState::Mismatch;
+                if !anime_qbittorrent_plan_is_automatic(&semantic_plan, targets)
+                    || !required_audio_satisfied
+                {
+                    mark_anime_semantic_coverage_fallback(
+                        &mut provenance,
+                        "semantic evidence failed deterministic coverage or audio policy",
+                    );
+                    let mut fallback = deterministic_resolution;
+                    fallback.audio_hard_mismatch |= audio_hard_mismatch;
+                    (fallback, Some(provenance))
+                } else {
+                    (
+                        QbittorrentAnimeResolvedCoverage {
+                            plan: semantic_plan,
+                            model_audio: None,
+                            required_audio_satisfied,
+                            audio_hard_mismatch,
+                        },
+                        Some(provenance),
+                    )
+                }
             }
             Err(error) => (
                 deterministic_resolution,
@@ -3720,6 +3779,7 @@ async fn refine_anime_qbittorrent_coverage(
         plan,
         model_audio,
         required_audio_satisfied,
+        audio_hard_mismatch,
     } = resolution;
     let anime_model_audio_profile = model_audio.as_ref().map(|evidence| evidence.profile);
     let anime_model_audio_policy = model_audio.as_ref().map(|evidence| evidence.policy.clone());
@@ -3797,7 +3857,7 @@ async fn refine_anime_qbittorrent_coverage(
         anime_model_audio_profile,
         anime_model_audio_policy,
         automatic_retry,
-        suppress_automatic_rediscovery: deterministic_audio_hard_mismatch,
+        suppress_automatic_rediscovery: audio_hard_mismatch,
     })
 }
 
@@ -5503,26 +5563,6 @@ fn anime_invalid_request_fallback_provenance(detail: String) -> AnimeMatchAssist
     }
 }
 
-fn qbittorrent_anime_audio_policy_evidence(
-    assessment: &crate::acquisition::language_policy::LanguagePreferenceAssessment,
-    required_preference_satisfied: bool,
-) -> Value {
-    json!({
-        "state": assessment.state.as_str(),
-        "scoreDelta": assessment.score_delta,
-        "matchingAudio": assessment.matching_audio,
-        "matchingSubtitles": assessment.matching_subtitles,
-        "matchingProfiles": assessment.matching_profiles,
-        "desiredAudio": assessment.desired_audio,
-        "desiredSubtitles": assessment.desired_subtitles,
-        "desiredProfiles": assessment.desired_profiles,
-        "evidenceAudio": assessment.evidence_audio,
-        "evidenceSubtitles": assessment.evidence_subtitles,
-        "evidenceProfiles": assessment.evidence_profiles,
-        "requiredPreferenceSatisfied": required_preference_satisfied,
-    })
-}
-
 fn qbittorrent_anime_release_file_input(
     file: &AcquisitionReleaseFile,
 ) -> Option<AnimeReleaseFileInput> {
@@ -6678,8 +6718,8 @@ mod tests {
             },
         },
         anime_matching::{
-            AnimeCandidateMatch, AnimeMatchAudioProfile, AnimeMatchEngine, AnimeMatchRequest,
-            AnimeMatchResponse,
+            ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION, AnimeSemanticEvidenceEngine,
+            AnimeSemanticEvidenceRequest, AnimeSemanticEvidenceResponse,
         },
         artwork::ArtworkService,
         auth::AuthService,
@@ -6730,7 +6770,7 @@ mod tests {
         }
 
         fn service(self: &Arc<Self>) -> AnimeMatchingService {
-            AnimeMatchingService::with_engine(self.clone())
+            AnimeMatchingService::with_semantic_engine(self.clone())
         }
 
         fn call_count(&self) -> usize {
@@ -6739,11 +6779,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl AnimeMatchEngine for QbittorrentAnimeMatchEngine {
-        async fn match_candidates(
+    impl AnimeSemanticEvidenceEngine for QbittorrentAnimeMatchEngine {
+        async fn select_hypothesis(
             &self,
-            request: AnimeMatchRequest,
-        ) -> anyhow::Result<AnimeMatchResponse> {
+            request: AnimeSemanticEvidenceRequest,
+        ) -> anyhow::Result<AnimeSemanticEvidenceResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
                 QbittorrentAnimeEngineBehavior::Error => {
@@ -6752,59 +6792,26 @@ mod tests {
                 QbittorrentAnimeEngineBehavior::Timeout => {
                     bail!("local model request deadline exceeded")
                 }
-                QbittorrentAnimeEngineBehavior::Empty => Ok(AnimeMatchResponse {
-                    schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                    matches: Vec::new(),
+                QbittorrentAnimeEngineBehavior::Empty => Ok(AnimeSemanticEvidenceResponse {
+                    schema_version: ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                    hypothesis_index: None,
                 }),
                 QbittorrentAnimeEngineBehavior::InvalidFileReference => {
-                    let candidate = request
-                        .candidates
-                        .first()
-                        .context("matcher fixture expected one candidate")?;
-                    let target_key = request
-                        .target
-                        .wanted_target_keys
-                        .first()
-                        .cloned()
-                        .context("matcher fixture expected one wanted target")?;
-                    Ok(AnimeMatchResponse {
-                        schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                        matches: vec![AnimeCandidateMatch {
-                            candidate_key: candidate.candidate_key.clone(),
-                            matched_target_keys: vec![target_key],
-                            audio_profile: AnimeMatchAudioProfile::Unknown,
-                            selected_file_keys: Some(vec![
-                                "candidate-0-file-does-not-exist".to_string(),
-                            ]),
-                        }],
+                    Ok(AnimeSemanticEvidenceResponse {
+                        schema_version: ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                        hypothesis_index: Some(usize::MAX),
                     })
                 }
                 QbittorrentAnimeEngineBehavior::MatchWantedFiles => {
-                    let candidate = request
-                        .candidates
-                        .first()
-                        .context("matcher fixture expected one candidate")?;
-                    let target_keys = request.target.wanted_target_keys.clone();
-                    if target_keys.is_empty() {
-                        bail!("matcher fixture expected at least one wanted target");
-                    }
-                    let selected_file_keys = candidate
-                        .files
+                    let hypothesis_index = request
+                        .hypotheses
                         .iter()
-                        .take(target_keys.len())
-                        .map(|file| file.file_key.clone())
-                        .collect::<Vec<_>>();
-                    if selected_file_keys.len() != target_keys.len() {
-                        bail!("matcher fixture expected one real file per wanted target");
-                    }
-                    Ok(AnimeMatchResponse {
-                        schema_version: ANIME_MATCH_SCHEMA_VERSION,
-                        matches: vec![AnimeCandidateMatch {
-                            candidate_key: candidate.candidate_key.clone(),
-                            matched_target_keys: target_keys,
-                            audio_profile: AnimeMatchAudioProfile::JaAudioEnSubs,
-                            selected_file_keys: Some(selected_file_keys),
-                        }],
+                        .max_by_key(|hypothesis| hypothesis.target_keys.len())
+                        .map(|hypothesis| hypothesis.index)
+                        .context("semantic matcher fixture expected a hypothesis")?;
+                    Ok(AnimeSemanticEvidenceResponse {
+                        schema_version: ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+                        hypothesis_index: Some(hypothesis_index),
                     })
                 }
             }
@@ -9087,19 +9094,16 @@ mod tests {
                 .anime_match_assist
                 .as_ref()
                 .map(|assist| assist.source),
-            Some(AnimeMatchAssistSource::LocalModel)
+            Some(AnimeMatchAssistSource::DeterministicFallback)
         );
         assert!(
             refinement.automatic_retry,
             "the model's non-dub mapping must not satisfy a required English dub"
         );
         assert_eq!(
-            refinement
-                .anime_model_audio_policy
-                .as_ref()
-                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
-                .and_then(Value::as_bool),
-            Some(false)
+            refinement.anime_model_audio_policy.as_ref(),
+            None,
+            "audio policy remains deterministic and is never model-authored"
         );
         Ok(())
     }
@@ -9341,8 +9345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alm7_qbittorrent_anime_model_maps_real_pack_files_and_skips_unselected_media()
-    -> anyhow::Result<()> {
+    async fn alm7_qbittorrent_anime_never_lets_model_map_opaque_pack_files() -> anyhow::Result<()> {
         let database = setup_db().await?;
         let resolved = setup_qbittorrent_resolved(&database).await?;
         let (subscription, targets) = setup_subscription_with_targets(
@@ -9378,12 +9381,12 @@ mod tests {
             MediaType::Anime,
             "Tokyo Ghoul",
             "anime",
-            "[Group] TGRA-X-A [1080p]",
+            "[Group] Tokyo Ghoul Root A S02 Complete [1080p]",
         )
         .await?;
         let rows = vec![
-            json!({ "index": 0, "name": "TGRA-X-A/track-alpha.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
-            json!({ "index": 1, "name": "TGRA-X-A/track-beta.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 0, "name": "Tokyo Ghoul Root A S02E01.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "Tokyo Ghoul Root A S02E02.mkv", "size": 1_500_000_000u64, "priority": 1, "progress": 0.0 }),
             json!({ "index": 2, "name": "TGRA-X-A/other-show-track.mkv", "size": 900_000_000u64, "priority": 1, "progress": 0.0 }),
         ];
         persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
@@ -9402,138 +9405,29 @@ mod tests {
         .await?;
 
         assert_eq!(engine.call_count(), 1);
-        assert_eq!(refinement.confidence, ReleaseConfidence::High);
-        assert!(!refinement.automatic_retry);
-        assert_eq!(
-            refinement.anime_model_audio_profile,
-            Some(AnimeMatchAudioProfile::JaAudioEnSubs)
-        );
-        assert_eq!(
-            refinement
-                .anime_model_audio_policy
-                .as_ref()
-                .and_then(|policy| policy.get("requiredPreferenceSatisfied"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
+        assert_eq!(refinement.confidence, ReleaseConfidence::ReviewRequired);
+        assert!(refinement.automatic_retry);
+        assert_eq!(refinement.anime_model_audio_profile, None);
+        assert_eq!(refinement.anime_model_audio_policy.as_ref(), None);
         assert_eq!(
             refinement
                 .anime_match_assist
                 .as_ref()
                 .map(|assist| assist.source),
-            Some(AnimeMatchAssistSource::LocalModel)
+            Some(AnimeMatchAssistSource::DeterministicFallback)
         );
         assert_eq!(
             refinement
                 .anime_match_assist
                 .as_ref()
                 .map(|assist| assist.result),
-            Some(AnimeMatchAssistResult::Matched)
+            Some(AnimeMatchAssistResult::Fallback)
         );
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
-        assert_eq!(coverage.len(), 2);
-        let coverage_by_target = coverage
-            .iter()
-            .map(|entry| (entry.target_id, entry.release_file_id))
-            .collect::<HashMap<_, _>>();
-        for (target, provider_file_id) in targets.iter().zip(["0", "1"]) {
-            let expected_file_id = files
-                .iter()
-                .find(|file| file.provider_file_id.as_deref() == Some(provider_file_id))
-                .map(|file| file.release_file_id);
-            assert_eq!(
-                coverage_by_target.get(&target.target_id),
-                Some(&expected_file_id)
-            );
-        }
+        assert!(coverage.is_empty());
         let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
-        assert!(decision.is_approved());
-        assert_eq!(decision.selected_file_ids, vec!["0", "1"]);
-        assert_eq!(decision.skipped_file_ids, vec!["2"]);
-        assert!(qbittorrent_priority_bookkeeping_pending(&release));
-        assert!(
-            persist_qbittorrent_priority_decision(
-                &database.pool,
-                &release,
-                &files,
-                &coverage,
-                &refinement,
-                &decision,
-                true,
-            )
-            .await
-            .is_err(),
-            "a staged anime priority decision must wait for acquisition bookkeeping"
-        );
-        let skipped_fields = qbittorrent_file_priority_fields(
-            TEST_HASH,
-            &decision.skipped_file_ids,
-            decision.skipped_priority,
-        );
-        assert_eq!(skipped_fields.get("id").map(String::as_str), Some("2"));
-        assert_eq!(
-            skipped_fields.get("priority").map(String::as_str),
-            Some("0")
-        );
-        let wanted_fields = qbittorrent_file_priority_fields(
-            TEST_HASH,
-            &decision.selected_file_ids,
-            decision.wanted_priority,
-        );
-        assert_eq!(wanted_fields.get("id").map(String::as_str), Some("0|1"));
-        assert_eq!(wanted_fields.get("priority").map(String::as_str), Some("1"));
-        update_qbittorrent_release_state_only(
-            &database.pool,
-            release.release_id,
-            TEST_HASH,
-            AcquisitionReleaseState::Staging,
-            AcquisitionReleaseState::Submitted,
-            "ALM-7 acquisition bookkeeping is durable.",
-            release.coverage_plan.clone().unwrap_or_else(|| json!({})),
-        )
-        .await?;
-        let bookkept_release = get_release(&database.pool, release.release_id)
-            .await?
-            .context("ALM-7 bookkept qBittorrent release")?;
-        persist_qbittorrent_priority_decision(
-            &database.pool,
-            &bookkept_release,
-            &files,
-            &coverage,
-            &refinement,
-            &decision,
-            true,
-        )
-        .await?;
-        let ready = get_release(&database.pool, release.release_id)
-            .await?
-            .context("ALM-7 model-selected qBittorrent release was not persisted")?;
-        assert_eq!(ready.state, AcquisitionReleaseState::Ready);
-        assert_eq!(
-            ready
-                .coverage_plan
-                .as_ref()
-                .and_then(|plan| plan.pointer("/priorityPolicy/priorityApplied"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        let persisted_files = list_release_files(&database.pool, release.release_id).await?;
-        assert_eq!(
-            persisted_files
-                .iter()
-                .filter(|file| file.selected == Some(true))
-                .filter_map(|file| file.provider_file_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["0", "1"]
-        );
-        assert_eq!(
-            persisted_files
-                .iter()
-                .filter(|file| file.selected == Some(false))
-                .filter_map(|file| file.provider_file_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["2"]
-        );
+        assert!(!decision.is_approved());
+        assert!(decision.selected_file_ids.is_empty());
         Ok(())
     }
 
@@ -10030,8 +9924,8 @@ mod tests {
             "a model mapping rejected by required audio policy must report fallback"
         );
         assert!(
-            anime_qbittorrent_retry_suppresses_rediscovery(&required_audio_refinement),
-            "a deterministic hard audio mismatch must move on to another release"
+            !anime_qbittorrent_retry_suppresses_rediscovery(&required_audio_refinement),
+            "opaque filenames provide no deterministic audio mismatch evidence"
         );
         let coverage = list_release_coverage(&database.pool, release.release_id).await?;
         assert_eq!(
@@ -10160,7 +10054,7 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| { plan.pointer("/retrySuppression/suppressAutomaticRediscovery") })
                 .and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             updated_release
