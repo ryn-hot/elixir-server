@@ -32,10 +32,14 @@ use crate::{
             acquisition_anime_deterministic_state, acquisition_candidate_language_evidence,
             acquisition_candidate_parse_facts, acquisition_match_context,
             acquisition_model_audio_profile_evidence, bind_exact_single_anime_provider_file,
+            bind_exact_single_anime_provider_file_with_semantic_evidence,
             model_derived_anime_coverage_plans_with_selection_resolver,
             selectable_anime_media_file,
         },
-        automation::synthetic_stream_candidate_requires_manual_review,
+        automation::{
+            anime_semantic_candidate_evidence, anime_semantic_media_kinds,
+            synthetic_stream_candidate_requires_manual_review,
+        },
         language_policy::{
             AcquisitionLanguagePreference, LanguagePreferenceAssessment,
             LanguagePreferenceAssessmentState, LanguagePreferenceMediaRule, LanguagePreferenceMode,
@@ -46,6 +50,7 @@ use crate::{
                 AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCoverageOptions,
                 AnimeFileCoveragePlan, AnimeReleaseFileInput,
                 plan_anime_file_coverage_with_options,
+                plan_anime_file_coverage_with_semantic_evidence,
             },
             models::ReleaseConfidence,
         },
@@ -59,11 +64,13 @@ use crate::{
         AnimeMatchAudioProfile, AnimeMatchBatchInput, AnimeMatchCandidateInput, AnimeMatchEngine,
         AnimeMatchFallbackReason, AnimeMatchFileInput, AnimeMatchRequest, AnimeMatchResponse,
         AnimeMatchSourceMap, AnimeMatchingService, AnimeRuntimeArtifactManifest,
-        AnimeRuntimeBackend, AnimeRuntimeProbeResult, AnimeRuntimeProfile, DeterministicMatchState,
-        InferenceProbeLimits, LocalModelEngine, LocalModelRuntimeProfile,
-        LocalModelSamplingProfile, PreparedAnimeMatchRequest, collect_inference_hardware_inventory,
-        extract_anime_runtime_for_qualification, inference_hardware_fingerprint,
-        validate_anime_match_request, validate_anime_match_response,
+        AnimeRuntimeBackend, AnimeRuntimeProbeResult, AnimeRuntimeProfile,
+        AnimeSemanticEvidenceEngine, DeterministicMatchState, InferenceProbeLimits,
+        LocalModelEngine, LocalModelRuntimeProfile, LocalModelSamplingProfile,
+        PreparedAnimeMatchRequest, build_semantic_evidence_request,
+        collect_inference_hardware_inventory, extract_anime_runtime_for_qualification,
+        inference_hardware_fingerprint, validate_anime_match_request,
+        validate_anime_match_response, validate_semantic_evidence_response,
     },
     db::models::MediaType,
     http::handlers::acquisition_sources::AcquisitionCandidate,
@@ -104,6 +111,35 @@ pub struct AnimeQualificationRunConfig {
     pub runtime_source_lock_path: PathBuf,
     pub scorer_path: PathBuf,
     pub gpu_preflight_evidence_path: Option<PathBuf>,
+    pub output_path: PathBuf,
+}
+
+/// Physical combined-path corpus run. Unlike the retired qualification
+/// adapter, this asks the model only to select one server-authored semantic
+/// hypothesis and lets the deterministic resolver author the final plan.
+#[derive(Debug, Clone)]
+pub struct AnimeSemanticCorpusRunConfig {
+    pub corpus_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub runtime_profile_path: PathBuf,
+    pub model_path: PathBuf,
+    pub runtime_artifact_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeSemanticCorpusRunSummary {
+    pub status: String,
+    pub corpus_id: String,
+    pub case_count: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub baseline_passed: usize,
+    pub recovered: usize,
+    pub regressed: usize,
+    pub selector_invocations: usize,
+    pub accepted_evidence: usize,
     pub output_path: PathBuf,
 }
 
@@ -463,6 +499,389 @@ pub async fn run_anime_inference_qualification(
         case_count,
         output_path: config.output_path,
     })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimeSemanticCorpusReport {
+    schema_version: u32,
+    status: String,
+    corpus_id: String,
+    model_id: String,
+    model_revision: String,
+    backend: String,
+    profile_fingerprint: String,
+    summary: AnimeSemanticCorpusRunSummary,
+    cases: Vec<AnimeSemanticCorpusCaseObservation>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimeSemanticCorpusCaseObservation {
+    case_id: String,
+    set: String,
+    slice: Option<String>,
+    origin: String,
+    deterministic_definitive: bool,
+    baseline_matches_expected: bool,
+    final_matches_expected: bool,
+    changed: bool,
+    recovered: bool,
+    regressed: bool,
+    selector_invocations: usize,
+    selector_selections: usize,
+    selector_abstentions: usize,
+    selector_errors: usize,
+    accepted_evidence: usize,
+    rejected_evidence: usize,
+    selected_hypotheses: Vec<AnimeSemanticCorpusSelection>,
+    baseline_final_plan: QualificationFinalPlan,
+    final_plan: QualificationFinalPlan,
+    expected_final_plan: QualificationFinalPlan,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimeSemanticCorpusSelection {
+    candidate_key: String,
+    hypothesis_index: usize,
+    accepted: bool,
+}
+
+#[derive(Default)]
+struct SemanticCaseCounters {
+    selector_invocations: usize,
+    selector_selections: usize,
+    selector_abstentions: usize,
+    selector_errors: usize,
+    accepted_evidence: usize,
+    rejected_evidence: usize,
+    selected_hypotheses: Vec<AnimeSemanticCorpusSelection>,
+}
+
+/// Run the frozen corpus through the current combined production architecture:
+/// deterministic fast path, bounded index-or-null semantic evidence, the same
+/// deterministic coverage planner, and unchanged fallback on every failure.
+pub async fn run_anime_semantic_corpus(
+    mut config: AnimeSemanticCorpusRunConfig,
+) -> Result<AnimeSemanticCorpusRunSummary> {
+    config.model_path = canonical_regular_file(&config.model_path, "model")?;
+    let corpus_bytes = read_limited(&config.corpus_path, "qualification corpus")?;
+    let corpus: QualificationCorpus =
+        serde_json::from_value(parse_strict_json(&corpus_bytes, "qualification corpus")?)
+            .context("decoding qualification corpus")?;
+    validate_corpus_shape(&corpus, &corpus_bytes)?;
+
+    let manifest: AnimeInferenceBundleManifest = read_json(&config.manifest_path, "manifest")?;
+    let runtime_profile: AnimeRuntimeProfile =
+        read_json(&config.runtime_profile_path, "runtime profile")?;
+    runtime_profile.validate()?;
+    ensure!(
+        runtime_profile.bundle_version == manifest.bundle_version
+            && runtime_profile.model_id == manifest.model.id
+            && runtime_profile.model_revision == manifest.model.revision
+            && runtime_profile.worker_revision == manifest.worker_revision,
+        "runtime profile does not identify the supplied manifest"
+    );
+    let runtime = manifest
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.artifact_key() == runtime_profile.runtime_artifact_key)
+        .context("runtime profile artifact is absent from the manifest")?;
+    let extraction = tempfile::Builder::new()
+        .prefix("elixir-anime-semantic-corpus-")
+        .tempdir()?;
+    let worker_path = extract_anime_runtime_for_qualification(
+        &config.runtime_artifact_path,
+        &extraction.path().join("runtime"),
+        runtime,
+    )
+    .await?;
+    let local_profile = LocalModelRuntimeProfile {
+        bundle_version: manifest.bundle_version.clone(),
+        model_id: manifest.model.id.clone(),
+        model_revision: manifest.model.revision.clone(),
+        worker_revision: manifest.worker_revision.clone(),
+        backend: runtime_profile.execution_backend.as_str().to_string(),
+        profile_fingerprint: runtime_profile.profile_fingerprint.clone(),
+        protocol_version: manifest.protocol_version,
+        matcher_schema_version: manifest.matcher_schema_version,
+        prompt_revision: ANIME_MATCH_PROMPT_REVISION.to_string(),
+        worker_path,
+        model_path: config.model_path.clone(),
+        context_tokens: manifest.model.context_tokens,
+        max_output_tokens: manifest.model.max_output_tokens,
+        threads: u32::from(runtime_profile.cpu_thread_count),
+        batch_threads: u32::from(runtime_profile.batch_thread_count),
+        gpu_layers: runtime_profile.gpu_layer_count,
+        kv_cache_type: match runtime_profile.kv_cache_type {
+            AnimeKvCacheType::F16 => "f16",
+            AnimeKvCacheType::Q8_0 => "q8_0",
+        }
+        .to_string(),
+        peak_rss_bytes: runtime_profile.peak_rss_bytes,
+        idle_unload_seconds: manifest.runtime_policy.idle_unload_seconds,
+        sampling: LocalModelSamplingProfile::default(),
+    };
+    local_profile.validate_contract()?;
+
+    let engine = LocalModelEngine::allow_all_for_probe()?;
+    engine.activate_profile_for_probe(local_profile).await?;
+    engine
+        .prime()
+        .await
+        .context("priming semantic corpus worker")?;
+    let result = run_semantic_corpus_cases(&corpus, &engine).await;
+    engine.shutdown().await;
+    drop(extraction);
+    let cases = result?;
+
+    let passed = cases
+        .iter()
+        .filter(|case| case.final_matches_expected)
+        .count();
+    let baseline_passed = cases
+        .iter()
+        .filter(|case| case.baseline_matches_expected)
+        .count();
+    let recovered = cases.iter().filter(|case| case.recovered).count();
+    let regressed = cases.iter().filter(|case| case.regressed).count();
+    let selector_invocations = cases.iter().map(|case| case.selector_invocations).sum();
+    let accepted_evidence = cases.iter().map(|case| case.accepted_evidence).sum();
+    let output_path = config.output_path.clone();
+    let summary = AnimeSemanticCorpusRunSummary {
+        status: if passed == cases.len() {
+            "passed".to_string()
+        } else {
+            "failed".to_string()
+        },
+        corpus_id: corpus.corpus_id.clone(),
+        case_count: cases.len(),
+        passed,
+        failed: cases.len() - passed,
+        baseline_passed,
+        recovered,
+        regressed,
+        selector_invocations,
+        accepted_evidence,
+        output_path,
+    };
+    let report = AnimeSemanticCorpusReport {
+        schema_version: 1,
+        status: summary.status.clone(),
+        corpus_id: corpus.corpus_id,
+        model_id: manifest.model.id,
+        model_revision: manifest.model.revision,
+        backend: runtime_profile.execution_backend.as_str().to_string(),
+        profile_fingerprint: runtime_profile.profile_fingerprint,
+        summary: summary.clone(),
+        cases,
+    };
+    write_new_canonical_json(&config.output_path, &report)?;
+    Ok(summary)
+}
+
+async fn run_semantic_corpus_cases(
+    corpus: &QualificationCorpus,
+    engine: &dyn AnimeSemanticEvidenceEngine,
+) -> Result<Vec<AnimeSemanticCorpusCaseObservation>> {
+    let mut observations = Vec::with_capacity(corpus.cases.len());
+    for (index, case) in corpus.cases.iter().enumerate() {
+        let started = Instant::now();
+        let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
+            .with_context(|| format!("decoding input for semantic case {}", case.case_id))?;
+        validate_case_input(case, &input)?;
+        let baseline_resolution = deterministic_baseline(&input)?;
+        let baseline = final_plan_for_resolution(&input.request, &baseline_resolution)?;
+        let deterministic_definitive =
+            deterministic_union_state(&input.request, &baseline_resolution)
+                == DeterministicMatchState::Definitive;
+        let mut combined = baseline_resolution;
+        let mut counters = SemanticCaseCounters::default();
+
+        if !deterministic_definitive {
+            for (candidate_index, candidate) in input.acquisition_candidates.iter().enumerate() {
+                if combined.candidate_plans[candidate_index].is_some() {
+                    continue;
+                }
+                let request_candidate = input
+                    .request
+                    .candidates
+                    .get(candidate_index)
+                    .ok_or_else(|| anyhow!("semantic corpus candidate cardinality mismatch"))?;
+                let candidate_input = anime_candidate_input(candidate);
+                let files = qualification_release_files(request_candidate, candidate)?;
+                let deterministic_plan = bind_exact_single_anime_provider_file(
+                    plan_anime_file_coverage_with_options(
+                        &input.scoring_context,
+                        &candidate_input,
+                        &files,
+                        AnimeCoverageOptions {
+                            file_selection_supported: *input
+                                .route_context
+                                .file_selection_supported_by_candidate_key
+                                .get(&request_candidate.candidate_key)
+                                .context("route context lacks candidate file-selection key")?,
+                        },
+                    ),
+                    &input.scoring_context,
+                    &candidate_input,
+                    &files,
+                );
+                if acquisition_anime_deterministic_state(&deterministic_plan)
+                    == DeterministicMatchState::Definitive
+                    && plan_definitively_excludes_wanted_targets(
+                        &input.request,
+                        &deterministic_plan,
+                    )
+                {
+                    continue;
+                }
+
+                let facts = &request_candidate.parse_facts;
+                let semantic_request = build_semantic_evidence_request(
+                    &input.request,
+                    request_candidate.candidate_key.clone(),
+                    request_candidate.title.clone(),
+                    None,
+                    facts.season_numbers.iter().copied(),
+                    facts.episode_numbers.iter().copied(),
+                    facts.absolute_episode_numbers.iter().copied(),
+                    anime_semantic_media_kinds(&request_candidate.title, facts),
+                )?;
+                let Some(semantic_request) = semantic_request else {
+                    continue;
+                };
+                counters.selector_invocations += 1;
+                let output = match engine
+                    .select_hypothesis_with_provenance(semantic_request.clone())
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(_) => {
+                        counters.selector_errors += 1;
+                        continue;
+                    }
+                };
+                let hypothesis = match validate_semantic_evidence_response(
+                    &semantic_request,
+                    &output.response,
+                ) {
+                    Ok(Some(hypothesis)) => hypothesis,
+                    Ok(None) => {
+                        counters.selector_abstentions += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        counters.selector_errors += 1;
+                        continue;
+                    }
+                };
+                counters.selector_selections += 1;
+                let Some(evidence) =
+                    anime_semantic_candidate_evidence(&semantic_request, hypothesis)
+                else {
+                    counters.rejected_evidence += 1;
+                    continue;
+                };
+                let semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
+                    &input.scoring_context,
+                    &candidate_input,
+                    &files,
+                    AnimeCoverageOptions {
+                        file_selection_supported: *input
+                            .route_context
+                            .file_selection_supported_by_candidate_key
+                            .get(&request_candidate.candidate_key)
+                            .context("route context lacks candidate file-selection key")?,
+                    },
+                    &evidence,
+                )
+                .map(|plan| {
+                    bind_exact_single_anime_provider_file_with_semantic_evidence(
+                        plan,
+                        &input.scoring_context,
+                        &candidate_input,
+                        &files,
+                        &evidence,
+                    )
+                });
+                let preference = language_preference(&input.request.target.audio_preference);
+                let assessment = assess_language_preference(
+                    &preference,
+                    MediaType::Anime,
+                    &acquisition_candidate_language_evidence(candidate),
+                );
+                let accepted = semantic_plan.as_ref().is_some_and(|plan| {
+                    acquisition_anime_deterministic_state(plan)
+                        == DeterministicMatchState::Definitive
+                        && plan_covers_only_wanted_targets(&input.request, plan)
+                        && required_language_satisfied(&preference, &assessment)
+                        && !synthetic_stream_candidate_requires_manual_review(candidate)
+                });
+                counters
+                    .selected_hypotheses
+                    .push(AnimeSemanticCorpusSelection {
+                        candidate_key: request_candidate.candidate_key.clone(),
+                        hypothesis_index: hypothesis.index,
+                        accepted,
+                    });
+                if accepted {
+                    let plan = semantic_plan.expect("accepted semantic plan");
+                    combined.candidate_plans[candidate_index] = Some(candidate_plan_for_coverage(
+                        &request_candidate.candidate_key,
+                        &plan,
+                        &assessment,
+                    ));
+                    counters.accepted_evidence += 1;
+                } else {
+                    counters.rejected_evidence += 1;
+                }
+            }
+        }
+
+        let final_plan = final_plan_for_resolution(&input.request, &combined)?;
+        let baseline_matches_expected = baseline == case.expected_final_plan;
+        let final_matches_expected = final_plan == case.expected_final_plan;
+        let changed = final_plan != baseline;
+        let recovered = !baseline_matches_expected && final_matches_expected;
+        let regressed = baseline_matches_expected && !final_matches_expected;
+        observations.push(AnimeSemanticCorpusCaseObservation {
+            case_id: case.case_id.clone(),
+            set: case.set.clone(),
+            slice: case.slice.clone(),
+            origin: case.origin.clone(),
+            deterministic_definitive,
+            baseline_matches_expected,
+            final_matches_expected,
+            changed,
+            recovered,
+            regressed,
+            selector_invocations: counters.selector_invocations,
+            selector_selections: counters.selector_selections,
+            selector_abstentions: counters.selector_abstentions,
+            selector_errors: counters.selector_errors,
+            accepted_evidence: counters.accepted_evidence,
+            rejected_evidence: counters.rejected_evidence,
+            selected_hypotheses: counters.selected_hypotheses,
+            baseline_final_plan: baseline,
+            final_plan,
+            expected_final_plan: case.expected_final_plan.clone(),
+        });
+        eprintln!(
+            "ALM9_SEMANTIC_CORPUS_CASE index={} total={} id={} final={} elapsedMs={}",
+            index + 1,
+            corpus.cases.len(),
+            case.case_id,
+            if final_matches_expected {
+                "pass"
+            } else {
+                "fail"
+            },
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        );
+    }
+    Ok(observations)
 }
 
 async fn run_cases(
