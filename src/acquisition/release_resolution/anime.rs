@@ -2084,14 +2084,11 @@ fn semantic_scoring_inputs(
         }
     }
 
-    // A numbered hypothesis may recover a missing interpretation, but it may
+    // A semantic hypothesis may recover a missing interpretation, but it may
     // not replace a different, clearly serialized episode in the release. The
-    // selected target owns both its seasonal and absolute coordinates, so
-    // either is sufficient. Explicit provider-season translations remain
-    // eligible because their episode offsets are graph semantics rather than a
-    // same-season contradiction.
-    if evidence.numbering != AnimeSemanticNumberingEvidence::EntityOnly
-        && authorized_release_season.is_none()
+    // selected entity and target own both seasonal and absolute coordinates,
+    // so either is sufficient. A provider-season translation can change the
+    // season label; it does not waive the raw episode coordinate.
     {
         let observed = semantic_explicit_release_episode_numbers(&parsed.original_title);
         let mut allowed = evidence
@@ -2108,6 +2105,24 @@ fn semantic_scoring_inputs(
         {
             allowed.extend(target.episode_number.filter(|number| *number > 0));
             allowed.extend(target.absolute_episode_number.filter(|number| *number > 0));
+        }
+        // Entity-only evidence deliberately leaves target keys empty so the
+        // deterministic parser owns numbering. It still may not turn a clear
+        // raw episode into a different episode merely because only one target
+        // from the selected entity is present in the scoped context.
+        if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly {
+            for target in context.targets.iter().filter(|target| {
+                evidence.anilist_season_id.as_deref().is_some_and(|id| {
+                    target
+                        .anilist_season_id
+                        .as_deref()
+                        .is_some_and(|target_id| target_id.eq_ignore_ascii_case(id))
+                }) || (evidence.anilist_season_id.is_none()
+                    && target.season_number == Some(evidence.season_number))
+            }) {
+                allowed.extend(target.episode_number.filter(|number| *number > 0));
+                allowed.extend(target.absolute_episode_number.filter(|number| *number > 0));
+            }
         }
         if !observed.is_empty() && !allowed.is_empty() && observed.is_disjoint(&allowed) {
             return None;
@@ -2253,24 +2268,27 @@ fn semantic_identity_supported_by_release(
     parsed: &AnimeParsedRelease,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
-    let mut entries = BTreeMap::new();
-    for alias in &evidence.aliases {
-        insert_alias_entry(
-            &mut entries,
-            alias,
-            "semantic_identity_validation",
-            60,
-            Some(evidence.season_number),
-            evidence.anilist_season_id.clone(),
-        );
-    }
-    !match_anime_aliases(
-        &AnimeAliasTable {
-            entries: entries.into_values().collect(),
-        },
-        parsed,
-    )
-    .is_empty()
+    let aliases = evidence
+        .aliases
+        .iter()
+        .map(|alias| normalize_anime_alias(alias))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
+    let parsed_titles = parsed
+        .series_title
+        .iter()
+        .chain(&parsed.alt_titles)
+        .chain(&parsed.anime_signal_facts.title_season_alias_candidates)
+        .map(|title| normalize_anime_alias(title))
+        .filter(|title| !title.is_empty())
+        .collect::<BTreeSet<_>>();
+
+    // The model chooses among server-owned entities; it does not get to turn
+    // the franchise root into proof for a distinct sequel, OVA, or movie. A
+    // normalized parser title must equal one of the selected entity's aliases.
+    // This retains punctuation/script normalization while rejecting matches
+    // that explain only a prefix such as "Tokyo Ghoul" in "Tokyo Ghoul Pinto".
+    !aliases.is_disjoint(&parsed_titles)
 }
 
 fn semantic_explicit_release_episode_numbers(input: &str) -> BTreeSet<i32> {
@@ -2631,10 +2649,16 @@ fn plan_anime_file_coverage_internal(
         }
         let mut requires_file_selection = false;
         if !files.is_empty() && !entries.is_empty() {
-            if let Some(selection_required) =
-                bind_non_pack_file_coverage(context, candidate, files, options, &mut entries)
-            {
-                requires_file_selection = selection_required;
+            match bind_non_pack_file_coverage(context, candidate, files, options, &mut entries) {
+                Some(selection_required) => requires_file_selection = selection_required,
+                None => {
+                    // A release may be semantically identified while its
+                    // provider files remain ambiguous. Never treat that as a
+                    // definitive automatic plan: file ownership is still a
+                    // deterministic responsibility, especially when a batch
+                    // was mislabeled as a single release upstream.
+                    review_reasons.push("file_list_does_not_cover_expected_targets".to_string());
+                }
             }
         }
         let confidence = if review_reasons.is_empty() && !entries.is_empty() {
@@ -7704,6 +7728,27 @@ mod tests {
     }
 
     #[test]
+    fn alm9_semantic_franchise_root_does_not_explain_a_distinct_ova() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul - Pinto OVA [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            anilist_season_id: Some("1001".to_string()),
+            aliases: vec!["Tokyo Ghoul".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
+        );
+    }
+
+    #[test]
     fn alm9_semantic_numbering_cannot_replace_a_different_raw_episode() {
         let context = tokyo_ghoul_scoped_context();
         let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 10 [1080p]");
@@ -7717,6 +7762,27 @@ mod tests {
             episode_numbers: vec![1],
             absolute_episode_numbers: Vec::new(),
             target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_entity_only_cannot_replace_a_different_raw_episode() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 02 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
         };
 
         assert!(
@@ -7989,7 +8055,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_non_pack_duplicate_file_matches_do_not_invent_file_ownership() {
+    fn alm9_non_pack_duplicate_file_matches_require_review() {
         let context = rr3e_scoring_context();
         let candidate = rr3e_candidate("[SubsPlease] Example Title - 01 [1080p]");
         let files = vec![
@@ -8013,10 +8079,14 @@ mod tests {
 
         let plan = plan_anime_file_coverage(&context, &candidate, &files);
 
-        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(plan.confidence, ReleaseConfidence::ReviewRequired);
         assert!(plan.selected_file_keys.is_empty());
         assert!(plan.entries[0].release_file_key.is_none());
-        assert!(plan.review_reasons.is_empty());
+        assert!(
+            plan.review_reasons
+                .iter()
+                .any(|reason| reason == "file_list_does_not_cover_expected_targets")
+        );
     }
 
     #[test]
