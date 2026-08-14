@@ -2042,6 +2042,13 @@ fn semantic_scoring_inputs(
     }
 
     let mut parsed = parse_anime_release_title(&candidate.title);
+    // Semantic identity is useful only when the untouched release text supports
+    // at least one alias owned by the selected canonical entity. Validate that
+    // relationship before adding semantic aliases to the parsed release;
+    // otherwise the injected alias would manufacture its own exact match.
+    if !semantic_identity_supported_by_release(&parsed, evidence) {
+        return None;
+    }
     let explicit_coordinate =
         parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title));
     let mut authorized_release_season = None;
@@ -2074,6 +2081,36 @@ fn semantic_scoring_inputs(
             }
             AnimeSemanticNumberingEvidence::Absolute
             | AnimeSemanticNumberingEvidence::EntityOnly => {}
+        }
+    }
+
+    // A numbered hypothesis may recover a missing interpretation, but it may
+    // not replace a different, clearly serialized episode in the release. The
+    // selected target owns both its seasonal and absolute coordinates, so
+    // either is sufficient. Explicit provider-season translations remain
+    // eligible because their episode offsets are graph semantics rather than a
+    // same-season contradiction.
+    if evidence.numbering != AnimeSemanticNumberingEvidence::EntityOnly
+        && authorized_release_season.is_none()
+    {
+        let observed = semantic_explicit_release_episode_numbers(&parsed.original_title);
+        let mut allowed = evidence
+            .episode_numbers
+            .iter()
+            .chain(&evidence.absolute_episode_numbers)
+            .copied()
+            .filter(|number| *number > 0)
+            .collect::<BTreeSet<_>>();
+        for target in context
+            .targets
+            .iter()
+            .filter(|target| selected_keys.contains(target.target_key.as_str()))
+        {
+            allowed.extend(target.episode_number.filter(|number| *number > 0));
+            allowed.extend(target.absolute_episode_number.filter(|number| *number > 0));
+        }
+        if !observed.is_empty() && !allowed.is_empty() && observed.is_disjoint(&allowed) {
+            return None;
         }
     }
 
@@ -2210,6 +2247,48 @@ fn semantic_scoring_inputs(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Some((scoped_context, parsed, alias_matches))
+}
+
+fn semantic_identity_supported_by_release(
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let mut entries = BTreeMap::new();
+    for alias in &evidence.aliases {
+        insert_alias_entry(
+            &mut entries,
+            alias,
+            "semantic_identity_validation",
+            60,
+            Some(evidence.season_number),
+            evidence.anilist_season_id.clone(),
+        );
+    }
+    !match_anime_aliases(
+        &AnimeAliasTable {
+            entries: entries.into_values().collect(),
+        },
+        parsed,
+    )
+    .is_empty()
+}
+
+fn semantic_explicit_release_episode_numbers(input: &str) -> BTreeSet<i32> {
+    let normalized = normalize_fullwidth_digits(input);
+    let mut numbers = if let Some((_, start, end)) = parse_sxxeyy_numbers(&normalized) {
+        expand_episode_numbers(start, end.unwrap_or(start), 200)
+    } else if let Some((_, episode)) = parse_season_dash_episode(&normalized) {
+        vec![episode]
+    } else {
+        let bracket_segments = extract_bracket_segments(&normalized);
+        parse_absolute_episode_numbers(&normalized, &bracket_segments)
+    };
+    // A bare four-digit production year is not affirmative episode evidence.
+    // Explicit SxxEyy values were returned above and are never discarded here.
+    if parse_sxxeyy_numbers(&normalized).is_none() {
+        numbers.retain(|number| !(1900..=2099).contains(number));
+    }
+    numbers.into_iter().filter(|number| *number > 0).collect()
 }
 
 fn positive_sorted_numbers(numbers: &[i32]) -> Vec<i32> {
@@ -4065,7 +4144,9 @@ pub(crate) fn anime_release_kind_for_coverage(parsed: &AnimeParsedRelease) -> Re
         (
             ReleaseKind::SeasonPack | ReleaseKind::MultiSeasonPack | ReleaseKind::SeriesPack,
             ReleaseKind::Single | ReleaseKind::MultiEpisode | ReleaseKind::Unknown,
-        ) => sonarr_kind,
+        ) if parsed.episode_numbers.is_empty() && parsed.absolute_episode_numbers.is_empty() => {
+            sonarr_kind
+        }
         (ReleaseKind::MultiEpisode, ReleaseKind::Single | ReleaseKind::Unknown) => sonarr_kind,
         (kind, ReleaseKind::Unknown) if kind != ReleaseKind::Unknown => kind,
         (_, kind) => kind,
@@ -7599,6 +7680,61 @@ mod tests {
         assert!(semantic_plan_is_definitive(&plan));
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].target_key, "S02E01");
+    }
+
+    #[test]
+    fn alm9_semantic_evidence_cannot_create_its_own_raw_identity_match() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Josee to Tora to Sakana-tachi - 01");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_numbering_cannot_replace_a_different_raw_episode() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 10 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_named_second_season_episode_is_not_promoted_to_a_pack() {
+        let parsed = parse_anime_release_title(
+            "[AU] Tokyo Ghoul Re 2nd Season - 04 [BS11 720p x264 AAC].mkv",
+        );
+
+        assert_eq!(parsed.absolute_episode_numbers, vec![4]);
+        assert_eq!(
+            anime_release_kind_for_coverage(&parsed),
+            ReleaseKind::Single
+        );
     }
 
     #[test]
