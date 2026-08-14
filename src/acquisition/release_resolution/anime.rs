@@ -1913,8 +1913,53 @@ pub fn score_anime_candidate_with_semantic_evidence(
     candidate: &AnimeCandidateInput,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> Option<AnimeCandidateScore> {
+    score_anime_candidate_with_semantic_evidence_mode(
+        context,
+        candidate,
+        evidence,
+        SemanticScoringMode::Strict,
+    )
+}
+
+/// Recreate the semantic score only after the coverage planner has proven the
+/// selected target through real provider files. This is the narrow bridge for
+/// parent torrent names that identify an anime entity but serialize their
+/// episode coordinates only in the contained filenames.
+pub fn score_anime_candidate_with_verified_semantic_plan(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+    plan: &AnimeFileCoveragePlan,
+) -> Option<AnimeCandidateScore> {
+    if let Some(score) = score_anime_candidate_with_semantic_evidence(context, candidate, evidence)
+    {
+        return Some(score);
+    }
+    if !semantic_bridge_plan_is_file_corroborated(plan, evidence) {
+        return None;
+    }
+    score_anime_candidate_with_semantic_evidence_mode(
+        context,
+        candidate,
+        evidence,
+        SemanticScoringMode::CoverageWithFiles,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticScoringMode {
+    Strict,
+    CoverageWithFiles,
+}
+
+fn score_anime_candidate_with_semantic_evidence_mode(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+    mode: SemanticScoringMode,
+) -> Option<AnimeCandidateScore> {
     let (scoped_context, parsed, alias_matches) =
-        semantic_scoring_inputs(context, candidate, evidence)?;
+        semantic_scoring_inputs(context, candidate, evidence, mode)?;
     Some(score_anime_candidate_from_parsed(
         &scoped_context,
         candidate,
@@ -2013,6 +2058,7 @@ fn semantic_scoring_inputs(
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
     evidence: &AnimeSemanticCandidateEvidence,
+    mode: SemanticScoringMode,
 ) -> Option<(
     AnimeCandidateScoringContext,
     AnimeParsedRelease,
@@ -2046,7 +2092,10 @@ fn semantic_scoring_inputs(
     // at least one alias owned by the selected canonical entity. Validate that
     // relationship before adding semantic aliases to the parsed release;
     // otherwise the injected alias would manufacture its own exact match.
-    if !semantic_identity_supported_by_release(context, &parsed, evidence) {
+    if !semantic_identity_supported_by_release(context, &parsed, evidence)
+        && !(mode == SemanticScoringMode::CoverageWithFiles
+            && semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence))
+    {
         return None;
     }
     let explicit_coordinate =
@@ -2143,7 +2192,8 @@ fn semantic_scoring_inputs(
             selected_keys.contains(target.target_key.as_str())
                 && (target.episode_number.is_some() || target.absolute_episode_number.is_some())
         });
-        if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
+        if mode == SemanticScoringMode::Strict
+            && evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
             && matches!(
                 evidence.media_kind,
                 AnimeSemanticMediaKindEvidence::Episode | AnimeSemanticMediaKindEvidence::Range
@@ -2337,25 +2387,7 @@ fn semantic_identity_supported_by_release(
         return false;
     }
 
-    let mut parsed_titles = parsed
-        .series_title
-        .iter()
-        .chain(&parsed.alt_titles)
-        .chain(&parsed.anime_signal_facts.title_season_alias_candidates)
-        .map(|title| title.as_str().to_string())
-        .filter(|title| !title.trim().is_empty())
-        .collect::<BTreeSet<_>>();
-    // Alternate releases commonly join equivalent English and romaji names
-    // with a slash or pipe. Treat each side as raw release evidence; do not add
-    // aliases supplied by the semantic hypothesis itself.
-    let alternate_segments = parsed_titles
-        .iter()
-        .flat_map(|title| title.split(['/', '|']))
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    parsed_titles.extend(alternate_segments);
+    let parsed_titles = semantic_parsed_title_candidates(parsed);
 
     let selected_score = parsed_titles
         .iter()
@@ -2384,6 +2416,143 @@ fn semantic_identity_supported_by_release(
     competing_score.is_none_or(|competing| {
         (selected_score >= 98 && competing < 98) || selected_score >= competing + 8
     })
+}
+
+/// Permit an adjacent-entity alias tie only when the raw release coordinate
+/// identifies exactly the selected server-owned target. Similarity thresholds
+/// are not lowered: the coordinate resolves ambiguity; it never supplies title
+/// identity by itself.
+fn semantic_identity_corroborated_by_unique_coordinate(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    if evidence.target_keys.is_empty()
+        || evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
+        || matches!(
+            evidence.media_kind,
+            AnimeSemanticMediaKindEvidence::SeasonPack
+                | AnimeSemanticMediaKindEvidence::SeriesPack
+                | AnimeSemanticMediaKindEvidence::Movie
+        )
+    {
+        return false;
+    }
+
+    let selected_keys = evidence
+        .target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected_keys.len() != evidence.target_keys.len() {
+        return false;
+    }
+    let coordinate_keys = match evidence.numbering {
+        AnimeSemanticNumberingEvidence::Seasonal => {
+            let Some(season) = explicit_structured_season(parsed) else {
+                return false;
+            };
+            let observed = parsed
+                .episode_numbers
+                .iter()
+                .copied()
+                .filter(|number| *number > 0)
+                .collect::<BTreeSet<_>>();
+            if observed.is_empty() {
+                return false;
+            }
+            context
+                .targets
+                .iter()
+                .filter(|target| {
+                    target.season_number == Some(season)
+                        && target
+                            .episode_number
+                            .is_some_and(|episode| observed.contains(&episode))
+                })
+                .map(|target| target.target_key.as_str())
+                .collect::<BTreeSet<_>>()
+        }
+        AnimeSemanticNumberingEvidence::Absolute => {
+            let observed = parsed
+                .absolute_episode_numbers
+                .iter()
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number))
+                .collect::<BTreeSet<_>>();
+            if observed.is_empty() {
+                return false;
+            }
+            context
+                .targets
+                .iter()
+                .filter(|target| {
+                    target
+                        .absolute_episode_number
+                        .is_some_and(|episode| observed.contains(&episode))
+                })
+                .map(|target| target.target_key.as_str())
+                .collect::<BTreeSet<_>>()
+        }
+        AnimeSemanticNumberingEvidence::EntityOnly => return false,
+    };
+    if coordinate_keys != selected_keys {
+        return false;
+    }
+
+    let parsed_titles = semantic_parsed_title_candidates(parsed);
+    let franchise_supported = parsed_titles.iter().any(|title| {
+        context.aliases.iter().any(|alias| {
+            semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
+        })
+    });
+    if !franchise_supported {
+        return false;
+    }
+
+    let generic_aliases = context
+        .aliases
+        .iter()
+        .map(|alias| normalize_anime_alias(alias))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
+    let selected_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str).filter(|alias| {
+            let normalized = normalize_anime_alias(alias);
+            !normalized.is_empty() && !generic_aliases.contains(&normalized)
+        }));
+    parsed_titles.iter().any(|title| {
+        selected_aliases.clone().any(|alias| {
+            semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
+        })
+    })
+}
+
+fn semantic_parsed_title_candidates(parsed: &AnimeParsedRelease) -> BTreeSet<String> {
+    let mut parsed_titles = parsed
+        .series_title
+        .iter()
+        .chain(&parsed.alt_titles)
+        .chain(&parsed.anime_signal_facts.title_season_alias_candidates)
+        .map(|title| title.as_str().to_string())
+        .filter(|title| !title.trim().is_empty())
+        .collect::<BTreeSet<_>>();
+    // Alternate releases commonly join equivalent English and romaji names
+    // with a slash or pipe. Treat each side as raw release evidence; do not add
+    // aliases supplied by the semantic hypothesis itself.
+    let alternate_segments = parsed_titles
+        .iter()
+        .flat_map(|title| title.split(['/', '|']))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    parsed_titles.extend(alternate_segments);
+    parsed_titles
 }
 
 fn semantic_alias_scope_is_selected(
@@ -2701,9 +2870,9 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     options: AnimeCoverageOptions,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> Option<AnimeFileCoveragePlan> {
-    let full =
-        plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence))
-            .map(|plan| enforce_semantic_target_coverage(plan, evidence));
+    let full = plan_anime_semantic_evidence_attempt(
+        context, candidate, files, options, evidence, evidence,
+    );
     if full.as_ref().is_some_and(semantic_plan_is_definitive) {
         return full;
     }
@@ -2718,14 +2887,14 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
 
     let mut without_target_binding = evidence.clone();
     without_target_binding.target_keys.clear();
-    let without_target_binding = plan_anime_file_coverage_internal(
+    let without_target_binding = plan_anime_semantic_evidence_attempt(
         context,
         candidate,
         files,
         options,
-        Some(&without_target_binding),
-    )
-    .map(|plan| enforce_semantic_target_coverage(plan, evidence));
+        &without_target_binding,
+        evidence,
+    );
     if without_target_binding
         .as_ref()
         .is_some_and(semantic_plan_is_definitive)
@@ -2737,9 +2906,14 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     identity_only.numbering = AnimeSemanticNumberingEvidence::EntityOnly;
     identity_only.episode_numbers.clear();
     identity_only.absolute_episode_numbers.clear();
-    let identity_only =
-        plan_anime_file_coverage_internal(context, candidate, files, options, Some(&identity_only))
-            .map(|plan| enforce_semantic_target_coverage(plan, &identity_only));
+    let identity_only = plan_anime_semantic_evidence_attempt(
+        context,
+        candidate,
+        files,
+        options,
+        &identity_only,
+        &identity_only,
+    );
     if identity_only
         .as_ref()
         .is_some_and(semantic_plan_is_definitive)
@@ -2748,6 +2922,217 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     }
 
     full.or(without_target_binding).or(identity_only)
+}
+
+fn plan_anime_semantic_evidence_attempt(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    options: AnimeCoverageOptions,
+    scoring_evidence: &AnimeSemanticCandidateEvidence,
+    required_evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeFileCoveragePlan> {
+    let uses_bridge =
+        score_anime_candidate_with_semantic_evidence(context, candidate, scoring_evidence)
+            .is_none();
+    let plan = plan_anime_file_coverage_internal(
+        context,
+        candidate,
+        files,
+        options,
+        Some(scoring_evidence),
+    )
+    .filter(semantic_plan_is_definitive)
+    .or_else(|| {
+        plan_entity_only_with_file_corroboration(
+            context,
+            candidate,
+            files,
+            options,
+            scoring_evidence,
+        )
+    })?;
+    let plan = enforce_semantic_target_coverage(plan, required_evidence);
+    Some(if uses_bridge {
+        enforce_semantic_bridge_file_corroboration(
+            plan,
+            context,
+            candidate,
+            files,
+            scoring_evidence,
+            required_evidence,
+        )
+    } else {
+        plan
+    })
+}
+
+fn plan_entity_only_with_file_corroboration(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    options: AnimeCoverageOptions,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeFileCoveragePlan> {
+    let parsed = parse_anime_release_title(&candidate.title);
+    if evidence.numbering != AnimeSemanticNumberingEvidence::EntityOnly
+        || evidence.target_keys.is_empty()
+        || !semantic_identity_supported_by_release(context, &parsed, evidence)
+    {
+        return None;
+    }
+    let observed_parent_numbers = semantic_explicit_release_episode_numbers(&parsed.original_title)
+        .into_iter()
+        .chain(
+            parsed
+                .episode_numbers
+                .iter()
+                .chain(&parsed.absolute_episode_numbers)
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number)),
+        )
+        .collect::<BTreeSet<_>>();
+    if !observed_parent_numbers.is_empty() {
+        return None;
+    }
+    if parsed.season_number.is_some_and(|season| {
+        season != evidence.season_number && !evidence.release_season_numbers.contains(&season)
+    }) {
+        return None;
+    }
+
+    let required = evidence
+        .target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if required.len() != evidence.target_keys.len() {
+        return None;
+    }
+    let targets = context
+        .targets
+        .iter()
+        .filter(|target| required.contains(target.target_key.as_str()))
+        .collect::<Vec<_>>();
+    if targets.len() != required.len() {
+        return None;
+    }
+    let media_files = files
+        .iter()
+        .filter(|file| {
+            is_anime_media_file(&file.path) && !is_anime_sample_or_extra_file(&file.path)
+        })
+        .collect::<Vec<_>>();
+    if media_files.is_empty() {
+        return None;
+    }
+
+    let release_kind = match evidence.media_kind {
+        AnimeSemanticMediaKindEvidence::SeriesPack => ReleaseKind::SeriesPack,
+        AnimeSemanticMediaKindEvidence::SeasonPack => ReleaseKind::SeasonPack,
+        AnimeSemanticMediaKindEvidence::Range => ReleaseKind::MultiEpisode,
+        _ if targets.len() > 1 => ReleaseKind::MultiEpisode,
+        _ => ReleaseKind::Single,
+    };
+    let coverage_kind = anime_coverage_kind(release_kind);
+    let mut entries_by_target = BTreeMap::new();
+    let mut selected_file_keys = BTreeSet::new();
+    for file in &media_files {
+        if !file.selectable {
+            continue;
+        }
+        let file_candidate = AnimeCandidateInput {
+            title: file.path.clone(),
+            source_kind: candidate.source_kind.clone(),
+            quality: candidate.quality.clone(),
+            size_bytes: file.size_bytes.and_then(|value| u64::try_from(value).ok()),
+            seeders: candidate.seeders,
+            cached_debrid: candidate.cached_debrid,
+            rank: candidate.rank,
+            source_score: candidate.source_score,
+            supported_routes: candidate.supported_routes.clone(),
+            default_route: candidate.default_route.clone(),
+        };
+        let Some(score) =
+            score_anime_candidate_with_semantic_evidence(context, &file_candidate, evidence)
+        else {
+            continue;
+        };
+        if !matches!(
+            score.confidence,
+            ReleaseConfidence::High | ReleaseConfidence::Medium
+        ) || !score.review_reasons.is_empty()
+            || !score.rejection_reasons.is_empty()
+        {
+            continue;
+        }
+        let file_targets = score
+            .target_matches
+            .iter()
+            .filter(|target| required.contains(target.target_key.as_str()))
+            .collect::<Vec<_>>();
+        if file_targets.is_empty() || file_targets.len() != score.target_matches.len() {
+            continue;
+        }
+        for target in file_targets {
+            if entries_by_target.contains_key(&target.target_key) {
+                return None;
+            }
+            entries_by_target.insert(
+                target.target_key.clone(),
+                AnimeFileCoverageEntry {
+                    target_key: target.target_key.clone(),
+                    canonical_key: target.canonical_key.clone(),
+                    release_file_key: Some(file.file_key.clone()),
+                    file_id: file.file_id.clone(),
+                    file_index: file.file_index,
+                    path: Some(file.path.clone()),
+                    coverage_kind,
+                    confidence: ReleaseConfidence::High,
+                    score: Some(target.score),
+                    reason: "semantic_parent_identity_and_deterministic_file_coordinate"
+                        .to_string(),
+                    state: ReleaseCoverageState::Planned,
+                },
+            );
+            selected_file_keys.insert(file.file_key.clone());
+        }
+    }
+    if entries_by_target
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != required
+    {
+        return None;
+    }
+
+    let requires_file_selection = selected_file_keys.len() < media_files.len();
+    if requires_file_selection
+        && (!options.file_selection_supported
+            || media_files
+                .iter()
+                .any(|file| !anime_file_has_safe_selection_id(file, options)))
+    {
+        return None;
+    }
+    let entries = evidence
+        .target_keys
+        .iter()
+        .filter_map(|target_key| entries_by_target.remove(target_key))
+        .collect::<Vec<_>>();
+    if entries.len() != required.len() {
+        return None;
+    }
+    Some(anime_file_coverage_plan(
+        release_kind,
+        ReleaseConfidence::High,
+        false,
+        requires_file_selection,
+        entries,
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 fn enforce_semantic_target_coverage(
@@ -2792,6 +3177,120 @@ fn semantic_plan_is_definitive(plan: &AnimeFileCoveragePlan) -> bool {
         && plan.rejection_reasons.is_empty()
 }
 
+fn semantic_bridge_plan_is_file_corroborated(
+    plan: &AnimeFileCoveragePlan,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    if !semantic_plan_is_definitive(plan) || evidence.target_keys.is_empty() {
+        return false;
+    }
+    let required = evidence
+        .target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let covered = plan
+        .entries
+        .iter()
+        .map(|entry| entry.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    required == covered
+        && plan.entries.len() == covered.len()
+        && plan.entries.iter().all(|entry| {
+            entry
+                .release_file_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+                && entry
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+        })
+        && !plan.selected_file_keys.is_empty()
+}
+
+fn enforce_semantic_bridge_file_corroboration(
+    mut plan: AnimeFileCoveragePlan,
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    scoring_evidence: &AnimeSemanticCandidateEvidence,
+    required_evidence: &AnimeSemanticCandidateEvidence,
+) -> AnimeFileCoveragePlan {
+    let single_file_verified = plan.release_kind != ReleaseKind::Single
+        || semantic_single_file_corroborates_plan(
+            &plan,
+            context,
+            candidate,
+            files,
+            scoring_evidence,
+        );
+    if !semantic_bridge_plan_is_file_corroborated(&plan, required_evidence) || !single_file_verified
+    {
+        plan.confidence = ReleaseConfidence::ReviewRequired;
+        plan.review_reasons
+            .push("semantic_bridge_file_corroboration_failed".to_string());
+        plan.review_reasons.sort();
+        plan.review_reasons.dedup();
+    }
+    plan
+}
+
+fn semantic_single_file_corroborates_plan(
+    plan: &AnimeFileCoveragePlan,
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    if plan.entries.len() != 1 {
+        return false;
+    }
+    let media_files = files
+        .iter()
+        .filter(|file| {
+            file.selectable
+                && is_anime_media_file(&file.path)
+                && !is_anime_sample_or_extra_file(&file.path)
+        })
+        .collect::<Vec<_>>();
+    let [file] = media_files.as_slice() else {
+        return false;
+    };
+    let file_candidate = AnimeCandidateInput {
+        title: file.path.clone(),
+        source_kind: candidate.source_kind.clone(),
+        quality: candidate.quality.clone(),
+        size_bytes: file.size_bytes.and_then(|value| u64::try_from(value).ok()),
+        seeders: candidate.seeders,
+        cached_debrid: candidate.cached_debrid,
+        rank: candidate.rank,
+        source_score: candidate.source_score,
+        supported_routes: candidate.supported_routes.clone(),
+        default_route: candidate.default_route.clone(),
+    };
+    let wanted = plan.entries[0].target_key.as_str();
+    std::iter::once(score_anime_candidate(context, &file_candidate))
+        .chain(score_anime_candidate_with_semantic_evidence(
+            context,
+            &file_candidate,
+            evidence,
+        ))
+        .chain(score_anime_candidate_with_semantic_evidence_mode(
+            context,
+            &file_candidate,
+            evidence,
+            SemanticScoringMode::CoverageWithFiles,
+        ))
+        .any(|score| {
+            score.confidence == ReleaseConfidence::High
+                && score.target_matches.len() == 1
+                && score.review_reasons.is_empty()
+                && score.rejection_reasons.is_empty()
+                && score.target_matches[0].target_key == wanted
+        })
+}
+
 fn plan_anime_file_coverage_internal(
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
@@ -2800,6 +3299,12 @@ fn plan_anime_file_coverage_internal(
     semantic_evidence: Option<&AnimeSemanticCandidateEvidence>,
 ) -> Option<AnimeFileCoveragePlan> {
     let candidate_score = match semantic_evidence {
+        Some(evidence) if !files.is_empty() => score_anime_candidate_with_semantic_evidence_mode(
+            context,
+            candidate,
+            evidence,
+            SemanticScoringMode::CoverageWithFiles,
+        )?,
         Some(evidence) => {
             score_anime_candidate_with_semantic_evidence(context, candidate, evidence)?
         }
@@ -7896,6 +8401,327 @@ mod tests {
                 .map(|target| target.target_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["S02E01"]
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_parent_coordinate_can_be_proven_by_exact_provider_file() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: "file-1".to_string(),
+            file_id: Some("1".to_string()),
+            file_index: Some(1),
+            path: "Tokyo Ghoul Root A - 01.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+        }];
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none(),
+            "the parent title alone must not invent an episode coordinate"
+        );
+        let plan = plan_anime_file_coverage_with_semantic_evidence(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+            &evidence,
+        )
+        .expect("the provider filename should corroborate the target");
+
+        assert!(semantic_plan_is_definitive(&plan), "{plan:#?}");
+        assert_eq!(plan.selected_file_keys, vec!["file-1"]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].target_key, "S02E01");
+        assert_eq!(
+            plan.entries[0].path.as_deref(),
+            Some(files[0].path.as_str())
+        );
+        assert!(
+            score_anime_candidate_with_verified_semantic_plan(
+                &context, &candidate, &evidence, &plan,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_parent_coordinate_rejects_wrong_provider_file() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: "file-2".to_string(),
+            file_id: Some("2".to_string()),
+            file_index: Some(2),
+            path: "Tokyo Ghoul Root A - 02.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+        }];
+
+        let plan = plan_anime_file_coverage_with_semantic_evidence(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+            &evidence,
+        );
+        assert!(plan.is_none_or(|plan| !semantic_plan_is_definitive(&plan)));
+    }
+
+    #[test]
+    fn alm9_semantic_provider_files_cannot_override_parent_episode_conflict() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 02 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: "file-1".to_string(),
+            file_id: Some("1".to_string()),
+            file_index: Some(1),
+            path: "Tokyo Ghoul Root A - 01.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+        }];
+
+        assert!(
+            plan_anime_file_coverage_with_semantic_evidence(
+                &context,
+                &candidate,
+                &files,
+                AnimeCoverageOptions {
+                    file_selection_supported: true,
+                },
+                &evidence,
+            )
+            .is_none_or(|plan| !semantic_plan_is_definitive(&plan))
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_entity_only_pack_requires_exact_per_file_coverage() {
+        let mut context = tokyo_ghoul_scoped_context();
+        context.targets.push(AnimeCandidateTarget {
+            target_key: "S02E02".to_string(),
+            canonical_key: Some("anilist:1002:S02E02".to_string()),
+            title: "Old Guard".to_string(),
+            season_number: Some(2),
+            anilist_season_id: Some("1002".to_string()),
+            episode_number: Some(2),
+            absolute_episode_number: Some(14),
+            tvdb_episode_id: Some("2014".to_string()),
+            anidb_episode_id: None,
+        });
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A Complete [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::SeasonPack,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string(), "S02E02".to_string()],
+        };
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "file-1".to_string(),
+                file_id: Some("1".to_string()),
+                file_index: Some(1),
+                path: "Tokyo Ghoul Root A - 01.mkv".to_string(),
+                size_bytes: Some(1_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "file-2".to_string(),
+                file_id: Some("2".to_string()),
+                file_index: Some(2),
+                path: "Tokyo Ghoul Root A - 02.mkv".to_string(),
+                size_bytes: Some(1_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_semantic_evidence(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+            &evidence,
+        )
+        .expect("every pack target has one independently parsed provider file");
+
+        assert!(semantic_plan_is_definitive(&plan), "{plan:#?}");
+        assert_eq!(plan.release_kind, ReleaseKind::SeasonPack);
+        assert_eq!(plan.selected_file_keys, vec!["file-1", "file-2"]);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S02E01", "S02E02"]
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_unique_coordinate_breaks_only_an_entity_alias_tie() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-coordinate-tie".to_string()),
+            aliases: vec!["Shared Franchise Arc".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Shared Franchise Arc".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("season-1".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Shared Franchise Arc".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(2),
+                    anilist_season_id: Some("season-2".to_string()),
+                },
+            ],
+            targets: vec![
+                AnimeCandidateTarget {
+                    target_key: "S01E01".to_string(),
+                    canonical_key: None,
+                    title: "Season One".to_string(),
+                    season_number: Some(1),
+                    anilist_season_id: Some("season-1".to_string()),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(1),
+                    tvdb_episode_id: None,
+                    anidb_episode_id: None,
+                },
+                AnimeCandidateTarget {
+                    target_key: "S02E01".to_string(),
+                    canonical_key: None,
+                    title: "Season Two".to_string(),
+                    season_number: Some(2),
+                    anilist_season_id: Some("season-2".to_string()),
+                    episode_number: Some(1),
+                    absolute_episode_number: Some(13),
+                    tvdb_episode_id: None,
+                    anidb_episode_id: None,
+                },
+            ],
+        };
+        let candidate = rr3e_candidate("Shared Franchise Arc S02E01 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("season-2".to_string()),
+            aliases: vec!["Shared Franchise Arc".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: vec![13],
+            target_keys: vec!["S02E01".to_string()],
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: "file-1".to_string(),
+            file_id: Some("1".to_string()),
+            file_index: Some(1),
+            path: "Shared Franchise Arc S02E01.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+        }];
+
+        assert!(!semantic_identity_supported_by_release(
+            &context,
+            &parse_anime_release_title(&candidate.title),
+            &evidence,
+        ));
+        let plan = plan_anime_file_coverage_with_semantic_evidence(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+            &evidence,
+        )
+        .expect("the unique raw S02E01 coordinate should resolve the alias tie");
+        assert!(semantic_plan_is_definitive(&plan));
+        assert_eq!(plan.entries[0].target_key, "S02E01");
+    }
+
+    #[test]
+    fn alm9_semantic_unique_coordinate_cannot_override_adjacent_season() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul S01E01 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![1],
+            absolute_episode_numbers: vec![13],
+            target_keys: vec!["S02E01".to_string()],
+        };
+        let files = vec![AnimeReleaseFileInput {
+            file_key: "file-1".to_string(),
+            file_id: Some("1".to_string()),
+            file_index: Some(1),
+            path: "Tokyo Ghoul S01E01.mkv".to_string(),
+            size_bytes: Some(1_000),
+            selectable: true,
+        }];
+
+        assert!(
+            plan_anime_file_coverage_with_semantic_evidence(
+                &context,
+                &candidate,
+                &files,
+                AnimeCoverageOptions {
+                    file_selection_supported: true,
+                },
+                &evidence,
+            )
+            .is_none_or(|plan| !semantic_plan_is_definitive(&plan))
         );
     }
 

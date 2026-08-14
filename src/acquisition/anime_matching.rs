@@ -18,7 +18,7 @@ use crate::{
                 AnimeCandidateScoringContext, AnimeFileCoverageEntry, AnimeFileCoveragePlan,
                 AnimeReleaseFileInput, AnimeScopedAlias, AnimeSemanticCandidateEvidence,
                 anime_coverage_kind, parse_anime_release_title, score_anime_candidate,
-                score_anime_candidate_with_semantic_evidence,
+                score_anime_candidate_with_verified_semantic_plan,
             },
             models::{ReleaseConfidence, ReleaseCoverageState, ReleaseKind, ReleaseResolverKind},
         },
@@ -226,7 +226,7 @@ fn bind_exact_single_anime_provider_file_internal(
     // resolve it to the one target already present in the server-owned plan.
     let deterministic_file_score = score_anime_candidate(context, &file_candidate);
     let semantic_file_score = semantic_evidence.and_then(|evidence| {
-        score_anime_candidate_with_semantic_evidence(context, &file_candidate, evidence)
+        score_anime_candidate_with_verified_semantic_plan(context, &file_candidate, evidence, &plan)
     });
     let Some(file_score) = std::iter::once(deterministic_file_score)
         .chain(semantic_file_score)

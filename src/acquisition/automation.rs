@@ -23,6 +23,7 @@ use crate::{
     acquisition::anime_matching::{
         acquisition_anime_deterministic_state, acquisition_anime_match_batch_input,
         assess_acquisition_anime_candidate_audio,
+        bind_exact_single_anime_provider_file_with_semantic_evidence,
     },
     acquisition::audit::{
         EVENT_ACQUISITION_SEARCH_SCHEDULED, EVENT_ROUTE_FALLBACK, NewAcquisitionAuditEvent,
@@ -39,7 +40,7 @@ use crate::{
             AnimeSemanticNumberingEvidence, anime_parser_diagnostics, build_anime_metadata_graph,
             infer_anizip_season_number, plan_anime_file_coverage_with_options,
             plan_anime_file_coverage_with_semantic_evidence, score_anime_candidate,
-            score_anime_candidate_with_semantic_evidence,
+            score_anime_candidate_with_verified_semantic_plan,
         },
         fingerprint::candidate_release_fingerprint,
         models::{
@@ -3072,14 +3073,20 @@ fn analyze_anime_candidate_coverage_with_semantic_evidence(
         &files,
         anime_coverage_options_for_candidate(subscription.route_policy, candidate),
         evidence,
-    )?;
+    )
+    .map(|plan| {
+        bind_exact_single_anime_provider_file_with_semantic_evidence(
+            plan, &context, &input, &files, evidence,
+        )
+    })?;
     if !plan.rejection_reasons.is_empty()
         || plan.confidence == ReleaseConfidence::ReviewRequired
         || plan.entries.is_empty()
     {
         return None;
     }
-    let score = score_anime_candidate_with_semantic_evidence(&context, &input, evidence)?;
+    let score =
+        score_anime_candidate_with_verified_semantic_plan(&context, &input, evidence, &plan)?;
     anime_candidate_coverage_analysis(subscription, candidate, targets, score, plan)
 }
 
