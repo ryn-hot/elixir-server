@@ -2046,7 +2046,7 @@ fn semantic_scoring_inputs(
     // at least one alias owned by the selected canonical entity. Validate that
     // relationship before adding semantic aliases to the parsed release;
     // otherwise the injected alias would manufacture its own exact match.
-    if !semantic_identity_supported_by_release(&parsed, evidence) {
+    if !semantic_identity_supported_by_release(context, &parsed, evidence) {
         return None;
     }
     let explicit_coordinate =
@@ -2265,30 +2265,168 @@ fn semantic_scoring_inputs(
 }
 
 fn semantic_identity_supported_by_release(
+    context: &AnimeCandidateScoringContext,
     parsed: &AnimeParsedRelease,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
-    let aliases = evidence
+    let mut selected_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .collect::<BTreeSet<_>>();
+    let competing_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| !semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .collect::<BTreeSet<_>>();
+    let generic_aliases = context
         .aliases
         .iter()
         .map(|alias| normalize_anime_alias(alias))
+        .chain(
+            competing_aliases
+                .iter()
+                .map(|alias| normalize_anime_alias(alias)),
+        )
         .filter(|alias| !alias.is_empty())
         .collect::<BTreeSet<_>>();
-    let parsed_titles = parsed
+    // The evidence object is constructed from the selected metadata entity.
+    // Keep useful entity-owned shorthand that is not present in the scoring
+    // graph (for example "Root A"), but discard global/shared franchise names
+    // because they cannot distinguish this entity from its neighbours.
+    selected_aliases.extend(evidence.aliases.iter().map(String::as_str).filter(|alias| {
+        let normalized = normalize_anime_alias(alias);
+        !normalized.is_empty() && !generic_aliases.contains(&normalized)
+    }));
+    if selected_aliases.is_empty() {
+        return false;
+    }
+
+    let mut parsed_titles = parsed
         .series_title
         .iter()
         .chain(&parsed.alt_titles)
         .chain(&parsed.anime_signal_facts.title_season_alias_candidates)
-        .map(|title| normalize_anime_alias(title))
-        .filter(|title| !title.is_empty())
+        .map(|title| title.as_str().to_string())
+        .filter(|title| !title.trim().is_empty())
         .collect::<BTreeSet<_>>();
+    // Alternate releases commonly join equivalent English and romaji names
+    // with a slash or pipe. Treat each side as raw release evidence; do not add
+    // aliases supplied by the semantic hypothesis itself.
+    let alternate_segments = parsed_titles
+        .iter()
+        .flat_map(|title| title.split(['/', '|']))
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    parsed_titles.extend(alternate_segments);
 
-    // The model chooses among server-owned entities; it does not get to turn
-    // the franchise root into proof for a distinct sequel, OVA, or movie. A
-    // normalized parser title must equal one of the selected entity's aliases.
-    // This retains punctuation/script normalization while rejecting matches
-    // that explain only a prefix such as "Tokyo Ghoul" in "Tokyo Ghoul Pinto".
-    !aliases.is_disjoint(&parsed_titles)
+    let selected_score = parsed_titles
+        .iter()
+        .flat_map(|title| {
+            selected_aliases
+                .iter()
+                .filter_map(move |alias| semantic_identity_alias_score(title, alias))
+        })
+        .max();
+    let Some(selected_score) = selected_score.filter(|score| *score >= 82) else {
+        return false;
+    };
+    let competing_score = parsed_titles
+        .iter()
+        .flat_map(|title| {
+            competing_aliases
+                .iter()
+                .filter_map(move |alias| semantic_identity_alias_score(title, alias))
+        })
+        .max();
+
+    // A selected entity must explain the release better than adjacent graph
+    // entities. This admits punctuation, ordinal, abbreviated subtitle, and
+    // joined English/romaji forms while preventing a shared franchise root
+    // from proving the wrong sequel, movie, or OVA.
+    competing_score.is_none_or(|competing| {
+        (selected_score >= 98 && competing < 98) || selected_score >= competing + 8
+    })
+}
+
+fn semantic_alias_scope_is_selected(
+    alias: &AnimeScopedAlias,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    evidence.anilist_season_id.as_deref().map_or_else(
+        || alias.season_number == Some(evidence.season_number),
+        |selected| {
+            alias
+                .anilist_season_id
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(selected))
+        },
+    )
+}
+
+fn semantic_identity_alias_score(title: &str, alias: &str) -> Option<u16> {
+    let title_tokens = semantic_identity_tokens(title);
+    let alias_tokens = semantic_identity_tokens(alias);
+    if title_tokens.is_empty() || alias_tokens.is_empty() {
+        return None;
+    }
+    if title_tokens == alias_tokens {
+        return Some(100);
+    }
+    if title_tokens.len() > alias_tokens.len()
+        && title_tokens.starts_with(&alias_tokens)
+        && alias_remainder_is_release_context(&title_tokens[alias_tokens.len()..])
+    {
+        return Some(94);
+    }
+    // Some release groups shorten a long canonical subtitle while preserving
+    // the franchise prefix and the distinguishing arc/part suffix, e.g.
+    // "Danganronpa 3 - Future Arc". The anchors keep a bare franchise title
+    // from becoming proof for a longer sequel name.
+    if title_tokens.len() >= 3
+        && title_tokens.len() < alias_tokens.len()
+        && title_tokens[..title_tokens.len().min(2)] == alias_tokens[..title_tokens.len().min(2)]
+        && title_tokens.last() == alias_tokens.last()
+        && ordered_token_subsequence(&title_tokens, &alias_tokens)
+    {
+        return Some(90);
+    }
+    let overlap = token_overlap_score(&title_tokens, &alias_tokens)?;
+    (overlap >= 0.72).then_some((60.0 + overlap * 35.0).round() as u16)
+}
+
+fn semantic_identity_tokens(value: &str) -> Vec<String> {
+    anime_alias_tokens(value)
+        .into_iter()
+        .map(|token| {
+            ["st", "nd", "rd", "th"]
+                .into_iter()
+                .find_map(|suffix| {
+                    token.strip_suffix(suffix).filter(|number| {
+                        !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+                    })
+                })
+                .map(str::to_string)
+                .unwrap_or(token)
+        })
+        .collect()
+}
+
+fn ordered_token_subsequence(needle: &[String], haystack: &[String]) -> bool {
+    let mut cursor = 0;
+    for token in haystack {
+        if needle.get(cursor) == Some(token) {
+            cursor += 1;
+            if cursor == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn semantic_explicit_release_episode_numbers(input: &str) -> BTreeSet<i32> {
@@ -7746,6 +7884,169 @@ mod tests {
         assert!(
             score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
         );
+    }
+
+    #[test]
+    fn alm9_semantic_identity_accepts_entity_owned_ordinal_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-ordinal-alias".to_string()),
+            aliases: vec!["Tokyo Ghoul".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul:re".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(3),
+                    anilist_season_id: Some("100240".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul:re 2".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(4),
+                    anilist_season_id: Some("102351".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title(
+            "[AU] Tokyo Ghoul Re 2nd Season - 04 [BS11 720p x264 AAC].mkv",
+        );
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 4,
+            release_season_numbers: vec![2, 4],
+            anilist_season_id: Some("102351".to_string()),
+            aliases: vec!["Tokyo Ghoul:re 2".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![4],
+            absolute_episode_numbers: vec![40],
+            target_keys: Vec::new(),
+        };
+
+        assert!(semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+    }
+
+    #[test]
+    fn alm9_semantic_identity_accepts_abbreviated_owned_arc_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-arc-alias".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Danganronpa 3: The End of Hope's Peak High School - Future Arc"
+                    .to_string(),
+                source: "anilist_english".to_string(),
+                language: Some("en".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("21509".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let parsed =
+            parse_anime_release_title("[HorribleSubs] Danganronpa 3 - Future Arc - 12 [1080p].mkv");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            anilist_season_id: Some("21509".to_string()),
+            aliases: vec![
+                "Danganronpa 3: The End of Hope's Peak High School - Future Arc".to_string(),
+            ],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![12],
+            absolute_episode_numbers: vec![25],
+            target_keys: Vec::new(),
+        };
+
+        assert!(semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+    }
+
+    #[test]
+    fn alm9_semantic_identity_accepts_slash_joined_owned_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-joined-alias".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "BELLE".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("127271".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Ryuu to Sobakasu no Hime".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("x-jat".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("127271".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title(
+            "Ryuu.to.Sobakasu.no.Hime/Belle.2021.1080p.BDRip.AAC5.1.10bits.x265-Rapta",
+        );
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            anilist_season_id: Some("127271".to_string()),
+            aliases: vec!["BELLE".to_string(), "Ryuu to Sobakasu no Hime".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+    }
+
+    #[test]
+    fn alm9_semantic_identity_rejects_adjacent_exact_entity() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-adjacent-alias".to_string()),
+            aliases: vec!["Tokyo Ghoul".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul:re".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(3),
+                    anilist_season_id: Some("100240".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Tokyo Ghoul:re 2".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(4),
+                    anilist_season_id: Some("102351".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title("[Group] Tokyo Ghoul:re - 04 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 4,
+            release_season_numbers: vec![4],
+            anilist_season_id: Some("102351".to_string()),
+            aliases: vec!["Tokyo Ghoul:re 2".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
     }
 
     #[test]
