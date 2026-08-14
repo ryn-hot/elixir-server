@@ -3158,6 +3158,67 @@ mod tests {
     use crate::http::handlers::acquisition_sources::AcquisitionCandidateFile;
 
     #[test]
+    fn alm9_frozen_ova_episode_two_cannot_validate_for_episode_one() -> Result<()> {
+        let corpus: QualificationCorpus = serde_json::from_str(include_str!(
+            "../../../artifacts/anime-inference/frozen-corpus/qualification-corpus.json"
+        ))?;
+        let case = corpus
+            .cases
+            .iter()
+            .find(|case| case.case_id == "frozen-special_boundaries-real-005")
+            .context("frozen OVA boundary case")?;
+        let input: QualificationCaseInput = serde_json::from_value(case.input.clone())?;
+        let candidate = input
+            .request
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_key == "candidate-5")
+            .context("episode-two candidate")?;
+        let request = build_semantic_evidence_request(
+            &input.request,
+            candidate.candidate_key.clone(),
+            candidate.title.clone(),
+            None,
+            candidate.parse_facts.title_candidates.iter().cloned(),
+            candidate.parse_facts.season_numbers.iter().copied(),
+            candidate.parse_facts.episode_numbers.iter().copied(),
+            candidate
+                .parse_facts
+                .absolute_episode_numbers
+                .iter()
+                .copied(),
+            anime_semantic_media_kinds(&candidate.title, &candidate.parse_facts),
+        )?
+        .context("semantic request")?;
+
+        assert_eq!(request.observed_release_episode_numbers, vec![2, 2014]);
+        let hypothesis = request
+            .hypotheses
+            .get(2)
+            .context("reported hypothesis index")?;
+        assert_eq!(
+            hypothesis.numbering,
+            crate::anime_matching::AnimeSemanticNumbering::Seasonal
+        );
+        assert_eq!(
+            hypothesis.media_kind,
+            crate::anime_matching::AnimeSemanticMediaKind::Ova
+        );
+        assert_eq!(hypothesis.episode_numbers, vec![1]);
+        assert!(
+            validate_semantic_evidence_response(
+                &request,
+                &crate::anime_matching::AnimeSemanticEvidenceResponse {
+                    schema_version: 1,
+                    hypothesis_index: Some(2),
+                },
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn qualification_hash_buffer_is_heap_backed() {
         let buffer = file_hash_buffer();
         assert_eq!(buffer.len(), FILE_HASH_BUFFER_BYTES);

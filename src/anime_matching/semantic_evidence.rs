@@ -412,7 +412,10 @@ pub fn validate_semantic_evidence_response<'a>(
     if !observed_numbers.is_empty()
         && matches!(
             hypothesis.media_kind,
-            AnimeSemanticMediaKind::Episode | AnimeSemanticMediaKind::Range
+            AnimeSemanticMediaKind::Episode
+                | AnimeSemanticMediaKind::Range
+                | AnimeSemanticMediaKind::Special
+                | AnimeSemanticMediaKind::Ova
         )
     {
         let selected_numbers = match hypothesis.numbering {
