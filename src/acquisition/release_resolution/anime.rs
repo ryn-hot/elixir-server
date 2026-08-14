@@ -1816,6 +1816,24 @@ pub fn reconcile_anime_graph(
         target_matches = direct_target_matches.clone();
     }
 
+    if let Some(alias) = most_specific_exact_scoped_alias(alias_matches)
+        && !target_matches.is_empty()
+    {
+        let owned_target_keys = context
+            .targets
+            .iter()
+            .filter(|target| anime_alias_scope_matches_target(alias, target))
+            .map(|target| target.target_key.as_str())
+            .collect::<BTreeSet<_>>();
+        target_matches.retain(|target| owned_target_keys.contains(target.target_key.as_str()));
+        if target_matches.is_empty() {
+            // A specific named sequel/season alias must not fall through to a
+            // coincident absolute number owned by the shorter franchise alias.
+            outcome = AnimeReconciliationOutcome::Unexplainable;
+            rejection_reasons.push("exact_scoped_alias_target_unmapped".to_string());
+        }
+    }
+
     if target_matches.is_empty()
         && (!parsed.episode_numbers.is_empty() || !parsed.absolute_episode_numbers.is_empty())
         && outcome != AnimeReconciliationOutcome::TrueContradiction
@@ -2692,10 +2710,11 @@ struct AnimeNonPackFileMatch<'a> {
     targets: BTreeMap<String, (f64, String)>,
 }
 
-/// Bind server-inventoried files for single and multi-episode releases. Title
-/// matching may identify the release, but a selectable plan is definitive only
-/// when basenames independently establish a complete, unambiguous target/file
-/// relation. This is deterministic and never reuses release-level model facts.
+/// Bind server-inventoried files for single and multi-episode releases. The
+/// already-definitive parent release establishes identity. A sole media file is
+/// therefore the owned payload; multi-file releases still require each basename
+/// to establish a unique target/file relation. This is entirely deterministic
+/// and never reuses model-authored facts.
 fn bind_non_pack_file_coverage(
     context: &AnimeCandidateScoringContext,
     candidate: &AnimeCandidateInput,
@@ -2721,6 +2740,24 @@ fn bind_non_pack_file_coverage(
         return None;
     }
 
+    // A definitive single/multi-episode release with one media payload has no
+    // file-ownership ambiguity. Re-parsing that basename as a second release
+    // identity is both redundant and harmful when indexer and payload names use
+    // different aliases or provider-season numbering.
+    if media_files.len() == 1 && media_files[0].selectable {
+        let file = media_files[0];
+        for entry in entries {
+            entry.release_file_key = Some(file.file_key.clone());
+            entry.file_id = file.file_id.clone();
+            entry.file_index = file.file_index;
+            entry.path = Some(file.path.clone());
+            entry.confidence = ReleaseConfidence::High;
+            entry.reason = "parent_release_identity_and_sole_media_file".to_string();
+        }
+        return Some(false);
+    }
+
+    let mut strict_file_matches = Vec::new();
     let mut file_matches = Vec::new();
     for file in &media_files {
         if !file.selectable {
@@ -2739,66 +2776,98 @@ fn bind_non_pack_file_coverage(
             default_route: candidate.default_route.clone(),
         };
         let score = score_anime_candidate(context, &file_candidate);
-        if !matches!(
+        if matches!(
             score.confidence,
             ReleaseConfidence::High | ReleaseConfidence::Medium
-        ) || !score.review_reasons.is_empty()
-            || !score.rejection_reasons.is_empty()
-            || score.target_matches.is_empty()
+        ) && score.review_reasons.is_empty()
+            && score.rejection_reasons.is_empty()
+            && !score.target_matches.is_empty()
+        {
+            let strict_target_keys = score
+                .target_matches
+                .iter()
+                .map(|target| target.target_key.clone())
+                .collect::<BTreeSet<_>>();
+            if strict_target_keys.is_subset(&planned_targets) {
+                strict_file_matches.push(AnimeNonPackFileMatch {
+                    file: *file,
+                    targets: score
+                        .target_matches
+                        .iter()
+                        .map(|target| {
+                            (
+                                target.target_key.clone(),
+                                (target.score, target.match_reason.clone()),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+        if !score.reconciliation.contradiction_reasons.is_empty()
+            || score.rejection_reasons.iter().any(|reason| {
+                !matches!(
+                    reason.as_str(),
+                    "no_graph_alias_match"
+                        | "no_graph_target_coverage"
+                        | "graph_reconciliation_unexplainable"
+                        | "exact_scoped_alias_target_unmapped"
+                )
+            })
         {
             continue;
         }
-        let target_keys = score
+        let mut targets = score
             .target_matches
             .iter()
-            .map(|target| target.target_key.clone())
-            .collect::<BTreeSet<_>>();
-        if target_keys.is_empty() || !target_keys.is_subset(&planned_targets) {
+            .filter(|target| planned_targets.contains(&target.target_key))
+            .map(|target| {
+                (
+                    target.target_key.clone(),
+                    (target.score, target.match_reason.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if targets.is_empty() {
+            for alias in score.alias_matches.iter().filter(|alias| {
+                alias.kind == AnimeAliasMatchKind::Exact
+                    && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
+            }) {
+                for target in context.targets.iter().filter(|target| {
+                    planned_targets.contains(&target.target_key)
+                        && anime_alias_scope_matches_target(alias, target)
+                }) {
+                    targets.insert(
+                        target.target_key.clone(),
+                        (
+                            100.0 + alias.score / 100.0,
+                            format!(
+                                "parent_release_identity_and_exact_file_alias:{}",
+                                alias.source
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        if targets.is_empty() {
             continue;
         }
-        let targets = score
-            .target_matches
-            .into_iter()
-            .map(|target| (target.target_key, (target.score, target.match_reason)))
-            .collect();
         file_matches.push(AnimeNonPackFileMatch {
             file: *file,
             targets,
         });
     }
 
-    let selected = if media_files.len() == 1
-        && file_matches.len() == 1
-        && file_matches[0]
-            .targets
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            == planned_targets
+    let (file_matches, selected) = if let Some(selected) =
+        select_non_pack_file_matches(entries, &strict_file_matches, &planned_targets)
     {
-        entries
-            .iter()
-            .map(|entry| (entry.target_key.clone(), 0_usize))
-            .collect::<BTreeMap<_, _>>()
+        (&strict_file_matches, selected)
     } else {
-        let mut selected = BTreeMap::new();
-        let mut selected_file_indexes = BTreeSet::new();
-        for entry in entries.iter() {
-            let candidates = file_matches
-                .iter()
-                .enumerate()
-                .filter(|(_, file_match)| {
-                    file_match.targets.len() == 1
-                        && file_match.targets.contains_key(&entry.target_key)
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if candidates.len() != 1 || !selected_file_indexes.insert(candidates[0]) {
-                return None;
-            }
-            selected.insert(entry.target_key.clone(), candidates[0]);
-        }
-        selected
+        (
+            &file_matches,
+            select_non_pack_file_matches(entries, &file_matches, &planned_targets)?,
+        )
     };
 
     let selected_file_indexes = selected.values().copied().collect::<BTreeSet<_>>();
@@ -2824,6 +2893,46 @@ fn bind_non_pack_file_coverage(
         entry.reason = reason.clone();
     }
     Some(requires_selection)
+}
+
+fn select_non_pack_file_matches(
+    entries: &[AnimeFileCoverageEntry],
+    file_matches: &[AnimeNonPackFileMatch<'_>],
+    planned_targets: &BTreeSet<String>,
+) -> Option<BTreeMap<String, usize>> {
+    if file_matches.len() == 1
+        && file_matches[0]
+            .targets
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            == *planned_targets
+    {
+        return Some(
+            entries
+                .iter()
+                .map(|entry| (entry.target_key.clone(), 0_usize))
+                .collect(),
+        );
+    }
+
+    let mut selected = BTreeMap::new();
+    let mut selected_file_indexes = BTreeSet::new();
+    for entry in entries {
+        let candidates = file_matches
+            .iter()
+            .enumerate()
+            .filter(|(_, file_match)| {
+                file_match.targets.len() == 1 && file_match.targets.contains_key(&entry.target_key)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 || !selected_file_indexes.insert(candidates[0]) {
+            return None;
+        }
+        selected.insert(entry.target_key.clone(), candidates[0]);
+    }
+    Some(selected)
 }
 
 pub fn merge_external_ids(target: &mut ExternalIds, source: &ExternalIds) {
@@ -3273,6 +3382,24 @@ fn alias_match_margin(matches: &[AnimeAliasMatch]) -> Option<f64> {
         .map(|candidate| best.score - candidate.score)
 }
 
+fn most_specific_exact_scoped_alias(matches: &[AnimeAliasMatch]) -> Option<&AnimeAliasMatch> {
+    let exact_scoped = matches
+        .iter()
+        .filter(|alias| {
+            alias.kind == AnimeAliasMatchKind::Exact
+                && (alias.season_number.is_some() || alias.anilist_season_id.is_some())
+        })
+        .collect::<Vec<_>>();
+    exact_scoped.iter().copied().find(|candidate| {
+        exact_scoped.iter().any(|other| {
+            candidate.normalized != other.normalized
+                && candidate.normalized.len() > other.normalized.len()
+                && (candidate.normalized.starts_with(&other.normalized)
+                    || candidate.normalized.ends_with(&other.normalized))
+        })
+    })
+}
+
 fn match_targets_by_alias_scope(
     context: &AnimeCandidateScoringContext,
     parsed: &AnimeParsedRelease,
@@ -3286,12 +3413,12 @@ fn match_targets_by_alias_scope(
     if scoped_matches.is_empty() {
         return Vec::new();
     }
-    let structured_sxxeyy_season = explicit_sxxeyy_season(parsed);
+    let structured_season = explicit_structured_season(parsed);
     let selected_scope = scoped_matches
         .iter()
         .find(|item| {
             item.kind == AnimeAliasMatchKind::Exact
-                && structured_sxxeyy_season.is_some_and(|season| {
+                && structured_season.is_some_and(|season| {
                     item.season_number == Some(season)
                         || context.targets.iter().any(|target| {
                             target.season_number == Some(season)
@@ -3346,13 +3473,12 @@ fn match_targets_by_alias_scope(
             if !anime_alias_scope_matches_target(alias, target) {
                 continue;
             }
-            if structured_sxxeyy_season
-                .zip(target.season_number)
-                .is_some_and(|(parsed_season, target_season)| {
+            if structured_season.zip(target.season_number).is_some_and(
+                |(parsed_season, target_season)| {
                     parsed_season != target_season
                         && !anime_alias_provider_season_matches_target(alias, target, parsed_season)
-                })
-            {
+                },
+            ) {
                 continue;
             }
             if !target
@@ -3379,7 +3505,7 @@ fn exact_scoped_alias_conflicts_with_structured_season(
     parsed: &AnimeParsedRelease,
     alias_matches: &[AnimeAliasMatch],
 ) -> bool {
-    let Some(structured_season) = explicit_sxxeyy_season(parsed) else {
+    let Some(structured_season) = explicit_structured_season(parsed) else {
         return false;
     };
     let exact_scoped = alias_matches
@@ -3431,14 +3557,18 @@ fn anime_alias_provider_season_matches_target(
             .is_some_and(|(alias_id, target_id)| alias_id == target_id)
 }
 
-fn explicit_sxxeyy_season(parsed: &AnimeParsedRelease) -> Option<i32> {
-    parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
-        .or_else(|| {
-            parse_sxxeyy_numbers(&normalize_fullwidth_digits(
-                &parsed.sonarr_facts.original_title,
-            ))
-        })
-        .map(|(season, _, _)| season)
+fn explicit_structured_season(parsed: &AnimeParsedRelease) -> Option<i32> {
+    [
+        parsed.original_title.as_str(),
+        parsed.sonarr_facts.original_title.as_str(),
+    ]
+    .into_iter()
+    .find_map(|title| {
+        let title = normalize_fullwidth_digits(title);
+        parse_sxxeyy_numbers(&title)
+            .map(|(season, _, _)| season)
+            .or_else(|| parse_season_dash_episode(&title).map(|(season, _)| season))
+    })
 }
 
 fn anime_alias_scope_matches_target(
@@ -4031,7 +4161,22 @@ fn is_anime_media_file(path: &str) -> bool {
 
 fn is_anime_sample_or_extra_file(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("/sample")
+    let parent_is_bonus_material = lower.rsplit_once('/').is_some_and(|(parent, _)| {
+        parent.split('/').any(|segment| {
+            let segment = segment.trim();
+            segment == "sample"
+                || segment == "samples"
+                || segment == "extra"
+                || segment == "extras"
+                || segment == "featurette"
+                || segment == "featurettes"
+                || segment == "related video clips"
+                || segment.starts_with("bonus ")
+                || segment == "bonus"
+        })
+    });
+    parent_is_bonus_material
+        || lower.contains("/sample")
         || lower.contains("sample.")
         || lower.contains("/extras/")
         || lower.contains("/extra/")
@@ -7249,6 +7394,101 @@ mod tests {
     }
 
     #[test]
+    fn alm9_exact_scoped_alias_cannot_fall_through_to_a_sibling_absolute_number() {
+        let mut context = tokyo_ghoul_scoped_context();
+        context.targets.push(AnimeCandidateTarget {
+            target_key: "S01E10".to_string(),
+            canonical_key: Some("anilist:1001:S01E10".to_string()),
+            title: "Season One Episode Ten".to_string(),
+            season_number: Some(1),
+            anilist_season_id: Some("1001".to_string()),
+            episode_number: Some(10),
+            absolute_episode_number: Some(10),
+            tvdb_episode_id: None,
+            anidb_episode_id: None,
+        });
+
+        let score = score_anime_candidate(
+            &context,
+            &rr3e_candidate("[BakedFish] Tokyo Ghoul Root A - 10 [1080p]"),
+        );
+
+        assert!(score.target_matches.is_empty());
+        assert_eq!(score.outcome, AnimeMatchOutcome::Rejected);
+        assert!(
+            score
+                .reconciliation
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason == "exact_scoped_alias_target_unmapped")
+        );
+    }
+
+    #[test]
+    fn alm9_season_dash_episode_prefers_the_matching_shared_season_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("alm9-shared-season-alias".to_string()),
+            aliases: vec!["Shared Anime".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Shared Anime".to_string(),
+                    source: "canonical_title".to_string(),
+                    language: None,
+                    season_number: Some(1),
+                    anilist_season_id: Some("season-1".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Shared Anime".to_string(),
+                    source: "canonical_title".to_string(),
+                    language: None,
+                    season_number: Some(2),
+                    anilist_season_id: Some("season-2".to_string()),
+                },
+            ],
+            targets: vec![
+                AnimeCandidateTarget {
+                    target_key: "S01E12".to_string(),
+                    canonical_key: None,
+                    title: "Season One Finale".to_string(),
+                    season_number: Some(1),
+                    anilist_season_id: Some("season-1".to_string()),
+                    episode_number: Some(12),
+                    absolute_episode_number: Some(12),
+                    tvdb_episode_id: None,
+                    anidb_episode_id: None,
+                },
+                AnimeCandidateTarget {
+                    target_key: "S02E12".to_string(),
+                    canonical_key: None,
+                    title: "Season Two Finale".to_string(),
+                    season_number: Some(2),
+                    anilist_season_id: Some("season-2".to_string()),
+                    episode_number: Some(12),
+                    absolute_episode_number: Some(24),
+                    tvdb_episode_id: None,
+                    anidb_episode_id: None,
+                },
+            ],
+        };
+
+        let score = score_anime_candidate(
+            &context,
+            &rr3e_candidate("[EMBER] Shared Anime S2 - 12 [1080p].mkv"),
+        );
+
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(
+            score
+                .target_matches
+                .iter()
+                .map(|target| target.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S02E12"]
+        );
+        assert!(score.reconciliation.contradiction_reasons.is_empty());
+    }
+
+    #[test]
     fn alm9_semantic_evidence_enriches_existing_resolver_without_authoring_a_plan() {
         let context = tokyo_ghoul_scoped_context();
         let candidate = rr3e_candidate("[Group] Root A - 01 [1080p]");
@@ -7400,7 +7640,7 @@ mod tests {
             file_key: "episode-1".to_string(),
             file_id: Some("episode-1".to_string()),
             file_index: Some(0),
-            path: "Example Title - 01 [1080p].mkv".to_string(),
+            path: "Provider Payload Alias - 01 [1080p].mkv".to_string(),
             size_bytes: Some(1_000_000),
             selectable: true,
         }];
@@ -7415,6 +7655,78 @@ mod tests {
             Some("episode-1")
         );
         assert!(plan.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn alm9_multi_file_release_uses_unique_exact_scoped_file_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("alm9-ova-file-binding".to_string()),
+            aliases: vec!["Example".to_string()],
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Example Jack".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: None,
+                season_number: Some(1),
+                anilist_season_id: Some("ova-jack".to_string()),
+            }],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "OVA-JACK".to_string(),
+                canonical_key: None,
+                title: "Example Jack".to_string(),
+                season_number: Some(1),
+                anilist_season_id: Some("ova-jack".to_string()),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let candidate = rr3e_candidate("[Group] Example Jack - 01 [1080p]");
+        let files = vec![
+            AnimeReleaseFileInput {
+                file_key: "jack".to_string(),
+                file_id: Some("jack".to_string()),
+                file_index: Some(0),
+                path: "Example Jack.mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+            AnimeReleaseFileInput {
+                file_key: "pinto".to_string(),
+                file_id: Some("pinto".to_string()),
+                file_index: Some(1),
+                path: "Example Pinto.mkv".to_string(),
+                size_bytes: Some(1_000_000),
+                selectable: true,
+            },
+        ];
+
+        let plan = plan_anime_file_coverage_with_options(
+            &context,
+            &candidate,
+            &files,
+            AnimeCoverageOptions {
+                file_selection_supported: true,
+            },
+        );
+
+        assert_eq!(plan.confidence, ReleaseConfidence::High);
+        assert_eq!(plan.selected_file_keys, vec!["jack"]);
+        assert_eq!(plan.entries[0].release_file_key.as_deref(), Some("jack"));
+        assert!(plan.review_reasons.is_empty());
+    }
+
+    #[test]
+    fn alm9_bonus_directories_are_not_media_payloads() {
+        assert!(is_anime_sample_or_extra_file(
+            "bonus goodies/related video clips/promo.mp4"
+        ));
+        assert!(is_anime_sample_or_extra_file(
+            "Release/Featurettes/interview.mkv"
+        ));
+        assert!(!is_anime_sample_or_extra_file(
+            "Release/Example Anime - 01.mkv"
+        ));
     }
 
     #[test]
