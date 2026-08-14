@@ -2416,7 +2416,58 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     options: AnimeCoverageOptions,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> Option<AnimeFileCoveragePlan> {
-    plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence))
+    let full =
+        plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence));
+    if full.as_ref().is_some_and(semantic_plan_is_definitive) {
+        return full;
+    }
+
+    // The selected hypothesis contains independent identity, canonical target
+    // joins, numbering, and media-kind fields. A secondary field must not erase
+    // useful identity evidence. Retry progressively smaller, still
+    // server-authored projections only when the complete interpretation could
+    // not produce a definitive plan. External wanted-target and audio gates are
+    // unchanged and remain the final authority.
+    let mut without_target_binding = evidence.clone();
+    without_target_binding.target_keys.clear();
+    let without_target_binding = plan_anime_file_coverage_internal(
+        context,
+        candidate,
+        files,
+        options,
+        Some(&without_target_binding),
+    );
+    if without_target_binding
+        .as_ref()
+        .is_some_and(semantic_plan_is_definitive)
+    {
+        return without_target_binding;
+    }
+
+    let mut identity_only = evidence.clone();
+    identity_only.numbering = AnimeSemanticNumberingEvidence::EntityOnly;
+    identity_only.episode_numbers.clear();
+    identity_only.absolute_episode_numbers.clear();
+    identity_only.target_keys.clear();
+    let identity_only =
+        plan_anime_file_coverage_internal(context, candidate, files, options, Some(&identity_only));
+    if identity_only
+        .as_ref()
+        .is_some_and(semantic_plan_is_definitive)
+    {
+        return identity_only;
+    }
+
+    full.or(without_target_binding).or(identity_only)
+}
+
+fn semantic_plan_is_definitive(plan: &AnimeFileCoveragePlan) -> bool {
+    matches!(
+        plan.confidence,
+        ReleaseConfidence::High | ReleaseConfidence::Medium
+    ) && !plan.entries.is_empty()
+        && plan.review_reasons.is_empty()
+        && plan.rejection_reasons.is_empty()
 }
 
 fn plan_anime_file_coverage_internal(
@@ -7516,6 +7567,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["S02E01"]
         );
+    }
+
+    #[test]
+    fn alm9_semantic_planner_retains_valid_identity_when_numbering_is_unsupported() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Root A - 01 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            // The selected identity is useful, but this secondary coordinate
+            // is unsupported by the raw release and must not erase it.
+            episode_numbers: vec![2],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        let plan = plan_anime_file_coverage_with_semantic_evidence(
+            &context,
+            &candidate,
+            &[],
+            AnimeCoverageOptions::default(),
+            &evidence,
+        )
+        .expect("identity-only projection should still produce a plan");
+
+        assert!(semantic_plan_is_definitive(&plan));
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].target_key, "S02E01");
     }
 
     #[test]

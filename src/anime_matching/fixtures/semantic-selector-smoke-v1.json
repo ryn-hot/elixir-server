@@ -9,6 +9,7 @@
         "requestId": "tokyo-ghoul-root-a-named-episode",
         "candidateKey": "candidate-0",
         "raw": "[SubsPlease] Tokyo Ghoul Root A - 01 [1080p]",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -29,6 +30,7 @@
         "requestId": "tokyo-ghoul-explicit-season-two",
         "candidateKey": "candidate-0",
         "raw": "Tokyo.Ghoul.S02E01.1080p.WEB-DL",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -48,6 +50,7 @@
         "requestId": "tokyo-ghoul-absolute-thirteen",
         "candidateKey": "candidate-0",
         "raw": "[Group] Tokyo Ghoul - 13 [BD 1080p]",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -67,6 +70,7 @@
         "requestId": "tokyo-ghoul-re-second-cour",
         "candidateKey": "candidate-0",
         "raw": "Tokyo Ghoul re 2nd Season - 03",
+        "target": {"canonicalTitle":"Tokyo Ghoul:re 2nd Season","scope":"episode","seasonNumber":4,"episodeNumbers":[3],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-re-v1",
         "entities": [
           {"index": 0, "seasonNumber": 3, "aliases": ["Tokyo Ghoul:re", "東京喰種:re"]},
@@ -87,6 +91,7 @@
         "requestId": "aot-final-season-part-two",
         "candidateKey": "candidate-0",
         "raw": "Attack on Titan The Final Season Part 2 - 10",
+        "target": {"canonicalTitle":"Attack on Titan The Final Season Part 2","scope":"episode","seasonNumber":5,"episodeNumbers":[10],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-aot-v1",
         "entities": [
           {"index": 0, "seasonNumber": 4, "aliases": ["Attack on Titan The Final Season", "Shingeki no Kyojin The Final Season"]},
@@ -106,6 +111,7 @@
         "requestId": "aot-final-season-explicit-coordinate",
         "candidateKey": "candidate-0",
         "raw": "Attack.on.Titan.S04E17.1080p",
+        "target": {"canonicalTitle":"Attack on Titan The Final Season","scope":"episode","seasonNumber":4,"episodeNumbers":[17],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-aot-explicit-v1",
         "entities": [
           {"index": 0, "seasonNumber": 3, "aliases": ["Attack on Titan Season 3"]},
@@ -125,6 +131,7 @@
         "requestId": "aot-japanese-part-two",
         "candidateKey": "candidate-0",
         "raw": "進撃の巨人 The Final Season Part 2 - 10",
+        "target": {"canonicalTitle":"Attack on Titan The Final Season Part 2","scope":"episode","seasonNumber":5,"episodeNumbers":[10],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-aot-v1",
         "entities": [
           {"index": 0, "seasonNumber": 4, "aliases": ["Attack on Titan The Final Season", "進撃の巨人 The Final Season"]},
@@ -144,6 +151,7 @@
         "requestId": "one-piece-absolute",
         "candidateKey": "candidate-0",
         "raw": "[Toei] One Piece - 1095 [1080p]",
+        "target": {"canonicalTitle":"One Piece","scope":"episode","seasonNumber":1,"absoluteEpisodeNumbers":[1095],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-one-piece-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["One Piece", "ワンピース"]},
@@ -163,6 +171,7 @@
         "requestId": "rezero-memory-snow-ova",
         "candidateKey": "candidate-0",
         "raw": "Re Zero Memory Snow OVA 1080p BluRay",
+        "target": {"canonicalTitle":"Re:ZERO Memory Snow","scope":"special","seasonNumber":0,"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-rezero-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Re:ZERO Starting Life in Another World", "Re Zero"]},
@@ -182,6 +191,7 @@
         "requestId": "mha-heroes-rising-movie",
         "candidateKey": "candidate-0",
         "raw": "Boku no Hero Academia Heroes Rising Movie 1080p",
+        "target": {"canonicalTitle":"My Hero Academia Heroes Rising","scope":"movie","seasonNumber":0,"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-mha-v1",
         "entities": [
           {"index": 0, "seasonNumber": 4, "aliases": ["My Hero Academia Season 4", "Boku no Hero Academia 4"]},
@@ -201,6 +211,7 @@
         "requestId": "steins-gate-zero-special",
         "candidateKey": "candidate-0",
         "raw": "Steins Gate 0 - 23 beta Special",
+        "target": {"canonicalTitle":"Steins;Gate 0 23 beta","scope":"special","seasonNumber":0,"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-steins-gate-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Steins;Gate 0", "Steins Gate Zero"]},
@@ -220,6 +231,7 @@
         "requestId": "unrelated-title-null",
         "candidateKey": "candidate-0",
         "raw": "[Group] Jujutsu Kaisen - 01 [1080p]",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-negative-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -239,6 +251,7 @@
         "requestId": "named-sequel-explicit-season-conflict-null",
         "candidateKey": "candidate-0",
         "raw": "Tokyo Ghoul Root A S01E01",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-negative-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -258,6 +271,7 @@
         "requestId": "sample-null",
         "candidateKey": "candidate-0",
         "raw": "Tokyo Ghoul Root A - 01 SAMPLE.mkv",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-negative-v1",
         "entities": [
           {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
@@ -275,6 +289,7 @@
         "requestId": "creditless-opening-null",
         "candidateKey": "candidate-0",
         "raw": "Tokyo Ghoul Root A NCOP 01 1080p",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-negative-v1",
         "entities": [
           {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
@@ -292,6 +307,7 @@
         "requestId": "off-by-one-null",
         "candidateKey": "candidate-0",
         "raw": "Tokyo Ghoul Root A - 14",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-negative-v1",
         "entities": [
           {"index": 0, "seasonNumber": 2, "aliases": ["Tokyo Ghoul Root A", "東京喰種√A"]}
@@ -310,6 +326,7 @@
         "requestId": "tokyo-ghoul-root-a-japanese-alias",
         "candidateKey": "candidate-0",
         "raw": "東京喰種√A - 01",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"episode","seasonNumber":2,"episodeNumbers":[1],"absoluteEpisodeNumbers":[13],"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},
@@ -329,6 +346,7 @@
         "requestId": "tokyo-ghoul-root-a-season-pack",
         "candidateKey": "candidate-0",
         "raw": "[Group] Tokyo Ghoul Root A Complete 1080p BluRay",
+        "target": {"canonicalTitle":"Tokyo Ghoul","scope":"season","seasonNumber":2,"audioPreference":{"mode":"any"}},
         "graphFingerprint": "smoke-tokyo-ghoul-v1",
         "entities": [
           {"index": 0, "seasonNumber": 1, "aliases": ["Tokyo Ghoul", "東京喰種"]},

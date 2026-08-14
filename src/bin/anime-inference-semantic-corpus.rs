@@ -7,7 +7,12 @@ use elixir_server::acquisition::anime_qualification::{
 
 const USAGE: &str = "usage: anime-inference-semantic-corpus \
   --corpus PATH --manifest PATH --runtime-profile PATH --model PATH \
-  --runtime-artifact PATH --output PATH";
+  --runtime-artifact PATH --output PATH [--baseline-failures-only]";
+
+struct Arguments {
+    paths: BTreeMap<String, PathBuf>,
+    baseline_failures_only: bool,
+}
 
 #[tokio::main]
 async fn main() {
@@ -20,12 +25,13 @@ async fn main() {
 async fn run() -> Result<()> {
     let arguments = parse_arguments(std::env::args_os().skip(1))?;
     let summary = run_anime_semantic_corpus(AnimeSemanticCorpusRunConfig {
-        corpus_path: required_path(&arguments, "--corpus")?,
-        manifest_path: required_path(&arguments, "--manifest")?,
-        runtime_profile_path: required_path(&arguments, "--runtime-profile")?,
-        model_path: required_path(&arguments, "--model")?,
-        runtime_artifact_path: required_path(&arguments, "--runtime-artifact")?,
-        output_path: required_path(&arguments, "--output")?,
+        corpus_path: required_path(&arguments.paths, "--corpus")?,
+        manifest_path: required_path(&arguments.paths, "--manifest")?,
+        runtime_profile_path: required_path(&arguments.paths, "--runtime-profile")?,
+        model_path: required_path(&arguments.paths, "--model")?,
+        runtime_artifact_path: required_path(&arguments.paths, "--runtime-artifact")?,
+        output_path: required_path(&arguments.paths, "--output")?,
+        baseline_failures_only: arguments.baseline_failures_only,
     })
     .await?;
     println!("{}", serde_json::to_string(&summary)?);
@@ -37,9 +43,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn parse_arguments(
-    mut arguments: impl Iterator<Item = OsString>,
-) -> Result<BTreeMap<String, PathBuf>> {
+fn parse_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<Arguments> {
     let allowed = [
         "--corpus",
         "--manifest",
@@ -49,6 +53,7 @@ fn parse_arguments(
         "--output",
     ];
     let mut parsed = BTreeMap::new();
+    let mut baseline_failures_only = false;
     while let Some(raw_flag) = arguments.next() {
         if raw_flag == "--help" || raw_flag == "-h" {
             println!("{USAGE}");
@@ -57,6 +62,11 @@ fn parse_arguments(
         let flag = raw_flag
             .into_string()
             .map_err(|_| anyhow::anyhow!("argument name is not valid UTF-8"))?;
+        if flag == "--baseline-failures-only" {
+            ensure!(!baseline_failures_only, "duplicate argument");
+            baseline_failures_only = true;
+            continue;
+        }
         ensure!(
             allowed.contains(&flag.as_str()),
             "unknown argument {flag:?}; {USAGE}"
@@ -73,7 +83,10 @@ fn parse_arguments(
     if !allowed.iter().all(|flag| parsed.contains_key(*flag)) {
         bail!("missing required arguments; {USAGE}");
     }
-    Ok(parsed)
+    Ok(Arguments {
+        paths: parsed,
+        baseline_failures_only,
+    })
 }
 
 fn required_path(arguments: &BTreeMap<String, PathBuf>, name: &str) -> Result<PathBuf> {
@@ -87,4 +100,51 @@ fn required_path(arguments: &BTreeMap<String, PathBuf>, name: &str) -> Result<Pa
     Ok(std::env::current_dir()
         .context("reading the current directory")?
         .join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn required_arguments() -> Vec<OsString> {
+        [
+            "--corpus",
+            "corpus.json",
+            "--manifest",
+            "manifest.json",
+            "--runtime-profile",
+            "profile.json",
+            "--model",
+            "model.gguf",
+            "--runtime-artifact",
+            "runtime.exe",
+            "--output",
+            "report.json",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    #[test]
+    fn alm9_semantic_corpus_cli_accepts_focused_failure_mode() {
+        let mut arguments = required_arguments();
+        arguments.push(OsString::from("--baseline-failures-only"));
+
+        let parsed = parse_arguments(arguments.into_iter()).unwrap();
+
+        assert!(parsed.baseline_failures_only);
+        assert_eq!(parsed.paths.len(), 6);
+    }
+
+    #[test]
+    fn alm9_semantic_corpus_cli_rejects_duplicate_focused_flag() {
+        let mut arguments = required_arguments();
+        arguments.extend([
+            OsString::from("--baseline-failures-only"),
+            OsString::from("--baseline-failures-only"),
+        ]);
+
+        assert!(parse_arguments(arguments.into_iter()).is_err());
+    }
 }

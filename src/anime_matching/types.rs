@@ -510,6 +510,26 @@ pub struct AnimeSemanticHypothesis {
     pub target_keys: Vec<String>,
 }
 
+/// The user request projected into the semantic selector contract. Provider
+/// identifiers remain private; the model sees only the title, coordinates,
+/// scope, and audio policy it must compare with one raw release.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnimeSemanticTarget {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub canonical_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AnimeMatchScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_number: Option<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episode_numbers: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absolute_episode_numbers: Vec<i32>,
+    #[serde(default)]
+    pub audio_preference: AnimeMatchAudioPreference,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnimeSemanticEvidenceRequest {
@@ -519,6 +539,12 @@ pub struct AnimeSemanticEvidenceRequest {
     pub raw: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_release: Option<String>,
+    /// Optional only for backward compatibility with the original 18-case
+    /// selector fixture. Every production-built request supplies this field.
+    #[serde(default)]
+    pub target: AnimeSemanticTarget,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub title_candidates: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

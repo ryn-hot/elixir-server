@@ -125,6 +125,9 @@ pub struct AnimeSemanticCorpusRunConfig {
     pub model_path: PathBuf,
     pub runtime_artifact_path: PathBuf,
     pub output_path: PathBuf,
+    /// Diagnostic iteration mode: execute inference only for cases the current
+    /// deterministic production path does not already solve exactly.
+    pub baseline_failures_only: bool,
 }
 
 /// Model-free corpus replay used while changing deterministic parsing and
@@ -141,6 +144,7 @@ pub struct AnimeSemanticBaselineRunConfig {
 pub struct AnimeSemanticCorpusRunSummary {
     pub status: String,
     pub corpus_id: String,
+    pub baseline_failures_only: bool,
     pub case_count: usize,
     pub passed: usize,
     pub failed: usize,
@@ -149,6 +153,8 @@ pub struct AnimeSemanticCorpusRunSummary {
     pub regressed: usize,
     pub selector_invocations: usize,
     pub accepted_evidence: usize,
+    pub expectation_audit_cases: usize,
+    pub rejection_reason_counts: BTreeMap<String, usize>,
     pub output_path: PathBuf,
 }
 
@@ -543,6 +549,8 @@ struct AnimeSemanticCorpusCaseObservation {
     selector_errors: usize,
     accepted_evidence: usize,
     rejected_evidence: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expectation_audit: Option<String>,
     selected_hypotheses: Vec<AnimeSemanticCorpusSelection>,
     baseline_final_plan: QualificationFinalPlan,
     final_plan: QualificationFinalPlan,
@@ -555,6 +563,8 @@ struct AnimeSemanticCorpusSelection {
     candidate_key: String,
     hypothesis_index: usize,
     accepted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejection_reasons: Vec<String>,
 }
 
 #[derive(Default)]
@@ -565,6 +575,7 @@ struct SemanticCaseCounters {
     selector_errors: usize,
     accepted_evidence: usize,
     rejected_evidence: usize,
+    rejection_reason_counts: BTreeMap<String, usize>,
     selected_hypotheses: Vec<AnimeSemanticCorpusSelection>,
 }
 
@@ -640,7 +651,7 @@ pub async fn run_anime_semantic_corpus(
         .prime()
         .await
         .context("priming semantic corpus worker")?;
-    let result = run_semantic_corpus_cases(&corpus, &engine).await;
+    let result = run_semantic_corpus_cases(&corpus, &engine, config.baseline_failures_only).await;
     engine.shutdown().await;
     drop(extraction);
     let cases = result?;
@@ -657,6 +668,19 @@ pub async fn run_anime_semantic_corpus(
     let regressed = cases.iter().filter(|case| case.regressed).count();
     let selector_invocations = cases.iter().map(|case| case.selector_invocations).sum();
     let accepted_evidence = cases.iter().map(|case| case.accepted_evidence).sum();
+    let expectation_audit_cases = cases
+        .iter()
+        .filter(|case| case.expectation_audit.is_some())
+        .count();
+    let mut rejection_reason_counts = BTreeMap::new();
+    for selection in cases
+        .iter()
+        .flat_map(|case| case.selected_hypotheses.iter())
+    {
+        for reason in &selection.rejection_reasons {
+            *rejection_reason_counts.entry(reason.clone()).or_insert(0) += 1;
+        }
+    }
     let output_path = config.output_path.clone();
     let summary = AnimeSemanticCorpusRunSummary {
         status: if passed == cases.len() {
@@ -665,6 +689,7 @@ pub async fn run_anime_semantic_corpus(
             "failed".to_string()
         },
         corpus_id: corpus.corpus_id.clone(),
+        baseline_failures_only: config.baseline_failures_only,
         case_count: cases.len(),
         passed,
         failed: cases.len() - passed,
@@ -673,6 +698,8 @@ pub async fn run_anime_semantic_corpus(
         regressed,
         selector_invocations,
         accepted_evidence,
+        expectation_audit_cases,
+        rejection_reason_counts,
         output_path,
     };
     let report = AnimeSemanticCorpusReport {
@@ -710,13 +737,16 @@ pub fn run_anime_semantic_baseline(
         let resolution = deterministic_baseline(&input)?;
         let final_plan = final_plan_for_resolution(&input.request, &resolution)?;
         let matches_expected = semantic_final_plans_match(&final_plan, &case.expected_final_plan);
+        let deterministic_definitive = deterministic_union_state(&input.request, &resolution)
+            == DeterministicMatchState::Definitive;
+        let expectation_audit =
+            semantic_expectation_audit(case, deterministic_definitive, &final_plan);
         cases.push(AnimeSemanticCorpusCaseObservation {
             case_id: case.case_id.clone(),
             set: case.set.clone(),
             slice: case.slice.clone(),
             origin: case.origin.clone(),
-            deterministic_definitive: deterministic_union_state(&input.request, &resolution)
-                == DeterministicMatchState::Definitive,
+            deterministic_definitive,
             baseline_matches_expected: matches_expected,
             final_matches_expected: matches_expected,
             changed: false,
@@ -728,6 +758,7 @@ pub fn run_anime_semantic_baseline(
             selector_errors: 0,
             accepted_evidence: 0,
             rejected_evidence: 0,
+            expectation_audit,
             selected_hypotheses: Vec::new(),
             baseline_final_plan: final_plan.clone(),
             final_plan,
@@ -746,6 +777,7 @@ pub fn run_anime_semantic_baseline(
             "failed".to_string()
         },
         corpus_id: corpus.corpus_id.clone(),
+        baseline_failures_only: false,
         case_count: cases.len(),
         passed,
         failed: cases.len() - passed,
@@ -754,6 +786,11 @@ pub fn run_anime_semantic_baseline(
         regressed: 0,
         selector_invocations: 0,
         accepted_evidence: 0,
+        expectation_audit_cases: cases
+            .iter()
+            .filter(|case| case.expectation_audit.is_some())
+            .count(),
+        rejection_reason_counts: BTreeMap::new(),
         output_path: config.output_path.clone(),
     };
     let report = AnimeSemanticCorpusReport {
@@ -774,6 +811,7 @@ pub fn run_anime_semantic_baseline(
 async fn run_semantic_corpus_cases(
     corpus: &QualificationCorpus,
     engine: &dyn AnimeSemanticEvidenceEngine,
+    baseline_failures_only: bool,
 ) -> Result<Vec<AnimeSemanticCorpusCaseObservation>> {
     let mut observations = Vec::with_capacity(corpus.cases.len());
     for (index, case) in corpus.cases.iter().enumerate() {
@@ -783,6 +821,11 @@ async fn run_semantic_corpus_cases(
         validate_case_input(case, &input)?;
         let baseline_resolution = deterministic_baseline(&input)?;
         let baseline = final_plan_for_resolution(&input.request, &baseline_resolution)?;
+        let baseline_matches_expected =
+            semantic_final_plans_match(&baseline, &case.expected_final_plan);
+        if baseline_failures_only && baseline_matches_expected {
+            continue;
+        }
         let deterministic_definitive =
             deterministic_union_state(&input.request, &baseline_resolution)
                 == DeterministicMatchState::Definitive;
@@ -873,6 +916,19 @@ async fn run_semantic_corpus_cases(
                     anime_semantic_candidate_evidence(&semantic_request, hypothesis)
                 else {
                     counters.rejected_evidence += 1;
+                    let reason = "canonical_entity_unavailable".to_string();
+                    *counters
+                        .rejection_reason_counts
+                        .entry(reason.clone())
+                        .or_insert(0) += 1;
+                    counters
+                        .selected_hypotheses
+                        .push(AnimeSemanticCorpusSelection {
+                            candidate_key: request_candidate.candidate_key.clone(),
+                            hypothesis_index: hypothesis.index,
+                            accepted: false,
+                            rejection_reasons: vec![reason],
+                        });
                     continue;
                 };
                 let semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
@@ -903,19 +959,27 @@ async fn run_semantic_corpus_cases(
                     MediaType::Anime,
                     &acquisition_candidate_language_evidence(candidate),
                 );
-                let accepted = semantic_plan.as_ref().is_some_and(|plan| {
-                    acquisition_anime_deterministic_state(plan)
-                        == DeterministicMatchState::Definitive
-                        && plan_covers_only_wanted_targets(&input.request, plan)
-                        && required_language_satisfied(&preference, &assessment)
-                        && !synthetic_stream_candidate_requires_manual_review(candidate)
-                });
+                let rejection_reasons = semantic_evidence_rejection_reasons(
+                    &input.request,
+                    semantic_plan.as_ref(),
+                    &preference,
+                    &assessment,
+                    candidate,
+                );
+                let accepted = rejection_reasons.is_empty();
+                for reason in &rejection_reasons {
+                    *counters
+                        .rejection_reason_counts
+                        .entry(reason.clone())
+                        .or_insert(0) += 1;
+                }
                 counters
                     .selected_hypotheses
                     .push(AnimeSemanticCorpusSelection {
                         candidate_key: request_candidate.candidate_key.clone(),
                         hypothesis_index: hypothesis.index,
                         accepted,
+                        rejection_reasons,
                     });
                 if accepted {
                     let plan = semantic_plan.expect("accepted semantic plan");
@@ -932,8 +996,6 @@ async fn run_semantic_corpus_cases(
         }
 
         let final_plan = final_plan_for_resolution(&input.request, &combined)?;
-        let baseline_matches_expected =
-            semantic_final_plans_match(&baseline, &case.expected_final_plan);
         let final_matches_expected =
             semantic_final_plans_match(&final_plan, &case.expected_final_plan);
         let changed = !semantic_final_plans_match(&final_plan, &baseline);
@@ -956,6 +1018,11 @@ async fn run_semantic_corpus_cases(
             selector_errors: counters.selector_errors,
             accepted_evidence: counters.accepted_evidence,
             rejected_evidence: counters.rejected_evidence,
+            expectation_audit: semantic_expectation_audit(
+                case,
+                deterministic_definitive,
+                &baseline,
+            ),
             selected_hypotheses: counters.selected_hypotheses,
             baseline_final_plan: baseline,
             final_plan,
@@ -1427,6 +1494,62 @@ fn plan_covers_only_wanted_targets(
         && !planned.is_empty()
         && planned.len() == plan.entries.len()
         && planned.is_subset(&wanted)
+}
+
+fn semantic_evidence_rejection_reasons(
+    request: &AnimeMatchRequest,
+    plan: Option<&AnimeFileCoveragePlan>,
+    preference: &AcquisitionLanguagePreference,
+    assessment: &LanguagePreferenceAssessment,
+    candidate: &AcquisitionCandidate,
+) -> Vec<String> {
+    let Some(plan) = plan else {
+        return vec!["semantic_planner_no_plan".to_string()];
+    };
+    let mut reasons = BTreeSet::new();
+    if acquisition_anime_deterministic_state(plan) != DeterministicMatchState::Definitive {
+        reasons.insert("plan_not_definitive".to_string());
+    }
+    if plan.entries.is_empty() {
+        reasons.insert("empty_target_coverage".to_string());
+    }
+    if !plan_covers_only_wanted_targets(request, plan) {
+        reasons.insert("wanted_target_coverage_failed".to_string());
+    }
+    if !required_language_satisfied(preference, assessment) {
+        reasons.insert("required_audio_failed".to_string());
+    }
+    if synthetic_stream_candidate_requires_manual_review(candidate) {
+        reasons.insert("candidate_policy_blocked".to_string());
+    }
+    reasons.extend(
+        plan.rejection_reasons
+            .iter()
+            .map(|reason| format!("planner_rejection:{reason}")),
+    );
+    reasons.extend(
+        plan.review_reasons
+            .iter()
+            .map(|reason| format!("planner_review:{reason}")),
+    );
+    reasons.into_iter().collect()
+}
+
+/// Preserve raw corpus scoring while identifying frozen synthetic labels that
+/// contradict a definitive source-shaped match. These remain visible failures;
+/// the implementation must not learn product behavior from them until their
+/// expected plan is independently corrected.
+fn semantic_expectation_audit(
+    case: &QualificationCase,
+    deterministic_definitive: bool,
+    baseline: &QualificationFinalPlan,
+) -> Option<String> {
+    (case.origin == "synthetic"
+        && case.counterfactual_pair_id.is_some()
+        && case.expected_final_plan.disposition == QualificationDisposition::NoMatch
+        && deterministic_definitive
+        && baseline.disposition == QualificationDisposition::Matched)
+        .then(|| "synthetic_no_match_conflicts_with_definitive_match".to_string())
 }
 
 fn candidate_plan_for_coverage(

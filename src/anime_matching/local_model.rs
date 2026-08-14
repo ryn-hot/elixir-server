@@ -70,7 +70,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v2";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v3";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-semantic-evidence-response-v1";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -89,9 +89,11 @@ Example: target Example Show season 2 episode 3; candidates are `Other Show S02E
 
 JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
 
-const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Interpret one raw anime release or filename using only the supplied title candidates, entities, and server-authored hypotheses.
+const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Match one raw anime release against the exact supplied target using the supplied context and server-authored hypotheses.
 
-Choose identity from title evidence first. Episode-number coincidence never proves identity. Each entity owns its aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists the explicit season labels valid for that entity even when Elixir's canonical season differs. Seasonal and absolute numbering are different interpretations. Entity-only means the title/media entity is clear and Elixir should retain its deterministic number parsing. Select a numbered hypothesis only when entity, numbering, and media kind all agree. Return null for an unrelated title, conflicting episode, insufficient title evidence, sample, opening, ending, or extra.
+The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Episode-number coincidence never proves identity. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. Seasonal and absolute numbering are different interpretations. Entity-only means identity is clear and Elixir should retain deterministic number parsing.
+
+Select a hypothesis only when the release/files affirmatively identify the requested target and the entity, numbering, media kind, and required audio agree. Prefer a complete numbered hypothesis when the raw text supports it; use entity-only when identity is clear but numbering is better left to Elixir. Return null when the release identifies an adjacent or different season, an unrelated title, a conflicting episode, insufficient identity evidence, an audio requirement it does not satisfy, a sample, opening, ending, or extra.
 
 Do not invent a title, entity, number, media kind, or hypothesis. Output JSON only: {\"schemaVersion\":1,\"hypothesisIndex\":<supplied integer or null>}."#;
 
@@ -2193,8 +2195,10 @@ fn build_semantic_chat_request(
         "semantic evidence request has no selectable interpretation"
     );
     let request_json = serde_json::to_string(&json!({
+        "target": request.target,
         "raw": request.raw,
         "parentRelease": request.parent_release,
+        "fileNames": request.file_names,
         "titleCandidates": request.title_candidates,
         "observedSeasonNumbers": request.observed_season_numbers,
         "entities": request.entities,
@@ -4095,7 +4099,7 @@ mod tests {
                 .expect("direct user JSON"),
         )
         .expect("direct user object");
-        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v2");
+        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v3");
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
             "anime-semantic-evidence-response-v1"
@@ -4190,6 +4194,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(user["raw"], "Tokyo Ghoul Root A - 01");
+        assert_eq!(user["target"]["canonicalTitle"], "Tokyo Ghoul");
+        assert_eq!(user["target"]["seasonNumber"], 2);
+        assert_eq!(user["target"]["episodeNumbers"], json!([1]));
+        assert_eq!(user["target"]["absoluteEpisodeNumbers"], json!([13]));
+        assert_eq!(user["target"]["audioPreference"]["mode"], "any");
+        assert_eq!(user["fileNames"], json!(["Tokyo Ghoul Root A - 01.mkv"]));
         assert!(
             user["hypotheses"]
                 .as_array()
