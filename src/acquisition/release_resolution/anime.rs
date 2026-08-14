@@ -2090,7 +2090,20 @@ fn semantic_scoring_inputs(
     // so either is sufficient. A provider-season translation can change the
     // season label; it does not waive the raw episode coordinate.
     {
-        let observed = semantic_explicit_release_episode_numbers(&parsed.original_title);
+        let mut observed = semantic_explicit_release_episode_numbers(&parsed.original_title);
+        // Reuse the production parser's coordinates as well as the narrow raw
+        // syntax probe. The latter intentionally understands only a few clear
+        // layouts and can miss forms such as `2014 OVA - 02`, while the main
+        // parser has already extracted episode 2. A four-digit production year
+        // is context, not an episode coordinate.
+        observed.extend(
+            parsed
+                .episode_numbers
+                .iter()
+                .chain(&parsed.absolute_episode_numbers)
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number)),
+        );
         let mut allowed = evidence
             .episode_numbers
             .iter()
@@ -2125,6 +2138,24 @@ fn semantic_scoring_inputs(
                 allowed.extend(target.episode_number.filter(|number| *number > 0));
                 allowed.extend(target.absolute_episode_number.filter(|number| *number > 0));
             }
+        }
+        let selected_target_has_coordinate = context.targets.iter().any(|target| {
+            selected_keys.contains(target.target_key.as_str())
+                && (target.episode_number.is_some() || target.absolute_episode_number.is_some())
+        });
+        if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
+            && matches!(
+                evidence.media_kind,
+                AnimeSemanticMediaKindEvidence::Episode | AnimeSemanticMediaKindEvidence::Range
+            )
+            && selected_target_has_coordinate
+            && observed.is_empty()
+        {
+            // Entity-only evidence confirms title identity; it never invents
+            // the coordinate for an episode/range whose release contains no
+            // parseable number. Numbered hypotheses remain available when the
+            // model can select a server-authored seasonal/absolute mapping.
+            return None;
         }
         if !observed.is_empty() && !allowed.is_empty() && observed.is_disjoint(&allowed) {
             return None;
@@ -8207,7 +8238,35 @@ mod tests {
             tvdb_episode_id: Some("2014".to_string()),
             anidb_episode_id: None,
         });
-        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 02 [1080p]");
+        let candidate = rr3e_candidate(
+            "[Group] Tokyo Ghoul Root A - 2014 OVA - 02 [DVD][0322C99B]",
+        );
+        assert!(
+            parse_anime_release_title(&candidate.title)
+                .episode_numbers
+                .contains(&2)
+        );
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(
+            score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence).is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_semantic_entity_only_cannot_invent_a_missing_episode_coordinate() {
+        let context = tokyo_ghoul_scoped_context();
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A [1080p]");
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
