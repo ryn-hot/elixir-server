@@ -2110,7 +2110,9 @@ fn semantic_scoring_inputs(
         // deterministic parser owns numbering. It still may not turn a clear
         // raw episode into a different episode merely because only one target
         // from the selected entity is present in the scoped context.
-        if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly {
+        if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
+            && selected_keys.is_empty()
+        {
             for target in context.targets.iter().filter(|target| {
                 evidence.anilist_season_id.as_deref().is_some_and(|id| {
                     target
@@ -2383,6 +2385,16 @@ fn semantic_identity_alias_score(title: &str, alias: &str) -> Option<u16> {
     {
         return Some(94);
     }
+    if title_tokens.len() >= 2
+        && title_tokens.len() < alias_tokens.len()
+        && alias_tokens.ends_with(&title_tokens)
+        && !alias_remainder_is_release_context(&title_tokens)
+    {
+        // Fansub releases often use only the entity-specific sequel/arc suffix
+        // ("Root A", "Future Arc"). It is affirmative only when it is the
+        // canonical alias suffix itself, not a generic season/pack marker.
+        return Some(92);
+    }
     // Some release groups shorten a long canonical subtitle while preserving
     // the franchise prefix and the distinguishing arc/part suffix, e.g.
     // "Danganronpa 3 - Future Arc". The anchors keep a bare franchise title
@@ -2396,7 +2408,14 @@ fn semantic_identity_alias_score(title: &str, alias: &str) -> Option<u16> {
         return Some(90);
     }
     let overlap = token_overlap_score(&title_tokens, &alias_tokens)?;
-    (overlap >= 0.72).then_some((60.0 + overlap * 35.0).round() as u16)
+    // High bag-of-words overlap is not enough for sequel identity: long anime
+    // franchise titles often differ by only one arc/movie phrase. Permit a
+    // fuzzy relation only when one form is an ordered abbreviation of the
+    // other, never when substantive identity tokens were replaced or shuffled.
+    (overlap >= 0.72
+        && (ordered_token_subsequence(&title_tokens, &alias_tokens)
+            || ordered_token_subsequence(&alias_tokens, &title_tokens)))
+    .then_some((60.0 + overlap * 35.0).round() as u16)
 }
 
 fn semantic_identity_tokens(value: &str) -> Vec<String> {
@@ -2652,17 +2671,20 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> Option<AnimeFileCoveragePlan> {
     let full =
-        plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence));
+        plan_anime_file_coverage_internal(context, candidate, files, options, Some(evidence))
+            .map(|plan| enforce_semantic_target_coverage(plan, evidence));
     if full.as_ref().is_some_and(semantic_plan_is_definitive) {
         return full;
     }
 
-    // The selected hypothesis contains independent identity, canonical target
-    // joins, numbering, and media-kind fields. A secondary field must not erase
-    // useful identity evidence. Retry progressively smaller, still
-    // server-authored projections only when the complete interpretation could
-    // not produce a definitive plan. External wanted-target and audio gates are
-    // unchanged and remain the final authority.
+    // Number interpretation is secondary evidence and may be dropped when the
+    // untouched release carries a better deterministic coordinate. Canonical
+    // wanted-target binding is not secondary: preserve it through the retry so
+    // an adjacent episode or entity can never satisfy the current request.
+    if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly {
+        return full;
+    }
+
     let mut without_target_binding = evidence.clone();
     without_target_binding.target_keys.clear();
     let without_target_binding = plan_anime_file_coverage_internal(
@@ -2671,7 +2693,8 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
         files,
         options,
         Some(&without_target_binding),
-    );
+    )
+    .map(|plan| enforce_semantic_target_coverage(plan, evidence));
     if without_target_binding
         .as_ref()
         .is_some_and(semantic_plan_is_definitive)
@@ -2683,9 +2706,9 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     identity_only.numbering = AnimeSemanticNumberingEvidence::EntityOnly;
     identity_only.episode_numbers.clear();
     identity_only.absolute_episode_numbers.clear();
-    identity_only.target_keys.clear();
     let identity_only =
-        plan_anime_file_coverage_internal(context, candidate, files, options, Some(&identity_only));
+        plan_anime_file_coverage_internal(context, candidate, files, options, Some(&identity_only))
+            .map(|plan| enforce_semantic_target_coverage(plan, &identity_only));
     if identity_only
         .as_ref()
         .is_some_and(semantic_plan_is_definitive)
@@ -2694,6 +2717,39 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     }
 
     full.or(without_target_binding).or(identity_only)
+}
+
+fn enforce_semantic_target_coverage(
+    mut plan: AnimeFileCoveragePlan,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> AnimeFileCoveragePlan {
+    let required = evidence
+        .target_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if required.is_empty() {
+        return plan;
+    }
+    let covered = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.state,
+                ReleaseCoverageState::ReviewRequired | ReleaseCoverageState::Rejected
+            )
+        })
+        .map(|entry| entry.target_key.as_str())
+        .collect::<BTreeSet<_>>();
+    if !required.is_subset(&covered) {
+        plan.confidence = ReleaseConfidence::ReviewRequired;
+        plan.review_reasons
+            .push("missing_semantic_target_coverage".to_string());
+        plan.review_reasons.sort();
+        plan.review_reasons.dedup();
+    }
+    plan
 }
 
 fn semantic_plan_is_definitive(plan: &AnimeFileCoveragePlan) -> bool {
@@ -8050,6 +8106,73 @@ mod tests {
     }
 
     #[test]
+    fn alm9_semantic_identity_rejects_replaced_sequel_tokens() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-distinct-movie".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Seishun Buta Yarou wa Randoseru Girl no Yume wo Minai".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("x-jat".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("161474".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title(
+            "Seishun Buta Yarou wa Odekake Sister no Yume wo Minai | \
+             Rascal Does Not Dream of a Sister Venturing Out",
+        );
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            anilist_season_id: Some("161474".to_string()),
+            aliases: vec!["Seishun Buta Yarou wa Randoseru Girl no Yume wo Minai".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+    }
+
+    #[test]
+    fn alm9_semantic_identity_rejects_unordered_special_overlap() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-distinct-ova".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "OVA Tokyo Ghoul".to_string(),
+                source: "animap_title".to_string(),
+                language: None,
+                season_number: Some(1),
+                anilist_season_id: Some("21132".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title("Tokyo Ghoul - Pinto OVA");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            anilist_season_id: Some("21132".to_string()),
+            aliases: vec!["OVA Tokyo Ghoul".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Ova,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+    }
+
+    #[test]
     fn alm9_semantic_numbering_cannot_replace_a_different_raw_episode() {
         let context = tokyo_ghoul_scoped_context();
         let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 10 [1080p]");
@@ -8072,7 +8195,18 @@ mod tests {
 
     #[test]
     fn alm9_semantic_entity_only_cannot_replace_a_different_raw_episode() {
-        let context = tokyo_ghoul_scoped_context();
+        let mut context = tokyo_ghoul_scoped_context();
+        context.targets.push(AnimeCandidateTarget {
+            target_key: "S02E02".to_string(),
+            canonical_key: Some("anilist:1002:S02E02".to_string()),
+            title: "Old Guard".to_string(),
+            season_number: Some(2),
+            anilist_season_id: Some("1002".to_string()),
+            episode_number: Some(2),
+            absolute_episode_number: Some(14),
+            tvdb_episode_id: Some("2014".to_string()),
+            anidb_episode_id: None,
+        });
         let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 02 [1080p]");
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
@@ -8083,7 +8217,7 @@ mod tests {
             media_kind: AnimeSemanticMediaKindEvidence::Episode,
             episode_numbers: Vec::new(),
             absolute_episode_numbers: Vec::new(),
-            target_keys: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
         };
 
         assert!(

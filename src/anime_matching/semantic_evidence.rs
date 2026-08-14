@@ -174,6 +174,25 @@ pub fn build_semantic_evidence_request(
 
     for kind in media_kinds {
         for entity in &entities {
+            let Some(context_season) = request.context.seasons.iter().find(|season| {
+                season.season_number == entity.season_number
+                    && season.anilist_id == entity.anilist_id
+            }) else {
+                continue;
+            };
+            let entity_wanted_target_keys = context_season
+                .targets
+                .iter()
+                .filter(|target| wanted_target_keys.contains(target.target_key.as_str()))
+                .map(|target| target.target_key.clone())
+                .collect::<Vec<_>>();
+            // Adjacent entities remain visible as comparison context, but they
+            // are not selectable interpretations of the exact user request.
+            // A hypothesis always carries the private canonical wanted-target
+            // binding; the model never authors or sees these keys.
+            if entity_wanted_target_keys.is_empty() {
+                continue;
+            }
             if matches!(
                 kind,
                 AnimeSemanticMediaKind::SeasonPack | AnimeSemanticMediaKind::SeriesPack
@@ -185,19 +204,17 @@ pub fn build_semantic_evidence_request(
                     episode_numbers: Vec::new(),
                     absolute_episode_numbers: Vec::new(),
                     media_kind: kind,
-                    target_keys: Vec::new(),
+                    target_keys: entity_wanted_target_keys,
                 });
                 continue;
             }
             let mut seasonal_targets = BTreeMap::<i32, Vec<String>>::new();
             let mut absolute_targets = BTreeMap::<i32, Vec<String>>::new();
-            let Some(context_season) = request.context.seasons.iter().find(|season| {
-                season.season_number == entity.season_number
-                    && season.anilist_id == entity.anilist_id
-            }) else {
-                continue;
-            };
-            for target in &context_season.targets {
+            for target in context_season
+                .targets
+                .iter()
+                .filter(|target| wanted_target_keys.contains(target.target_key.as_str()))
+            {
                 if let Some(episode) = target
                     .episode_number
                     .filter(|value| seasonal_numbers.contains(value))
@@ -243,7 +260,7 @@ pub fn build_semantic_evidence_request(
                 episode_numbers: Vec::new(),
                 absolute_episode_numbers: Vec::new(),
                 media_kind: kind,
-                target_keys: Vec::new(),
+                target_keys: entity_wanted_target_keys,
             });
         }
     }
@@ -565,6 +582,16 @@ mod tests {
             hypothesis.entity_index == root_a.index
                 && hypothesis.numbering == AnimeSemanticNumbering::Absolute
                 && hypothesis.absolute_episode_numbers == vec![13]
+        }));
+        assert!(
+            request
+                .hypotheses
+                .iter()
+                .all(|hypothesis| hypothesis.entity_index == root_a.index)
+        );
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+                && hypothesis.target_keys == vec!["S02E01"]
         }));
     }
 
