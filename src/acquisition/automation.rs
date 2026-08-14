@@ -1894,6 +1894,7 @@ async fn build_anime_candidate_release_plans_with_matching(
                     wire_candidate.candidate_key.clone(),
                     wire_candidate.title.clone(),
                     None,
+                    parse_facts.title_candidates.iter().cloned(),
                     parse_facts.season_numbers.iter().copied(),
                     parse_facts.episode_numbers.iter().copied(),
                     parse_facts.absolute_episode_numbers.iter().copied(),
@@ -2092,6 +2093,7 @@ pub(crate) fn anime_semantic_candidate_evidence(
     let entity = request.entities.get(hypothesis.entity_index)?;
     (entity.index == hypothesis.entity_index).then_some(AnimeSemanticCandidateEvidence {
         season_number: entity.season_number,
+        release_season_numbers: entity.release_season_numbers.clone(),
         anilist_season_id: (!entity.anilist_id.trim().is_empty())
             .then(|| entity.anilist_id.clone()),
         aliases: entity.aliases.clone(),
@@ -12634,7 +12636,7 @@ mod tests {
         deterministic.id = Some("deterministic-dual".to_string());
         deterministic.language = Some("eng".to_string());
         let mut unresolved = candidate(
-            "Opaque.Release.Subbed.1080p",
+            "Example.Title.Unknown.Subbed.1080p",
             vec![DEBRID_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID],
             Some(true),
             Some(40),

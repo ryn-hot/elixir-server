@@ -70,7 +70,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v1";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v2";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-semantic-evidence-response-v1";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -89,9 +89,9 @@ Example: target Example Show season 2 episode 3; candidates are `Other Show S02E
 
 JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
 
-const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Interpret one raw anime release or filename using only the supplied entities and complete hypotheses.
+const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Interpret one raw anime release or filename using only the supplied title candidates, entities, and server-authored hypotheses.
 
-Each entity owns its aliases. A named sequel, part, cour, arc, movie, special, or OVA may have a title that differs from the franchise title. Seasonal and absolute numbering are different interpretations. Select a hypothesis only when its entity aliases, numbering, and media kind agree with the raw value. Return null for an unrelated title, conflicting season or episode, insufficient evidence, sample, opening, ending, or extra.
+Choose identity from title evidence first. Episode-number coincidence never proves identity. Each entity owns its aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists the explicit season labels valid for that entity even when Elixir's canonical season differs. Seasonal and absolute numbering are different interpretations. Entity-only means the title/media entity is clear and Elixir should retain its deterministic number parsing. Select a numbered hypothesis only when entity, numbering, and media kind all agree. Return null for an unrelated title, conflicting episode, insufficient title evidence, sample, opening, ending, or extra.
 
 Do not invent a title, entity, number, media kind, or hypothesis. Output JSON only: {\"schemaVersion\":1,\"hypothesisIndex\":<supplied integer or null>}."#;
 
@@ -2195,6 +2195,8 @@ fn build_semantic_chat_request(
     let request_json = serde_json::to_string(&json!({
         "raw": request.raw,
         "parentRelease": request.parent_release,
+        "titleCandidates": request.title_candidates,
+        "observedSeasonNumbers": request.observed_season_numbers,
         "entities": request.entities,
         "hypotheses": request.hypotheses,
     }))
@@ -4093,7 +4095,7 @@ mod tests {
                 .expect("direct user JSON"),
         )
         .expect("direct user object");
-        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v1");
+        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v2");
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
             "anime-semantic-evidence-response-v1"
@@ -4171,6 +4173,7 @@ mod tests {
             "candidate-0",
             "Tokyo Ghoul Root A - 01",
             None,
+            ["Tokyo Ghoul Root A".to_string()],
             [],
             [1],
             [13],
@@ -4187,7 +4190,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(user["raw"], "Tokyo Ghoul Root A - 01");
-        assert_eq!(user["hypotheses"].as_array().map(Vec::len), Some(2));
+        assert!(
+            user["hypotheses"]
+                .as_array()
+                .is_some_and(|hypotheses| hypotheses.len() >= 3)
+        );
+        assert_eq!(user["titleCandidates"][0], "Tokyo Ghoul Root A");
         let encoded = serde_json::to_string(&user).unwrap();
         assert!(!encoded.contains("S02E01"));
         assert!(!encoded.contains("candidate-0"));

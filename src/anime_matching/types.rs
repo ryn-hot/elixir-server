@@ -479,6 +479,12 @@ pub enum AnimeSemanticNumbering {
 pub struct AnimeSemanticEntity {
     pub index: usize,
     pub season_number: i32,
+    /// Season numbers release names may use for this provider-owned entity.
+    /// This includes the canonical Elixir season plus explicit season markers
+    /// found in the entity's own aliases (for example an AniList "Season 3"
+    /// alias on canonical season 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub release_season_numbers: Vec<i32>,
     pub aliases: Vec<String>,
     /// Private canonical join key. The model selects `index`; it never needs
     /// or returns provider identity.
@@ -513,6 +519,10 @@ pub struct AnimeSemanticEvidenceRequest {
     pub raw: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_release: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub title_candidates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_season_numbers: Vec<i32>,
     pub graph_fingerprint: String,
     pub entities: Vec<AnimeSemanticEntity>,
     pub hypotheses: Vec<AnimeSemanticHypothesis>,

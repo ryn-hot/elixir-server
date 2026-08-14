@@ -47,9 +47,9 @@ use crate::{
         },
         release_resolution::{
             anime::{
-                AnimeCandidateInput, AnimeCandidateScoringContext, AnimeCoverageOptions,
-                AnimeFileCoveragePlan, AnimeReleaseFileInput,
-                plan_anime_file_coverage_with_options,
+                ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput,
+                AnimeCandidateScoringContext, AnimeCoverageOptions, AnimeFileCoveragePlan,
+                AnimeReleaseFileInput, plan_anime_file_coverage_with_options,
                 plan_anime_file_coverage_with_semantic_evidence,
             },
             models::ReleaseConfidence,
@@ -124,6 +124,15 @@ pub struct AnimeSemanticCorpusRunConfig {
     pub runtime_profile_path: PathBuf,
     pub model_path: PathBuf,
     pub runtime_artifact_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
+/// Model-free corpus replay used while changing deterministic parsing and
+/// coverage. It intentionally shares the exact corpus decoder, production
+/// adapters, planner, and final-plan scorer with the physical semantic run.
+#[derive(Debug, Clone)]
+pub struct AnimeSemanticBaselineRunConfig {
+    pub corpus_path: PathBuf,
     pub output_path: PathBuf,
 }
 
@@ -681,6 +690,87 @@ pub async fn run_anime_semantic_corpus(
     Ok(summary)
 }
 
+/// Evaluate the deterministic production path across the frozen corpus without
+/// loading a worker or model. This makes parser and file-coverage iteration
+/// cheap and ensures GPU runs are reserved for genuine semantic evaluation.
+pub fn run_anime_semantic_baseline(
+    config: AnimeSemanticBaselineRunConfig,
+) -> Result<AnimeSemanticCorpusRunSummary> {
+    let corpus_bytes = read_limited(&config.corpus_path, "qualification corpus")?;
+    let corpus: QualificationCorpus =
+        serde_json::from_value(parse_strict_json(&corpus_bytes, "qualification corpus")?)
+            .context("decoding qualification corpus")?;
+    validate_corpus_shape(&corpus, &corpus_bytes)?;
+
+    let mut cases = Vec::with_capacity(corpus.cases.len());
+    for case in &corpus.cases {
+        let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
+            .with_context(|| format!("decoding input for semantic case {}", case.case_id))?;
+        validate_case_input(case, &input)?;
+        let resolution = deterministic_baseline(&input)?;
+        let final_plan = final_plan_for_resolution(&input.request, &resolution)?;
+        let matches_expected = semantic_final_plans_match(&final_plan, &case.expected_final_plan);
+        cases.push(AnimeSemanticCorpusCaseObservation {
+            case_id: case.case_id.clone(),
+            set: case.set.clone(),
+            slice: case.slice.clone(),
+            origin: case.origin.clone(),
+            deterministic_definitive: deterministic_union_state(&input.request, &resolution)
+                == DeterministicMatchState::Definitive,
+            baseline_matches_expected: matches_expected,
+            final_matches_expected: matches_expected,
+            changed: false,
+            recovered: false,
+            regressed: false,
+            selector_invocations: 0,
+            selector_selections: 0,
+            selector_abstentions: 0,
+            selector_errors: 0,
+            accepted_evidence: 0,
+            rejected_evidence: 0,
+            selected_hypotheses: Vec::new(),
+            baseline_final_plan: final_plan.clone(),
+            final_plan,
+            expected_final_plan: case.expected_final_plan.clone(),
+        });
+    }
+
+    let passed = cases
+        .iter()
+        .filter(|case| case.final_matches_expected)
+        .count();
+    let summary = AnimeSemanticCorpusRunSummary {
+        status: if passed == cases.len() {
+            "passed".to_string()
+        } else {
+            "failed".to_string()
+        },
+        corpus_id: corpus.corpus_id.clone(),
+        case_count: cases.len(),
+        passed,
+        failed: cases.len() - passed,
+        baseline_passed: passed,
+        recovered: 0,
+        regressed: 0,
+        selector_invocations: 0,
+        accepted_evidence: 0,
+        output_path: config.output_path.clone(),
+    };
+    let report = AnimeSemanticCorpusReport {
+        schema_version: 1,
+        status: summary.status.clone(),
+        corpus_id: corpus.corpus_id,
+        model_id: "deterministic".to_string(),
+        model_revision: ANIME_SHOKO_STYLE_RESOLVER_VERSION.to_string(),
+        backend: "none".to_string(),
+        profile_fingerprint: "deterministic".to_string(),
+        summary: summary.clone(),
+        cases,
+    };
+    write_new_canonical_json(&config.output_path, &report)?;
+    Ok(summary)
+}
+
 async fn run_semantic_corpus_cases(
     corpus: &QualificationCorpus,
     engine: &dyn AnimeSemanticEvidenceEngine,
@@ -744,6 +834,7 @@ async fn run_semantic_corpus_cases(
                     request_candidate.candidate_key.clone(),
                     request_candidate.title.clone(),
                     None,
+                    facts.title_candidates.iter().cloned(),
                     facts.season_numbers.iter().copied(),
                     facts.episode_numbers.iter().copied(),
                     facts.absolute_episode_numbers.iter().copied(),
@@ -841,9 +932,11 @@ async fn run_semantic_corpus_cases(
         }
 
         let final_plan = final_plan_for_resolution(&input.request, &combined)?;
-        let baseline_matches_expected = baseline == case.expected_final_plan;
-        let final_matches_expected = final_plan == case.expected_final_plan;
-        let changed = final_plan != baseline;
+        let baseline_matches_expected =
+            semantic_final_plans_match(&baseline, &case.expected_final_plan);
+        let final_matches_expected =
+            semantic_final_plans_match(&final_plan, &case.expected_final_plan);
+        let changed = !semantic_final_plans_match(&final_plan, &baseline);
         let recovered = !baseline_matches_expected && final_matches_expected;
         let regressed = baseline_matches_expected && !final_matches_expected;
         observations.push(AnimeSemanticCorpusCaseObservation {
@@ -1492,6 +1585,54 @@ fn final_plan_for_resolution(
         absolute_episode_numbers: absolutes,
         candidate_plans,
     })
+}
+
+/// Candidate, target, and file arrays are protocol sets. Coverage remains an
+/// exact target-to-file relation, but provider enumeration order is not part of
+/// anime identity and must not turn a correct plan into a corpus failure.
+fn semantic_final_plans_match(
+    left: &QualificationFinalPlan,
+    right: &QualificationFinalPlan,
+) -> bool {
+    canonical_semantic_final_plan(left) == canonical_semantic_final_plan(right)
+}
+
+fn canonical_semantic_final_plan(plan: &QualificationFinalPlan) -> QualificationFinalPlan {
+    let mut plan = plan.clone();
+    plan.episode_numbers.sort_unstable();
+    plan.absolute_episode_numbers.sort_unstable();
+    for candidate in &mut plan.candidate_plans {
+        candidate.target_keys.sort();
+        candidate.file_keys.sort();
+        candidate.coverage.sort_by(|left, right| {
+            (
+                &left.target_key,
+                &left.file_key,
+                coverage_status_order(&left.status),
+            )
+                .cmp(&(
+                    &right.target_key,
+                    &right.file_key,
+                    coverage_status_order(&right.status),
+                ))
+        });
+    }
+    plan.candidate_plans.sort_by(|left, right| {
+        (&left.candidate_key, &left.target_keys, &left.file_keys).cmp(&(
+            &right.candidate_key,
+            &right.target_keys,
+            &right.file_keys,
+        ))
+    });
+    plan
+}
+
+fn coverage_status_order(status: &QualificationCoverageStatus) -> u8 {
+    match status {
+        QualificationCoverageStatus::Covered => 0,
+        QualificationCoverageStatus::Missing => 1,
+        QualificationCoverageStatus::Ineligible => 2,
+    }
 }
 
 fn deterministic_union_state(

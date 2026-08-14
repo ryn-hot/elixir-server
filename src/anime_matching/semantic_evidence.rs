@@ -2,15 +2,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 use super::{
     ANIME_SEMANTIC_EVIDENCE_SCHEMA_VERSION, AnimeMatchContext, AnimeMatchRequest,
     AnimeMatchRuntimeProvenance, AnimeSemanticEntity, AnimeSemanticEvidenceRequest,
     AnimeSemanticEvidenceResponse, AnimeSemanticHypothesis, AnimeSemanticMediaKind,
-    AnimeSemanticNumbering,
+    AnimeSemanticNumbering, anime_match_alias_equivalence_key,
 };
 
 pub const ANIME_SEMANTIC_EVIDENCE_MAX_HYPOTHESES: usize = 48;
+
+static EXPLICIT_ALIAS_SEASON_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?ix)(?:\bS0*(?P<short>\d{1,3})\b|\bSeason[\s._-]*0*(?P<word>\d{1,3})\b|\b0*(?P<ordinal>\d{1,3})(?:st|nd|rd|th)\s+Season\b|第\s*0*(?P<native>\d{1,3})\s*期)",
+    )
+    .expect("valid explicit anime alias season regex")
+});
 
 #[async_trait]
 pub trait AnimeSemanticEvidenceEngine: Send + Sync {
@@ -45,6 +54,7 @@ pub fn build_semantic_evidence_request(
     candidate_key: impl Into<String>,
     raw: impl Into<String>,
     parent_release: Option<String>,
+    observed_titles: impl IntoIterator<Item = String>,
     observed_seasons: impl IntoIterator<Item = i32>,
     observed_episodes: impl IntoIterator<Item = i32>,
     observed_absolute_episodes: impl IntoIterator<Item = i32>,
@@ -56,40 +66,74 @@ pub fn build_semantic_evidence_request(
         "semantic evidence raw value is empty"
     );
 
-    let entities = semantic_entities(&request.context);
-    if entities.is_empty() {
-        return Ok(None);
-    }
-    // Season observations are deliberately not a filter. A bad inferred
-    // season is one of the ambiguities this evidence path exists to resolve;
-    // explicit SxxEyy contradictions are enforced later by the resolver.
-    let _observed_seasons = positive_set(observed_seasons);
+    let mut title_candidates = observed_titles
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    title_candidates.insert(raw.clone());
+    let observed_seasons = positive_set(observed_seasons);
     let observed_episodes = positive_set(observed_episodes);
     let observed_absolute = positive_set(observed_absolute_episodes);
-    // A bare anime number is inherently ambiguous: parser A may call `13`
-    // seasonal while parser B calls it absolute. Preserve both complete graph
-    // interpretations and let explicit SxxEyy contradiction checks decide
-    // when only seasonal numbering is legal.
+    // A bare anime number is inherently ambiguous, but an explicit SxxEyy
+    // coordinate is not. Preserve both interpretations only for bare numbers;
+    // otherwise keep seasonal and independently observed absolute facts apart.
     let observed_numbers = observed_episodes
         .union(&observed_absolute)
         .copied()
         .collect::<BTreeSet<_>>();
+    let seasonal_numbers = if observed_seasons.is_empty() {
+        &observed_numbers
+    } else {
+        &observed_episodes
+    };
+    let absolute_numbers = if observed_seasons.is_empty() {
+        &observed_numbers
+    } else {
+        &observed_absolute
+    };
     let media_kinds = media_kinds.into_iter().collect::<BTreeSet<_>>();
     if media_kinds.is_empty() {
         return Ok(None);
+    }
+
+    // Numeric coincidence never establishes anime identity. Restrict the
+    // selector to entities for which the raw release or one deterministic title
+    // candidate has affirmative normalized alias overlap. This is deliberately
+    // generic: all English, romaji, native, synonym, and generated aliases are
+    // considered, with no title-specific exceptions.
+    let mut entities = semantic_entities(&request.context)
+        .into_iter()
+        .filter_map(|entity| {
+            semantic_entity_relevance(&entity, &title_candidates)
+                .map(|relevance| (relevance, entity))
+        })
+        .collect::<Vec<_>>();
+    entities.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.index.cmp(&right.1.index))
+    });
+    let worst_case_hypotheses_per_entity = media_kinds.len().saturating_mul(3).max(1);
+    let entity_limit =
+        (ANIME_SEMANTIC_EVIDENCE_MAX_HYPOTHESES / worst_case_hypotheses_per_entity).max(1);
+    let mut entities = entities
+        .into_iter()
+        .take(entity_limit)
+        .map(|(_, entity)| entity)
+        .collect::<Vec<_>>();
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    for (index, entity) in entities.iter_mut().enumerate() {
+        entity.index = index;
     }
 
     let mut hypotheses = Vec::new();
 
     for kind in media_kinds {
         for entity in &entities {
-            if matches!(
-                kind,
-                AnimeSemanticMediaKind::Special | AnimeSemanticMediaKind::Ova
-            ) && entity.season_number != 0
-            {
-                continue;
-            }
             if matches!(
                 kind,
                 AnimeSemanticMediaKind::SeasonPack | AnimeSemanticMediaKind::SeriesPack
@@ -116,7 +160,7 @@ pub fn build_semantic_evidence_request(
             for target in &context_season.targets {
                 if let Some(episode) = target
                     .episode_number
-                    .filter(|value| observed_numbers.contains(value))
+                    .filter(|value| seasonal_numbers.contains(value))
                 {
                     seasonal_targets
                         .entry(episode)
@@ -125,7 +169,7 @@ pub fn build_semantic_evidence_request(
                 }
                 if let Some(absolute) = target
                     .absolute_episode_number
-                    .filter(|value| observed_numbers.contains(value))
+                    .filter(|value| absolute_numbers.contains(value))
                 {
                     absolute_targets
                         .entry(absolute)
@@ -149,17 +193,18 @@ pub fn build_semantic_evidence_request(
                 absolute_targets,
             );
 
-            if observed_episodes.is_empty() && observed_absolute.is_empty() {
-                hypotheses.push(AnimeSemanticHypothesis {
-                    index: hypotheses.len(),
-                    entity_index: entity.index,
-                    numbering: AnimeSemanticNumbering::EntityOnly,
-                    episode_numbers: Vec::new(),
-                    absolute_episode_numbers: Vec::new(),
-                    media_kind: kind,
-                    target_keys: Vec::new(),
-                });
-            }
+            // Identity and coordinate interpretation are separable. EntityOnly
+            // means the model affirms the title/media entity while the existing
+            // deterministic parser retains responsibility for observed numbers.
+            hypotheses.push(AnimeSemanticHypothesis {
+                index: hypotheses.len(),
+                entity_index: entity.index,
+                numbering: AnimeSemanticNumbering::EntityOnly,
+                episode_numbers: Vec::new(),
+                absolute_episode_numbers: Vec::new(),
+                media_kind: kind,
+                target_keys: Vec::new(),
+            });
         }
     }
 
@@ -201,10 +246,43 @@ pub fn build_semantic_evidence_request(
         candidate_key: candidate_key.into(),
         raw,
         parent_release,
+        title_candidates: title_candidates.into_iter().collect(),
+        observed_season_numbers: observed_seasons.into_iter().collect(),
         graph_fingerprint: request.context.graph_fingerprint.clone(),
         entities,
         hypotheses,
     }))
+}
+
+fn semantic_entity_relevance(
+    entity: &AnimeSemanticEntity,
+    titles: &BTreeSet<String>,
+) -> Option<u8> {
+    let title_keys = titles
+        .iter()
+        .map(|title| anime_match_alias_equivalence_key(title))
+        .filter(|key| !key.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut relevance = None;
+    for alias in &entity.aliases {
+        let alias = anime_match_alias_equivalence_key(alias);
+        if alias.is_empty() {
+            continue;
+        }
+        for title in &title_keys {
+            let score = if title == &alias {
+                Some(3)
+            } else if title.len().min(alias.len()) >= 4
+                && (title.contains(&alias) || alias.contains(title))
+            {
+                Some(2)
+            } else {
+                None
+            };
+            relevance = relevance.max(score);
+        }
+    }
+    relevance
 }
 
 pub fn validate_semantic_evidence_response<'a>(
@@ -260,14 +338,31 @@ fn semantic_entities(context: &AnimeMatchContext) -> Vec<AnimeSemanticEntity> {
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
             );
+            let mut release_season_numbers = BTreeSet::from([season.season_number]);
+            for alias in &aliases {
+                release_season_numbers.extend(explicit_alias_season_numbers(alias));
+            }
             AnimeSemanticEntity {
                 index,
                 season_number: season.season_number,
+                release_season_numbers: release_season_numbers.into_iter().collect(),
                 aliases: aliases.into_iter().collect(),
                 anilist_id: season.anilist_id.clone(),
             }
         })
         .collect()
+}
+
+fn explicit_alias_season_numbers(alias: &str) -> impl Iterator<Item = i32> + '_ {
+    EXPLICIT_ALIAS_SEASON_RE
+        .captures_iter(alias)
+        .filter_map(|captures| {
+            ["short", "word", "ordinal", "native"]
+                .into_iter()
+                .find_map(|name| captures.name(name))
+                .and_then(|value| value.as_str().parse::<i32>().ok())
+                .filter(|value| *value >= 0)
+        })
 }
 
 fn positive_set(values: impl IntoIterator<Item = i32>) -> BTreeSet<i32> {
@@ -360,6 +455,7 @@ mod tests {
             "candidate-0",
             "[Group] Tokyo Ghoul Root A - 01",
             None,
+            ["Tokyo Ghoul Root A".to_string()],
             [],
             [1],
             [13],
@@ -369,20 +465,24 @@ mod tests {
         .expect("ambiguous evidence request");
 
         assert_eq!(request.entities.len(), 2);
-        assert!(
-            request.entities[1]
-                .aliases
-                .iter()
-                .any(|value| value == "Tokyo Ghoul Root A")
-        );
+        let root_a = request
+            .entities
+            .iter()
+            .find(|entity| {
+                entity
+                    .aliases
+                    .iter()
+                    .any(|value| value == "Tokyo Ghoul Root A")
+            })
+            .expect("Root A entity");
         assert!(request.hypotheses.iter().any(|hypothesis| {
-            hypothesis.entity_index == 1
+            hypothesis.entity_index == root_a.index
                 && hypothesis.numbering == AnimeSemanticNumbering::Seasonal
                 && hypothesis.episode_numbers == vec![1]
                 && hypothesis.target_keys == vec!["S02E01"]
         }));
         assert!(request.hypotheses.iter().any(|hypothesis| {
-            hypothesis.entity_index == 1
+            hypothesis.entity_index == root_a.index
                 && hypothesis.numbering == AnimeSemanticNumbering::Absolute
                 && hypothesis.absolute_episode_numbers == vec![13]
         }));
@@ -395,6 +495,7 @@ mod tests {
             "candidate-0",
             "Tokyo Ghoul Root A - 01",
             None,
+            ["Tokyo Ghoul Root A".to_string()],
             [],
             [1],
             [13],
@@ -432,6 +533,7 @@ mod tests {
             "candidate-0",
             "[Group] Tokyo Ghoul Root A - 13",
             None,
+            ["Tokyo Ghoul Root A".to_string()],
             [],
             [13],
             [],
@@ -440,11 +542,116 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        let root_a_index = request
+            .entities
+            .iter()
+            .find(|entity| entity.season_number == 2)
+            .map(|entity| entity.index)
+            .unwrap();
         assert!(request.hypotheses.iter().any(|hypothesis| {
-            hypothesis.entity_index == 1
+            hypothesis.entity_index == root_a_index
                 && hypothesis.numbering == AnimeSemanticNumbering::Absolute
                 && hypothesis.absolute_episode_numbers == vec![13]
                 && hypothesis.target_keys == vec!["S02E01"]
         }));
+    }
+
+    #[test]
+    fn alm9_numeric_coincidence_cannot_offer_an_unrelated_entity() {
+        let request = build_semantic_evidence_request(
+            &tokyo_ghoul_request(),
+            "candidate-0",
+            "[Group] Ishuzoku Reviewers - 13",
+            None,
+            ["Ishuzoku Reviewers".to_string()],
+            [],
+            [13],
+            [],
+            [AnimeSemanticMediaKind::Episode],
+        )
+        .unwrap();
+
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn alm9_explicit_season_keeps_seasonal_and_absolute_observations_separate() {
+        let request = build_semantic_evidence_request(
+            &tokyo_ghoul_request(),
+            "candidate-0",
+            "Tokyo Ghoul Root A S02E01",
+            None,
+            ["Tokyo Ghoul Root A".to_string()],
+            [2],
+            [1],
+            [],
+            [AnimeSemanticMediaKind::Episode],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::Seasonal
+                && hypothesis.episode_numbers == vec![1]
+        }));
+        assert!(!request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::Absolute
+                && !hypothesis.absolute_episode_numbers.is_empty()
+        }));
+    }
+
+    #[test]
+    fn alm9_ova_can_select_a_nonzero_canonical_entity() {
+        let request = build_semantic_evidence_request(
+            &tokyo_ghoul_request(),
+            "candidate-0",
+            "Tokyo Ghoul Root A OVA",
+            None,
+            ["Tokyo Ghoul Root A".to_string()],
+            [],
+            [],
+            [],
+            [AnimeSemanticMediaKind::Ova],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.media_kind == AnimeSemanticMediaKind::Ova
+                && hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+                && request.entities[hypothesis.entity_index].season_number == 2
+        }));
+    }
+
+    #[test]
+    fn alm9_entity_exposes_only_explicit_alias_season_translations() {
+        let mut request = tokyo_ghoul_request();
+        request.context.seasons[1].season_number = 4;
+        request.context.seasons[1].aliases.push(AnimeMatchAlias {
+            value: "Tokyo Ghoul Root A Season 3".to_string(),
+            kind: AnimeMatchAliasKind::English,
+            source: None,
+            language: Some("en".to_string()),
+        });
+        let semantic = build_semantic_evidence_request(
+            &request,
+            "candidate-0",
+            "Tokyo Ghoul Root A Season 3",
+            None,
+            ["Tokyo Ghoul Root A Season 3".to_string()],
+            [3],
+            [1],
+            [],
+            [AnimeSemanticMediaKind::Episode],
+        )
+        .unwrap()
+        .unwrap();
+        let entity = semantic
+            .entities
+            .iter()
+            .find(|entity| entity.season_number == 4)
+            .unwrap();
+
+        assert_eq!(entity.release_season_numbers, vec![3, 4]);
     }
 }

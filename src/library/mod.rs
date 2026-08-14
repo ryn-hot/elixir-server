@@ -4695,6 +4695,7 @@ async fn resolve_difficult_library_anime_files(
             wire_candidate.candidate_key.clone(),
             wire_candidate.title.clone(),
             None,
+            facts.title_candidates.iter().cloned(),
             observed_seasons,
             observed_episodes,
             observed_absolute_episodes,

@@ -7411,6 +7411,7 @@ async fn refine_anime_debrid_coverage(
                     wire_candidate.candidate_key.clone(),
                     wire_candidate.title.clone(),
                     None,
+                    facts.title_candidates.iter().cloned(),
                     facts.season_numbers.iter().copied(),
                     facts.episode_numbers.iter().copied(),
                     facts.absolute_episode_numbers.iter().copied(),
