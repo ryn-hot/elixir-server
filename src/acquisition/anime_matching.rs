@@ -238,6 +238,13 @@ fn bind_exact_single_anime_provider_file_internal(
                 && score.target_matches[0].target_key == plan.entries[0].target_key
         })
     else {
+        if semantic_evidence.is_some() {
+            plan.confidence = ReleaseConfidence::ReviewRequired;
+            plan.review_reasons
+                .push("semantic_provider_file_target_unverified".to_string());
+            plan.review_reasons.sort();
+            plan.review_reasons.dedup();
+        }
         return plan;
     };
 

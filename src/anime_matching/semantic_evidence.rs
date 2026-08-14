@@ -74,13 +74,35 @@ pub fn build_semantic_evidence_request(
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
     title_candidates.insert(raw.clone());
-    // These sets describe the release, not the wanted target. The target is
-    // already present in `request.target`; unioning its coordinates here would
-    // manufacture numbered hypotheses for releases that contain no number or
-    // explicitly contain a different one.
-    let observed_seasons = positive_set(observed_seasons);
-    let observed_episodes = positive_set(observed_episodes);
-    let observed_absolute = positive_set(observed_absolute_episodes);
+    // Preserve release observations separately from the target coordinates.
+    // Both are useful for offering complete server-authored hypotheses, but a
+    // selected hypothesis is validated later against the private release-only
+    // set so target context can never manufacture supporting evidence.
+    let release_observed_seasons = positive_set(observed_seasons);
+    let release_observed_episodes = positive_set(observed_episodes);
+    let release_observed_absolute = positive_set(observed_absolute_episodes);
+    let observed_release_numbers = release_observed_episodes
+        .union(&release_observed_absolute)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let observed_seasons = positive_set(
+        release_observed_seasons
+            .iter()
+            .copied()
+            .chain(request.target.season_number),
+    );
+    let observed_episodes = positive_set(
+        release_observed_episodes
+            .iter()
+            .copied()
+            .chain(request.target.episode_numbers.iter().copied()),
+    );
+    let observed_absolute = positive_set(
+        release_observed_absolute
+            .iter()
+            .copied()
+            .chain(request.target.absolute_episode_numbers.iter().copied()),
+    );
     // A bare anime number is inherently ambiguous, but an explicit SxxEyy
     // coordinate is not. Preserve both interpretations only for bare numbers;
     // otherwise keep seasonal and independently observed absolute facts apart.
@@ -319,7 +341,7 @@ pub fn build_semantic_evidence_request(
         file_names,
         title_candidates: title_candidates.into_iter().collect(),
         observed_season_numbers: observed_seasons.into_iter().collect(),
-        observed_release_episode_numbers: observed_numbers.into_iter().collect(),
+        observed_release_episode_numbers: observed_release_numbers.into_iter().collect(),
         graph_fingerprint: request.context.graph_fingerprint.clone(),
         entities,
         hypotheses,
@@ -381,35 +403,39 @@ pub fn validate_semantic_evidence_response<'a>(
             .is_some_and(|entity| entity.index == hypothesis.entity_index),
         "semantic evidence hypothesis references unknown entity"
     );
-    if hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+    let observed_numbers = request
+        .observed_release_episode_numbers
+        .iter()
+        .copied()
+        .filter(|number| *number > 0 && !(1900..=2099).contains(number))
+        .collect::<BTreeSet<_>>();
+    if !observed_numbers.is_empty()
         && matches!(
-            request.target.scope,
-            Some(
-                AnimeMatchScope::Episode
-                    | AnimeMatchScope::Range
-                    | AnimeMatchScope::AnimeArc
-                    | AnimeMatchScope::SelectedTargets
-                    | AnimeMatchScope::Missing
-            )
+            hypothesis.media_kind,
+            AnimeSemanticMediaKind::Episode | AnimeSemanticMediaKind::Range
         )
     {
-        let target_numbers = request
-            .target
-            .episode_numbers
-            .iter()
-            .chain(&request.target.absolute_episode_numbers)
-            .copied()
-            .filter(|number| *number > 0)
-            .collect::<BTreeSet<_>>();
-        let observed_numbers = request
-            .observed_release_episode_numbers
-            .iter()
-            .copied()
-            .filter(|number| *number > 0)
-            .collect::<BTreeSet<_>>();
-        if !target_numbers.is_empty()
-            && (observed_numbers.is_empty() || observed_numbers.is_disjoint(&target_numbers))
-        {
+        let selected_numbers = match hypothesis.numbering {
+            AnimeSemanticNumbering::Seasonal => hypothesis
+                .episode_numbers
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            AnimeSemanticNumbering::Absolute => hypothesis
+                .absolute_episode_numbers
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            AnimeSemanticNumbering::EntityOnly => request
+                .target
+                .episode_numbers
+                .iter()
+                .chain(&request.target.absolute_episode_numbers)
+                .copied()
+                .filter(|number| *number > 0)
+                .collect::<BTreeSet<_>>(),
+        };
+        if !selected_numbers.is_empty() && observed_numbers.is_disjoint(&selected_numbers) {
             return Ok(None);
         }
     }
@@ -721,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_explicit_season_does_not_invent_an_absolute_observation() {
+    fn alm9_explicit_season_preserves_target_owned_numbering_alternatives() {
         let request = build_semantic_evidence_request(
             &tokyo_ghoul_request(),
             "candidate-0",
@@ -740,16 +766,14 @@ mod tests {
             hypothesis.numbering == AnimeSemanticNumbering::Seasonal
                 && hypothesis.episode_numbers == vec![1]
         }));
-        assert!(
-            request
-                .hypotheses
-                .iter()
-                .all(|hypothesis| hypothesis.numbering != AnimeSemanticNumbering::Absolute)
-        );
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::Absolute
+                && hypothesis.absolute_episode_numbers == vec![13]
+        }));
     }
 
     #[test]
-    fn alm9_target_coordinates_do_not_create_release_numbering_hypotheses() {
+    fn alm9_target_coordinates_remain_distinct_from_release_observations() {
         let request = build_semantic_evidence_request(
             &tokyo_ghoul_request(),
             "candidate-0",
@@ -764,22 +788,15 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(request.hypotheses.iter().all(|hypothesis| {
-            hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
-                && hypothesis.episode_numbers.is_empty()
-                && hypothesis.absolute_episode_numbers.is_empty()
+        assert!(request.observed_release_episode_numbers.is_empty());
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::Seasonal
+                && hypothesis.episode_numbers == vec![1]
         }));
-        assert!(
-            validate_semantic_evidence_response(
-                &request,
-                &AnimeSemanticEvidenceResponse {
-                    schema_version: 1,
-                    hypothesis_index: Some(0),
-                },
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(request.hypotheses.iter().any(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::Absolute
+                && hypothesis.absolute_episode_numbers == vec![13]
+        }));
     }
 
     #[test]
@@ -797,10 +814,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let entity_only = request
+        let contradicted = request
             .hypotheses
             .iter()
-            .find(|hypothesis| hypothesis.numbering == AnimeSemanticNumbering::EntityOnly)
+            .find(|hypothesis| {
+                hypothesis.numbering == AnimeSemanticNumbering::Absolute
+                    && hypothesis.media_kind == AnimeSemanticMediaKind::Episode
+                    && hypothesis.absolute_episode_numbers == vec![13]
+            })
             .unwrap();
 
         assert!(
@@ -808,7 +829,7 @@ mod tests {
                 &request,
                 &AnimeSemanticEvidenceResponse {
                     schema_version: 1,
-                    hypothesis_index: Some(entity_only.index),
+                    hypothesis_index: Some(contradicted.index),
                 },
             )
             .unwrap()
