@@ -8238,14 +8238,7 @@ mod tests {
             tvdb_episode_id: Some("2014".to_string()),
             anidb_episode_id: None,
         });
-        let candidate = rr3e_candidate(
-            "[Group] Tokyo Ghoul Root A - 2014 OVA - 02 [DVD][0322C99B]",
-        );
-        assert!(
-            parse_anime_release_title(&candidate.title)
-                .episode_numbers
-                .contains(&2)
-        );
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A - 02 [1080p]");
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],

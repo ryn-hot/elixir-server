@@ -74,21 +74,13 @@ pub fn build_semantic_evidence_request(
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
     title_candidates.insert(raw.clone());
-    let observed_seasons = positive_set(
-        observed_seasons
-            .into_iter()
-            .chain(request.target.season_number),
-    );
-    let observed_episodes = positive_set(
-        observed_episodes
-            .into_iter()
-            .chain(request.target.episode_numbers.iter().copied()),
-    );
-    let observed_absolute = positive_set(
-        observed_absolute_episodes
-            .into_iter()
-            .chain(request.target.absolute_episode_numbers.iter().copied()),
-    );
+    // These sets describe the release, not the wanted target. The target is
+    // already present in `request.target`; unioning its coordinates here would
+    // manufacture numbered hypotheses for releases that contain no number or
+    // explicitly contain a different one.
+    let observed_seasons = positive_set(observed_seasons);
+    let observed_episodes = positive_set(observed_episodes);
+    let observed_absolute = positive_set(observed_absolute_episodes);
     // A bare anime number is inherently ambiguous, but an explicit SxxEyy
     // coordinate is not. Preserve both interpretations only for bare numbers;
     // otherwise keep seasonal and independently observed absolute facts apart.
@@ -327,6 +319,7 @@ pub fn build_semantic_evidence_request(
         file_names,
         title_candidates: title_candidates.into_iter().collect(),
         observed_season_numbers: observed_seasons.into_iter().collect(),
+        observed_release_episode_numbers: observed_numbers.into_iter().collect(),
         graph_fingerprint: request.context.graph_fingerprint.clone(),
         entities,
         hypotheses,
@@ -388,6 +381,38 @@ pub fn validate_semantic_evidence_response<'a>(
             .is_some_and(|entity| entity.index == hypothesis.entity_index),
         "semantic evidence hypothesis references unknown entity"
     );
+    if hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+        && matches!(
+            request.target.scope,
+            Some(
+                AnimeMatchScope::Episode
+                    | AnimeMatchScope::Range
+                    | AnimeMatchScope::AnimeArc
+                    | AnimeMatchScope::SelectedTargets
+                    | AnimeMatchScope::Missing
+            )
+        )
+    {
+        let target_numbers = request
+            .target
+            .episode_numbers
+            .iter()
+            .chain(&request.target.absolute_episode_numbers)
+            .copied()
+            .filter(|number| *number > 0)
+            .collect::<BTreeSet<_>>();
+        let observed_numbers = request
+            .observed_release_episode_numbers
+            .iter()
+            .copied()
+            .filter(|number| *number > 0)
+            .collect::<BTreeSet<_>>();
+        if !target_numbers.is_empty()
+            && (observed_numbers.is_empty() || observed_numbers.is_disjoint(&target_numbers))
+        {
+            return Ok(None);
+        }
+    }
     Ok(Some(hypothesis))
 }
 
@@ -696,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_explicit_season_preserves_target_owned_numbering_alternatives() {
+    fn alm9_explicit_season_does_not_invent_an_absolute_observation() {
         let request = build_semantic_evidence_request(
             &tokyo_ghoul_request(),
             "candidate-0",
@@ -715,10 +740,80 @@ mod tests {
             hypothesis.numbering == AnimeSemanticNumbering::Seasonal
                 && hypothesis.episode_numbers == vec![1]
         }));
-        assert!(request.hypotheses.iter().any(|hypothesis| {
-            hypothesis.numbering == AnimeSemanticNumbering::Absolute
-                && hypothesis.absolute_episode_numbers == vec![13]
+        assert!(
+            request
+                .hypotheses
+                .iter()
+                .all(|hypothesis| hypothesis.numbering != AnimeSemanticNumbering::Absolute)
+        );
+    }
+
+    #[test]
+    fn alm9_target_coordinates_do_not_create_release_numbering_hypotheses() {
+        let request = build_semantic_evidence_request(
+            &tokyo_ghoul_request(),
+            "candidate-0",
+            "Tokyo Ghoul Root A DHD",
+            None,
+            ["Tokyo Ghoul Root A".to_string()],
+            [],
+            [],
+            [],
+            [AnimeSemanticMediaKind::Episode],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(request.hypotheses.iter().all(|hypothesis| {
+            hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+                && hypothesis.episode_numbers.is_empty()
+                && hypothesis.absolute_episode_numbers.is_empty()
         }));
+        assert!(
+            validate_semantic_evidence_response(
+                &request,
+                &AnimeSemanticEvidenceResponse {
+                    schema_version: 1,
+                    hypothesis_index: Some(0),
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_entity_only_rejects_a_different_observed_release_episode() {
+        let request = build_semantic_evidence_request(
+            &tokyo_ghoul_request(),
+            "candidate-0",
+            "Tokyo Ghoul Root A - 2014 OVA - 02",
+            None,
+            ["Tokyo Ghoul Root A".to_string()],
+            [],
+            [2],
+            [2, 2014],
+            [AnimeSemanticMediaKind::Ova],
+        )
+        .unwrap()
+        .unwrap();
+        let entity_only = request
+            .hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis.numbering == AnimeSemanticNumbering::EntityOnly)
+            .unwrap();
+
+        assert!(
+            validate_semantic_evidence_response(
+                &request,
+                &AnimeSemanticEvidenceResponse {
+                    schema_version: 1,
+                    hypothesis_index: Some(entity_only.index),
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

@@ -549,6 +549,10 @@ pub struct AnimeSemanticEvidenceRequest {
     pub title_candidates: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_season_numbers: Vec<i32>,
+    /// Private release coordinates retained for response validation. These are
+    /// adapter-owned parse observations and are never serialized to the model.
+    #[serde(skip)]
+    pub observed_release_episode_numbers: Vec<i32>,
     pub graph_fingerprint: String,
     pub entities: Vec<AnimeSemanticEntity>,
     pub hypotheses: Vec<AnimeSemanticHypothesis>,
