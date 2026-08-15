@@ -735,7 +735,7 @@ pub fn run_anime_semantic_baseline(
     for case in &corpus.cases {
         let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
             .with_context(|| format!("decoding input for semantic case {}", case.case_id))?;
-        validate_case_input(case, &input)?;
+        let input = current_semantic_case_input(case, input)?;
         let resolution = deterministic_baseline(&input)?;
         let final_plan = final_plan_for_resolution(&input.request, &resolution)?;
         let matches_expected = semantic_final_plans_match(&final_plan, &case.expected_final_plan);
@@ -821,7 +821,7 @@ async fn run_semantic_corpus_cases(
         let started = Instant::now();
         let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
             .with_context(|| format!("decoding input for semantic case {}", case.case_id))?;
-        validate_case_input(case, &input)?;
+        let input = current_semantic_case_input(case, input)?;
         let baseline_resolution = deterministic_baseline(&input)?;
         let baseline = final_plan_for_resolution(&input.request, &baseline_resolution)?;
         let baseline_matches_expected =
@@ -1934,6 +1934,34 @@ fn selectable_request_file_bindings<'a>(
 }
 
 fn validate_case_input(case: &QualificationCase, input: &QualificationCaseInput) -> Result<()> {
+    validate_frozen_case_input(case, input)?;
+    let prepared = prepare_production_request(input)?;
+    ensure!(
+        prepared.request() == &input.request,
+        "case {} request differs from production adapter output",
+        case.case_id
+    );
+    Ok(())
+}
+
+/// Semantic integration evaluates today's parser against frozen raw releases,
+/// metadata context, and expected plans. Parser-derived request facts are not
+/// labels and must be rebuilt after deterministic parser improvements.
+fn current_semantic_case_input(
+    case: &QualificationCase,
+    mut input: QualificationCaseInput,
+) -> Result<QualificationCaseInput> {
+    validate_frozen_case_input(case, &input)?;
+    let prepared = prepare_production_request(&input)?;
+    input.request = prepared.request().clone();
+    validate_case_references(case, &input)?;
+    Ok(input)
+}
+
+fn validate_frozen_case_input(
+    case: &QualificationCase,
+    input: &QualificationCaseInput,
+) -> Result<()> {
     let actual_fingerprint = canonical_json_fingerprint(&case.input)?;
     ensure!(
         normalize_sha256(&case.input_fingerprint)? == actual_fingerprint,
@@ -1955,13 +1983,14 @@ fn validate_case_input(case: &QualificationCase, input: &QualificationCaseInput)
         "case {} worker request is not the exact production wire shape",
         case.case_id
     );
-    let prepared = prepare_production_request(input)?;
-    ensure!(
-        prepared.request() == &input.request,
-        "case {} request differs from production adapter output",
-        case.case_id
-    );
     validate_scoring_context_binding(&case.case_id, input)?;
+    validate_case_references(case, input)
+}
+
+fn validate_case_references(
+    case: &QualificationCase,
+    input: &QualificationCaseInput,
+) -> Result<()> {
     let candidate_keys = input
         .request
         .candidates
