@@ -141,10 +141,6 @@ pub async fn run_anime_semantic_smoke(
 
     let engine = LocalModelEngine::allow_all_for_probe()?;
     engine.activate_profile_for_probe(local_profile).await?;
-    engine
-        .prime()
-        .await
-        .context("priming semantic smoke worker")?;
 
     let mut observations = Vec::with_capacity(corpus.cases.len());
     for case in corpus.cases {

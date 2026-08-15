@@ -19,7 +19,7 @@ use std::fs::File;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -27,17 +27,18 @@ use tokio::sync::Mutex;
 use crate::playback::hardware::{HostHardwareInventory, collect_host_hardware_inventory};
 
 use super::{
-    ANIME_MATCH_PROMPT_REVISION, AnimeArtifactUrlPolicy, AnimeBundleCompatibilityPolicy,
-    AnimeBundleQualificationGate, AnimeExecutionBackend, AnimeInferenceBundleManifest,
-    AnimeKvCacheType, AnimeRuntimeBackend, AnimeRuntimeSelection, InferenceBackend,
-    InferenceEnvelopeProbe, InferenceModelEnvelope, InferenceProbeError, InferenceProbeLimits,
-    InferenceProbeMeasurement, InferenceRuntimeCandidate, InferenceRuntimeProfile,
-    LocalModelEngine, LocalModelRuntimeProfile, LocalModelSamplingProfile, ResolvedAnimeRuntime,
-    RuntimeProfileIdentity, RuntimeProfilePolicy, ValidatedAnimeBundle,
-    assess_inference_memory_pressure, bundle_inference_host, bundle_runtime_profile_from_probe,
-    collect_inference_hardware_inventory, extract_anime_runtime_for_qualification,
-    inference_hardware_fingerprint, resolve_anime_runtime, runtime_device_memory,
-    runtime_profile_candidates, select_runtime_profile, validate_anime_bundle,
+    ANIME_MATCH_PROMPT_REVISION, ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION,
+    AnimeArtifactUrlPolicy, AnimeBundleCompatibilityPolicy, AnimeBundleQualificationGate,
+    AnimeExecutionBackend, AnimeInferenceBundleManifest, AnimeKvCacheType, AnimeRuntimeBackend,
+    AnimeRuntimeSelection, AnimeSemanticEvidenceRequest, InferenceBackend, InferenceEnvelopeProbe,
+    InferenceModelEnvelope, InferenceProbeError, InferenceProbeLimits, InferenceProbeMeasurement,
+    InferenceRuntimeCandidate, InferenceRuntimeProfile, LocalModelEngine, LocalModelRuntimeProfile,
+    LocalModelSamplingProfile, ResolvedAnimeRuntime, RuntimeProfileIdentity, RuntimeProfilePolicy,
+    ValidatedAnimeBundle, assess_inference_memory_pressure, bundle_inference_host,
+    bundle_runtime_profile_from_probe, collect_inference_hardware_inventory,
+    extract_anime_runtime_for_qualification, inference_hardware_fingerprint, resolve_anime_runtime,
+    runtime_device_memory, runtime_profile_candidates, select_runtime_profile,
+    validate_anime_bundle,
 };
 
 use super::{
@@ -52,6 +53,23 @@ pub struct AnimeInferenceProfileProbeConfig {
     pub model_path: PathBuf,
     pub runtime_artifact_path: PathBuf,
     pub output_path: PathBuf,
+    /// Optional release-only semantic fixtures. When present, the hardware
+    /// envelope is proven through the selector contract instead of the retired
+    /// direct-plan contract.
+    pub semantic_probe_corpus_path: Option<PathBuf>,
+    pub semantic_prompt_revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SemanticProbeCorpus {
+    cases: Vec<SemanticProbeCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SemanticProbeCase {
+    request: AnimeSemanticEvidenceRequest,
 }
 
 /// Generates one execution-capable, sealed profile from the production envelope
@@ -92,6 +110,16 @@ pub async fn run_anime_inference_profile_probe(
     let model_path = absolute_existing_path(&config.model_path, "candidate model")?;
     let runtime_artifact_path =
         absolute_existing_path(&config.runtime_artifact_path, "candidate runtime artifact")?;
+    let semantic_probe_requests = config
+        .semantic_probe_corpus_path
+        .as_deref()
+        .map(read_semantic_probe_requests)
+        .transpose()?;
+    let prompt_revision = config
+        .semantic_prompt_revision
+        .as_deref()
+        .unwrap_or(ANIME_MATCH_PROMPT_REVISION)
+        .to_string();
 
     let host = collect_host_hardware_inventory().await;
     let inventory = collect_inference_hardware_inventory(host.clone()).await;
@@ -125,6 +153,8 @@ pub async fn run_anime_inference_profile_probe(
         inventory: &inventory,
         worker_path,
         model_path: model_path.clone(),
+        semantic_probe_requests,
+        prompt_revision,
         active_engine: Mutex::new(None),
     };
     let identity = RuntimeProfileIdentity {
@@ -226,7 +256,41 @@ fn validate_config(config: &AnimeInferenceProfileProbeConfig) -> Result<()> {
             && config.runtime_artifact_path != config.output_path,
         "output path aliases an input path"
     );
+    ensure!(
+        config.semantic_probe_corpus_path.is_some() == config.semantic_prompt_revision.is_some(),
+        "semantic probe corpus and prompt revision must be supplied together"
+    );
+    if let Some(revision) = config.semantic_prompt_revision.as_deref() {
+        ensure!(
+            revision == ANIME_MATCH_PROMPT_REVISION
+                || revision == ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION,
+            "semantic prompt revision is unsupported"
+        );
+        ensure!(
+            config
+                .semantic_probe_corpus_path
+                .as_ref()
+                .is_some_and(|path| path != &config.output_path),
+            "output path aliases the semantic probe corpus"
+        );
+    }
     Ok(())
+}
+
+fn read_semantic_probe_requests(path: &Path) -> Result<[AnimeSemanticEvidenceRequest; 2]> {
+    let corpus: SemanticProbeCorpus = read_strict_json(path, "semantic probe corpus")?;
+    let mut requests = corpus.cases.into_iter().map(|case| case.request);
+    let priming_request = requests
+        .next()
+        .context("semantic probe corpus requires two cases")?;
+    let request = requests
+        .next()
+        .context("semantic probe corpus requires two cases")?;
+    ensure!(
+        priming_request.request_id != request.request_id,
+        "semantic probe requests must be distinct"
+    );
+    Ok([priming_request, request])
 }
 
 fn ensure_output_absent(path: &Path) -> Result<()> {
@@ -325,7 +389,17 @@ struct ReleaseEnvelopeProbe<'a> {
     inventory: &'a super::InferenceHardwareInventory,
     worker_path: PathBuf,
     model_path: PathBuf,
+    semantic_probe_requests: Option<[AnimeSemanticEvidenceRequest; 2]>,
+    prompt_revision: String,
     active_engine: Mutex<Option<LocalModelEngine>>,
+}
+
+struct ReleaseProbeMeasurement {
+    worker_ready: bool,
+    smoke_match_passed: bool,
+    load_time_ms: u64,
+    warm_latency_ms: u64,
+    peak_rss_bytes: Option<u64>,
 }
 
 #[async_trait]
@@ -359,13 +433,38 @@ impl ReleaseEnvelopeProbe<'_> {
             &self.model_path,
             self.inventory,
             candidate,
+            &self.prompt_revision,
         )?;
-        let [priming_request, request] = smoke_requests()?;
         let engine = LocalModelEngine::allow_all_for_probe()?;
         engine.activate_profile_for_probe(profile).await?;
         *self.active_engine.lock().await = Some(engine.clone());
 
-        let measured = match engine.probe(priming_request, request).await {
+        let measured_result =
+            if let Some([priming_request, request]) = self.semantic_probe_requests.as_ref() {
+                engine
+                    .probe_semantic(priming_request.clone(), request.clone())
+                    .await
+                    .map(|measured| ReleaseProbeMeasurement {
+                        worker_ready: measured.worker_ready,
+                        smoke_match_passed: measured.smoke_match_passed,
+                        load_time_ms: measured.load_time_ms,
+                        warm_latency_ms: measured.warm_latency_ms,
+                        peak_rss_bytes: measured.peak_rss_bytes,
+                    })
+            } else {
+                let [priming_request, request] = smoke_requests()?;
+                engine
+                    .probe(priming_request, request)
+                    .await
+                    .map(|measured| ReleaseProbeMeasurement {
+                        worker_ready: measured.worker_ready,
+                        smoke_match_passed: measured.smoke_match_passed,
+                        load_time_ms: measured.load_time_ms,
+                        warm_latency_ms: measured.warm_latency_ms,
+                        peak_rss_bytes: measured.peak_rss_bytes,
+                    })
+            };
+        let measured = match measured_result {
             Ok(measured) => measured,
             Err(error) => {
                 engine.shutdown().await;
@@ -422,6 +521,7 @@ fn local_profile_for_probe(
     model_path: &Path,
     inventory: &super::InferenceHardwareInventory,
     candidate: &InferenceRuntimeCandidate,
+    prompt_revision: &str,
 ) -> Result<LocalModelRuntimeProfile> {
     let manifest = bundle.manifest();
     let sampling = LocalModelSamplingProfile::default();
@@ -443,6 +543,7 @@ fn local_profile_for_probe(
         "gpuLayers": candidate.gpu_layers,
         "cpuThreads": candidate.cpu_threads,
         "batchThreads": candidate.batch_threads,
+        "promptRevision": prompt_revision,
     });
     let profile_fingerprint = format!(
         "sha256:{:x}",
@@ -457,7 +558,7 @@ fn local_profile_for_probe(
         profile_fingerprint,
         protocol_version: manifest.protocol_version,
         matcher_schema_version: manifest.matcher_schema_version,
-        prompt_revision: ANIME_MATCH_PROMPT_REVISION.to_string(),
+        prompt_revision: prompt_revision.to_string(),
         worker_path: worker_path.to_path_buf(),
         model_path: model_path.to_path_buf(),
         context_tokens: manifest.model.context_tokens,
@@ -693,11 +794,22 @@ mod tests {
             model_path: "model.gguf".into(),
             runtime_artifact_path: "runtime.tar.gz".into(),
             output_path: "profile.json".into(),
+            semantic_probe_corpus_path: None,
+            semantic_prompt_revision: None,
         };
         validate_config(&base).unwrap();
-        let mut invalid = base;
+        let mut invalid = base.clone();
         invalid.runtime_id = "linux x86_64 CUDA".to_string();
         assert!(validate_config(&invalid).is_err());
+
+        let mut unpaired = base.clone();
+        unpaired.semantic_probe_corpus_path = Some("semantic.json".into());
+        assert!(validate_config(&unpaired).is_err());
+
+        let mut semantic = base;
+        semantic.semantic_probe_corpus_path = Some("semantic.json".into());
+        semantic.semantic_prompt_revision = Some(ANIME_MATCH_PROMPT_REVISION.to_string());
+        validate_config(&semantic).unwrap();
     }
 
     #[test]

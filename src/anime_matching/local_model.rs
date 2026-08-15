@@ -437,6 +437,18 @@ pub struct LocalModelProbeMeasurement {
     pub response: AnimeMatchResponse,
 }
 
+/// Hardware-envelope measurement for selector-only semantic models. Accuracy
+/// is intentionally excluded: the frozen integrated corpus owns that gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalModelSemanticProbeMeasurement {
+    pub worker_ready: bool,
+    pub smoke_match_passed: bool,
+    pub load_time_ms: u64,
+    pub warm_latency_ms: u64,
+    pub current_rss_bytes: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
+}
+
 /// Release-certification measurement from the exact production worker path.
 /// This is intentionally not exposed through HTTP or product configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,10 +480,29 @@ struct LocalModelCompletion {
     generation_time_ms: Option<u64>,
 }
 
+#[derive(Debug)]
+struct LocalModelRequestProbeMeasurement {
+    worker_ready: bool,
+    smoke_match_passed: bool,
+    load_time_ms: u64,
+    warm_latency_ms: u64,
+    current_rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+    priming_completion: LocalModelCompletion,
+    completion: LocalModelCompletion,
+}
+
 #[derive(Debug, Clone)]
 enum LocalModelRequest {
     Match(AnimeMatchRequest),
     Semantic(AnimeSemanticEvidenceRequest),
+}
+
+fn local_request_id(request: &LocalModelRequest) -> &str {
+    match request {
+        LocalModelRequest::Match(request) => &request.request_id,
+        LocalModelRequest::Semantic(request) => &request.request_id,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -855,6 +886,39 @@ impl LocalModelEngine {
         worker_phase: LocalModelAdmissionPhase,
         inference_phase: LocalModelAdmissionPhase,
     ) -> Result<()> {
+        self.prime_request_with_phases(
+            LocalModelRequest::Match(prime_request()?),
+            worker_phase,
+            inference_phase,
+        )
+        .await
+    }
+
+    /// Prime a selector-only model with its actual semantic contract. A
+    /// task-specific adapter is not required to retain the retired direct-plan
+    /// behavior merely to prove that its worker can load and decode safely.
+    pub async fn prime_semantic(&self, request: AnimeSemanticEvidenceRequest) -> Result<()> {
+        let phases = if self.inner.publish_runtime_metrics {
+            (
+                LocalModelAdmissionPhase::WorkerStart,
+                LocalModelAdmissionPhase::Inference,
+            )
+        } else {
+            (
+                LocalModelAdmissionPhase::ProbeWorkerStart,
+                LocalModelAdmissionPhase::ProbeInference,
+            )
+        };
+        self.prime_request_with_phases(LocalModelRequest::Semantic(request), phases.0, phases.1)
+            .await
+    }
+
+    async fn prime_request_with_phases(
+        &self,
+        request: LocalModelRequest,
+        worker_phase: LocalModelAdmissionPhase,
+        inference_phase: LocalModelAdmissionPhase,
+    ) -> Result<()> {
         let mut operation = MetricOperation::new("worker_prime");
         ensure!(
             !self.inner.shutdown.is_cancelled(),
@@ -874,7 +938,6 @@ impl LocalModelEngine {
             .await
             .map_err(|_| anyhow!("local model engine is shut down"))?;
         let profile = self.active_profile().await?;
-        let request = prime_request()?;
         let mut slot = self.inner.worker.lock().await;
         self.ensure_primed_locked(&profile, &mut slot, worker_phase, inference_phase, &request)
             .await?;
@@ -888,7 +951,7 @@ impl LocalModelEngine {
         slot: &mut WorkerSlot,
         worker_phase: LocalModelAdmissionPhase,
         inference_phase: LocalModelAdmissionPhase,
-        request: &AnimeMatchRequest,
+        request: &LocalModelRequest,
     ) -> Result<SocketAddr> {
         if slot.worker.as_ref().is_some_and(|worker| {
             worker.profile_fingerprint == profile.profile_fingerprint && worker.primed
@@ -936,7 +999,7 @@ impl LocalModelEngine {
             inference_phase,
             profile,
             &self.inner.shutdown,
-            resolve_direct_request(&self.inner.http, address, request, profile),
+            resolve_local_request(&self.inner.http, address, request, profile),
         );
         let completion = match timeout_at(prime_deadline, completion).await {
             Ok(AdmissionMonitored::Completed(result)) => result,
@@ -997,6 +1060,54 @@ impl LocalModelEngine {
         priming_request: AnimeMatchRequest,
         request: AnimeMatchRequest,
     ) -> Result<LocalModelProbeMeasurement> {
+        let measured = self
+            .probe_requests(
+                LocalModelRequest::Match(priming_request),
+                LocalModelRequest::Match(request),
+            )
+            .await?;
+        Ok(LocalModelProbeMeasurement {
+            worker_ready: measured.worker_ready,
+            smoke_match_passed: measured.smoke_match_passed,
+            load_time_ms: measured.load_time_ms,
+            warm_latency_ms: measured.warm_latency_ms,
+            current_rss_bytes: measured.current_rss_bytes,
+            peak_rss_bytes: measured.peak_rss_bytes,
+            priming_response: measured.priming_completion.match_response()?.clone(),
+            response: measured.completion.match_response()?.clone(),
+        })
+    }
+
+    /// Probe a selector-only model through the exact semantic request and
+    /// response contract used by production anime recovery.
+    pub async fn probe_semantic(
+        &self,
+        priming_request: AnimeSemanticEvidenceRequest,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<LocalModelSemanticProbeMeasurement> {
+        let measured = self
+            .probe_requests(
+                LocalModelRequest::Semantic(priming_request),
+                LocalModelRequest::Semantic(request),
+            )
+            .await?;
+        measured.priming_completion.semantic_response()?;
+        measured.completion.semantic_response()?;
+        Ok(LocalModelSemanticProbeMeasurement {
+            worker_ready: measured.worker_ready,
+            smoke_match_passed: measured.smoke_match_passed,
+            load_time_ms: measured.load_time_ms,
+            warm_latency_ms: measured.warm_latency_ms,
+            current_rss_bytes: measured.current_rss_bytes,
+            peak_rss_bytes: measured.peak_rss_bytes,
+        })
+    }
+
+    async fn probe_requests(
+        &self,
+        priming_request: LocalModelRequest,
+        request: LocalModelRequest,
+    ) -> Result<LocalModelRequestProbeMeasurement> {
         let mut operation = MetricOperation::new("profile_probe");
         ensure!(
             !self.inner.publish_runtime_metrics,
@@ -1021,7 +1132,7 @@ impl LocalModelEngine {
             .await
             .map_err(|_| anyhow!("local model engine is shut down"))?;
         ensure!(
-            priming_request.request_id != request.request_id,
+            local_request_id(&priming_request) != local_request_id(&request),
             "hardware-envelope priming and measured requests must be distinct"
         );
         let profile = self.active_profile().await?;
@@ -1102,15 +1213,15 @@ impl LocalModelEngine {
         // reference checks. Hardware probing must not duplicate the corpus's
         // semantic-accuracy decision.
         let smoke_match_passed = true;
-        Ok(LocalModelProbeMeasurement {
+        Ok(LocalModelRequestProbeMeasurement {
             worker_ready: true,
             smoke_match_passed,
             load_time_ms,
             warm_latency_ms,
             current_rss_bytes,
             peak_rss_bytes,
-            priming_response: priming_completion.match_response()?.clone(),
-            response: completion.match_response()?.clone(),
+            priming_completion,
+            completion,
         })
     }
 
@@ -1119,7 +1230,7 @@ impl LocalModelEngine {
         profile: &LocalModelRuntimeProfile,
         slot: &mut WorkerSlot,
         address: SocketAddr,
-        request: &AnimeMatchRequest,
+        request: &LocalModelRequest,
         completion_deadline: Duration,
         deadline_error: &'static str,
     ) -> Result<LocalModelCompletion> {
@@ -1138,7 +1249,7 @@ impl LocalModelEngine {
             LocalModelAdmissionPhase::ProbeInference,
             profile,
             &self.inner.shutdown,
-            resolve_direct_request(&self.inner.http, address, request, profile),
+            resolve_local_request(&self.inner.http, address, request, profile),
         );
         let monitored = match timeout_at(request_deadline, completion).await {
             Ok(monitored) => monitored,
@@ -1806,7 +1917,13 @@ impl LocalModelEngine {
                         .infer_completion_with_deadline(request, remaining)
                         .await;
                 }
-                match timeout_at(final_deadline, self.prime()).await {
+                let prime_result = match &request {
+                    LocalModelRequest::Match(_) => timeout_at(final_deadline, self.prime()).await,
+                    LocalModelRequest::Semantic(request) => {
+                        timeout_at(final_deadline, self.prime_semantic(request.clone())).await
+                    }
+                };
+                match prime_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) if resource_admission_deferred(&error) => continue,
                     Ok(Err(error)) => return Err(error),
@@ -2819,6 +2936,22 @@ struct CompactAnimeMatchResponse {
 
 #[derive(Debug, Deserialize)]
 struct CompactCandidateMapping(usize, Vec<usize>, Vec<usize>);
+
+async fn resolve_local_request(
+    client: &Client,
+    address: SocketAddr,
+    request: &LocalModelRequest,
+    profile: &LocalModelRuntimeProfile,
+) -> Result<LocalModelCompletion> {
+    match request {
+        LocalModelRequest::Match(request) => {
+            resolve_direct_request(client, address, request, profile).await
+        }
+        LocalModelRequest::Semantic(request) => {
+            resolve_semantic_request(client, address, request, profile).await
+        }
+    }
+}
 
 async fn resolve_direct_request(
     client: &Client,

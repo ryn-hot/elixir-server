@@ -6,7 +6,8 @@ use elixir_server::anime_matching::{
 };
 
 const USAGE: &str = "usage: anime-inference-profile-probe \
-  --runtime-id ID --manifest PATH --model PATH --runtime-artifact PATH --output PATH";
+  --runtime-id ID --manifest PATH --model PATH --runtime-artifact PATH --output PATH \
+  [--semantic-probe-corpus PATH --semantic-prompt-revision REVISION]";
 
 #[tokio::main]
 async fn main() {
@@ -24,6 +25,8 @@ async fn run() -> Result<()> {
         model_path: required_path(&arguments, "--model")?,
         runtime_artifact_path: required_path(&arguments, "--runtime-artifact")?,
         output_path: required_path(&arguments, "--output")?,
+        semantic_probe_corpus_path: optional_path(&arguments, "--semantic-probe-corpus"),
+        semantic_prompt_revision: optional_text(&arguments, "--semantic-prompt-revision")?,
     };
     let output = config
         .output_path
@@ -50,6 +53,8 @@ fn parse_arguments(
         "--model",
         "--runtime-artifact",
         "--output",
+        "--semantic-probe-corpus",
+        "--semantic-prompt-revision",
     ];
     let mut parsed = BTreeMap::new();
     while let Some(raw_flag) = arguments.next() {
@@ -73,8 +78,10 @@ fn parse_arguments(
             "duplicate argument {flag:?}"
         );
     }
-    if parsed.len() != allowed.len() {
-        bail!("missing required arguments; {USAGE}");
+    for required in &allowed[..5] {
+        if !parsed.contains_key(*required) {
+            bail!("missing required argument {required}; {USAGE}");
+        }
     }
     Ok(parsed)
 }
@@ -94,6 +101,22 @@ fn required_text(arguments: &BTreeMap<String, OsString>, name: &str) -> Result<S
         .with_context(|| format!("missing {name}; {USAGE}"))?
         .into_string()
         .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+}
+
+fn optional_path(arguments: &BTreeMap<String, OsString>, name: &str) -> Option<PathBuf> {
+    arguments.get(name).cloned().map(PathBuf::from)
+}
+
+fn optional_text(arguments: &BTreeMap<String, OsString>, name: &str) -> Result<Option<String>> {
+    arguments
+        .get(name)
+        .cloned()
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -138,5 +161,17 @@ mod tests {
             OsString::from("linux-x86_64-cpu"),
         ]);
         assert!(parse_arguments(duplicate.into_iter()).is_err());
+    }
+
+    #[test]
+    fn parser_accepts_paired_semantic_probe_arguments() {
+        let mut arguments = complete_arguments();
+        arguments.extend([
+            OsString::from("--semantic-probe-corpus"),
+            OsString::from("semantic.json"),
+            OsString::from("--semantic-prompt-revision"),
+            OsString::from("anime-semantic-evidence-v5"),
+        ]);
+        assert_eq!(parse_arguments(arguments.into_iter()).unwrap().len(), 7);
     }
 }

@@ -652,10 +652,6 @@ pub async fn run_anime_semantic_corpus(
 
     let engine = LocalModelEngine::allow_all_for_probe()?;
     engine.activate_profile_for_probe(local_profile).await?;
-    engine
-        .prime()
-        .await
-        .context("priming semantic corpus worker")?;
     let result = run_semantic_corpus_cases(&corpus, &engine, config.baseline_failures_only).await;
     engine.shutdown().await;
     drop(extraction);
