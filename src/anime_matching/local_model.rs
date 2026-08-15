@@ -70,7 +70,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
-pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v4";
+pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v5";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-semantic-evidence-response-v1";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -91,7 +91,7 @@ JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted index
 
 pub(crate) const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Classify the semantic anime identity and media kind of one raw release using only the supplied context and server-authored hypotheses.
 
-The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Episode-number coincidence never proves identity. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. Elixir, not the model, applies and validates all episode coordinates.
+The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. `observedReleaseEpisodeNumbers` contains numbers parsed from the release, and an entity's optional `episodeNumberOffset` translates a release-local E01-style number into that entity's canonical numbering. Use numbers only to disambiguate otherwise related entities; number coincidence never proves title identity. Elixir, not the model, applies and validates all episode coordinates.
 
 Select the supplied entity-only hypothesis when the release/files affirmatively identify that anime entity and media kind and satisfy required audio. A coordinate difference by itself is not a reason to return null; deterministic resolution handles it after semantic identity. Return null for an adjacent or different entity, an unrelated title, insufficient identity evidence, an audio requirement it does not satisfy, a sample, opening, ending, or extra.
 
@@ -2223,6 +2223,7 @@ pub(crate) fn semantic_evidence_training_messages(
         "fileNames": request.file_names,
         "titleCandidates": request.title_candidates,
         "observedSeasonNumbers": request.observed_season_numbers,
+        "observedReleaseEpisodeNumbers": request.observed_release_episode_numbers,
         "entities": request.entities,
         "hypotheses": request.hypotheses,
     }))
@@ -4111,7 +4112,7 @@ mod tests {
                 .expect("direct user JSON"),
         )
         .expect("direct user object");
-        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v4");
+        assert_eq!(ANIME_MATCH_PROMPT_REVISION, "anime-semantic-evidence-v5");
         assert_eq!(
             ANIME_MATCH_RESPONSE_SCHEMA_REVISION,
             "anime-semantic-evidence-response-v1"
@@ -4184,8 +4185,10 @@ mod tests {
 
     #[test]
     fn alm9_semantic_prompt_exposes_only_server_owned_identity_hypotheses() {
+        let mut input = request();
+        input.context.seasons[0].episode_number_offset = 12;
         let request = build_semantic_evidence_request(
-            &request(),
+            &input,
             "candidate-0",
             "Tokyo Ghoul Root A - 01",
             None,
@@ -4210,6 +4213,7 @@ mod tests {
         assert_eq!(user["target"]["seasonNumber"], 2);
         assert_eq!(user["target"]["episodeNumbers"], json!([1]));
         assert_eq!(user["target"]["absoluteEpisodeNumbers"], json!([13]));
+        assert_eq!(user["observedReleaseEpisodeNumbers"], json!([1, 13]));
         assert_eq!(user["target"]["audioPreference"]["mode"], "any");
         assert_eq!(user["fileNames"], json!(["Tokyo Ghoul Root A - 01.mkv"]));
         let hypotheses = user["hypotheses"].as_array().unwrap();
@@ -4228,7 +4232,7 @@ mod tests {
         assert!(!encoded.contains("S02E01"));
         assert!(!encoded.contains("candidate-0"));
         assert!(!encoded.contains("27899"));
-        assert!(!encoded.contains("episodeNumberOffset"));
+        assert_eq!(user["entities"][0]["episodeNumberOffset"], 12);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         let grammar = body["grammar"].as_str().unwrap();
         assert!(grammar.contains("hypothesisIndex"));

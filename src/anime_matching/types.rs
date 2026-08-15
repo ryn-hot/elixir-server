@@ -531,9 +531,10 @@ pub struct AnimeSemanticEntity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub release_season_numbers: Vec<i32>,
     /// Server-derived translation from a release-local E01-style coordinate
-    /// to the canonical episode coordinate owned by this entity. It remains
-    /// private because the selector classifies identity, not numbering.
-    #[serde(skip)]
+    /// to the canonical episode coordinate owned by this entity. The selector
+    /// may use it as read-only identity evidence, but cannot return or alter
+    /// any coordinate.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub episode_number_offset: i32,
     pub aliases: Vec<String>,
     /// Private canonical join key. The model selects `index`; it never needs
@@ -599,9 +600,10 @@ pub struct AnimeSemanticEvidenceRequest {
     pub title_candidates: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_season_numbers: Vec<i32>,
-    /// Private release coordinates retained for response validation. These are
-    /// adapter-owned parse observations and are never serialized to the model.
-    #[serde(skip)]
+    /// Adapter-owned release coordinates. They are exposed as read-only
+    /// evidence so split cours and absolute-numbered releases can be
+    /// distinguished; response validation still owns their interpretation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_release_episode_numbers: Vec<i32>,
     pub graph_fingerprint: String,
     pub entities: Vec<AnimeSemanticEntity>,
