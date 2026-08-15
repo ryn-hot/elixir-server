@@ -424,6 +424,7 @@ pub struct AnimeCoverageOptions {
 pub struct AnimeSemanticCandidateEvidence {
     pub season_number: i32,
     pub release_season_numbers: Vec<i32>,
+    pub episode_number_offset: i32,
     pub anilist_season_id: Option<String>,
     pub aliases: Vec<String>,
     pub numbering: AnimeSemanticNumberingEvidence,
@@ -1434,6 +1435,22 @@ impl AnimeMetadataGraph {
         release_delay_seconds: i64,
         now: DateTime<Utc>,
     ) -> Vec<NewAcquisitionTarget> {
+        let episode_number_offsets = self
+            .seasons
+            .iter()
+            .filter_map(|season| {
+                let offset = crate::anime_matching::complete_episode_number_offset(
+                    season.episodes,
+                    self.targets
+                        .iter()
+                        .filter(|target| target.anilist_season_id == season.anilist_id)
+                        .filter_map(|target| {
+                            target.episode_number.or(target.absolute_episode_number)
+                        }),
+                );
+                (offset > 0).then(|| (season.anilist_id.as_str(), offset))
+            })
+            .collect::<BTreeMap<_, _>>();
         self.targets
             .iter()
             .map(|target| NewAcquisitionTarget {
@@ -1456,6 +1473,10 @@ impl AnimeMetadataGraph {
                     "scopedAliases": self.scoped_aliases,
                     "anilistRootId": self.root_anilist_id,
                     "anilistSeasonId": target.anilist_season_id,
+                    "episodeNumberOffset": episode_number_offsets
+                        .get(target.anilist_season_id.as_str())
+                        .copied()
+                        .unwrap_or(0),
                     "anilistSeason": target.season,
                     "anilistStatus": target.anilist_status,
                     "tvdbSeriesId": target.tvdb_series_id,
@@ -2138,6 +2159,7 @@ fn semantic_scoring_inputs(
         }
     }
 
+    let mut translated_entity_episode_numbers = None;
     // A semantic hypothesis may recover a missing interpretation, but it may
     // not replace a different, clearly serialized episode in the release. The
     // selected entity and target own both seasonal and absolute coordinates,
@@ -2208,12 +2230,31 @@ fn semantic_scoring_inputs(
         {
             // Entity-only evidence confirms title identity; it never invents
             // the coordinate for an episode/range whose release contains no
-            // parseable number. Numbered hypotheses remain available when the
-            // model can select a server-authored seasonal/absolute mapping.
+            // parseable number. The deterministic resolver must decline it.
             return None;
         }
         if !observed.is_empty() && !allowed.is_empty() && observed.is_disjoint(&allowed) {
-            return None;
+            let release_season = explicit_coordinate
+                .map(|(season, _, _)| season)
+                .or(parsed.season_number);
+            let translated = release_season
+                .filter(|season| evidence.release_season_numbers.contains(season))
+                .filter(|_| evidence.episode_number_offset > 0)
+                .map(|_| {
+                    parsed
+                        .episode_numbers
+                        .iter()
+                        .filter_map(|number| number.checked_add(evidence.episode_number_offset))
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            if evidence.numbering != AnimeSemanticNumberingEvidence::EntityOnly
+                || translated.is_empty()
+                || translated.is_disjoint(&allowed)
+            {
+                return None;
+            }
+            translated_entity_episode_numbers = Some(translated.into_iter().collect::<Vec<_>>());
         }
     }
 
@@ -2243,8 +2284,12 @@ fn semantic_scoring_inputs(
         }
         AnimeSemanticNumberingEvidence::EntityOnly => {
             parsed.season_number = Some(evidence.season_number);
-            if parsed.sonarr_facts.season_number.is_none() {
-                parsed.sonarr_facts.season_number = Some(evidence.season_number);
+            parsed.sonarr_facts.season_number = Some(evidence.season_number);
+            if let Some(translated) = translated_entity_episode_numbers {
+                parsed.episode_numbers = translated.clone();
+                parsed.absolute_episode_numbers.clear();
+                parsed.sonarr_facts.episode_numbers = translated;
+                parsed.sonarr_facts.absolute_episode_numbers.clear();
             }
         }
     }
@@ -7974,6 +8019,55 @@ mod tests {
     }
 
     #[test]
+    fn alm9_complete_absolute_entity_persists_release_episode_offset() {
+        let mapping = AniZipMapping {
+            episodes: (13..=24)
+                .map(|episode| crate::library::AniZipEpisodeRecord {
+                    absolute_episode_number: Some(episode),
+                    episode_label: Some(episode.to_string()),
+                    mainline_episode_number: Some(episode),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let graph = build_anime_metadata_graph(AnimeMetadataGraphInput {
+            title: "Komi Can't Communicate".to_string(),
+            year: Some(2022),
+            seed_anilist_id: "142984".to_string(),
+            seed_season_number: 1,
+            external_ids: ExternalIds::default(),
+            seasons: vec![AnimeSeasonMapping {
+                season: AniListSeasonChainEntry {
+                    season_number: 1,
+                    anilist_id: "142984".to_string(),
+                    title: "Komi Can't Communicate Season 2".to_string(),
+                    format: Some("TV".to_string()),
+                    season_year: Some(2022),
+                    start_year: Some(2022),
+                    status: Some("FINISHED".to_string()),
+                    episodes: Some(12),
+                    next_airing_episode: None,
+                    next_airing_at: None,
+                    confidence: 1.0,
+                },
+                mapping: Some(mapping),
+            }],
+        });
+        let targets = graph.to_new_acquisition_targets(0, Utc::now());
+
+        assert_eq!(targets.len(), 12);
+        assert!(targets.iter().all(|target| {
+            target
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("episodeNumberOffset"))
+                .and_then(JsonValue::as_i64)
+                == Some(12)
+        }));
+    }
+
+    #[test]
     fn rr3q_reconciliation_goldens_cover_expected_outcomes() {
         let goldens = load_anime_reconciliation_goldens();
         assert_eq!(goldens.fixture_set, "rr3q-anime-reconciliation-goldens");
@@ -8407,6 +8501,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8431,12 +8526,43 @@ mod tests {
     }
 
     #[test]
+    fn alm9_entity_only_translates_release_season_episode_with_server_offset() {
+        let mut context = tokyo_ghoul_scoped_context();
+        let target = context
+            .targets
+            .iter_mut()
+            .find(|target| target.target_key == "S02E01")
+            .unwrap();
+        target.episode_number = Some(13);
+        let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A S02E01 [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            episode_number_offset: 12,
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        let score = score_anime_candidate_with_semantic_evidence(&context, &candidate, &evidence)
+            .expect("server-owned offset should translate release-local episode 1 to canonical 13");
+        assert_eq!(score.outcome, AnimeMatchOutcome::Planned);
+        assert_eq!(score.target_matches[0].target_key, "S02E01");
+        assert_eq!(score.target_matches[0].episode_number, Some(13));
+    }
+
+    #[test]
     fn alm9_semantic_parent_coordinate_can_be_proven_by_exact_provider_file() {
         let context = tokyo_ghoul_scoped_context();
         let candidate = rr3e_candidate("[Group] Tokyo Ghoul Root A [1080p]");
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8492,6 +8618,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8528,6 +8655,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8577,6 +8705,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8677,6 +8806,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("season-2".to_string()),
             aliases: vec!["Shared Franchise Arc".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8720,6 +8850,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8758,6 +8889,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8790,6 +8922,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8811,6 +8944,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
             release_season_numbers: vec![1],
+            episode_number_offset: 0,
             anilist_season_id: Some("1001".to_string()),
             aliases: vec!["Tokyo Ghoul".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8854,6 +8988,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 4,
             release_season_numbers: vec![2, 4],
+            episode_number_offset: 0,
             anilist_season_id: Some("102351".to_string()),
             aliases: vec!["Tokyo Ghoul:re 2".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -8888,6 +9023,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
             release_season_numbers: vec![1],
+            episode_number_offset: 0,
             anilist_season_id: Some("21509".to_string()),
             aliases: vec![
                 "Danganronpa 3: The End of Hope's Peak High School - Future Arc".to_string(),
@@ -8933,6 +9069,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
             release_season_numbers: vec![1],
+            episode_number_offset: 0,
             anilist_season_id: Some("127271".to_string()),
             aliases: vec!["BELLE".to_string(), "Ryuu to Sobakasu no Hime".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -8974,6 +9111,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 4,
             release_season_numbers: vec![4],
+            episode_number_offset: 0,
             anilist_season_id: Some("102351".to_string()),
             aliases: vec!["Tokyo Ghoul:re 2".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -9009,6 +9147,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
             release_season_numbers: vec![1],
+            episode_number_offset: 0,
             anilist_season_id: Some("161474".to_string()),
             aliases: vec!["Seishun Buta Yarou wa Randoseru Girl no Yume wo Minai".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -9041,6 +9180,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
             release_season_numbers: vec![1],
+            episode_number_offset: 0,
             anilist_season_id: Some("21132".to_string()),
             aliases: vec!["OVA Tokyo Ghoul".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -9062,6 +9202,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -9094,6 +9235,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -9115,6 +9257,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
@@ -9147,6 +9290,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec!["Tokyo Ghoul Root A".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
@@ -9171,6 +9315,7 @@ mod tests {
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 2,
             release_season_numbers: vec![2, 3],
+            episode_number_offset: 0,
             anilist_season_id: Some("1002".to_string()),
             aliases: vec![
                 "Tokyo Ghoul Root A".to_string(),

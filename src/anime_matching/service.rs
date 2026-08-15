@@ -1046,6 +1046,7 @@ mod tests {
                 seasons: vec![AnimeMatchSeasonContext {
                     season_number: 2,
                     anilist_id: "1002".to_string(),
+                    episode_number_offset: 0,
                     aliases: vec![AnimeMatchAlias {
                         value: "Tokyo Ghoul Root A".to_string(),
                         kind: AnimeMatchAliasKind::English,

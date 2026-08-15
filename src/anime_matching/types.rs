@@ -13,6 +13,46 @@ pub const ANIME_MATCH_MAX_CANDIDATES: usize = 6;
 /// ALM-6 also applies the bundle's exact tokenizer limit before inference.
 pub const ANIME_MATCH_MAX_REQUEST_BYTES: usize = 16 * 1024;
 
+fn is_zero_i32(value: &i32) -> bool {
+    *value == 0
+}
+
+/// Return a release-local-to-canonical episode offset only when a complete
+/// metadata entity proves a consecutive canonical range. Scoped or partial
+/// target lists must pass no expected count and therefore cannot invent one.
+pub(crate) fn complete_episode_number_offset(
+    expected_count: Option<i32>,
+    numbers: impl IntoIterator<Item = i32>,
+) -> i32 {
+    let Some(expected_count) = expected_count
+        .filter(|count| *count >= 2)
+        .and_then(|count| usize::try_from(count).ok())
+    else {
+        return 0;
+    };
+    let numbers = numbers
+        .into_iter()
+        .filter(|number| *number > 0)
+        .collect::<BTreeSet<_>>();
+    if numbers.len() != expected_count {
+        return 0;
+    }
+    let Some(first) = numbers.first().copied().filter(|number| *number > 1) else {
+        return 0;
+    };
+    let Some(last) = numbers.last().copied() else {
+        return 0;
+    };
+    let Some(span) = last
+        .checked_sub(first)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return 0;
+    };
+    (span == numbers.len()).then_some(first - 1).unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AnimeMatchMediaType {
@@ -176,6 +216,11 @@ pub struct AnimeMatchContextTarget {
 pub struct AnimeMatchSeasonContext {
     pub season_number: i32,
     pub anilist_id: String,
+    /// Offset from release-local episode numbering to Elixir's canonical
+    /// numbering for this metadata entity. It is derived from the complete
+    /// target list before request scoping and is never model-authored.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub episode_number_offset: i32,
     pub aliases: Vec<AnimeMatchAlias>,
     pub targets: Vec<AnimeMatchContextTarget>,
 }
@@ -485,6 +530,11 @@ pub struct AnimeSemanticEntity {
     /// alias on canonical season 4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub release_season_numbers: Vec<i32>,
+    /// Server-derived translation from a release-local E01-style coordinate
+    /// to the canonical episode coordinate owned by this entity. It remains
+    /// private because the selector classifies identity, not numbering.
+    #[serde(skip)]
+    pub episode_number_offset: i32,
     pub aliases: Vec<String>,
     /// Private canonical join key. The model selects `index`; it never needs
     /// or returns provider identity.
@@ -755,10 +805,23 @@ mod tests {
     }
 
     #[test]
+    fn alm9_episode_offset_requires_a_complete_consecutive_metadata_entity() {
+        assert_eq!(complete_episode_number_offset(Some(12), 13..=24), 12);
+        assert_eq!(complete_episode_number_offset(Some(12), 13..=23), 0);
+        assert_eq!(
+            complete_episode_number_offset(Some(12), (13..=24).filter(|value| *value != 18)),
+            0
+        );
+        assert_eq!(complete_episode_number_offset(None, 13..=24), 0);
+        assert_eq!(complete_episode_number_offset(Some(12), 1..=12), 0);
+    }
+
+    #[test]
     fn alm5_context_scope_keeps_wanted_targets_and_only_immediate_numbering_boundaries() {
         let season = |season_number: i32, targets: Vec<(&str, i32, i32)>| AnimeMatchSeasonContext {
             season_number,
             anilist_id: format!("anilist-{season_number}"),
+            episode_number_offset: 0,
             aliases: vec![AnimeMatchAlias {
                 value: format!("Series Season {season_number}"),
                 kind: AnimeMatchAliasKind::Generated,
@@ -778,7 +841,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let context = AnimeMatchContext {
+        let mut context = AnimeMatchContext {
             graph_fingerprint: "bounded-context".to_string(),
             seasons: vec![
                 season(
@@ -796,6 +859,7 @@ mod tests {
                 season(4, vec![("S04E01", 1, 10)]),
             ],
         };
+        context.seasons[1].episode_number_offset = 12;
         let target = AnimeMatchTarget {
             media_type: AnimeMatchMediaType::Anime,
             canonical_title: "Series".to_string(),
@@ -832,6 +896,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["S02E01", "S02E02", "S02E03"]
         );
+        assert_eq!(scoped.seasons[1].episode_number_offset, 12);
         assert_eq!(
             scoped.seasons[2]
                 .targets
@@ -859,12 +924,14 @@ mod tests {
                 AnimeMatchSeasonContext {
                     season_number: 1,
                     anilist_id: "one".to_string(),
+                    episode_number_offset: 0,
                     aliases: Vec::new(),
                     targets: vec![target_entry(1)],
                 },
                 AnimeMatchSeasonContext {
                     season_number: 2,
                     anilist_id: "two".to_string(),
+                    episode_number_offset: 0,
                     aliases: Vec::new(),
                     targets: vec![target_entry(2)],
                 },
@@ -910,12 +977,14 @@ mod tests {
                     AnimeMatchSeasonContext {
                         season_number: 1,
                         anilist_id: "one".to_string(),
+                        episode_number_offset: 0,
                         aliases: Vec::new(),
                         targets: vec![entry("A0001", 1)],
                     },
                     AnimeMatchSeasonContext {
                         season_number: 2,
                         anilist_id: "two".to_string(),
+                        episode_number_offset: 0,
                         aliases: Vec::new(),
                         targets: vec![entry("S02E01", 2)],
                     },
@@ -960,6 +1029,7 @@ mod tests {
                     AnimeMatchSeasonContext {
                         season_number: 2,
                         anilist_id: "relation-two".to_string(),
+                        episode_number_offset: 0,
                         aliases: Vec::new(),
                         targets: vec![
                             entry("S03E01", 3, "valid relation-two target"),
@@ -969,6 +1039,7 @@ mod tests {
                     AnimeMatchSeasonContext {
                         season_number: 3,
                         anilist_id: "relation-three".to_string(),
+                        episode_number_offset: 0,
                         aliases: Vec::new(),
                         targets: vec![entry("A0014", 3, "valid absolute target")],
                     },
@@ -1020,6 +1091,7 @@ mod tests {
                 seasons: vec![AnimeMatchSeasonContext {
                     season_number: 1,
                     anilist_id: "one".to_string(),
+                    episode_number_offset: 0,
                     aliases: Vec::new(),
                     targets: vec![target_entry("first"), target_entry("second")],
                 }],
@@ -1044,6 +1116,7 @@ mod tests {
         let season = |season_number: i32| AnimeMatchSeasonContext {
             season_number,
             anilist_id: format!("season-{season_number}"),
+            episode_number_offset: 0,
             aliases: Vec::new(),
             targets: (1..=3)
                 .map(|episode| AnimeMatchContextTarget {

@@ -3199,13 +3199,14 @@ mod tests {
             .context("reported hypothesis index")?;
         assert_eq!(
             hypothesis.numbering,
-            crate::anime_matching::AnimeSemanticNumbering::Seasonal
+            crate::anime_matching::AnimeSemanticNumbering::EntityOnly
         );
         assert_eq!(
             hypothesis.media_kind,
             crate::anime_matching::AnimeSemanticMediaKind::Ova
         );
-        assert_eq!(hypothesis.episode_numbers, vec![1]);
+        assert!(hypothesis.episode_numbers.is_empty());
+        assert!(hypothesis.absolute_episode_numbers.is_empty());
         assert!(
             validate_semantic_evidence_response(
                 &request,
@@ -3329,6 +3330,7 @@ mod tests {
                 seasons: vec![AnimeMatchSeasonContext {
                     season_number: 2,
                     anilist_id: "27899".to_string(),
+                    episode_number_offset: 0,
                     aliases: vec![AnimeMatchAlias {
                         value: "Tokyo Ghoul Root A".to_string(),
                         kind: AnimeMatchAliasKind::English,

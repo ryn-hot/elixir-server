@@ -105,7 +105,8 @@ pub(crate) fn acquisition_anime_match_batch_input(
         absolute_episode_numbers,
         audio_preference: acquisition_audio_preference(subscription),
     };
-    let context = acquisition_match_context(&subscription.title, context, &target)?;
+    let mut context = acquisition_match_context(&subscription.title, context, &target)?;
+    apply_metadata_episode_number_offsets(&mut context, wanted_targets);
     let candidates = candidates
         .iter()
         .enumerate()
@@ -135,6 +136,53 @@ pub(crate) fn acquisition_anime_match_batch_input(
         context,
         candidates,
     })
+}
+
+fn apply_metadata_episode_number_offsets(
+    context: &mut AnimeMatchContext,
+    targets: &[AcquisitionTarget],
+) {
+    let mut offsets = BTreeMap::<String, BTreeSet<i32>>::new();
+    for target in targets {
+        let Some(metadata) = target.metadata.as_ref() else {
+            continue;
+        };
+        let anilist_id = metadata
+            .get("anilistSeasonId")
+            .and_then(json_scalar_string)
+            .or_else(|| {
+                metadata
+                    .get("anilistSeason")
+                    .and_then(|season| season.get("anilistId"))
+                    .and_then(json_scalar_string)
+            });
+        let offset = metadata
+            .get("episodeNumberOffset")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        if let (Some(anilist_id), Some(offset)) = (anilist_id, offset) {
+            offsets.entry(anilist_id).or_default().insert(offset);
+        }
+    }
+    for season in &mut context.seasons {
+        if let Some(values) = offsets.get(&season.anilist_id)
+            && values.len() == 1
+        {
+            season.episode_number_offset = values.first().copied().unwrap_or(0);
+        }
+    }
+}
+
+fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 /// Mirrors the current acquisition acceptance gate without teaching the
@@ -965,6 +1013,7 @@ pub(crate) fn acquisition_match_context(
             .or_insert_with(|| AnimeMatchSeasonContext {
                 season_number,
                 anilist_id,
+                episode_number_offset: 0,
                 aliases: Vec::new(),
                 targets: Vec::new(),
             });
@@ -1802,6 +1851,7 @@ mod tests {
         let season = &request.context.seasons[0];
         assert_eq!(season.season_number, 2);
         assert_eq!(season.anilist_id, "1002");
+        assert_eq!(season.episode_number_offset, 0);
         assert_eq!(season.targets[0].target_key, "S02E01");
         assert_eq!(season.targets[0].absolute_episode_number, Some(13));
         assert_eq!(season.targets[0].tvdb_episode_id.as_deref(), Some("2013"));
@@ -1882,6 +1932,27 @@ mod tests {
                 "leaked private value {private}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn alm9_acquisition_adapter_uses_only_explicit_metadata_episode_offset() -> Result<()> {
+        let subscription = tokyo_ghoul_subscription();
+        let mut target = tokyo_ghoul_target(&subscription);
+        target.metadata = Some(json!({
+            "anilistSeasonId": "1002",
+            "episodeNumberOffset": 12,
+        }));
+        let input = acquisition_anime_match_batch_input(
+            "offset-contract",
+            &subscription,
+            &[target],
+            &tokyo_ghoul_context(),
+            &[],
+        )?;
+
+        assert_eq!(input.context.seasons.len(), 1);
+        assert_eq!(input.context.seasons[0].episode_number_offset, 12);
         Ok(())
     }
 

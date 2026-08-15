@@ -2095,6 +2095,7 @@ pub(crate) fn anime_semantic_candidate_evidence(
     (entity.index == hypothesis.entity_index).then_some(AnimeSemanticCandidateEvidence {
         season_number: entity.season_number,
         release_season_numbers: entity.release_season_numbers.clone(),
+        episode_number_offset: entity.episode_number_offset,
         anilist_season_id: (!entity.anilist_id.trim().is_empty())
             .then(|| entity.anilist_id.clone()),
         aliases: entity.aliases.clone(),

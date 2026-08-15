@@ -435,10 +435,13 @@ fn validate_source(source: &TrainingSource) -> Result<()> {
             ),
             None => {}
         }
-        if example.example_kind == "positive" {
+        if matches!(
+            example.example_kind.as_str(),
+            "positive" | "wrong_coordinate"
+        ) {
             ensure!(
                 example.expected_anilist_id.is_some() && example.expected_media_kind.is_some(),
-                "positive example {} lacks its gold hypothesis identity",
+                "semantic-positive example {} lacks its gold hypothesis identity",
                 example.example_id
             );
         } else {
@@ -510,19 +513,17 @@ fn compile_example(source: TrainingSourceExample) -> Result<CompiledTrainingExam
         )
     })?;
 
-    let hypothesis_index = if source.example_kind == "positive" {
+    let hypothesis_index = if source.expected_anilist_id.is_some() {
         Some(select_gold_hypothesis(
             &source.example_id,
             &semantic,
             source
                 .expected_anilist_id
                 .as_deref()
-                .expect("positive source validated"),
+                .expect("semantic-positive source validated"),
             source
                 .expected_media_kind
-                .expect("positive source validated"),
-            request,
-            facts,
+                .expect("semantic-positive source validated"),
         )?)
     } else {
         None
@@ -562,8 +563,6 @@ fn select_gold_hypothesis(
     semantic: &crate::anime_matching::AnimeSemanticEvidenceRequest,
     expected_anilist_id: &str,
     expected_media_kind: AnimeSemanticMediaKind,
-    request: &crate::anime_matching::AnimeMatchRequest,
-    facts: &crate::anime_matching::AnimeMatchParseFacts,
 ) -> Result<usize> {
     let entity_index = semantic
         .entities
@@ -575,51 +574,17 @@ fn select_gold_hypothesis(
                 "positive training example {example_id} lacks expected entity {expected_anilist_id}"
             )
         })?;
-    let target = &request.target;
-    let seasonal_observed = target
-        .episode_numbers
+    let matches = semantic
+        .hypotheses
         .iter()
-        .any(|episode| facts.episode_numbers.contains(episode))
-        && (facts.season_numbers.is_empty()
-            || target
-                .season_number
-                .is_some_and(|season| facts.season_numbers.contains(&season)));
-    let absolute_observed = target
-        .absolute_episode_numbers
-        .iter()
-        .any(|episode| facts.absolute_episode_numbers.contains(episode));
-    let order = if seasonal_observed {
-        [
-            AnimeSemanticNumbering::Seasonal,
-            AnimeSemanticNumbering::Absolute,
-            AnimeSemanticNumbering::EntityOnly,
-        ]
-    } else if absolute_observed {
-        [
-            AnimeSemanticNumbering::Absolute,
-            AnimeSemanticNumbering::Seasonal,
-            AnimeSemanticNumbering::EntityOnly,
-        ]
-    } else {
-        [
-            AnimeSemanticNumbering::EntityOnly,
-            AnimeSemanticNumbering::Seasonal,
-            AnimeSemanticNumbering::Absolute,
-        ]
-    };
-    for numbering in order {
-        let matches = semantic
-            .hypotheses
-            .iter()
-            .filter(|hypothesis| {
-                hypothesis.entity_index == entity_index
-                    && hypothesis.media_kind == expected_media_kind
-                    && hypothesis.numbering == numbering
-            })
-            .collect::<Vec<_>>();
-        if matches.len() == 1 {
-            return Ok(matches[0].index);
-        }
+        .filter(|hypothesis| {
+            hypothesis.entity_index == entity_index
+                && hypothesis.media_kind == expected_media_kind
+                && hypothesis.numbering == AnimeSemanticNumbering::EntityOnly
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return Ok(matches[0].index);
     }
     bail!(
         "positive training example {example_id} has no unique {:?} hypothesis for entity {}",

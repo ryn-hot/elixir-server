@@ -304,10 +304,17 @@ fn build_season_context(
         .as_ref()
         .map(|mapping| build_mapping_targets(canonical_title, season_number, mapping))
         .unwrap_or_default();
+    let episode_number_offset = crate::anime_matching::complete_episode_number_offset(
+        input.season.episodes,
+        targets
+            .iter()
+            .filter_map(|target| target.episode_number.or(target.absolute_episode_number)),
+    );
 
     AnimeMatchSeasonContext {
         season_number,
         anilist_id: input.season.anilist_id,
+        episode_number_offset,
         aliases,
         targets,
     }
