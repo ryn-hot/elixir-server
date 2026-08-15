@@ -126,6 +126,9 @@ pub struct AnimeSemanticCorpusRunConfig {
     pub model_path: PathBuf,
     pub runtime_artifact_path: PathBuf,
     pub output_path: PathBuf,
+    /// Server-owned prompt projection paired with the frozen selector under
+    /// test. Product activation continues to use the current server revision.
+    pub semantic_prompt_revision: String,
     /// Diagnostic iteration mode: execute inference only for cases the current
     /// deterministic production path does not already solve exactly.
     pub baseline_failures_only: bool,
@@ -525,6 +528,7 @@ struct AnimeSemanticCorpusReport {
     corpus_id: String,
     model_id: String,
     model_revision: String,
+    prompt_revision: String,
     backend: String,
     profile_fingerprint: String,
     summary: AnimeSemanticCorpusRunSummary,
@@ -627,7 +631,7 @@ pub async fn run_anime_semantic_corpus(
         profile_fingerprint: runtime_profile.profile_fingerprint.clone(),
         protocol_version: manifest.protocol_version,
         matcher_schema_version: manifest.matcher_schema_version,
-        prompt_revision: ANIME_MATCH_PROMPT_REVISION.to_string(),
+        prompt_revision: config.semantic_prompt_revision.clone(),
         worker_path,
         model_path: config.model_path.clone(),
         context_tokens: manifest.model.context_tokens,
@@ -709,6 +713,7 @@ pub async fn run_anime_semantic_corpus(
         corpus_id: corpus.corpus_id,
         model_id: manifest.model.id,
         model_revision: manifest.model.revision,
+        prompt_revision: config.semantic_prompt_revision,
         backend: runtime_profile.execution_backend.as_str().to_string(),
         profile_fingerprint: runtime_profile.profile_fingerprint,
         summary: summary.clone(),
@@ -800,6 +805,7 @@ pub fn run_anime_semantic_baseline(
         corpus_id: corpus.corpus_id,
         model_id: "deterministic".to_string(),
         model_revision: ANIME_SHOKO_STYLE_RESOLVER_VERSION.to_string(),
+        prompt_revision: ANIME_MATCH_PROMPT_REVISION.to_string(),
         backend: "none".to_string(),
         profile_fingerprint: "deterministic".to_string(),
         summary: summary.clone(),

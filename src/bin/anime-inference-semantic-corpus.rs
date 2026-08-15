@@ -4,13 +4,16 @@ use anyhow::{Context, Result, bail, ensure};
 use elixir_server::acquisition::anime_qualification::{
     AnimeSemanticCorpusRunConfig, run_anime_semantic_corpus,
 };
+use elixir_server::anime_matching::ANIME_MATCH_PROMPT_REVISION;
 
 const USAGE: &str = "usage: anime-inference-semantic-corpus \
   --corpus PATH --manifest PATH --runtime-profile PATH --model PATH \
-  --runtime-artifact PATH --output PATH [--baseline-failures-only]";
+  --runtime-artifact PATH --output PATH [--semantic-prompt-revision REVISION] \
+  [--baseline-failures-only]";
 
 struct Arguments {
     paths: BTreeMap<String, PathBuf>,
+    semantic_prompt_revision: String,
     baseline_failures_only: bool,
 }
 
@@ -31,6 +34,7 @@ async fn run() -> Result<()> {
         model_path: required_path(&arguments.paths, "--model")?,
         runtime_artifact_path: required_path(&arguments.paths, "--runtime-artifact")?,
         output_path: required_path(&arguments.paths, "--output")?,
+        semantic_prompt_revision: arguments.semantic_prompt_revision,
         baseline_failures_only: arguments.baseline_failures_only,
     })
     .await?;
@@ -53,6 +57,7 @@ fn parse_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<Argu
         "--output",
     ];
     let mut parsed = BTreeMap::new();
+    let mut semantic_prompt_revision = None;
     let mut baseline_failures_only = false;
     while let Some(raw_flag) = arguments.next() {
         if raw_flag == "--help" || raw_flag == "-h" {
@@ -65,6 +70,17 @@ fn parse_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<Argu
         if flag == "--baseline-failures-only" {
             ensure!(!baseline_failures_only, "duplicate argument");
             baseline_failures_only = true;
+            continue;
+        }
+        if flag == "--semantic-prompt-revision" {
+            ensure!(semantic_prompt_revision.is_none(), "duplicate argument");
+            let value = arguments
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{flag} requires a value; {USAGE}"))?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("prompt revision is not valid UTF-8"))?;
+            ensure!(!value.trim().is_empty(), "prompt revision is empty");
+            semantic_prompt_revision = Some(value);
             continue;
         }
         ensure!(
@@ -85,6 +101,8 @@ fn parse_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<Argu
     }
     Ok(Arguments {
         paths: parsed,
+        semantic_prompt_revision: semantic_prompt_revision
+            .unwrap_or_else(|| ANIME_MATCH_PROMPT_REVISION.to_string()),
         baseline_failures_only,
     })
 }
@@ -134,7 +152,24 @@ mod tests {
         let parsed = parse_arguments(arguments.into_iter()).unwrap();
 
         assert!(parsed.baseline_failures_only);
+        assert_eq!(parsed.semantic_prompt_revision, ANIME_MATCH_PROMPT_REVISION);
         assert_eq!(parsed.paths.len(), 6);
+    }
+
+    #[test]
+    fn alm9_semantic_corpus_cli_accepts_frozen_selector_prompt_revision() {
+        let mut arguments = required_arguments();
+        arguments.extend([
+            OsString::from("--semantic-prompt-revision"),
+            OsString::from("anime-semantic-evidence-v4"),
+        ]);
+
+        let parsed = parse_arguments(arguments.into_iter()).unwrap();
+
+        assert_eq!(
+            parsed.semantic_prompt_revision,
+            "anime-semantic-evidence-v4"
+        );
     }
 
     #[test]

@@ -71,6 +71,7 @@ const QUEUE_AND_ACTIVE_CAPACITY: usize = 2;
 /// Prompt behavior is owned by the server release, not by a downloadable
 /// bundle. A bundle can name this revision but cannot replace its semantics.
 pub const ANIME_MATCH_PROMPT_REVISION: &str = "anime-semantic-evidence-v5";
+pub const ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION: &str = "anime-semantic-evidence-v4";
 pub const ANIME_MATCH_RESPONSE_SCHEMA_REVISION: &str = "anime-semantic-evidence-response-v1";
 pub const ANIME_MATCH_SAMPLING_REVISION: &str = "anime-match-v1";
 pub const LLAMA_SERVER_PROTOCOL_VERSION: u32 = 1;
@@ -92,6 +93,14 @@ JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted index
 pub(crate) const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Classify the semantic anime identity and media kind of one raw release using only the supplied context and server-authored hypotheses.
 
 The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. `observedReleaseEpisodeNumbers` contains numbers parsed from the release, and an entity's optional `episodeNumberOffset` translates a release-local E01-style number into that entity's canonical numbering. Use numbers only to disambiguate otherwise related entities; number coincidence never proves title identity. Elixir, not the model, applies and validates all episode coordinates.
+
+Select the supplied entity-only hypothesis when the release/files affirmatively identify that anime entity and media kind and satisfy required audio. A coordinate difference by itself is not a reason to return null; deterministic resolution handles it after semantic identity. Return null for an adjacent or different entity, an unrelated title, insufficient identity evidence, an audio requirement it does not satisfy, a sample, opening, ending, or extra.
+
+Do not invent a title, entity, number, media kind, or hypothesis. Output JSON only: {\"schemaVersion\":1,\"hypothesisIndex\":<supplied integer or null>}."#;
+
+const SEMANTIC_EVIDENCE_V4_PROMPT: &str = r#"Classify the semantic anime identity and media kind of one raw release using only the supplied context and server-authored hypotheses.
+
+The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Episode-number coincidence never proves identity. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. Elixir, not the model, applies and validates all episode coordinates.
 
 Select the supplied entity-only hypothesis when the release/files affirmatively identify that anime entity and media kind and satisfy required audio. A coordinate difference by itself is not a reason to return null; deterministic resolution handles it after semantic identity. Return null for an adjacent or different entity, an unrelated title, insufficient identity evidence, an audio requirement it does not satisfy, a sample, opening, ending, or extra.
 
@@ -201,10 +210,12 @@ impl LocalModelRuntimeProfile {
             self.matcher_schema_version
         );
         ensure!(
-            self.prompt_revision == ANIME_MATCH_PROMPT_REVISION,
-            "bundle prompt revision '{}' is incompatible with server prompt '{}'",
-            self.prompt_revision,
-            ANIME_MATCH_PROMPT_REVISION
+            matches!(
+                self.prompt_revision.as_str(),
+                ANIME_MATCH_PROMPT_REVISION | ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION
+            ),
+            "unsupported server-owned prompt revision '{}'",
+            self.prompt_revision
         );
         ensure!(
             self.context_tokens == V1_CONTEXT_TOKENS,
@@ -2194,7 +2205,7 @@ fn build_semantic_chat_request(
         !request.entities.is_empty() && !request.hypotheses.is_empty(),
         "semantic evidence request has no selectable interpretation"
     );
-    let messages = semantic_evidence_training_messages(request)?;
+    let messages = semantic_evidence_messages_for_revision(request, &profile.prompt_revision)?;
     Ok(json!({
         "model": profile.model_id,
         "messages": messages,
@@ -2216,20 +2227,61 @@ fn build_semantic_chat_request(
 pub(crate) fn semantic_evidence_training_messages(
     request: &AnimeSemanticEvidenceRequest,
 ) -> Result<Vec<Value>> {
-    let request_json = serde_json::to_string(&json!({
+    semantic_evidence_messages_for_revision(request, ANIME_MATCH_PROMPT_REVISION)
+}
+
+pub(crate) fn semantic_evidence_messages_for_revision(
+    request: &AnimeSemanticEvidenceRequest,
+    prompt_revision: &str,
+) -> Result<Vec<Value>> {
+    ensure!(
+        matches!(
+            prompt_revision,
+            ANIME_MATCH_PROMPT_REVISION | ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION
+        ),
+        "unsupported semantic evidence prompt revision {prompt_revision:?}"
+    );
+    let mut entities =
+        serde_json::to_value(&request.entities).context("encoding semantic evidence entities")?;
+    if prompt_revision == ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION {
+        for entity in entities
+            .as_array_mut()
+            .context("semantic evidence entities are not an array")?
+        {
+            entity
+                .as_object_mut()
+                .context("semantic evidence entity is not an object")?
+                .remove("episodeNumberOffset");
+        }
+    }
+    let mut projection = json!({
         "target": request.target,
         "raw": request.raw,
         "parentRelease": request.parent_release,
         "fileNames": request.file_names,
         "titleCandidates": request.title_candidates,
         "observedSeasonNumbers": request.observed_season_numbers,
-        "observedReleaseEpisodeNumbers": request.observed_release_episode_numbers,
-        "entities": request.entities,
+        "entities": entities,
         "hypotheses": request.hypotheses,
-    }))
-    .context("encoding semantic evidence request")?;
+    });
+    if prompt_revision == ANIME_MATCH_PROMPT_REVISION {
+        projection
+            .as_object_mut()
+            .expect("semantic projection is an object")
+            .insert(
+                "observedReleaseEpisodeNumbers".to_string(),
+                json!(request.observed_release_episode_numbers),
+            );
+    }
+    let request_json =
+        serde_json::to_string(&projection).context("encoding semantic evidence request")?;
+    let system_prompt = if prompt_revision == ANIME_MATCH_PROMPT_REVISION {
+        SEMANTIC_EVIDENCE_PROMPT
+    } else {
+        SEMANTIC_EVIDENCE_V4_PROMPT
+    };
     Ok(vec![
-        json!({"role": "system", "content": SEMANTIC_EVIDENCE_PROMPT}),
+        json!({"role": "system", "content": system_prompt}),
         json!({"role": "user", "content": request_json}),
     ])
 }
@@ -4237,6 +4289,29 @@ mod tests {
         let grammar = body["grammar"].as_str().unwrap();
         assert!(grammar.contains("hypothesisIndex"));
         assert!(grammar.contains("choice ::= \"null\" | \"0\""));
+
+        let mut legacy_profile = profile();
+        legacy_profile.prompt_revision = ANIME_SEMANTIC_EVIDENCE_V4_PROMPT_REVISION.to_string();
+        let legacy_body = build_semantic_chat_request(&request, &legacy_profile).unwrap();
+        let legacy_user: Value = serde_json::from_str(
+            legacy_body
+                .pointer("/messages/1/content")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_user.get("observedReleaseEpisodeNumbers").is_none());
+        assert!(
+            legacy_user["entities"][0]
+                .get("episodeNumberOffset")
+                .is_none()
+        );
+        assert!(
+            legacy_body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Episode-number coincidence never proves identity")
+        );
     }
 
     #[test]
