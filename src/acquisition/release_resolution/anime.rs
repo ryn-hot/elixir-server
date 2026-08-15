@@ -726,7 +726,12 @@ impl AnimeCandidateScoringContext {
 
 pub fn parse_anime_sonarr_adapter_facts(input: &str) -> AnimeSonarrParseFacts {
     let resolver = TvSonarrStyleResolver;
-    sonarr_facts_from_tv_parse(resolver.parse_title(input))
+    let coordinate_input = strip_anime_crc32_tokens(input);
+    sonarr_facts_from_tv_parse(resolver.parse_title(&coordinate_input))
+}
+
+fn strip_anime_crc32_tokens(input: &str) -> String {
+    CRC32_RE.replace_all(input, " ").into_owned()
 }
 
 fn sonarr_facts_from_tv_parse(parsed: TvParsedRelease) -> AnimeSonarrParseFacts {
@@ -5347,8 +5352,9 @@ fn parse_air_date(value: &str) -> Option<DateTime<Utc>> {
 
 fn anime_classifier_hints(input: &str) -> Vec<elixir_classifier::hint::ClassificationHint> {
     let parser = AnimeParserAdapter;
-    let mut file_input = ClassifierFileInput::new(input);
-    file_input.file_name = Some(input.to_string());
+    let coordinate_input = strip_anime_crc32_tokens(input);
+    let mut file_input = ClassifierFileInput::new(&coordinate_input);
+    file_input.file_name = Some(coordinate_input);
     file_input.library_type_hint = Some(ClassifierLibraryType::Anime);
     parser.parse(&file_input)
 }
@@ -7253,6 +7259,26 @@ mod tests {
             parsed.sonarr_facts.quality.resolution.as_deref(),
             Some("1080p")
         );
+    }
+
+    #[test]
+    fn anime_crc32_with_episode_shaped_hex_is_not_a_coordinate() {
+        let parsed = parse_anime_release_title(
+            "[cbm]_FLCL_Alternative_06_(English_Dub)_[HDTV_720p_8bit]_[E5E7481E].mkv",
+        );
+
+        let coordinates = parsed
+            .episode_numbers
+            .iter()
+            .chain(&parsed.absolute_episode_numbers)
+            .chain(&parsed.sonarr_facts.episode_numbers)
+            .chain(&parsed.sonarr_facts.absolute_episode_numbers)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(coordinates.contains(&6));
+        assert!(!coordinates.contains(&7481));
+        assert!(coordinates.len() <= 2);
+        assert_eq!(parsed.crc32.as_deref(), Some("E5E7481E"));
     }
 
     #[test]

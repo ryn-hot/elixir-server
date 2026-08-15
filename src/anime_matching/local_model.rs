@@ -89,7 +89,7 @@ Example: target Example Show season 2 episode 3; candidates are `Other Show S02E
 
 JSON only: {\"d\":[decision per candidate],\"m\":[[candidate index,[wanted indexes],[file indexes]],...]}. Fileless candidates use an empty file list."#;
 
-const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Match one raw anime release against the exact supplied target using the supplied context and server-authored hypotheses.
+pub(crate) const SEMANTIC_EVIDENCE_PROMPT: &str = r#"Match one raw anime release against the exact supplied target using the supplied context and server-authored hypotheses.
 
 The target contains the requested title, scope, season, seasonal/absolute episode coordinates, and audio requirements. `raw` is the release name; `fileNames` are its selectable media basenames when available. Choose identity from raw title or filename evidence first. Episode-number coincidence never proves identity. Each entity owns English, romaji, Japanese, alternate, and episode-title aliases; a named sequel, part, cour, arc, movie, special, or OVA may differ from the franchise title. `releaseSeasonNumbers` lists explicit season labels valid for that entity even when Elixir's canonical season differs. Seasonal and absolute numbering are different interpretations. Entity-only means identity is clear and Elixir should retain deterministic number parsing.
 
@@ -2194,6 +2194,28 @@ fn build_semantic_chat_request(
         !request.entities.is_empty() && !request.hypotheses.is_empty(),
         "semantic evidence request has no selectable interpretation"
     );
+    let messages = semantic_evidence_training_messages(request)?;
+    Ok(json!({
+        "model": profile.model_id,
+        "messages": messages,
+        "max_tokens": profile.max_output_tokens,
+        "temperature": profile.sampling.temperature,
+        "top_p": profile.sampling.top_p,
+        "top_k": profile.sampling.top_k,
+        "min_p": profile.sampling.min_p,
+        "seed": profile.sampling.seed,
+        "stream": false,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "grammar": semantic_response_grammar(request)?
+    }))
+}
+
+/// Return the exact messages supplied to the production semantic selector.
+/// Training-data compilation uses this helper so prompt or wire-shape changes
+/// cannot silently diverge from runtime inference.
+pub(crate) fn semantic_evidence_training_messages(
+    request: &AnimeSemanticEvidenceRequest,
+) -> Result<Vec<Value>> {
     let request_json = serde_json::to_string(&json!({
         "target": request.target,
         "raw": request.raw,
@@ -2205,22 +2227,10 @@ fn build_semantic_chat_request(
         "hypotheses": request.hypotheses,
     }))
     .context("encoding semantic evidence request")?;
-    Ok(json!({
-        "model": profile.model_id,
-        "messages": [
-            {"role": "system", "content": SEMANTIC_EVIDENCE_PROMPT},
-            {"role": "user", "content": request_json}
-        ],
-        "max_tokens": profile.max_output_tokens,
-        "temperature": profile.sampling.temperature,
-        "top_p": profile.sampling.top_p,
-        "top_k": profile.sampling.top_k,
-        "min_p": profile.sampling.min_p,
-        "seed": profile.sampling.seed,
-        "stream": false,
-        "chat_template_kwargs": {"enable_thinking": false},
-        "grammar": semantic_response_grammar(request)?
-    }))
+    Ok(vec![
+        json!({"role": "system", "content": SEMANTIC_EVIDENCE_PROMPT}),
+        json!({"role": "user", "content": request_json}),
+    ])
 }
 
 fn semantic_response_grammar(request: &AnimeSemanticEvidenceRequest) -> Result<String> {

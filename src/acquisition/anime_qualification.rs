@@ -6,6 +6,7 @@
 //! acquisition, then emits evidence for the independent Python scorer.
 
 pub mod corpus_compiler;
+pub mod training_dataset;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
