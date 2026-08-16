@@ -83,6 +83,7 @@ use crate::acquisition::language_policy::CandidateLanguageEvidence;
 
 const MAX_QUALIFICATION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const EXPECTED_CASE_COUNT: usize = 520;
+const CLEAN_VALIDATION_DIAGNOSTIC_CASE_COUNT: usize = 640;
 const QUALIFICATION_CORPUS_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
@@ -177,8 +178,18 @@ struct QualificationCorpus {
     schema_version: u32,
     status: String,
     corpus_id: String,
+    #[serde(default)]
+    profile: QualificationCorpusProfile,
     sets: QualificationSets,
     cases: Vec<QualificationCase>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum QualificationCorpusProfile {
+    #[default]
+    Certification520,
+    CleanValidationDiagnosticV1,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2318,7 +2329,7 @@ fn validate_case_selection(
         "qualification case-selection ID is invalid"
     );
     ensure!(
-        !selection.case_ids.is_empty() && selection.case_ids.len() < EXPECTED_CASE_COUNT,
+        !selection.case_ids.is_empty() && selection.case_ids.len() < corpus_case_ids.len(),
         "qualification cross-runtime case selection must be a non-empty proper subset"
     );
     let selected = selection.case_ids.iter().cloned().collect::<BTreeSet<_>>();
@@ -2355,22 +2366,38 @@ fn validate_corpus_shape(corpus: &QualificationCorpus, raw: &[u8]) -> Result<()>
         corpus.schema_version == QUALIFICATION_CORPUS_SCHEMA_VERSION && corpus.status == "frozen",
         "qualification corpus must be frozen schema v{QUALIFICATION_CORPUS_SCHEMA_VERSION}"
     );
-    ensure!(
-        corpus.cases.len() == EXPECTED_CASE_COUNT,
-        "qualification corpus must contain exactly {EXPECTED_CASE_COUNT} cases"
-    );
-    ensure!(
-        corpus.sets.smoke.len() == 40,
-        "qualification smoke set must contain 40 cases"
-    );
-    ensure!(
-        corpus.sets.development.len() == 160,
-        "qualification development set must contain 160 cases"
-    );
-    ensure!(
-        corpus.sets.frozen.len() == 320,
-        "qualification frozen set must contain 320 cases"
-    );
+    match corpus.profile {
+        QualificationCorpusProfile::Certification520 => {
+            ensure!(
+                corpus.cases.len() == EXPECTED_CASE_COUNT,
+                "certification qualification corpus must contain exactly {EXPECTED_CASE_COUNT} cases"
+            );
+            ensure!(
+                corpus.sets.smoke.len() == 40,
+                "qualification smoke set must contain 40 cases"
+            );
+            ensure!(
+                corpus.sets.development.len() == 160,
+                "qualification development set must contain 160 cases"
+            );
+            ensure!(
+                corpus.sets.frozen.len() == 320,
+                "qualification frozen set must contain 320 cases"
+            );
+        }
+        QualificationCorpusProfile::CleanValidationDiagnosticV1 => {
+            ensure!(
+                corpus.cases.len() == CLEAN_VALIDATION_DIAGNOSTIC_CASE_COUNT,
+                "clean validation diagnostic corpus must contain exactly {CLEAN_VALIDATION_DIAGNOSTIC_CASE_COUNT} cases"
+            );
+            ensure!(
+                corpus.sets.smoke.is_empty()
+                    && corpus.sets.frozen.is_empty()
+                    && corpus.sets.development.len() == CLEAN_VALIDATION_DIAGNOSTIC_CASE_COUNT,
+                "clean validation diagnostic cases must all belong to development"
+            );
+        }
+    }
     let membership = corpus
         .sets
         .smoke
@@ -2379,7 +2406,7 @@ fn validate_corpus_shape(corpus: &QualificationCorpus, raw: &[u8]) -> Result<()>
         .chain(&corpus.sets.frozen)
         .collect::<BTreeSet<_>>();
     ensure!(
-        membership.len() == EXPECTED_CASE_COUNT,
+        membership.len() == corpus.cases.len(),
         "qualification set membership contains duplicates"
     );
     let case_ids = corpus
@@ -2403,6 +2430,17 @@ fn validate_corpus_shape(corpus: &QualificationCorpus, raw: &[u8]) -> Result<()>
             "qualification case {} has invalid origin",
             case.case_id
         );
+        if corpus.profile == QualificationCorpusProfile::CleanValidationDiagnosticV1 {
+            ensure!(
+                case.set == "development"
+                    && case.origin == "real"
+                    && case.counterfactual_pair_id.is_none()
+                    && case.counterfactual_mutation.is_none()
+                    && !case.stability_subset,
+                "clean validation diagnostic case {} has certification-only state",
+                case.case_id
+            );
+        }
         let expected_membership = match case.set.as_str() {
             "smoke" => &corpus.sets.smoke,
             "development" => &corpus.sets.development,
