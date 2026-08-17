@@ -3128,7 +3128,9 @@ fn try_plan_model_selected_single_target_coverage(
         .find(|target| target.target_key == *target_key)
         .ok_or("selected_target_not_found")?;
     let parsed = parse_anime_release_title(&candidate.title);
-    if !semantic_identity_supported_by_release(context, &parsed, evidence) {
+    if !semantic_identity_supported_by_release(context, &parsed, evidence)
+        && !semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
+    {
         return Err("release_identity_not_supported");
     }
     if semantic_release_coordinate_contradicts_target(&parsed, target, evidence) {
