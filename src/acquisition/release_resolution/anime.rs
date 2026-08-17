@@ -3021,9 +3021,11 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     // wanted-target binding is not secondary: preserve it through the retry so
     // an adjacent episode or entity can never satisfy the current request.
     if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly {
-        return full.or_else(|| {
-            plan_model_selected_single_target_coverage(context, candidate, files, evidence)
-        });
+        // A legacy review/deferred plan is not stronger than a validated model
+        // selection that passes every contradiction check below. Prefer the
+        // definitive single-target plan; retain the legacy plan as fallback.
+        return plan_model_selected_single_target_coverage(context, candidate, files, evidence)
+            .or(full);
     }
 
     let mut without_target_binding = evidence.clone();
@@ -3168,6 +3170,14 @@ fn semantic_release_coordinate_contradicts_target(
         && !evidence.release_season_numbers.contains(&season)
     {
         return true;
+    }
+
+    // A movie is one canonical media target. Years, dimensions, and numerals
+    // in its title are not episode coordinates. Explicit SxxEyy remains a hard
+    // contradiction above; unstructured numeric parser guesses do not veto a
+    // model-selected movie entity.
+    if evidence.media_kind == AnimeSemanticMediaKindEvidence::Movie {
+        return false;
     }
 
     let observed = semantic_explicit_release_episode_numbers(&parsed.original_title)
@@ -9436,6 +9446,44 @@ mod tests {
             &context,
             &parsed,
             &episode_evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_movie_ignores_unstructured_numeric_parser_noise() {
+        let target = AnimeCandidateTarget {
+            target_key: "movie:palme".to_string(),
+            canonical_key: None,
+            title: "A Tree of Palme".to_string(),
+            season_number: Some(1),
+            anilist_season_id: Some("palme".to_string()),
+            episode_number: Some(1),
+            absolute_episode_number: Some(1),
+            tvdb_episode_id: None,
+            anidb_episode_id: None,
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("palme".to_string()),
+            aliases: vec!["A Tree of Palme".to_string(), "Palme no Ki".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["movie:palme".to_string()],
+        };
+
+        assert!(!semantic_release_coordinate_contradicts_target(
+            &parse_anime_release_title("Palme no Ki (DVD 676x444 h264)"),
+            &target,
+            &evidence,
+        ));
+        assert!(semantic_release_coordinate_contradicts_target(
+            &parse_anime_release_title("Palme no Ki S02E01"),
+            &target,
+            &evidence,
         ));
     }
 
