@@ -2715,7 +2715,11 @@ fn semantic_identity_alias_score(title: &str, alias: &str) -> Option<u16> {
     if title_tokens.is_empty() || alias_tokens.is_empty() {
         return None;
     }
-    if title_tokens == alias_tokens {
+    // Anime release names frequently join or split romanized words differently
+    // (`Kumamiko`/`Kuma Miko`, `Mahoutsukai`/`Mahou Tsukai`). Once punctuation
+    // and token boundaries are removed, equality is still exact identity—not
+    // fuzzy similarity.
+    if title_tokens == alias_tokens || title_tokens.concat() == alias_tokens.concat() {
         return Some(100);
     }
     if title_tokens.len() > alias_tokens.len()
@@ -3130,6 +3134,7 @@ fn try_plan_model_selected_single_target_coverage(
     let parsed = parse_anime_release_title(&candidate.title);
     if !semantic_identity_supported_by_release(context, &parsed, evidence)
         && !semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
+        && !model_selected_entity_has_exact_release_identity(context, &parsed, evidence)
     {
         return Err("release_identity_not_supported");
     }
@@ -3194,6 +3199,33 @@ fn try_plan_model_selected_single_target_coverage(
         Vec::new(),
         Vec::new(),
     ))
+}
+
+/// The selector has already compared the raw release with the bounded,
+/// server-authored entity hypotheses. At this final single-target boundary an
+/// exact normalized match to any alias owned by the selected entity is enough
+/// positive identity evidence, even when graph projection also copied that
+/// canonical alias onto an adjacent entity. Competing entities remain useful
+/// to the ordinary semantic scorer, but an artificial alias tie must not veto
+/// a correct model selection. Hard coordinate, year, media-boundary, and file
+/// contradictions are checked immediately after this function returns.
+fn model_selected_entity_has_exact_release_identity(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let selected_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str));
+    let parsed_titles = semantic_parsed_title_candidates(parsed);
+    parsed_titles.iter().any(|title| {
+        selected_aliases.clone().any(|alias| {
+            semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
+        })
+    })
 }
 
 fn semantic_release_coordinate_contradicts_target(
@@ -9484,6 +9516,88 @@ mod tests {
             &parsed,
             &episode_evidence,
         ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_accepts_exact_joined_entity_alias() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-exact-joined-alias".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Mahou Tsukai no Yakusoku".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("wizard".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("wizard".to_string()),
+            aliases: vec!["Mahou Tsukai no Yakusoku".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("Mahoutsukai no Yakusoku - 10"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_exact_model_identity_cannot_override_wrong_episode() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-exact-wrong-coordinate".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Kumamiko".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("kuma".to_string()),
+            }],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "S01E09".to_string(),
+                canonical_key: None,
+                title: "Episode 9".to_string(),
+                season_number: Some(1),
+                anilist_season_id: Some("kuma".to_string()),
+                episode_number: Some(9),
+                absolute_episode_number: Some(9),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("kuma".to_string()),
+            aliases: vec!["Kumamiko".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S01E09".to_string()],
+        };
+
+        assert!(
+            plan_model_selected_single_target_coverage(
+                &context,
+                &rr3e_candidate("Kuma Miko - 08"),
+                &[],
+                &evidence,
+            )
+            .is_none()
+        );
     }
 
     #[test]
