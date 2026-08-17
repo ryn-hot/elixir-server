@@ -2627,8 +2627,18 @@ fn semantic_identity_corroborated_by_unique_coordinate(
     parsed_titles.iter().any(|title| {
         selected_aliases.clone().any(|alias| {
             semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
+                || semantic_title_is_substantial_alias_prefix(title, alias)
         })
     })
+}
+
+fn semantic_title_is_substantial_alias_prefix(title: &str, alias: &str) -> bool {
+    let title_tokens = semantic_identity_tokens(title);
+    let alias_tokens = semantic_identity_tokens(alias);
+    title_tokens.len() >= 2
+        && title_tokens.len() < alias_tokens.len()
+        && title_tokens.concat().len() >= 10
+        && alias_tokens.starts_with(&title_tokens)
 }
 
 /// Independently corroborate the one provider basename already owned by a
@@ -3221,13 +3231,148 @@ fn model_selected_entity_has_exact_release_identity(
         .iter()
         .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
         .map(|alias| alias.display.as_str())
-        .chain(evidence.aliases.iter().map(String::as_str));
+        .chain(evidence.aliases.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
     let parsed_titles = semantic_parsed_title_candidates(parsed);
     parsed_titles.iter().any(|title| {
-        selected_aliases.clone().any(|alias| {
+        selected_aliases.iter().any(|alias| {
             semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
-        })
+                || model_selected_alias_with_release_context(title, alias, evidence)
+        }) || model_selected_compound_title_has_owned_identity(title, &selected_aliases, evidence)
     })
+}
+
+/// Accept a selected-entity alias followed only by technical packaging or a
+/// media-boundary marker that agrees with the selected hypothesis. This also
+/// handles harmless token-boundary differences such as
+/// `Amefuri Kozou`/`Amefurikozou`; substantive sequel or episode-title text is
+/// never discarded.
+fn model_selected_alias_with_release_context(
+    title: &str,
+    alias: &str,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let title_tokens = semantic_identity_tokens(title);
+    let alias_tokens = semantic_identity_tokens(alias);
+    if title_tokens.is_empty() || alias_tokens.is_empty() {
+        return false;
+    }
+    let alias_joined = alias_tokens.concat();
+    if alias_joined.len() < 5 {
+        return false;
+    }
+    (1..title_tokens.len()).any(|prefix_len| {
+        title_tokens[..prefix_len].concat() == alias_joined
+            && model_selected_release_context_is_safe(&title_tokens[prefix_len..], evidence)
+    })
+}
+
+/// Fansub names often place two equivalent owned aliases around ` - `, for
+/// example `Harmagedon - Genma Taisen` or
+/// `Sen to Chihiro no Kamikakushi - Spirited Away`. Every substantive segment
+/// must be owned by the selected entity; one matching franchise prefix cannot
+/// hide a different OVA, sequel, or episode subtitle in another segment.
+fn model_selected_compound_title_has_owned_identity(
+    title: &str,
+    selected_aliases: &BTreeSet<&str>,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let segments = title
+        .split(" - ")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return false;
+    }
+
+    let mut matched_owned_alias = false;
+    for segment in segments {
+        if selected_aliases.iter().any(|alias| {
+            semantic_identity_alias_score(segment, alias).is_some_and(|score| score == 100)
+                || model_selected_alias_with_release_context(segment, alias, evidence)
+        }) {
+            matched_owned_alias = true;
+            continue;
+        }
+        let tokens = semantic_identity_tokens(segment);
+        if model_selected_compound_segment_is_release_context(&tokens, evidence) {
+            continue;
+        }
+        return false;
+    }
+    matched_owned_alias
+}
+
+fn model_selected_compound_segment_is_release_context(
+    tokens: &[String],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    if model_selected_release_context_is_safe(tokens, evidence) {
+        return true;
+    }
+    let Some((first, remainder)) = tokens.split_first() else {
+        return false;
+    };
+    matches!(first.as_str(), "episode" | "ep")
+        && remainder.first().is_some_and(|number| {
+            !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+        })
+        && remainder[1..].iter().all(|token| {
+            matches!(
+                token.as_str(),
+                "eng" | "english" | "sub" | "subs" | "subbed" | "dub" | "dubbed"
+            )
+        })
+}
+
+fn model_selected_release_context_is_safe(
+    tokens: &[String],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            let technical = matches!(
+                token.as_str(),
+                "the"
+                    | "animation"
+                    | "dual"
+                    | "audio"
+                    | "dub"
+                    | "dubbed"
+                    | "multi"
+                    | "sub"
+                    | "subs"
+                    | "subbed"
+                    | "bd"
+                    | "dvd"
+                    | "pal"
+                    | "ntsc"
+                    | "bluray"
+                    | "bdrip"
+                    | "webrip"
+                    | "web"
+                    | "remux"
+                    | "rip"
+            ) || token
+                .parse::<i32>()
+                .is_ok_and(|number| (1900..=2099).contains(&number));
+            if technical {
+                return true;
+            }
+            match token.as_str() {
+                "movie" => evidence.media_kind == AnimeSemanticMediaKindEvidence::Movie,
+                "ova" | "oad" | "ona" => matches!(
+                    evidence.media_kind,
+                    AnimeSemanticMediaKindEvidence::Ova | AnimeSemanticMediaKindEvidence::Special
+                ),
+                "special" | "specials" => matches!(
+                    evidence.media_kind,
+                    AnimeSemanticMediaKindEvidence::Special | AnimeSemanticMediaKindEvidence::Ova
+                ),
+                _ => false,
+            }
+        })
 }
 
 fn semantic_release_coordinate_contradicts_target(
@@ -9586,6 +9731,253 @@ mod tests {
             &parse_anime_release_title(
                 "[Tech-Mod] Highlander - The Search for Vengeance [Director's Cut].mkv",
             ),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_accepts_only_fully_owned_compound_titles() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-owned-compound-title".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Harmagedon".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("harmagedon".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Genma Taisen".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("harmagedon".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("harmagedon".to_string()),
+            aliases: vec!["Harmagedon".to_string(), "Genma Taisen".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("Harmagedon - Genma Taisen [BD 720p]"),
+            &evidence,
+        ));
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("Harmagedon - A Different Movie [BD 720p]"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_compound_identity_rejects_adjacent_special_subtitles() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-compound-adjacent-special".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Sora no Method".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("sora-tv".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("sora-tv".to_string()),
+            aliases: vec!["Sora no Method".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title(
+                "[Butter] Sora no Method - Mou Hitotsu no Negai [WEB 1080p AAC]",
+            ),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_movie_identity_rejects_plain_episode_suffixes() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-movie-episode-suffix".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Kaijuu Girls".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("kaijuu-movie".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("kaijuu-movie".to_string()),
+            aliases: vec!["Kaijuu Girls".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[HorribleSubs] Kaijuu Girls - 07 [480p].mkv"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_rejects_adjacent_owned_prefixes() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-adjacent-owned-prefix".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Baja no Studio: Baja no Mita Umi".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(0),
+                anilist_season_id: Some("baja-second".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("baja-second".to_string()),
+            aliases: vec!["Baja no Studio: Baja no Mita Umi".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Special,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[PAS] Baja no Studio [BD 1080p qAAC]"),
+            &evidence,
+        ));
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[PAS] Baja no Studio - v2 [BD 1080p AAC]"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_accepts_only_compatible_release_context() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-release-context".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Amefurikozou".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(0),
+                anilist_season_id: Some("rain-boy".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("rain-boy".to_string()),
+            aliases: vec!["Amefurikozou".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Ova,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[ARR] Amefuri Kozou OVA"),
+            &evidence,
+        ));
+        let mut episode = evidence;
+        episode.media_kind = AnimeSemanticMediaKindEvidence::Episode;
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[ARR] Amefuri Kozou OVA"),
+            &episode,
+        ));
+    }
+
+    #[test]
+    fn alm9_unique_coordinate_accepts_a_substantial_owned_title_prefix() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-coordinate-prefix".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Seisen Cerberus: Ryuukoku no Fatalite".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("cerberus".to_string()),
+            }],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "S01E13".to_string(),
+                canonical_key: None,
+                title: "Episode 13".to_string(),
+                season_number: Some(1),
+                anilist_season_id: Some("cerberus".to_string()),
+                episode_number: Some(13),
+                absolute_episode_number: Some(13),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("cerberus".to_string()),
+            aliases: vec!["Seisen Cerberus: Ryuukoku no Fatalite".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S01E13".to_string()],
+        };
+
+        assert!(semantic_identity_corroborated_by_unique_coordinate(
+            &context,
+            &parse_anime_release_title("Seisen Cerberus - 13"),
+            &evidence,
+        ));
+        assert!(!semantic_identity_corroborated_by_unique_coordinate(
+            &context,
+            &parse_anime_release_title("Seisen Cerberus - 12"),
             &evidence,
         ));
     }
