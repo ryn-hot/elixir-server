@@ -50,7 +50,8 @@ use crate::{
             anime::{
                 ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput,
                 AnimeCandidateScoringContext, AnimeCoverageOptions, AnimeFileCoveragePlan,
-                AnimeReleaseFileInput, plan_anime_file_coverage_with_options,
+                AnimeReleaseFileInput, model_selected_single_target_coverage_rejection_reason,
+                plan_anime_file_coverage_with_options,
                 plan_anime_file_coverage_with_semantic_evidence,
             },
             models::ReleaseConfidence,
@@ -1130,6 +1131,13 @@ async fn run_semantic_corpus_cases(
                         &evidence,
                     )
                 });
+                let model_selected_coverage_rejection =
+                    model_selected_single_target_coverage_rejection_reason(
+                        &input.scoring_context,
+                        &candidate_input,
+                        &files,
+                        &evidence,
+                    );
                 let preference = language_preference(&input.request.target.audio_preference);
                 let assessment = assess_language_preference(
                     &preference,
@@ -1142,6 +1150,7 @@ async fn run_semantic_corpus_cases(
                     &preference,
                     &assessment,
                     candidate,
+                    model_selected_coverage_rejection,
                 );
                 let accepted = rejection_reasons.is_empty();
                 for reason in &rejection_reasons {
@@ -1679,11 +1688,16 @@ fn semantic_evidence_rejection_reasons(
     preference: &AcquisitionLanguagePreference,
     assessment: &LanguagePreferenceAssessment,
     candidate: &AcquisitionCandidate,
+    model_selected_coverage_rejection: Option<&str>,
 ) -> Vec<String> {
-    let Some(plan) = plan else {
-        return vec!["semantic_planner_no_plan".to_string()];
-    };
     let mut reasons = BTreeSet::new();
+    let Some(plan) = plan else {
+        reasons.insert("semantic_planner_no_plan".to_string());
+        if let Some(reason) = model_selected_coverage_rejection {
+            reasons.insert(format!("model_selected_coverage_rejected:{reason}"));
+        }
+        return reasons.into_iter().collect();
+    };
     if acquisition_anime_deterministic_state(plan) != DeterministicMatchState::Definitive {
         reasons.insert("plan_not_definitive".to_string());
     }
@@ -1698,6 +1712,11 @@ fn semantic_evidence_rejection_reasons(
     }
     if synthetic_stream_candidate_requires_manual_review(candidate) {
         reasons.insert("candidate_policy_blocked".to_string());
+    }
+    if acquisition_anime_deterministic_state(plan) != DeterministicMatchState::Definitive
+        && let Some(reason) = model_selected_coverage_rejection
+    {
+        reasons.insert(format!("model_selected_coverage_rejected:{reason}"));
     }
     reasons.extend(
         plan.rejection_reasons

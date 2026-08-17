@@ -3064,9 +3064,15 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
         return identity_only;
     }
 
-    full.or(without_target_binding)
+    // The attempts above have already had every opportunity to return a
+    // definitive deterministic plan. Do not let one of their legacy
+    // review/deferred results shadow a validated model-selected single target.
+    // The direct plan still has to pass all identity, coordinate, year, media
+    // boundary, and provider-file contradiction checks below.
+    plan_model_selected_single_target_coverage(context, candidate, files, evidence)
+        .or(full)
+        .or(without_target_binding)
         .or(identity_only)
-        .or_else(|| plan_model_selected_single_target_coverage(context, candidate, files, evidence))
 }
 
 /// Convert a validated semantic selection into coverage when the normal anime
@@ -3080,6 +3086,27 @@ fn plan_model_selected_single_target_coverage(
     files: &[AnimeReleaseFileInput],
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> Option<AnimeFileCoveragePlan> {
+    try_plan_model_selected_single_target_coverage(context, candidate, files, evidence).ok()
+}
+
+/// Explain why the validated model-selected single-target path could not
+/// author coverage. This is consumed by the qualification harness so replay
+/// failures identify the exact deterministic safeguard involved.
+pub(crate) fn model_selected_single_target_coverage_rejection_reason(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<&'static str> {
+    try_plan_model_selected_single_target_coverage(context, candidate, files, evidence).err()
+}
+
+fn try_plan_model_selected_single_target_coverage(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Result<AnimeFileCoveragePlan, &'static str> {
     if evidence.target_keys.len() != 1
         || matches!(
             evidence.media_kind,
@@ -3088,21 +3115,30 @@ fn plan_model_selected_single_target_coverage(
                 | AnimeSemanticMediaKindEvidence::SeriesPack
         )
     {
-        return None;
+        return Err("unsupported_target_cardinality_or_pack");
     }
 
-    let target_key = evidence.target_keys.first()?;
+    let target_key = evidence
+        .target_keys
+        .first()
+        .ok_or("selected_target_key_missing")?;
     let target = context
         .targets
         .iter()
-        .find(|target| target.target_key == *target_key)?;
+        .find(|target| target.target_key == *target_key)
+        .ok_or("selected_target_not_found")?;
     let parsed = parse_anime_release_title(&candidate.title);
-    if !semantic_identity_supported_by_release(context, &parsed, evidence)
-        || semantic_release_coordinate_contradicts_target(&parsed, target, evidence)
-        || semantic_release_year_contradicts_selected_entity(context, &parsed, evidence)
-        || semantic_special_boundary_contradicts_selected_target(context, &parsed, target, evidence)
-    {
-        return None;
+    if !semantic_identity_supported_by_release(context, &parsed, evidence) {
+        return Err("release_identity_not_supported");
+    }
+    if semantic_release_coordinate_contradicts_target(&parsed, target, evidence) {
+        return Err("release_coordinate_contradiction");
+    }
+    if semantic_release_year_contradicts_selected_entity(context, &parsed, evidence) {
+        return Err("release_year_contradiction");
+    }
+    if semantic_special_boundary_contradicts_selected_target(context, &parsed, target, evidence) {
+        return Err("release_media_boundary_contradiction");
     }
 
     let media_files = files
@@ -3115,24 +3151,23 @@ fn plan_model_selected_single_target_coverage(
         [] => None,
         [file] => {
             let file_parsed = parse_anime_release_title(&file.path);
-            if semantic_release_coordinate_contradicts_target(&file_parsed, target, evidence)
-                || semantic_release_year_contradicts_selected_entity(
-                    context,
-                    &file_parsed,
-                    evidence,
-                )
-                || semantic_special_boundary_contradicts_selected_target(
-                    context,
-                    &file_parsed,
-                    target,
-                    evidence,
-                )
-            {
-                return None;
+            if semantic_release_coordinate_contradicts_target(&file_parsed, target, evidence) {
+                return Err("provider_file_coordinate_contradiction");
+            }
+            if semantic_release_year_contradicts_selected_entity(context, &file_parsed, evidence) {
+                return Err("provider_file_year_contradiction");
+            }
+            if semantic_special_boundary_contradicts_selected_target(
+                context,
+                &file_parsed,
+                target,
+                evidence,
+            ) {
+                return Err("provider_file_media_boundary_contradiction");
             }
             Some(*file)
         }
-        _ => return None,
+        _ => return Err("multiple_provider_media_files_require_exact_coverage"),
     };
 
     let entry = AnimeFileCoverageEntry {
@@ -3148,7 +3183,7 @@ fn plan_model_selected_single_target_coverage(
         reason: "model_selected_entity_without_deterministic_contradiction".to_string(),
         state: ReleaseCoverageState::Planned,
     };
-    Some(anime_file_coverage_plan(
+    Ok(anime_file_coverage_plan(
         ReleaseKind::Single,
         ReleaseConfidence::High,
         false,
