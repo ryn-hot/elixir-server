@@ -3275,10 +3275,10 @@ fn model_selected_title_matches_owned_alias(
         || model_selected_title_matches_named_alias_segment(title, alias)
 }
 
-/// Metadata titles commonly append a subtitle that release names omit. Trust
-/// that one-way abbreviation only when the raw name is substantial and is not
-/// itself the exact title of an adjacent entity. This avoids treating a base
-/// franchise title as a sequel or OVA merely because it is a shared prefix.
+/// Metadata punctuation and filler words can make a release title a contracted
+/// form of the selected alias. Require four retained identity tokens and at
+/// least 60% token coverage; short franchise prefixes remain ambiguous and
+/// fall back instead of being promoted to a sequel, movie, or OVA.
 fn model_selected_title_is_unambiguous_alias_abbreviation(
     context: &AnimeCandidateScoringContext,
     title: &str,
@@ -3286,12 +3286,13 @@ fn model_selected_title_is_unambiguous_alias_abbreviation(
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
     let title_tokens = semantic_identity_tokens(title);
-    if title_tokens.len() < 2 || title_tokens.concat().len() < 10 {
+    if title_tokens.len() < 4 || title_tokens.concat().len() < 16 {
         return false;
     }
     let selected_completion = selected_aliases.iter().any(|alias| {
         let alias_tokens = semantic_identity_tokens(alias);
         title_tokens.len() < alias_tokens.len()
+            && title_tokens.len() * 5 >= alias_tokens.len() * 3
             && title_tokens.first() == alias_tokens.first()
             && title_tokens
                 .iter()
@@ -3369,7 +3370,7 @@ fn model_selected_compound_title_has_owned_identity(
     coordinate_identifies_selected_targets: bool,
 ) -> bool {
     let segments = title
-        .split(" - ")
+        .split(" -")
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
@@ -3614,7 +3615,7 @@ fn semantic_special_boundary_contradicts_selected_target(
         .collect::<Vec<_>>();
     let has_entity_specific_compound_title = parsed_titles.iter().any(|title| {
         let substantive_segments = title
-            .split(" - ")
+            .split(" -")
             .map(str::trim)
             .filter(|segment| {
                 semantic_identity_tokens(segment)
@@ -10070,23 +10071,33 @@ mod tests {
             &parse_anime_release_title("[PAS] Baja no Studio - v2 [BD 1080p AAC]"),
             &evidence,
         ));
+        let mut incomplete_context = context;
+        incomplete_context
+            .scoped_aliases
+            .retain(|alias| alias.anilist_season_id.as_deref() == Some("baja-second"));
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &incomplete_context,
+            &parse_anime_release_title("[PAS] Baja no Studio [BD 1080p qAAC]"),
+            &evidence,
+        ));
     }
 
     #[test]
-    fn alm9_model_selected_identity_accepts_unambiguous_metadata_abbreviations() {
+    fn alm9_model_selected_identity_accepts_substantial_alias_contractions() {
         let context = AnimeCandidateScoringContext {
-            graph_fingerprint: Some("semantic-metadata-abbreviation".to_string()),
+            graph_fingerprint: Some("semantic-alias-contraction".to_string()),
             aliases: Vec::new(),
             scoped_aliases: vec![
                 AnimeScopedAlias {
-                    display: "Time Stranger Kyoko: Chocola ni Omakase!".to_string(),
+                    display: "Jungle Emperor: The Symphonic Poem Film".to_string(),
                     source: "anilist_english".to_string(),
                     language: Some("en".to_string()),
                     season_number: Some(0),
-                    anilist_season_id: Some("kyoko-ova".to_string()),
+                    anilist_season_id: Some("jungle-special".to_string()),
                 },
                 AnimeScopedAlias {
-                    display: "Sengoku Otome: Momoiro Paradox".to_string(),
+                    display: "The Returnee Noble Lady Attacks His Majesty the Dragon Emperor"
+                        .to_string(),
                     source: "anilist_romaji".to_string(),
                     language: Some("ja-Latn".to_string()),
                     season_number: Some(1),
@@ -10099,8 +10110,8 @@ mod tests {
             season_number: 0,
             release_season_numbers: vec![0],
             episode_number_offset: 0,
-            anilist_season_id: Some("kyoko-ova".to_string()),
-            aliases: vec!["Time Stranger Kyoko: Chocola ni Omakase!".to_string()],
+            anilist_season_id: Some("jungle-special".to_string()),
+            aliases: vec!["Jungle Emperor: The Symphonic Poem Film".to_string()],
             numbering: AnimeSemanticNumberingEvidence::EntityOnly,
             media_kind: AnimeSemanticMediaKindEvidence::Special,
             episode_numbers: Vec::new(),
@@ -10110,7 +10121,7 @@ mod tests {
 
         assert!(model_selected_entity_has_exact_release_identity(
             &context,
-            &parse_anime_release_title("[CF] Time Stranger Kyoko [VHS]"),
+            &parse_anime_release_title("Jungle Emperor - Symphonic Poem [Blu-Flash]"),
             &evidence,
         ));
     }
