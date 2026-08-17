@@ -253,6 +253,17 @@ fn bind_exact_single_anime_provider_file_internal(
         return plan;
     }
     let file = media_files[0];
+    if semantic_evidence.is_some()
+        && plan.entries[0].release_file_key.as_deref() == Some(file.file_key.as_str())
+        && plan.entries[0].path.as_deref() == Some(file.path.as_str())
+    {
+        // The semantic planner has already established the sole payload's
+        // deterministic ownership. Requiring the basename parser to discover
+        // that same identity again would turn this binder into a second,
+        // redundant positive gate over a validated model selection.
+        plan.selected_file_keys = vec![file.file_key.clone()];
+        return plan;
+    }
     let file_candidate = AnimeCandidateInput {
         title: file
             .path

@@ -3021,7 +3021,9 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
     // wanted-target binding is not secondary: preserve it through the retry so
     // an adjacent episode or entity can never satisfy the current request.
     if evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly {
-        return full;
+        return full.or_else(|| {
+            plan_model_selected_single_target_coverage(context, candidate, files, evidence)
+        });
     }
 
     let mut without_target_binding = evidence.clone();
@@ -3060,7 +3062,126 @@ pub fn plan_anime_file_coverage_with_semantic_evidence(
         return identity_only;
     }
 
-    full.or(without_target_binding).or(identity_only)
+    full.or(without_target_binding)
+        .or(identity_only)
+        .or_else(|| plan_model_selected_single_target_coverage(context, candidate, files, evidence))
+}
+
+/// Convert a validated semantic selection into coverage when the normal anime
+/// resolver cannot reconstruct the same single-target plan. The model still
+/// selects only a server-authored entity/media-kind hypothesis; target and file
+/// ownership remain deterministic. This fallback intentionally excludes packs
+/// and ranges, where every file must continue to prove exact coverage.
+fn plan_model_selected_single_target_coverage(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeFileCoveragePlan> {
+    if evidence.target_keys.len() != 1
+        || matches!(
+            evidence.media_kind,
+            AnimeSemanticMediaKindEvidence::Range
+                | AnimeSemanticMediaKindEvidence::SeasonPack
+                | AnimeSemanticMediaKindEvidence::SeriesPack
+        )
+    {
+        return None;
+    }
+
+    let target_key = evidence.target_keys.first()?;
+    let target = context
+        .targets
+        .iter()
+        .find(|target| target.target_key == *target_key)?;
+    let parsed = parse_anime_release_title(&candidate.title);
+    if !semantic_identity_supported_by_release(context, &parsed, evidence)
+        || semantic_release_coordinate_contradicts_target(&parsed, target, evidence)
+    {
+        return None;
+    }
+
+    let media_files = files
+        .iter()
+        .filter(|file| {
+            is_anime_media_file(&file.path) && !is_anime_sample_or_extra_file(&file.path)
+        })
+        .collect::<Vec<_>>();
+    let bound_file = match media_files.as_slice() {
+        [] => None,
+        [file] => {
+            let file_parsed = parse_anime_release_title(&file.path);
+            if semantic_release_coordinate_contradicts_target(&file_parsed, target, evidence) {
+                return None;
+            }
+            Some(*file)
+        }
+        _ => return None,
+    };
+
+    let entry = AnimeFileCoverageEntry {
+        target_key: target.target_key.clone(),
+        canonical_key: target.canonical_key.clone(),
+        release_file_key: bound_file.map(|file| file.file_key.clone()),
+        file_id: bound_file.and_then(|file| file.file_id.clone()),
+        file_index: bound_file.and_then(|file| file.file_index),
+        path: bound_file.map(|file| file.path.clone()),
+        coverage_kind: anime_coverage_kind(ReleaseKind::Single),
+        confidence: ReleaseConfidence::High,
+        score: Some(100.0),
+        reason: "model_selected_entity_without_deterministic_contradiction".to_string(),
+        state: ReleaseCoverageState::Planned,
+    };
+    Some(anime_file_coverage_plan(
+        ReleaseKind::Single,
+        ReleaseConfidence::High,
+        false,
+        false,
+        vec![entry],
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
+fn semantic_release_coordinate_contradicts_target(
+    parsed: &AnimeParsedRelease,
+    target: &AnimeCandidateTarget,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    if let Some((season, _, _)) =
+        parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
+        && season != evidence.season_number
+        && !evidence.release_season_numbers.contains(&season)
+    {
+        return true;
+    }
+
+    let observed = semantic_explicit_release_episode_numbers(&parsed.original_title)
+        .into_iter()
+        .chain(
+            parsed
+                .episode_numbers
+                .iter()
+                .chain(&parsed.absolute_episode_numbers)
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number)),
+        )
+        .collect::<BTreeSet<_>>();
+    let allowed = target
+        .episode_number
+        .into_iter()
+        .chain(target.absolute_episode_number)
+        .filter(|number| *number > 0)
+        .collect::<BTreeSet<_>>();
+    if observed.is_empty() || allowed.is_empty() || !observed.is_disjoint(&allowed) {
+        return false;
+    }
+
+    evidence.episode_number_offset <= 0
+        || observed
+            .iter()
+            .filter_map(|number| number.checked_add(evidence.episode_number_offset))
+            .all(|number| !allowed.contains(&number))
 }
 
 fn plan_anime_semantic_evidence_attempt(
