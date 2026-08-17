@@ -3136,7 +3136,7 @@ fn try_plan_model_selected_single_target_coverage(
     let parsed = parse_anime_release_title(&candidate.title);
     if !semantic_identity_supported_by_release(context, &parsed, evidence)
         && !semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
-        && !model_selected_entity_has_exact_release_identity(context, &parsed, evidence)
+        && !model_selected_entity_has_strong_release_identity(context, &parsed, evidence)
     {
         return Err("release_identity_not_supported");
     }
@@ -3205,13 +3205,14 @@ fn try_plan_model_selected_single_target_coverage(
 
 /// The selector has already compared the raw release with the bounded,
 /// server-authored entity hypotheses. At this final single-target boundary an
-/// exact normalized match to any alias owned by the selected entity is enough
+/// strong raw-derived match to an alias owned by the selected entity is enough
 /// positive identity evidence, even when graph projection also copied that
-/// canonical alias onto an adjacent entity. Competing entities remain useful
-/// to the ordinary semantic scorer, but an artificial alias tie must not veto
-/// a correct model selection. Hard coordinate, year, media-boundary, and file
+/// canonical alias onto an adjacent entity. This deliberately accepts only an
+/// exact normalized match, a substantial containment relation, or an almost
+/// identical token set. Short franchise roots cannot absorb a substantive
+/// sequel/OVA subtitle. Hard coordinate, year, media-boundary, and file
 /// contradictions are checked immediately after this function returns.
-fn model_selected_entity_has_exact_release_identity(
+fn model_selected_entity_has_strong_release_identity(
     context: &AnimeCandidateScoringContext,
     parsed: &AnimeParsedRelease,
     evidence: &AnimeSemanticCandidateEvidence,
@@ -3221,13 +3222,56 @@ fn model_selected_entity_has_exact_release_identity(
         .iter()
         .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
         .map(|alias| alias.display.as_str())
-        .chain(evidence.aliases.iter().map(String::as_str));
+        .chain(evidence.aliases.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
     let parsed_titles = semantic_parsed_title_candidates(parsed);
     parsed_titles.iter().any(|title| {
-        selected_aliases.clone().any(|alias| {
-            semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
+        selected_aliases.iter().any(|alias| {
+            if semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 94) {
+                return true;
+            }
+
+            let title_tokens = semantic_identity_tokens(title);
+            let alias_tokens = semantic_identity_tokens(alias);
+            if title_tokens.is_empty() || alias_tokens.is_empty() {
+                return false;
+            }
+            let title_joined = title_tokens.concat();
+            let alias_joined = alias_tokens.concat();
+            let shorter_len = title_joined.len().min(alias_joined.len());
+            if shorter_len >= 10
+                && (title_joined.contains(&alias_joined) || alias_joined.contains(&title_joined))
+                && !(title_tokens.starts_with(&alias_tokens)
+                    && semantic_identity_remainder_is_only_sequence(
+                        &title_tokens[alias_tokens.len()..],
+                    ))
+                && !(alias_tokens.starts_with(&title_tokens)
+                    && semantic_identity_remainder_is_only_sequence(
+                        &alias_tokens[title_tokens.len()..],
+                    ))
+            {
+                return true;
+            }
+
+            let title_set = title_tokens.iter().collect::<BTreeSet<_>>();
+            let alias_set = alias_tokens.iter().collect::<BTreeSet<_>>();
+            title_set.len().min(alias_set.len()) >= 3
+                && title_set.is_subset(&alias_set)
+                && alias_set.len().saturating_sub(title_set.len()) <= 1
         })
     })
+}
+
+fn semantic_identity_remainder_is_only_sequence(tokens: &[String]) -> bool {
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            matches!(token.as_str(), "s" | "season" | "part" | "cour")
+                || token.chars().all(|ch| ch.is_ascii_digit())
+                || token.strip_prefix('s').is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+                })
+                || roman_numeral_value(token).is_some()
+        })
 }
 
 fn semantic_release_coordinate_contradicts_target(
@@ -5295,6 +5339,19 @@ fn alias_remainder_is_release_context(tokens: &[String]) -> bool {
                     | "batch"
                     | "complete"
                     | "collection"
+                    | "animation"
+                    | "dual"
+                    | "audio"
+                    | "dvd"
+                    | "pal"
+                    | "ntsc"
+                    | "bd"
+                    | "bluray"
+                    | "bdrip"
+                    | "webrip"
+                    | "web"
+                    | "rip"
+                    | "remux"
             ) || token.chars().all(|ch| ch.is_ascii_digit())
                 || token.strip_prefix('s').is_some_and(|suffix| {
                     !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
@@ -9547,7 +9604,7 @@ mod tests {
             target_keys: Vec::new(),
         };
 
-        assert!(model_selected_entity_has_exact_release_identity(
+        assert!(model_selected_entity_has_strong_release_identity(
             &context,
             &parse_anime_release_title("Mahoutsukai no Yakusoku - 10"),
             &evidence,
@@ -9581,7 +9638,7 @@ mod tests {
             target_keys: Vec::new(),
         };
 
-        assert!(model_selected_entity_has_exact_release_identity(
+        assert!(model_selected_entity_has_strong_release_identity(
             &context,
             &parse_anime_release_title(
                 "[Tech-Mod] Highlander - The Search for Vengeance [Director's Cut].mkv",
@@ -9993,6 +10050,9 @@ mod tests {
         assert!(!semantic_identity_supported_by_release(
             &context, &parsed, &evidence
         ));
+        assert!(!model_selected_entity_has_strong_release_identity(
+            &context, &parsed, &evidence,
+        ));
     }
 
     #[test]
@@ -10029,6 +10089,9 @@ mod tests {
         assert!(!semantic_identity_supported_by_release(
             &context, &parsed, &evidence
         ));
+        assert!(!model_selected_entity_has_strong_release_identity(
+            &context, &parsed, &evidence,
+        ));
     }
 
     #[test]
@@ -10061,6 +10124,9 @@ mod tests {
 
         assert!(!semantic_identity_supported_by_release(
             &context, &parsed, &evidence
+        ));
+        assert!(!model_selected_entity_has_strong_release_identity(
+            &context, &parsed, &evidence,
         ));
     }
 
