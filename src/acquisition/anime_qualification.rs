@@ -66,9 +66,9 @@ use crate::{
         AnimeMatchFallbackReason, AnimeMatchFileInput, AnimeMatchRequest, AnimeMatchResponse,
         AnimeMatchSourceMap, AnimeMatchingService, AnimeRuntimeArtifactManifest,
         AnimeRuntimeBackend, AnimeRuntimeProbeResult, AnimeRuntimeProfile,
-        AnimeSemanticEvidenceEngine, DeterministicMatchState, InferenceProbeLimits,
-        LocalModelEngine, LocalModelRuntimeProfile, LocalModelSamplingProfile,
-        PreparedAnimeMatchRequest, build_semantic_evidence_request,
+        AnimeSemanticEvidenceEngine, AnimeSemanticEvidenceResponse, DeterministicMatchState,
+        InferenceProbeLimits, LocalModelEngine, LocalModelRuntimeProfile,
+        LocalModelSamplingProfile, PreparedAnimeMatchRequest, build_semantic_evidence_request,
         collect_inference_hardware_inventory, extract_anime_runtime_for_qualification,
         inference_hardware_fingerprint, validate_anime_match_request,
         validate_anime_match_response, validate_semantic_evidence_response,
@@ -135,6 +135,17 @@ pub struct AnimeSemanticCorpusRunConfig {
     pub baseline_failures_only: bool,
 }
 
+/// Model-free replay of one retained semantic corpus report through the current
+/// anime resolver. The recorded index-or-null decisions are immutable inputs;
+/// only deterministic acceptance and coverage code can affect the result.
+#[derive(Debug, Clone)]
+pub struct AnimeSemanticCorpusReplayConfig {
+    pub corpus_path: PathBuf,
+    pub recorded_report_path: PathBuf,
+    pub output_path: PathBuf,
+    pub baseline_failures_only: bool,
+}
+
 /// Model-free corpus replay used while changing deterministic parsing and
 /// coverage. It intentionally shares the exact corpus decoder, production
 /// adapters, planner, and final-plan scorer with the physical semantic run.
@@ -144,7 +155,7 @@ pub struct AnimeSemanticBaselineRunConfig {
     pub output_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeSemanticCorpusRunSummary {
     pub status: String,
@@ -531,7 +542,7 @@ pub async fn run_anime_inference_qualification(
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AnimeSemanticCorpusReport {
     schema_version: u32,
@@ -546,7 +557,7 @@ struct AnimeSemanticCorpusReport {
     cases: Vec<AnimeSemanticCorpusCaseObservation>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AnimeSemanticCorpusCaseObservation {
     case_id: String,
@@ -573,7 +584,7 @@ struct AnimeSemanticCorpusCaseObservation {
     expected_final_plan: QualificationFinalPlan,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AnimeSemanticCorpusSelection {
     candidate_key: String,
@@ -667,7 +678,37 @@ pub async fn run_anime_semantic_corpus(
     engine.shutdown().await;
     drop(extraction);
     let cases = result?;
+    finish_semantic_corpus_report(
+        corpus.corpus_id,
+        cases,
+        config.baseline_failures_only,
+        SemanticCorpusReportIdentity {
+            model_id: manifest.model.id,
+            model_revision: manifest.model.revision,
+            prompt_revision: config.semantic_prompt_revision,
+            backend: runtime_profile.execution_backend.as_str().to_string(),
+            profile_fingerprint: runtime_profile.profile_fingerprint,
+        },
+        config.output_path,
+    )
+}
 
+#[derive(Debug)]
+struct SemanticCorpusReportIdentity {
+    model_id: String,
+    model_revision: String,
+    prompt_revision: String,
+    backend: String,
+    profile_fingerprint: String,
+}
+
+fn finish_semantic_corpus_report(
+    corpus_id: String,
+    cases: Vec<AnimeSemanticCorpusCaseObservation>,
+    baseline_failures_only: bool,
+    identity: SemanticCorpusReportIdentity,
+    output_path: PathBuf,
+) -> Result<AnimeSemanticCorpusRunSummary> {
     let passed = cases
         .iter()
         .filter(|case| case.final_matches_expected)
@@ -693,15 +734,14 @@ pub async fn run_anime_semantic_corpus(
             *rejection_reason_counts.entry(reason.clone()).or_insert(0) += 1;
         }
     }
-    let output_path = config.output_path.clone();
     let summary = AnimeSemanticCorpusRunSummary {
         status: if passed == cases.len() {
             "passed".to_string()
         } else {
             "failed".to_string()
         },
-        corpus_id: corpus.corpus_id.clone(),
-        baseline_failures_only: config.baseline_failures_only,
+        corpus_id: corpus_id.clone(),
+        baseline_failures_only,
         case_count: cases.len(),
         passed,
         failed: cases.len() - passed,
@@ -712,22 +752,145 @@ pub async fn run_anime_semantic_corpus(
         accepted_evidence,
         expectation_audit_cases,
         rejection_reason_counts,
-        output_path,
+        output_path: output_path.clone(),
     };
     let report = AnimeSemanticCorpusReport {
         schema_version: 1,
         status: summary.status.clone(),
-        corpus_id: corpus.corpus_id,
-        model_id: manifest.model.id,
-        model_revision: manifest.model.revision,
-        prompt_revision: config.semantic_prompt_revision,
-        backend: runtime_profile.execution_backend.as_str().to_string(),
-        profile_fingerprint: runtime_profile.profile_fingerprint,
+        corpus_id,
+        model_id: identity.model_id,
+        model_revision: identity.model_revision,
+        prompt_revision: identity.prompt_revision,
+        backend: identity.backend,
+        profile_fingerprint: identity.profile_fingerprint,
         summary: summary.clone(),
         cases,
     };
-    write_new_canonical_json(&config.output_path, &report)?;
+    write_new_canonical_json(&output_path, &report)?;
     Ok(summary)
+}
+
+struct RecordedSemanticEvidenceEngine {
+    request_ids: BTreeSet<String>,
+    selected_hypotheses: BTreeMap<(String, String), usize>,
+}
+
+#[async_trait]
+impl AnimeSemanticEvidenceEngine for RecordedSemanticEvidenceEngine {
+    async fn select_hypothesis(
+        &self,
+        request: crate::anime_matching::AnimeSemanticEvidenceRequest,
+    ) -> Result<AnimeSemanticEvidenceResponse> {
+        ensure!(
+            self.request_ids.contains(&request.request_id),
+            "recorded semantic replay has no request {}",
+            request.request_id
+        );
+        Ok(AnimeSemanticEvidenceResponse {
+            schema_version: request.schema_version,
+            hypothesis_index: self
+                .selected_hypotheses
+                .get(&(request.request_id, request.candidate_key))
+                .copied(),
+        })
+    }
+}
+
+/// Replay one retained model run through the current deterministic anime path.
+/// This never starts a worker and never changes the model-visible contract.
+pub async fn run_anime_semantic_corpus_replay(
+    config: AnimeSemanticCorpusReplayConfig,
+) -> Result<AnimeSemanticCorpusRunSummary> {
+    let corpus_bytes = read_limited(&config.corpus_path, "qualification corpus")?;
+    let corpus: QualificationCorpus =
+        serde_json::from_value(parse_strict_json(&corpus_bytes, "qualification corpus")?)
+            .context("decoding qualification corpus")?;
+    validate_corpus_shape(&corpus, &corpus_bytes)?;
+
+    let recorded: AnimeSemanticCorpusReport = read_json(
+        &config.recorded_report_path,
+        "recorded semantic corpus report",
+    )?;
+    ensure!(
+        recorded.schema_version == 1,
+        "unsupported recorded report schema"
+    );
+    ensure!(
+        recorded.corpus_id == corpus.corpus_id,
+        "recorded report identifies a different corpus"
+    );
+    ensure!(
+        recorded.cases.len() == corpus.cases.len(),
+        "recorded report case count differs from the corpus"
+    );
+    ensure!(
+        recorded.cases.iter().all(|case| case.selector_errors == 0),
+        "recorded report contains selector errors that cannot be replayed exactly"
+    );
+
+    let recorded_cases = recorded
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect::<BTreeMap<_, _>>();
+    let mut request_ids = BTreeSet::new();
+    let mut selected_hypotheses = BTreeMap::new();
+    for case in &corpus.cases {
+        let input: QualificationCaseInput = serde_json::from_value(case.input.clone())
+            .with_context(|| format!("decoding input for replay case {}", case.case_id))?;
+        let recorded_case = recorded_cases
+            .get(case.case_id.as_str())
+            .with_context(|| format!("recorded report lacks case {}", case.case_id))?;
+        ensure!(
+            request_ids.insert(input.request.request_id.clone()),
+            "qualification corpus repeats request ID {}",
+            input.request.request_id
+        );
+        for selection in &recorded_case.selected_hypotheses {
+            ensure!(
+                input
+                    .request
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.candidate_key == selection.candidate_key),
+                "recorded case {} selects unknown candidate {}",
+                case.case_id,
+                selection.candidate_key
+            );
+            ensure!(
+                selected_hypotheses
+                    .insert(
+                        (
+                            input.request.request_id.clone(),
+                            selection.candidate_key.clone(),
+                        ),
+                        selection.hypothesis_index,
+                    )
+                    .is_none(),
+                "recorded case {} selects candidate {} more than once",
+                case.case_id,
+                selection.candidate_key
+            );
+        }
+    }
+    let engine = RecordedSemanticEvidenceEngine {
+        request_ids,
+        selected_hypotheses,
+    };
+    let cases = run_semantic_corpus_cases(&corpus, &engine, config.baseline_failures_only).await?;
+    finish_semantic_corpus_report(
+        corpus.corpus_id,
+        cases,
+        config.baseline_failures_only,
+        SemanticCorpusReportIdentity {
+            model_id: recorded.model_id,
+            model_revision: recorded.model_revision,
+            prompt_revision: recorded.prompt_revision,
+            backend: "recorded-replay".to_string(),
+            profile_fingerprint: recorded.profile_fingerprint,
+        },
+        config.output_path,
+    )
 }
 
 /// Evaluate the deterministic production path across the frozen corpus without
