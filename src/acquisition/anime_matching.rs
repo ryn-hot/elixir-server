@@ -19,6 +19,7 @@ use crate::{
                 AnimeReleaseFileInput, AnimeScopedAlias, AnimeSemanticCandidateEvidence,
                 anime_coverage_kind, parse_anime_release_title, score_anime_candidate,
                 score_anime_candidate_with_verified_semantic_plan,
+                semantic_provider_file_corroborates_target,
             },
             models::{ReleaseConfidence, ReleaseCoverageState, ReleaseKind, ReleaseResolverKind},
         },
@@ -276,7 +277,7 @@ fn bind_exact_single_anime_provider_file_internal(
     let semantic_file_score = semantic_evidence.and_then(|evidence| {
         score_anime_candidate_with_verified_semantic_plan(context, &file_candidate, evidence, &plan)
     });
-    let Some(file_score) = std::iter::once(deterministic_file_score)
+    let file_score = std::iter::once(deterministic_file_score)
         .chain(semantic_file_score)
         .find(|score| {
             score.confidence == ReleaseConfidence::High
@@ -284,8 +285,26 @@ fn bind_exact_single_anime_provider_file_internal(
                 && score.review_reasons.is_empty()
                 && score.rejection_reasons.is_empty()
                 && score.target_matches[0].target_key == plan.entries[0].target_key
+        });
+    if file_score.is_none()
+        && semantic_evidence.is_some_and(|evidence| {
+            plan.entries[0].release_file_key.as_deref() == Some(file.file_key.as_str())
+                && semantic_provider_file_corroborates_target(
+                    context,
+                    &file_candidate,
+                    evidence,
+                    &plan.entries[0].target_key,
+                )
         })
-    else {
+    {
+        // The coverage planner already bound this sole provider payload. The
+        // basename has now independently confirmed both selected identity and
+        // the exact server-owned coordinate, so no second full graph plan is
+        // required merely to retain that binding.
+        plan.selected_file_keys = vec![file.file_key.clone()];
+        return plan;
+    }
+    let Some(file_score) = file_score else {
         if semantic_evidence.is_some() {
             plan.confidence = ReleaseConfidence::ReviewRequired;
             plan.review_reasons

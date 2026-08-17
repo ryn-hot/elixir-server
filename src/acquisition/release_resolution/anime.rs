@@ -2459,13 +2459,15 @@ fn semantic_identity_supported_by_release(
         })
         .max();
 
-    // A selected entity must explain the release better than adjacent graph
-    // entities. This admits punctuation, ordinal, abbreviated subtitle, and
-    // joined English/romaji forms while preventing a shared franchise root
-    // from proving the wrong sequel, movie, or OVA.
-    competing_score.is_none_or(|competing| {
-        (selected_score >= 98 && competing < 98) || selected_score >= competing + 8
-    })
+    // A selected entity must normally explain the release better than adjacent
+    // graph entities. Movies have no episode coordinate with which to break an
+    // exact metadata-alias tie, so an exact raw alias plus the model-selected
+    // movie hypothesis is the bounded tie-breaker. Fuzzy/shared franchise
+    // names remain insufficient.
+    (selected_score == 100 && evidence.media_kind == AnimeSemanticMediaKindEvidence::Movie)
+        || competing_score.is_none_or(|competing| {
+            (selected_score >= 98 && competing < 98) || selected_score >= competing + 8
+        })
 }
 
 /// Permit an adjacent-entity alias tie only when the raw release coordinate
@@ -2478,7 +2480,6 @@ fn semantic_identity_corroborated_by_unique_coordinate(
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
     if evidence.target_keys.is_empty()
-        || evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
         || matches!(
             evidence.media_kind,
             AnimeSemanticMediaKindEvidence::SeasonPack
@@ -2497,7 +2498,7 @@ fn semantic_identity_corroborated_by_unique_coordinate(
     if selected_keys.len() != evidence.target_keys.len() {
         return false;
     }
-    let coordinate_keys = match evidence.numbering {
+    let coordinate_key_sets = match evidence.numbering {
         AnimeSemanticNumberingEvidence::Seasonal => {
             let Some(season) = explicit_structured_season(parsed) else {
                 return false;
@@ -2511,17 +2512,19 @@ fn semantic_identity_corroborated_by_unique_coordinate(
             if observed.is_empty() {
                 return false;
             }
-            context
-                .targets
-                .iter()
-                .filter(|target| {
-                    target.season_number == Some(season)
-                        && target
-                            .episode_number
-                            .is_some_and(|episode| observed.contains(&episode))
-                })
-                .map(|target| target.target_key.as_str())
-                .collect::<BTreeSet<_>>()
+            vec![
+                context
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        target.season_number == Some(season)
+                            && target
+                                .episode_number
+                                .is_some_and(|episode| observed.contains(&episode))
+                    })
+                    .map(|target| target.target_key.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ]
         }
         AnimeSemanticNumberingEvidence::Absolute => {
             let observed = parsed
@@ -2533,33 +2536,79 @@ fn semantic_identity_corroborated_by_unique_coordinate(
             if observed.is_empty() {
                 return false;
             }
-            context
-                .targets
-                .iter()
-                .filter(|target| {
-                    target
-                        .absolute_episode_number
-                        .is_some_and(|episode| observed.contains(&episode))
-                })
-                .map(|target| target.target_key.as_str())
-                .collect::<BTreeSet<_>>()
+            vec![
+                context
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        target
+                            .absolute_episode_number
+                            .is_some_and(|episode| observed.contains(&episode))
+                    })
+                    .map(|target| target.target_key.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ]
         }
-        AnimeSemanticNumberingEvidence::EntityOnly => return false,
+        AnimeSemanticNumberingEvidence::EntityOnly => {
+            // The current selector intentionally returns entity identity only.
+            // Raw coordinates remain parser-owned. Consider their seasonal and
+            // absolute interpretations independently and proceed only when one
+            // interpretation identifies exactly the selected server targets.
+            let observed_seasonal = parsed
+                .episode_numbers
+                .iter()
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number))
+                .collect::<BTreeSet<_>>();
+            let observed_absolute = parsed
+                .absolute_episode_numbers
+                .iter()
+                .copied()
+                .filter(|number| *number > 0 && !(1900..=2099).contains(number))
+                .collect::<BTreeSet<_>>();
+            let structured_season = explicit_structured_season(parsed);
+            let mut interpretations = Vec::new();
+            if !observed_seasonal.is_empty() {
+                interpretations.push(
+                    context
+                        .targets
+                        .iter()
+                        .filter(|target| {
+                            structured_season
+                                .is_none_or(|season| target.season_number == Some(season))
+                                && target
+                                    .episode_number
+                                    .is_some_and(|episode| observed_seasonal.contains(&episode))
+                        })
+                        .map(|target| target.target_key.as_str())
+                        .collect::<BTreeSet<_>>(),
+                );
+            }
+            if !observed_absolute.is_empty() {
+                interpretations.push(
+                    context
+                        .targets
+                        .iter()
+                        .filter(|target| {
+                            target
+                                .absolute_episode_number
+                                .is_some_and(|episode| observed_absolute.contains(&episode))
+                        })
+                        .map(|target| target.target_key.as_str())
+                        .collect::<BTreeSet<_>>(),
+                );
+            }
+            interpretations
+        }
     };
-    if coordinate_keys != selected_keys {
+    if !coordinate_key_sets
+        .iter()
+        .any(|coordinate_keys| coordinate_keys == &selected_keys)
+    {
         return false;
     }
 
     let parsed_titles = semantic_parsed_title_candidates(parsed);
-    let franchise_supported = parsed_titles.iter().any(|title| {
-        context.aliases.iter().any(|alias| {
-            semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
-        })
-    });
-    if !franchise_supported {
-        return false;
-    }
-
     let generic_aliases = context
         .aliases
         .iter()
@@ -2580,6 +2629,46 @@ fn semantic_identity_corroborated_by_unique_coordinate(
             semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
         })
     })
+}
+
+/// Independently corroborate the one provider basename already owned by a
+/// definitive semantic parent plan. Identity must still be present in the raw
+/// basename and its explicit coordinate must agree with the exact planned
+/// server target; absence or contradiction remains a rejection.
+pub(crate) fn semantic_provider_file_corroborates_target(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+    target_key: &str,
+) -> bool {
+    let parsed = parse_anime_release_title(&candidate.title);
+    if !semantic_identity_supported_by_release(context, &parsed, evidence) {
+        return false;
+    }
+    let Some(target) = context
+        .targets
+        .iter()
+        .find(|target| target.target_key == target_key)
+    else {
+        return false;
+    };
+    if let Some((season, _, _)) =
+        parse_sxxeyy_numbers(&normalize_fullwidth_digits(&parsed.original_title))
+        && season != evidence.season_number
+        && !evidence.release_season_numbers.contains(&season)
+    {
+        return false;
+    }
+    let observed = semantic_explicit_release_episode_numbers(&parsed.original_title);
+    let allowed = target
+        .episode_number
+        .into_iter()
+        .chain(target.absolute_episode_number)
+        .filter(|number| *number > 0)
+        .collect::<BTreeSet<_>>();
+    !observed.is_empty()
+        && !allowed.is_empty()
+        && observed.iter().all(|number| allowed.contains(number))
 }
 
 fn semantic_parsed_title_candidates(parsed: &AnimeParsedRelease) -> BTreeSet<String> {
@@ -8757,7 +8846,7 @@ mod tests {
     }
 
     #[test]
-    fn alm9_semantic_unique_coordinate_breaks_only_an_entity_alias_tie() {
+    fn alm9_entity_only_selection_uses_unique_raw_coordinate_to_break_alias_tie() {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("semantic-coordinate-tie".to_string()),
             aliases: vec!["Shared Franchise Arc".to_string()],
@@ -8809,10 +8898,10 @@ mod tests {
             episode_number_offset: 0,
             anilist_season_id: Some("season-2".to_string()),
             aliases: vec!["Shared Franchise Arc".to_string()],
-            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
             media_kind: AnimeSemanticMediaKindEvidence::Episode,
-            episode_numbers: vec![1],
-            absolute_episode_numbers: vec![13],
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
             target_keys: vec!["S02E01".to_string()],
         };
         let files = vec![AnimeReleaseFileInput {
@@ -8838,9 +8927,94 @@ mod tests {
             },
             &evidence,
         )
-        .expect("the unique raw S02E01 coordinate should resolve the alias tie");
+        .expect("the server-owned S02E01 coordinate should break the exact alias tie");
         assert!(semantic_plan_is_definitive(&plan));
         assert_eq!(plan.entries[0].target_key, "S02E01");
+    }
+
+    #[test]
+    fn alm9_movie_selection_breaks_only_an_exact_adjacent_alias_tie() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-movie-alias-tie".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Shared Movie Title".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("movie-1".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Shared Movie Title".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(2),
+                    anilist_season_id: Some("movie-2".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let parsed = parse_anime_release_title("[Group] Shared Movie Title [1080p]");
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("movie-1".to_string()),
+            aliases: vec!["Shared Movie Title".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(semantic_identity_supported_by_release(
+            &context, &parsed, &evidence
+        ));
+        let mut episode_evidence = evidence;
+        episode_evidence.media_kind = AnimeSemanticMediaKindEvidence::Episode;
+        assert!(!semantic_identity_supported_by_release(
+            &context,
+            &parsed,
+            &episode_evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_provider_basename_corroboration_requires_identity_and_exact_coordinate() {
+        let context = tokyo_ghoul_scoped_context();
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            episode_number_offset: 0,
+            anilist_season_id: Some("1002".to_string()),
+            aliases: vec!["Tokyo Ghoul Root A".to_string(), "Root A".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S02E01".to_string()],
+        };
+
+        assert!(semantic_provider_file_corroborates_target(
+            &context,
+            &rr3e_candidate("Tokyo Ghoul Root A - 01.mkv"),
+            &evidence,
+            "S02E01",
+        ));
+        assert!(!semantic_provider_file_corroborates_target(
+            &context,
+            &rr3e_candidate("Tokyo Ghoul Root A - 02.mkv"),
+            &evidence,
+            "S02E01",
+        ));
+        assert!(!semantic_provider_file_corroborates_target(
+            &context,
+            &rr3e_candidate("Unrelated Show - 01.mkv"),
+            &evidence,
+            "S02E01",
+        ));
     }
 
     #[test]
