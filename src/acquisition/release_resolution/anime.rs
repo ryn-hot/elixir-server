@@ -3098,7 +3098,7 @@ fn plan_model_selected_single_target_coverage(
     if !semantic_identity_supported_by_release(context, &parsed, evidence)
         || semantic_release_coordinate_contradicts_target(&parsed, target, evidence)
         || semantic_release_year_contradicts_selected_entity(context, &parsed, evidence)
-        || semantic_special_boundary_contradicts_selected_target(context, &parsed, evidence)
+        || semantic_special_boundary_contradicts_selected_target(context, &parsed, target, evidence)
     {
         return None;
     }
@@ -3122,6 +3122,7 @@ fn plan_model_selected_single_target_coverage(
                 || semantic_special_boundary_contradicts_selected_target(
                     context,
                     &file_parsed,
+                    target,
                     evidence,
                 )
             {
@@ -3226,12 +3227,16 @@ fn semantic_release_year_contradicts_selected_entity(
 fn semantic_special_boundary_contradicts_selected_target(
     context: &AnimeCandidateScoringContext,
     parsed: &AnimeParsedRelease,
+    target: &AnimeCandidateTarget,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
     let boundary_tokens = ["movie", "ova", "oad", "ona", "special", "specials"];
     let parsed_titles = semantic_parsed_title_candidates(parsed);
-    let release_boundaries = parsed_titles
-        .iter()
+    let raw_without_release_group = LEADING_RELEASE_GROUP_RE
+        .replace(&parsed.original_title, "")
+        .into_owned();
+    let release_boundaries = std::iter::once(raw_without_release_group.as_str())
+        .chain(parsed_titles.iter().map(String::as_str))
         .flat_map(|title| semantic_identity_tokens(title))
         .filter(|token| boundary_tokens.contains(&token.as_str()))
         .collect::<BTreeSet<_>>();
@@ -3251,7 +3256,8 @@ fn semantic_special_boundary_contradicts_selected_target(
         .flat_map(semantic_identity_tokens)
         .filter(|token| boundary_tokens.contains(&token.as_str()))
         .collect::<BTreeSet<_>>();
-    if evidence.media_kind == AnimeSemanticMediaKindEvidence::Episode
+    if target.season_number.is_some()
+        && target.episode_number.is_some()
         && !release_boundaries.is_subset(&selected_boundaries)
     {
         return true;
@@ -9134,7 +9140,17 @@ mod tests {
                     anilist_season_id: Some("ova".to_string()),
                 },
             ],
-            targets: Vec::new(),
+            targets: vec![AnimeCandidateTarget {
+                target_key: "S01E05".to_string(),
+                canonical_key: None,
+                title: "But I Do Like You".to_string(),
+                season_number: Some(1),
+                anilist_season_id: Some("tv".to_string()),
+                episode_number: Some(5),
+                absolute_episode_number: Some(5),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
         };
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 1,
@@ -9152,11 +9168,13 @@ mod tests {
         assert!(semantic_special_boundary_contradicts_selected_target(
             &context,
             &parse_anime_release_title("[SS] Love Stage!! OVA"),
+            &context.targets[0],
             &evidence,
         ));
         assert!(!semantic_special_boundary_contradicts_selected_target(
             &context,
             &parse_anime_release_title("[HorribleSubs] Love Stage!! - 05 [480p].mkv"),
+            &context.targets[0],
             &evidence,
         ));
     }
@@ -9189,7 +9207,17 @@ mod tests {
                     anilist_season_id: Some("specials".to_string()),
                 },
             ],
-            targets: Vec::new(),
+            targets: vec![AnimeCandidateTarget {
+                target_key: "S00E09".to_string(),
+                canonical_key: None,
+                title: "Owaranai Seraph 09".to_string(),
+                season_number: None,
+                anilist_season_id: Some("specials".to_string()),
+                episode_number: Some(9),
+                absolute_episode_number: None,
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
         };
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 0,
@@ -9210,11 +9238,13 @@ mod tests {
         assert!(semantic_special_boundary_contradicts_selected_target(
             &context,
             &parse_anime_release_title("Owari no Seraph - OAD [DVD]"),
+            &context.targets[0],
             &evidence,
         ));
         assert!(!semantic_special_boundary_contradicts_selected_target(
             &context,
             &parse_anime_release_title("Owari no Seraph Specials - Owaranai Seraph - 09 [1080p]"),
+            &context.targets[0],
             &evidence,
         ));
     }
@@ -9240,7 +9270,17 @@ mod tests {
                     anilist_season_id: Some("adjacent".to_string()),
                 },
             ],
-            targets: Vec::new(),
+            targets: vec![AnimeCandidateTarget {
+                target_key: "S00E01".to_string(),
+                canonical_key: None,
+                title: "Rain Boy".to_string(),
+                season_number: None,
+                anilist_season_id: Some("rain-boy".to_string()),
+                episode_number: Some(1),
+                absolute_episode_number: Some(1),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
         };
         let evidence = AnimeSemanticCandidateEvidence {
             season_number: 0,
@@ -9258,6 +9298,7 @@ mod tests {
         assert!(!semantic_special_boundary_contradicts_selected_target(
             &context,
             &parse_anime_release_title("Amefuri Kozou OVA [DVD]"),
+            &context.targets[0],
             &evidence,
         ));
     }
