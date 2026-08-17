@@ -20,6 +20,8 @@ const CORPUS_SCHEMA_VERSION: u32 = 1;
 const REPORT_SCHEMA_VERSION: u32 = 1;
 const EXPECTED_CASE_COUNT: usize = 18;
 const MAX_JSON_BYTES: u64 = 2 * 1024 * 1024;
+const INSTALLED_SEMANTIC_SMOKE_CORPUS_BYTES: &[u8] =
+    include_bytes!("fixtures/semantic-selector-smoke-v1.json");
 
 #[derive(Debug, Clone)]
 pub struct AnimeSemanticSmokeConfig {
@@ -78,6 +80,29 @@ struct SemanticSmokeObservation {
     passed: bool,
     latency_ms: u64,
     error: Option<String>,
+}
+
+/// Two distinct, frozen semantic requests used only to prove that the
+/// installed worker can load and speak the production selector contract. Model
+/// intelligence is already established by the clean release corpus.
+pub(crate) fn installed_semantic_probe_requests() -> Result<[AnimeSemanticEvidenceRequest; 2]> {
+    let corpus: SemanticSmokeCorpus = serde_json::from_slice(INSTALLED_SEMANTIC_SMOKE_CORPUS_BYTES)
+        .context("decoding compiled semantic selector smoke corpus")?;
+    validate_corpus(&corpus)?;
+    let mut cases = corpus.cases.into_iter();
+    let priming = cases
+        .next()
+        .context("compiled semantic selector priming case is missing")?
+        .request;
+    let measured = cases
+        .next()
+        .context("compiled semantic selector measured case is missing")?
+        .request;
+    ensure!(
+        priming.request_id != measured.request_id,
+        "compiled semantic selector probe requests are not distinct"
+    );
+    Ok([priming, measured])
 }
 
 pub async fn run_anime_semantic_smoke(

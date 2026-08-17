@@ -18,6 +18,11 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
         .route(
+            "/api/v1/settings/anime-inference",
+            get(handlers::settings::anime_inference_settings)
+                .patch(handlers::settings::update_anime_inference_settings),
+        )
+        .route(
             "/api/v1/network/protection",
             get(handlers::network_protection::protection),
         )

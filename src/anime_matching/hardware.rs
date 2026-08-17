@@ -38,6 +38,13 @@ use super::bundle::{
 pub const INFERENCE_HARDWARE_SCHEMA_VERSION: u32 = 1;
 pub const INFERENCE_RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 2;
 pub const MIN_AVAILABLE_SYSTEM_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Hosts below this total-memory floor never receive an automatic model
+/// download or install-time inference probe. The deterministic anime matcher
+/// remains available, and an owner can explicitly opt in to local inference.
+pub const MIN_AUTOMATIC_INFERENCE_SYSTEM_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Minimum physical accelerator memory for the bounded automatic probe. This
+/// is deliberately separate from the live one-GiB reserve enforced below.
+pub const MIN_AUTOMATIC_INFERENCE_DEVICE_MEMORY_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub const MIN_DEVICE_MEMORY_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_INFERENCE_CPU_THREADS: u32 = 4;
@@ -316,6 +323,7 @@ pub enum InferenceProbeRejection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceProbeLimits {
+    pub total_timeout: Duration,
     pub per_candidate_timeout: Duration,
     pub maximum_load_time: Duration,
     pub maximum_warm_latency: Duration,
@@ -326,21 +334,42 @@ pub struct InferenceProbeLimits {
 
 impl Default for InferenceProbeLimits {
     fn default() -> Self {
+        let per_candidate_timeout = PROBE_LOAD_ALLOWANCE
+            .saturating_add(PROBE_PRIME_ALLOWANCE)
+            .saturating_add(PROBE_REQUEST_ALLOWANCE)
+            .saturating_add(PROBE_FINALIZATION_ALLOWANCE)
+            .saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE);
         Self {
             // The wrapper leaves room for cold readiness, internal priming,
             // one production-bounded request, post-probe inventory collection,
             // and worker teardown. Add a small scheduler-jitter allowance so
             // scheduler jitter cannot cancel cleanup.
-            per_candidate_timeout: PROBE_LOAD_ALLOWANCE
-                .saturating_add(PROBE_PRIME_ALLOWANCE)
-                .saturating_add(PROBE_REQUEST_ALLOWANCE)
-                .saturating_add(PROBE_FINALIZATION_ALLOWANCE)
-                .saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE),
+            total_timeout: per_candidate_timeout
+                .saturating_mul(MAX_RUNTIME_PROFILE_CANDIDATES as u32),
+            per_candidate_timeout,
             maximum_load_time: PROBE_LOAD_ALLOWANCE,
             // Correctness determines model eligibility. Latency is retained as
             // hardware-routing evidence and rejected only at the same generous
             // final failure boundary used by production matching.
             maximum_warm_latency: PROBE_REQUEST_ALLOWANCE,
+            maximum_worker_rss_bytes: MAX_WORKER_RSS_BYTES,
+            minimum_available_system_bytes: MIN_AVAILABLE_SYSTEM_MEMORY_BYTES,
+            minimum_available_device_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
+        }
+    }
+}
+
+impl InferenceProbeLimits {
+    /// Tight limits used by the installed product. Release qualification may
+    /// use [`Self::default`] because it runs on dedicated lab hardware; a
+    /// customer's server must never spend minutes repeatedly probing a broken
+    /// worker/backend combination.
+    pub fn installed_product() -> Self {
+        Self {
+            total_timeout: Duration::from_secs(90),
+            per_candidate_timeout: Duration::from_secs(30),
+            maximum_load_time: Duration::from_secs(20),
+            maximum_warm_latency: Duration::from_secs(20),
             maximum_worker_rss_bytes: MAX_WORKER_RSS_BYTES,
             minimum_available_system_bytes: MIN_AVAILABLE_SYSTEM_MEMORY_BYTES,
             minimum_available_device_bytes: MIN_DEVICE_MEMORY_RESERVE_BYTES,
@@ -1132,6 +1161,58 @@ pub fn runtime_profile_candidates(
     candidates
 }
 
+/// Returns whether this host is safe to probe automatically during first-run
+/// background setup. This is a cheap inventory decision: it does not start a
+/// worker or touch a GPU. CPU-only and undersized hosts remain deterministic
+/// until the owner deliberately enables the slow-hardware path.
+pub fn automatic_inference_probe_eligible(
+    inventory: &InferenceHardwareInventory,
+    candidates: &[InferenceRuntimeCandidate],
+) -> bool {
+    if inventory
+        .memory
+        .total_bytes
+        .is_none_or(|bytes| bytes < MIN_AUTOMATIC_INFERENCE_SYSTEM_MEMORY_BYTES)
+    {
+        return false;
+    }
+
+    candidates.iter().any(|candidate| {
+        candidate.backend != InferenceBackend::Cpu
+            && runtime_device_memory(
+                inventory,
+                candidate.backend,
+                candidate.device_key.as_deref(),
+            )
+            .and_then(|device| device.total_bytes)
+            .is_some_and(|bytes| bytes >= MIN_AUTOMATIC_INFERENCE_DEVICE_MEMORY_BYTES)
+    })
+}
+
+/// The installed product probes only the useful edge of the candidate set:
+/// the best accelerated profile, one reduced-offload fallback, and (only for
+/// explicit slow-hardware opt-in) the best CPU profile. This caps local compute
+/// without changing the larger candidate set used by release qualification.
+pub fn installed_product_probe_candidates(
+    candidates: &[InferenceRuntimeCandidate],
+    allow_cpu: bool,
+) -> Vec<InferenceRuntimeCandidate> {
+    let mut selected = candidates
+        .iter()
+        .filter(|candidate| candidate.backend != InferenceBackend::Cpu)
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if allow_cpu
+        && let Some(cpu) = candidates
+            .iter()
+            .find(|candidate| candidate.backend == InferenceBackend::Cpu)
+    {
+        selected.push(cpu.clone());
+    }
+    selected
+}
+
 pub async fn select_runtime_profile<P: InferenceEnvelopeProbe>(
     inventory: &InferenceHardwareInventory,
     identity: &RuntimeProfileIdentity,
@@ -1140,6 +1221,7 @@ pub async fn select_runtime_profile<P: InferenceEnvelopeProbe>(
     probe: &P,
 ) -> RuntimeProfileSelection {
     let mut attempts = Vec::new();
+    let total_deadline = tokio::time::Instant::now() + limits.total_timeout;
     for candidate in candidates.iter().take(MAX_RUNTIME_PROFILE_CANDIDATES) {
         if !runtime_candidate_is_well_formed(inventory, candidate) {
             attempts.push(InferenceProbeAttempt {
@@ -1151,7 +1233,15 @@ pub async fn select_runtime_profile<P: InferenceEnvelopeProbe>(
             });
             continue;
         }
-        let result = timeout(limits.per_candidate_timeout, probe.probe(candidate)).await;
+        let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let result = timeout(
+            limits.per_candidate_timeout.min(remaining),
+            probe.probe(candidate),
+        )
+        .await;
         let (status, measurement, rejection, detail) = match result {
             Err(_) => (
                 InferenceProbeStatus::TimedOut,
@@ -3777,6 +3867,7 @@ mod tests {
         assert_eq!(PROBE_SCHEDULER_JITTER_ALLOWANCE, Duration::from_secs(4));
         assert_eq!(limits.maximum_warm_latency, Duration::from_secs(30 * 60));
         assert_eq!(limits.per_candidate_timeout, Duration::from_secs(2_234));
+        assert_eq!(limits.total_timeout, Duration::from_secs(17_872));
         let required = limits
             .maximum_load_time
             .saturating_add(PROBE_PRIME_ALLOWANCE)
@@ -3785,6 +3876,92 @@ mod tests {
         assert_eq!(
             limits.per_candidate_timeout,
             required.saturating_add(PROBE_SCHEDULER_JITTER_ALLOWANCE)
+        );
+    }
+
+    #[test]
+    fn installed_product_probe_is_tightly_bounded() {
+        let limits = InferenceProbeLimits::installed_product();
+        assert_eq!(limits.total_timeout, Duration::from_secs(90));
+        assert_eq!(limits.per_candidate_timeout, Duration::from_secs(30));
+        assert_eq!(limits.maximum_load_time, Duration::from_secs(20));
+        assert_eq!(limits.maximum_warm_latency, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn automatic_probe_requires_memory_and_a_sized_accelerator() {
+        let candidates = runtime_profile_candidates(
+            &inventory(
+                "windows",
+                "x86_64",
+                8,
+                gib(12),
+                vec![device("nvidia", Some(gib(8)), Some(gib(7)))],
+            ),
+            &policy(&[InferenceBackend::Cuda, InferenceBackend::Cpu]),
+        );
+        let eligible = inventory(
+            "windows",
+            "x86_64",
+            8,
+            gib(12),
+            vec![device("nvidia", Some(gib(8)), Some(gib(7)))],
+        );
+        assert!(automatic_inference_probe_eligible(&eligible, &candidates));
+
+        let mut low_system_memory = eligible.clone();
+        low_system_memory.memory.total_bytes = Some(gib(8));
+        assert!(!automatic_inference_probe_eligible(
+            &low_system_memory,
+            &candidates
+        ));
+
+        let low_vram = inventory(
+            "windows",
+            "x86_64",
+            8,
+            gib(12),
+            vec![device("nvidia", Some(gib(4)), Some(gib(3)))],
+        );
+        assert!(!automatic_inference_probe_eligible(&low_vram, &candidates));
+        assert!(!automatic_inference_probe_eligible(
+            &eligible,
+            &candidates
+                .iter()
+                .filter(|candidate| candidate.backend == InferenceBackend::Cpu)
+                .cloned()
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    #[test]
+    fn installed_product_candidate_set_is_small_and_cpu_is_opt_in_only() {
+        let inventory = inventory(
+            "windows",
+            "x86_64",
+            8,
+            gib(12),
+            vec![device("nvidia", Some(gib(8)), Some(gib(7)))],
+        );
+        let all = runtime_profile_candidates(
+            &inventory,
+            &policy(&[InferenceBackend::Cuda, InferenceBackend::Cpu]),
+        );
+        let automatic = installed_product_probe_candidates(&all, false);
+        assert!(!automatic.is_empty());
+        assert!(automatic.len() <= 2);
+        assert!(
+            automatic
+                .iter()
+                .all(|candidate| candidate.backend != InferenceBackend::Cpu)
+        );
+
+        let opted_in = installed_product_probe_candidates(&all, true);
+        assert!(opted_in.len() <= 3);
+        assert!(
+            opted_in
+                .iter()
+                .any(|candidate| candidate.backend == InferenceBackend::Cpu)
         );
     }
 

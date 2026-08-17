@@ -3988,7 +3988,7 @@ fn safe_artifact_parent(paths: &AnimeBundlePaths, relative: &str, kind: &str) ->
     })
 }
 
-fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(super) fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -4011,7 +4011,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("parsing inference descriptor '{}'", path.display()))
 }
 
-fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(super) fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("descriptor path has no parent"))?;

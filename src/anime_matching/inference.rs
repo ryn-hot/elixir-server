@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Notify, RwLock},
@@ -36,6 +36,8 @@ use crate::{
     },
 };
 
+use super::bundle::{read_optional_json, write_atomic_json};
+use super::semantic_qualification::installed_semantic_probe_requests;
 use super::{
     ANIME_MATCH_PROMPT_REVISION, ActiveAnimeBundleDescriptor, AnimeBundleCompatibilityPolicy,
     AnimeBundleStore, AnimeExecutionBackend, AnimeInferenceBundleManifest, AnimeKvCacheType,
@@ -46,12 +48,13 @@ use super::{
     LocalModelRuntimeProfile, LocalModelSamplingProfile, LocalModelSnapshot, LocalModelWorkerState,
     QualifiedAnimeBundleApproval, ResolvedAnimeRuntime, RuntimeProfileIdentity,
     RuntimeProfilePolicy, SignedAnimeBundleEnvelope, StagedAnimeBundle, ValidatedAnimeBundle,
-    VerifiedAnimeBundleEnvelope, assess_inference_memory_pressure, bundle_inference_host,
-    bundle_runtime_profile_from_probe, cached_profile_driver_evidence_is_reusable,
-    collect_current_inference_memory, collect_inference_hardware_inventory,
-    commit_accepted_anime_update, ensure_monotonic_anime_update, inference_hardware_fingerprint,
-    load_accepted_anime_update, resolve_anime_runtime, runtime_device_memory,
-    runtime_profile_candidates, select_runtime_profile, smoke_requests,
+    VerifiedAnimeBundleEnvelope, assess_inference_memory_pressure,
+    automatic_inference_probe_eligible, bundle_inference_host, bundle_runtime_profile_from_probe,
+    cached_profile_driver_evidence_is_reusable, collect_current_inference_memory,
+    collect_inference_hardware_inventory, commit_accepted_anime_update,
+    ensure_monotonic_anime_update, inference_hardware_fingerprint,
+    installed_product_probe_candidates, load_accepted_anime_update, resolve_anime_runtime,
+    runtime_device_memory, runtime_profile_candidates, select_runtime_profile,
     verify_anime_bundle_envelope,
 };
 
@@ -64,6 +67,24 @@ const UPDATE_SUCCESS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const UNKNOWN_AVAILABLE_MEMORY: u64 = u64::MAX;
+const ACTIVATION_PREFERENCE_SCHEMA_VERSION: u32 = 1;
+const ACTIVATION_PREFERENCE_FILE: &str = "activation-preference.json";
+/// A measured profile must leave acquisition orchestration headroom inside the
+/// user's 15-minute/1,000-candidate ceiling. The conservative 2x calibration
+/// below already includes the margin between the short probe and a real batch.
+pub const ANIME_INFERENCE_DEFAULT_TARGET_SECONDS_PER_1000: u64 = 900;
+pub const ANIME_INFERENCE_PROBE_LATENCY_CALIBRATION: u64 = 2;
+const INSTALLED_PRODUCT_PROBE_BUDGET: Duration = Duration::from_secs(90);
+pub const ANIME_INFERENCE_SLOW_HARDWARE_WARNING: &str = "Local anime AI did not meet the default speed target. Enabling it can greatly increase acquisition times and will use additional CPU, memory, or GPU resources.";
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimeInferencePerformanceTier {
+    Pending,
+    DefaultEnabled,
+    OptInRequired,
+    Unavailable,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +94,7 @@ pub enum AnimeInferenceLifecycleState {
     Downloading,
     Probing,
     Active,
+    AvailableOptIn,
     DeterministicOnly,
     ShuttingDown,
 }
@@ -82,6 +104,16 @@ pub enum AnimeInferenceLifecycleState {
 pub struct AnimeInferenceSnapshot {
     pub state: AnimeInferenceLifecycleState,
     pub deterministic_fallback_available: bool,
+    pub performance_tier: AnimeInferencePerformanceTier,
+    pub automatic_enabled: bool,
+    pub slow_hardware_enabled: bool,
+    pub effective_enabled: bool,
+    pub measured_warm_latency_ms: Option<u64>,
+    pub estimated_seconds_per_thousand_candidates: Option<u64>,
+    pub estimated_candidates_per_second: Option<f64>,
+    pub default_target_seconds_per_thousand_candidates: u64,
+    pub activation_reason: Option<String>,
+    pub slow_hardware_warning: &'static str,
     pub bundle_version: Option<String>,
     pub model_id: Option<String>,
     pub backend: Option<String>,
@@ -103,6 +135,11 @@ pub struct AnimeInferenceSnapshot {
 #[derive(Debug, Clone)]
 struct InferenceServiceState {
     lifecycle: AnimeInferenceLifecycleState,
+    performance_tier: AnimeInferencePerformanceTier,
+    automatic_enabled: bool,
+    measured_warm_latency_ms: Option<u64>,
+    estimated_seconds_per_thousand_candidates: Option<u64>,
+    activation_reason: Option<String>,
     bundle_version: Option<String>,
     model_id: Option<String>,
     backend: Option<String>,
@@ -120,6 +157,11 @@ impl Default for InferenceServiceState {
     fn default() -> Self {
         Self {
             lifecycle: AnimeInferenceLifecycleState::Inactive,
+            performance_tier: AnimeInferencePerformanceTier::Pending,
+            automatic_enabled: false,
+            measured_warm_latency_ms: None,
+            estimated_seconds_per_thousand_candidates: None,
+            activation_reason: None,
             bundle_version: None,
             model_id: None,
             backend: None,
@@ -131,6 +173,70 @@ impl Default for InferenceServiceState {
             last_successful_update_at: None,
             last_error: None,
             updated_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnimeInferenceActivationPreference {
+    schema_version: u32,
+    slow_hardware_enabled: bool,
+}
+
+impl Default for AnimeInferenceActivationPreference {
+    fn default() -> Self {
+        Self {
+            schema_version: ACTIVATION_PREFERENCE_SCHEMA_VERSION,
+            slow_hardware_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnimeInferencePerformanceAssessment {
+    tier: AnimeInferencePerformanceTier,
+    automatic_enabled: bool,
+    warm_latency_ms: Option<u64>,
+    estimated_seconds_per_thousand: Option<u64>,
+    reason: &'static str,
+}
+
+impl AnimeInferencePerformanceAssessment {
+    fn from_profile(profile: &super::AnimeRuntimeProfile) -> Self {
+        Self::from_warm_latency_ms(profile.warm_latency_ms)
+    }
+
+    fn from_warm_latency_ms(warm_latency_ms: u64) -> Self {
+        let estimated_seconds = warm_latency_ms
+            .saturating_mul(ANIME_INFERENCE_PROBE_LATENCY_CALIBRATION)
+            .max(1);
+        let automatic_enabled =
+            estimated_seconds <= ANIME_INFERENCE_DEFAULT_TARGET_SECONDS_PER_1000;
+        Self {
+            tier: if automatic_enabled {
+                AnimeInferencePerformanceTier::DefaultEnabled
+            } else {
+                AnimeInferencePerformanceTier::OptInRequired
+            },
+            automatic_enabled,
+            warm_latency_ms: Some(warm_latency_ms),
+            estimated_seconds_per_thousand: Some(estimated_seconds),
+            reason: if automatic_enabled {
+                "measured_profile_meets_default_speed_target"
+            } else {
+                "measured_profile_below_default_speed_target"
+            },
+        }
+    }
+
+    const fn static_opt_in(reason: &'static str) -> Self {
+        Self {
+            tier: AnimeInferencePerformanceTier::OptInRequired,
+            automatic_enabled: false,
+            warm_latency_ms: None,
+            estimated_seconds_per_thousand: None,
+            reason,
         }
     }
 }
@@ -339,8 +445,9 @@ impl HttpAnimeManifestSource {
 }
 
 /// Owns the single local anime-matching engine, its background artifacts, and
-/// its automatic hardware execution profile. No normal user setting is
-/// exposed by this type.
+/// its automatic hardware execution profile. The only user control is a
+/// persisted owner opt-in for hardware that misses the automatic speed tier;
+/// model and backend selection remain automatic.
 pub struct AnimeInferenceService {
     engine: Option<Arc<LocalModelEngine>>,
     store: AnimeBundleStore,
@@ -350,6 +457,8 @@ pub struct AnimeInferenceService {
     host_inventory: Arc<SharedHostHardwareInventory>,
     state: RwLock<InferenceServiceState>,
     active_profile: RwLock<Option<LocalModelRuntimeProfile>>,
+    slow_hardware_enabled: AtomicBool,
+    semantic_enabled: AtomicBool,
     activation_generation: AtomicU64,
     activation_notify: Notify,
     construction_error: Option<String>,
@@ -411,6 +520,8 @@ impl AnimeInferenceService {
             host_inventory,
             state: RwLock::new(InferenceServiceState::default()),
             active_profile: RwLock::new(None),
+            slow_hardware_enabled: AtomicBool::new(false),
+            semantic_enabled: AtomicBool::new(false),
             activation_generation: AtomicU64::new(0),
             activation_notify: Notify::new(),
             construction_error,
@@ -424,6 +535,9 @@ impl AnimeInferenceService {
     }
 
     pub fn matching_service(&self) -> AnimeMatchingService {
+        if !self.semantic_enabled.load(Ordering::Acquire) {
+            return AnimeMatchingService::disabled();
+        }
         self.engine
             .as_ref()
             .map_or_else(AnimeMatchingService::disabled, |engine| {
@@ -475,6 +589,16 @@ impl AnimeInferenceService {
     /// Schedules one automatic runtime/profile repair. Signals coalesce so a
     /// failed backend cannot create a retry storm or a user-facing decision.
     pub fn request_runtime_repair(&self) {
+        self.schedule_runtime_repair(false);
+    }
+
+    /// An explicit owner opt-in should not inherit an earlier automatic
+    /// backoff. It still coalesces with pending/running repair work.
+    fn request_runtime_repair_after_owner_opt_in(&self) {
+        self.schedule_runtime_repair(true);
+    }
+
+    fn schedule_runtime_repair(&self, override_backoff: bool) {
         if self.shutdown.is_cancelled() {
             return;
         }
@@ -484,6 +608,10 @@ impl AnimeInferenceService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let notify = match *schedule {
             RepairScheduleState::Idle => {
+                *schedule = RepairScheduleState::Requested;
+                true
+            }
+            RepairScheduleState::Backoff if override_backoff => {
                 *schedule = RepairScheduleState::Requested;
                 true
             }
@@ -575,6 +703,21 @@ impl AnimeInferenceService {
         AnimeInferenceSnapshot {
             state: state.lifecycle,
             deterministic_fallback_available: true,
+            performance_tier: state.performance_tier,
+            automatic_enabled: state.automatic_enabled,
+            slow_hardware_enabled: self.slow_hardware_enabled.load(Ordering::Acquire),
+            effective_enabled: self.semantic_enabled.load(Ordering::Acquire),
+            measured_warm_latency_ms: state.measured_warm_latency_ms,
+            estimated_seconds_per_thousand_candidates: state
+                .estimated_seconds_per_thousand_candidates,
+            estimated_candidates_per_second: state
+                .estimated_seconds_per_thousand_candidates
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| 1000.0 / seconds as f64),
+            default_target_seconds_per_thousand_candidates:
+                ANIME_INFERENCE_DEFAULT_TARGET_SECONDS_PER_1000,
+            activation_reason: state.activation_reason,
+            slow_hardware_warning: ANIME_INFERENCE_SLOW_HARDWARE_WARNING,
             bundle_version: state.bundle_version,
             model_id: state.model_id,
             backend: worker.backend.or(state.backend),
@@ -592,6 +735,41 @@ impl AnimeInferenceService {
             last_error: worker.last_error.or(state.last_error),
             updated_at: state.updated_at,
         }
+    }
+
+    /// Persists the single advanced activation override. Enabling is
+    /// asynchronous: the background lifecycle reuses an installed profile or
+    /// performs the bounded first-run setup. Disabling a below-threshold
+    /// profile immediately unloads it and restores deterministic-only matching.
+    pub async fn set_slow_hardware_enabled(&self, enabled: bool) -> Result<AnimeInferenceSnapshot> {
+        self.store.ensure_layout().await?;
+        let preference = AnimeInferenceActivationPreference {
+            schema_version: ACTIVATION_PREFERENCE_SCHEMA_VERSION,
+            slow_hardware_enabled: enabled,
+        };
+        write_atomic_json(&self.activation_preference_path(), &preference)
+            .context("persisting anime inference activation preference")?;
+        self.slow_hardware_enabled.store(enabled, Ordering::Release);
+
+        let automatic_enabled = self.state.read().await.automatic_enabled;
+        if !enabled && !automatic_enabled {
+            self.semantic_enabled.store(false, Ordering::Release);
+            if let Some(engine) = self.engine.as_ref() {
+                engine.suspend().await?;
+            }
+            let has_profile = self.active_profile.read().await.is_some();
+            let mut state = self.state.write().await;
+            state.lifecycle = if has_profile {
+                AnimeInferenceLifecycleState::AvailableOptIn
+            } else {
+                AnimeInferenceLifecycleState::DeterministicOnly
+            };
+            state.updated_at = Utc::now();
+        } else if enabled && !self.semantic_enabled.load(Ordering::Acquire) {
+            self.request_runtime_repair_after_owner_opt_in();
+        }
+
+        Ok(self.snapshot().await)
     }
 
     pub async fn run_background(self: Arc<Self>, external_shutdown: CancellationToken) {
@@ -756,6 +934,7 @@ impl AnimeInferenceService {
         )
         .await;
         self.store.ensure_layout().await?;
+        self.load_activation_preference();
         // A durable marker means the prior process committed a new Active
         // pointer but did not finish live verification. Restore the exact
         // previous pointer before pruning or attempting any cached startup.
@@ -822,10 +1001,9 @@ impl AnimeInferenceService {
     }
 
     async fn repair_active_bundle(&self) -> Result<()> {
-        let active = self
-            .store
-            .load_active()?
-            .ok_or_else(|| anyhow!("no active anime bundle is available for repair"))?;
+        let Some(active) = self.store.load_active()? else {
+            return self.check_for_update().await;
+        };
         let accepted_channel = load_accepted_anime_update(self.store.paths().root(), Utc::now())?;
         let policy = self.policy_with_channel(accepted_channel.as_ref());
         let bundle = self
@@ -876,6 +1054,35 @@ impl AnimeInferenceService {
         }
     }
 
+    fn activation_preference_path(&self) -> PathBuf {
+        self.store.paths().root().join(ACTIVATION_PREFERENCE_FILE)
+    }
+
+    fn load_activation_preference(&self) {
+        let loaded = read_optional_json::<AnimeInferenceActivationPreference>(
+            &self.activation_preference_path(),
+        );
+        let enabled = match loaded {
+            Ok(Some(preference))
+                if preference.schema_version == ACTIVATION_PREFERENCE_SCHEMA_VERSION =>
+            {
+                preference.slow_hardware_enabled
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "ignoring anime inference activation preference with unsupported schema"
+                );
+                false
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring invalid anime inference activation preference");
+                false
+            }
+        };
+        self.slow_hardware_enabled.store(enabled, Ordering::Release);
+    }
+
     async fn record_update_channel(
         &self,
         channel: &VerifiedAnimeBundleEnvelope,
@@ -909,7 +1116,8 @@ impl AnimeInferenceService {
         }
         let _maintenance = self.admission.enter_maintenance();
         let profile = local_profile_from_active(&self.store, bundle, &active)?;
-        if let Err(error) = self.activate_local_profile(profile).await {
+        let assessment = AnimeInferencePerformanceAssessment::from_profile(&active.profile);
+        if let Err(error) = self.activate_local_profile(profile, assessment).await {
             if let Some(engine) = self.engine.as_ref() {
                 engine.clear_profile().await;
             }
@@ -935,7 +1143,8 @@ impl AnimeInferenceService {
             let _maintenance = self.admission.enter_maintenance();
             let had_active_profile = self.active_profile.read().await.is_some();
             let profile = local_profile_from_active(&self.store, bundle, &active)?;
-            match self.activate_local_profile(profile).await {
+            let assessment = AnimeInferencePerformanceAssessment::from_profile(&active.profile);
+            match self.activate_local_profile(profile, assessment).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     if !had_active_profile {
@@ -975,6 +1184,13 @@ impl AnimeInferenceService {
             !candidates.is_empty(),
             "host has no viable inference profile candidates"
         );
+        if !self.slow_hardware_enabled.load(Ordering::Acquire)
+            && !automatic_inference_probe_eligible(&candidate_inventory, &candidates)
+        {
+            self.remain_opt_in_only("automatic_hardware_floor_not_met")
+                .await;
+            return Ok(());
+        }
         let required = super::MIN_AVAILABLE_SYSTEM_MEMORY_BYTES
             .saturating_add(bundle.manifest().model.size_bytes);
         ensure!(
@@ -1066,14 +1282,18 @@ impl AnimeInferenceService {
         if let Err(error) = result {
             match old_profile {
                 Some(profile) => {
-                    let disk_matches = self
+                    let restored_descriptor = self
                         .store
                         .load_active()
                         .ok()
                         .flatten()
-                        .is_some_and(|active| descriptor_matches_local_profile(&active, &profile));
-                    if disk_matches {
-                        if let Err(restore_error) = self.activate_local_profile(profile).await {
+                        .filter(|active| descriptor_matches_local_profile(active, &profile));
+                    if let Some(active) = restored_descriptor {
+                        let assessment =
+                            AnimeInferencePerformanceAssessment::from_profile(&active.profile);
+                        if let Err(restore_error) =
+                            self.activate_local_profile(profile, assessment).await
+                        {
                             tracing::error!(error = %restore_error, "failed to restore previous inference worker");
                             engine.clear_profile().await;
                             *self.active_profile.write().await = None;
@@ -1129,6 +1349,7 @@ impl AnimeInferenceService {
 
         let mut last_probe_error = None;
         let mut persisted = None;
+        let mut remaining_probe_budget = INSTALLED_PRODUCT_PROBE_BUDGET;
         for attempt_selection in selection.ordered_probe_attempts() {
             let runtime = attempt_selection.preferred();
             let runtime_is_staged = staged.runtimes().iter().any(|staged_runtime| {
@@ -1227,7 +1448,12 @@ impl AnimeInferenceService {
                 ));
                 continue;
             }
-            match self
+            ensure!(
+                !remaining_probe_budget.is_zero(),
+                "installed-product inference probe exhausted its total compute budget"
+            );
+            let probe_started = std::time::Instant::now();
+            let probe_result = self
                 .probe_staged_profile(
                     bundle,
                     host,
@@ -1235,9 +1461,11 @@ impl AnimeInferenceService {
                     &attempt_selection,
                     &candidates,
                     &staged,
+                    remaining_probe_budget,
                 )
-                .await
-            {
+                .await;
+            remaining_probe_budget = remaining_probe_budget.saturating_sub(probe_started.elapsed());
+            match probe_result {
                 Ok(profile) => {
                     persisted = Some(profile);
                     break;
@@ -1298,12 +1526,17 @@ impl AnimeInferenceService {
         let activation = async {
             let pending = self.store.pending_activation_token(&descriptor)?;
             let profile = local_profile_from_active(&self.store, bundle, &descriptor)?;
-            self.warm_local_profile(&profile).await?;
+            let assessment = AnimeInferencePerformanceAssessment::from_profile(&descriptor.profile);
+            if assessment.automatic_enabled || self.slow_hardware_enabled.load(Ordering::Acquire) {
+                self.warm_local_profile(&profile).await?;
+            } else if let Some(engine) = self.engine.as_ref() {
+                engine.suspend().await?;
+            }
             // A new active pointer is not considered healthy until its exact
             // validated manifest is also durable for an offline restart.
             self.store.cache_validated_manifest(bundle)?;
             self.store.complete_pending_activation(&pending).await?;
-            self.publish_local_profile(profile).await;
+            self.publish_local_profile(profile, assessment).await;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -1331,6 +1564,7 @@ impl AnimeInferenceService {
         selection: &AnimeRuntimeSelection,
         candidates: &[InferenceRuntimeCandidate],
         staged: &StagedAnimeBundle,
+        remaining_probe_budget: Duration,
     ) -> Result<super::AnimeRuntimeProfile> {
         ensure!(
             !self.admission.playback.has_latency_sensitive_work(),
@@ -1357,14 +1591,18 @@ impl AnimeInferenceService {
                 .clone(),
             kv_cache_type: bundle.manifest().runtime_policy.kv_cache_type,
         };
-        let selected = select_runtime_profile(
-            inventory,
-            &identity,
+        let candidates = installed_product_probe_candidates(
             candidates,
-            &InferenceProbeLimits::default(),
-            &probe,
-        )
-        .await;
+            self.slow_hardware_enabled.load(Ordering::Acquire),
+        );
+        ensure!(
+            !candidates.is_empty(),
+            "no bounded installed-product inference candidates are available"
+        );
+        let mut limits = InferenceProbeLimits::installed_product();
+        limits.total_timeout = remaining_probe_budget.min(limits.total_timeout);
+        let selected =
+            select_runtime_profile(inventory, &identity, &candidates, &limits, &probe).await;
         // `select_runtime_profile` owns an outer candidate deadline. If that
         // deadline cancels a probe future, explicitly stop and reap the
         // disposable worker before a fallback runtime can be downloaded.
@@ -1393,7 +1631,8 @@ impl AnimeInferenceService {
             }
             result = async {
                 engine.activate_profile_cold(profile.clone()).await?;
-                engine.prime_for_activation().await
+                let [request, _] = installed_semantic_probe_requests()?;
+                engine.prime_semantic_for_activation(request).await
             } => result,
         };
         if let Err(error) = activation {
@@ -1402,23 +1641,46 @@ impl AnimeInferenceService {
         Ok(())
     }
 
-    async fn publish_local_profile(&self, profile: LocalModelRuntimeProfile) {
+    async fn publish_local_profile(
+        &self,
+        profile: LocalModelRuntimeProfile,
+        assessment: AnimeInferencePerformanceAssessment,
+    ) {
+        let effective_enabled =
+            assessment.automatic_enabled || self.slow_hardware_enabled.load(Ordering::Acquire);
+        self.semantic_enabled
+            .store(effective_enabled, Ordering::Release);
         *self.active_profile.write().await = Some(profile.clone());
-        self.transition(
-            AnimeInferenceLifecycleState::Active,
+        self.transition_with_assessment(
+            if effective_enabled {
+                AnimeInferenceLifecycleState::Active
+            } else {
+                AnimeInferenceLifecycleState::AvailableOptIn
+            },
             Some(profile.bundle_version),
             Some(profile.model_id),
             Some(profile.backend),
             Some(profile.profile_fingerprint),
+            assessment,
         )
         .await;
-        self.activation_generation.fetch_add(1, Ordering::Release);
-        self.activation_notify.notify_waiters();
+        if effective_enabled {
+            self.activation_generation.fetch_add(1, Ordering::Release);
+            self.activation_notify.notify_waiters();
+        }
     }
 
-    async fn activate_local_profile(&self, profile: LocalModelRuntimeProfile) -> Result<()> {
-        self.warm_local_profile(&profile).await?;
-        self.publish_local_profile(profile).await;
+    async fn activate_local_profile(
+        &self,
+        profile: LocalModelRuntimeProfile,
+        assessment: AnimeInferencePerformanceAssessment,
+    ) -> Result<()> {
+        if assessment.automatic_enabled || self.slow_hardware_enabled.load(Ordering::Acquire) {
+            self.warm_local_profile(&profile).await?;
+        } else if let Some(engine) = self.engine.as_ref() {
+            engine.suspend().await?;
+        }
+        self.publish_local_profile(profile, assessment).await;
         Ok(())
     }
 
@@ -1432,6 +1694,7 @@ impl AnimeInferenceService {
             engine.clear_profile().await;
         }
         *self.active_profile.write().await = None;
+        self.semantic_enabled.store(false, Ordering::Release);
         self.admission
             .resource_suspended
             .store(false, Ordering::Release);
@@ -1441,6 +1704,41 @@ impl AnimeInferenceService {
             None,
             None,
             None,
+        )
+        .await;
+        let mut state = self.state.write().await;
+        state.performance_tier = AnimeInferencePerformanceTier::Unavailable;
+        state.automatic_enabled = false;
+        state.measured_warm_latency_ms = None;
+        state.estimated_seconds_per_thousand_candidates = None;
+        state.activation_reason = Some("no_qualified_runtime_available".to_string());
+        state.updated_at = Utc::now();
+    }
+
+    async fn remain_opt_in_only(&self, reason: &'static str) {
+        if let Some(engine) = self.engine.as_ref() {
+            engine.clear_profile().await;
+        }
+        *self.active_profile.write().await = None;
+        self.semantic_enabled.store(false, Ordering::Release);
+        self.admission
+            .resource_suspended
+            .store(false, Ordering::Release);
+        self.transition(
+            AnimeInferenceLifecycleState::DeterministicOnly,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        self.transition_with_assessment(
+            AnimeInferenceLifecycleState::AvailableOptIn,
+            None,
+            None,
+            None,
+            None,
+            AnimeInferencePerformanceAssessment::static_opt_in(reason),
         )
         .await;
     }
@@ -1509,6 +1807,7 @@ impl AnimeInferenceService {
         }
         if snapshot.state == LocalModelWorkerState::Unavailable
             && self.active_profile.read().await.is_some()
+            && self.semantic_enabled.load(Ordering::Acquire)
             && !self.repair_is_running()
         {
             self.request_runtime_repair();
@@ -1517,6 +1816,7 @@ impl AnimeInferenceService {
             .admission
             .resource_suspended
             .swap(false, Ordering::AcqRel)
+            && self.semantic_enabled.load(Ordering::Acquire)
         {
             let peak = self
                 .active_profile
@@ -1546,7 +1846,11 @@ impl AnimeInferenceService {
         let mut state = self.state.write().await;
         match active {
             Some(profile) => {
-                state.lifecycle = AnimeInferenceLifecycleState::Active;
+                state.lifecycle = if self.semantic_enabled.load(Ordering::Acquire) {
+                    AnimeInferenceLifecycleState::Active
+                } else {
+                    AnimeInferenceLifecycleState::AvailableOptIn
+                };
                 state.bundle_version = Some(profile.bundle_version);
                 state.model_id = Some(profile.model_id);
                 state.backend = Some(profile.backend);
@@ -1594,6 +1898,32 @@ impl AnimeInferenceService {
             state.profile_fingerprint = profile_fingerprint;
         }
         state.last_error = None;
+        state.updated_at = Utc::now();
+    }
+
+    async fn transition_with_assessment(
+        &self,
+        lifecycle: AnimeInferenceLifecycleState,
+        bundle_version: Option<String>,
+        model_id: Option<String>,
+        backend: Option<String>,
+        profile_fingerprint: Option<String>,
+        assessment: AnimeInferencePerformanceAssessment,
+    ) {
+        self.transition(
+            lifecycle,
+            bundle_version,
+            model_id,
+            backend,
+            profile_fingerprint,
+        )
+        .await;
+        let mut state = self.state.write().await;
+        state.performance_tier = assessment.tier;
+        state.automatic_enabled = assessment.automatic_enabled;
+        state.measured_warm_latency_ms = assessment.warm_latency_ms;
+        state.estimated_seconds_per_thousand_candidates = assessment.estimated_seconds_per_thousand;
+        state.activation_reason = Some(assessment.reason.to_string());
         state.updated_at = Utc::now();
     }
 }
@@ -1650,7 +1980,7 @@ impl LocalEnvelopeProbe<'_> {
             staged_runtime.entrypoint().to_path_buf(),
             candidate,
         )?;
-        let [priming_request, request] = smoke_requests()?;
+        let [priming_request, request] = installed_semantic_probe_requests()?;
         let engine = LocalModelEngine::new_for_probe(self.admission.clone())?;
         engine.activate_profile_for_probe(profile).await?;
         *self.active_engine.lock().await = Some(engine.clone());
@@ -1659,7 +1989,7 @@ impl LocalEnvelopeProbe<'_> {
             _ = self.cancellation.cancelled() => {
                 Err(anyhow!("anime inference service is shutting down"))
             }
-            result = engine.probe(priming_request, request) => result,
+            result = engine.probe_semantic(priming_request, request) => result,
         } {
             Ok(measured) => measured,
             Err(error) => {
@@ -2078,6 +2408,26 @@ mod tests {
         }
     }
 
+    fn test_default_enabled_assessment() -> AnimeInferencePerformanceAssessment {
+        AnimeInferencePerformanceAssessment {
+            tier: AnimeInferencePerformanceTier::DefaultEnabled,
+            automatic_enabled: true,
+            warm_latency_ms: Some(300),
+            estimated_seconds_per_thousand: Some(600),
+            reason: "test_profile_meets_default_speed_target",
+        }
+    }
+
+    fn test_opt_in_assessment() -> AnimeInferencePerformanceAssessment {
+        AnimeInferencePerformanceAssessment {
+            tier: AnimeInferencePerformanceTier::OptInRequired,
+            automatic_enabled: false,
+            warm_latency_ms: Some(3_266),
+            estimated_seconds_per_thousand: Some(6_532),
+            reason: "test_profile_below_default_speed_target",
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn alm6_construction_does_not_create_inference_storage() {
         let root = std::env::temp_dir().join(format!("elixir-alm6-no-io-{}", uuid::Uuid::new_v4()));
@@ -2116,7 +2466,9 @@ mod tests {
             "non-Active lifecycle transitions must not notify activation waiters"
         );
 
-        service.publish_local_profile(test_runtime_profile()).await;
+        service
+            .publish_local_profile(test_runtime_profile(), test_default_enabled_assessment())
+            .await;
         assert_eq!(service.activation_generation(), 1);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -2130,6 +2482,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn slow_profile_stays_unloaded_until_owner_opt_in() {
+        let root = std::env::temp_dir().join(format!(
+            "elixir-anime-slow-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let service = test_service(root);
+
+        service
+            .publish_local_profile(test_runtime_profile(), test_opt_in_assessment())
+            .await;
+        let snapshot = service.snapshot().await;
+        assert_eq!(snapshot.state, AnimeInferenceLifecycleState::AvailableOptIn);
+        assert_eq!(
+            snapshot.performance_tier,
+            AnimeInferencePerformanceTier::OptInRequired
+        );
+        assert!(!snapshot.automatic_enabled);
+        assert!(!snapshot.effective_enabled);
+        assert_eq!(
+            snapshot.estimated_seconds_per_thousand_candidates,
+            Some(6_532)
+        );
+        assert_eq!(service.activation_generation(), 0);
+    }
+
+    #[test]
+    fn default_activation_threshold_is_inclusive_and_conservative() {
+        let at_target = AnimeInferencePerformanceAssessment::from_warm_latency_ms(450);
+        assert!(at_target.automatic_enabled);
+        assert_eq!(at_target.estimated_seconds_per_thousand, Some(900));
+
+        let over_target = AnimeInferencePerformanceAssessment::from_warm_latency_ms(451);
+        assert!(!over_target.automatic_enabled);
+        assert_eq!(over_target.estimated_seconds_per_thousand, Some(902));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_hardware_preference_persists_across_service_restarts() {
+        let temporary = tempfile::tempdir().expect("temporary inference root");
+        let root = temporary.path().join("anime-inference");
+        let service = test_service(root.clone());
+
+        let snapshot = service
+            .set_slow_hardware_enabled(true)
+            .await
+            .expect("persist slow-hardware preference");
+        assert!(snapshot.slow_hardware_enabled);
+
+        let restarted = test_service(root);
+        restarted.load_activation_preference();
+        assert!(restarted.snapshot().await.slow_hardware_enabled);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_opt_in_releases_an_existing_repair_backoff() {
+        let root = std::env::temp_dir().join(format!(
+            "elixir-anime-opt-in-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let service = test_service(root);
+        *service
+            .repair_schedule
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RepairScheduleState::Backoff;
+
+        service.request_runtime_repair();
+        assert_eq!(
+            *service
+                .repair_schedule
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            RepairScheduleState::Backoff
+        );
+
+        service.request_runtime_repair_after_owner_opt_in();
+        assert_eq!(
+            *service
+                .repair_schedule
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            RepairScheduleState::Requested
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_snapshot_uses_the_client_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "elixir-anime-activation-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot = test_service(root).snapshot().await;
+        let value = serde_json::to_value(snapshot).expect("serialize activation snapshot");
+
+        assert_eq!(value["performanceTier"], "pending");
+        assert_eq!(value["slowHardwareEnabled"], false);
+        assert_eq!(
+            value["defaultTargetSecondsPerThousandCandidates"],
+            ANIME_INFERENCE_DEFAULT_TARGET_SECONDS_PER_1000
+        );
+        assert!(value.get("slow_hardware_enabled").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn alm8_activation_signal_reports_updates_and_coalesces_publications() {
         let root = std::env::temp_dir().join(format!(
             "elixir-alm8-profile-update-{}",
@@ -2137,7 +2592,9 @@ mod tests {
         ));
         let service = Arc::new(test_service(root));
 
-        service.publish_local_profile(test_runtime_profile()).await;
+        service
+            .publish_local_profile(test_runtime_profile(), test_default_enabled_assessment())
+            .await;
         assert_eq!(service.activation_generation(), 1);
 
         let update_waiter = tokio::spawn({
@@ -2149,7 +2606,9 @@ mod tests {
         let mut updated_profile = test_runtime_profile();
         updated_profile.bundle_version = "2026.08.2".to_string();
         updated_profile.profile_fingerprint = format!("sha256:{}", "2".repeat(64));
-        service.publish_local_profile(updated_profile).await;
+        service
+            .publish_local_profile(updated_profile, test_default_enabled_assessment())
+            .await;
 
         assert_eq!(service.activation_generation(), 2);
         assert_eq!(
@@ -2175,7 +2634,9 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let service = test_service(root);
-        service.publish_local_profile(test_runtime_profile()).await;
+        service
+            .publish_local_profile(test_runtime_profile(), test_default_enabled_assessment())
+            .await;
         service
             .admission
             .resource_suspended
@@ -2225,7 +2686,9 @@ mod tests {
         assert!(snapshot.profile_fingerprint.is_none());
 
         let profile = test_runtime_profile();
-        *service.active_profile.write().await = Some(profile.clone());
+        service
+            .publish_local_profile(profile.clone(), test_default_enabled_assessment())
+            .await;
         service
             .transition(
                 AnimeInferenceLifecycleState::Downloading,

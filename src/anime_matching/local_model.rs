@@ -913,6 +913,25 @@ impl LocalModelEngine {
             .await
     }
 
+    /// Manager-owned semantic prime used during atomic bundle activation.
+    /// This mirrors [`Self::prime_for_activation`] but exercises the current
+    /// selector contract instead of the retired direct-plan contract.
+    pub async fn prime_semantic_for_activation(
+        &self,
+        request: AnimeSemanticEvidenceRequest,
+    ) -> Result<()> {
+        ensure!(
+            self.inner.publish_runtime_metrics,
+            "activation semantic prime requires the production local model engine"
+        );
+        self.prime_request_with_phases(
+            LocalModelRequest::Semantic(request),
+            LocalModelAdmissionPhase::ActivationWorkerStart,
+            LocalModelAdmissionPhase::ActivationInference,
+        )
+        .await
+    }
+
     async fn prime_request_with_phases(
         &self,
         request: LocalModelRequest,

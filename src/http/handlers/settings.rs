@@ -1,9 +1,11 @@
 use axum::{Json, extract::State};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    anime_matching::AnimeInferenceSnapshot,
+    authz::Capability,
     config::{RunEnvironment, Settings},
-    http::error::ApiResult,
+    http::{auth::CurrentPrincipal, error::ApiResult},
     live::service::LiveServiceSnapshot,
     state::AppState,
 };
@@ -18,6 +20,7 @@ pub struct SettingsResponse {
     telemetry: TelemetrySettings,
     playback: PlaybackSettings,
     live: LiveServiceSnapshot,
+    anime_inference: AnimeInferenceSnapshot,
 }
 
 #[derive(Serialize)]
@@ -118,7 +121,35 @@ pub async fn settings(State(app_state): State<AppState>) -> ApiResult<Json<Setti
         },
         playback: playback_settings(settings),
         live: app_state.live.snapshot().await,
+        anime_inference: app_state.anime_inference.snapshot().await,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateAnimeInferenceSettingsRequest {
+    slow_hardware_enabled: bool,
+}
+
+pub async fn anime_inference_settings(
+    State(app_state): State<AppState>,
+    principal: CurrentPrincipal,
+) -> ApiResult<Json<AnimeInferenceSnapshot>> {
+    principal.require(Capability::SettingsManage)?;
+    Ok(Json(app_state.anime_inference.snapshot().await))
+}
+
+pub async fn update_anime_inference_settings(
+    State(app_state): State<AppState>,
+    principal: CurrentPrincipal,
+    Json(request): Json<UpdateAnimeInferenceSettingsRequest>,
+) -> ApiResult<Json<AnimeInferenceSnapshot>> {
+    principal.require(Capability::SettingsManage)?;
+    let snapshot = app_state
+        .anime_inference
+        .set_slow_hardware_enabled(request.slow_hardware_enabled)
+        .await?;
+    Ok(Json(snapshot))
 }
 
 fn playback_settings(settings: &Settings) -> PlaybackSettings {
