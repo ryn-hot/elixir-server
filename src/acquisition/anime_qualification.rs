@@ -1022,33 +1022,6 @@ async fn run_semantic_corpus_cases(
                     .ok_or_else(|| anyhow!("semantic corpus candidate cardinality mismatch"))?;
                 let candidate_input = anime_candidate_input(candidate);
                 let files = qualification_release_files(request_candidate, candidate)?;
-                let deterministic_plan = bind_exact_single_anime_provider_file(
-                    plan_anime_file_coverage_with_options(
-                        &input.scoring_context,
-                        &candidate_input,
-                        &files,
-                        AnimeCoverageOptions {
-                            file_selection_supported: *input
-                                .route_context
-                                .file_selection_supported_by_candidate_key
-                                .get(&request_candidate.candidate_key)
-                                .context("route context lacks candidate file-selection key")?,
-                        },
-                    ),
-                    &input.scoring_context,
-                    &candidate_input,
-                    &files,
-                );
-                if acquisition_anime_deterministic_state(&deterministic_plan)
-                    == DeterministicMatchState::Definitive
-                    && plan_definitively_excludes_wanted_targets(
-                        &input.request,
-                        &deterministic_plan,
-                    )
-                {
-                    continue;
-                }
-
                 let facts = &request_candidate.parse_facts;
                 let semantic_request = build_semantic_evidence_request(
                     &input.request,

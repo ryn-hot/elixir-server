@@ -2479,6 +2479,39 @@ fn semantic_identity_corroborated_by_unique_coordinate(
     parsed: &AnimeParsedRelease,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
+    if !semantic_coordinate_identifies_selected_targets(context, parsed, evidence) {
+        return false;
+    }
+
+    let parsed_titles = semantic_parsed_title_candidates(parsed);
+    let generic_aliases = context
+        .aliases
+        .iter()
+        .map(|alias| normalize_anime_alias(alias))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
+    let selected_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str).filter(|alias| {
+            let normalized = normalize_anime_alias(alias);
+            !normalized.is_empty() && !generic_aliases.contains(&normalized)
+        }));
+    parsed_titles.iter().any(|title| {
+        selected_aliases.clone().any(|alias| {
+            semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
+                || semantic_title_is_substantial_alias_prefix(title, alias)
+        })
+    })
+}
+
+fn semantic_coordinate_identifies_selected_targets(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
     if evidence.target_keys.is_empty()
         || matches!(
             evidence.media_kind,
@@ -2500,9 +2533,11 @@ fn semantic_identity_corroborated_by_unique_coordinate(
     }
     let coordinate_key_sets = match evidence.numbering {
         AnimeSemanticNumberingEvidence::Seasonal => {
-            let Some(season) = explicit_structured_season(parsed) else {
-                return false;
-            };
+            // Anime releases normally omit S01. An explicit season remains
+            // authoritative; otherwise the model-selected entity supplies the
+            // season while the raw episode coordinate still has to identify
+            // exactly the selected server target.
+            let season = explicit_structured_season(parsed).unwrap_or(evidence.season_number);
             let observed = parsed
                 .episode_numbers
                 .iter()
@@ -2601,35 +2636,9 @@ fn semantic_identity_corroborated_by_unique_coordinate(
             interpretations
         }
     };
-    if !coordinate_key_sets
+    coordinate_key_sets
         .iter()
         .any(|coordinate_keys| coordinate_keys == &selected_keys)
-    {
-        return false;
-    }
-
-    let parsed_titles = semantic_parsed_title_candidates(parsed);
-    let generic_aliases = context
-        .aliases
-        .iter()
-        .map(|alias| normalize_anime_alias(alias))
-        .filter(|alias| !alias.is_empty())
-        .collect::<BTreeSet<_>>();
-    let selected_aliases = context
-        .scoped_aliases
-        .iter()
-        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
-        .map(|alias| alias.display.as_str())
-        .chain(evidence.aliases.iter().map(String::as_str).filter(|alias| {
-            let normalized = normalize_anime_alias(alias);
-            !normalized.is_empty() && !generic_aliases.contains(&normalized)
-        }));
-    parsed_titles.iter().any(|title| {
-        selected_aliases.clone().any(|alias| {
-            semantic_identity_alias_score(title, alias).is_some_and(|score| score >= 82)
-                || semantic_title_is_substantial_alias_prefix(title, alias)
-        })
-    })
 }
 
 fn semantic_title_is_substantial_alias_prefix(title: &str, alias: &str) -> bool {
@@ -3233,13 +3242,93 @@ fn model_selected_entity_has_exact_release_identity(
         .map(|alias| alias.display.as_str())
         .chain(evidence.aliases.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
+    let coordinate_identifies_selected_targets =
+        semantic_coordinate_identifies_selected_targets(context, parsed, evidence);
     let parsed_titles = semantic_parsed_title_candidates(parsed);
     parsed_titles.iter().any(|title| {
-        selected_aliases.iter().any(|alias| {
-            semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
-                || model_selected_alias_with_release_context(title, alias, evidence)
-        }) || model_selected_compound_title_has_owned_identity(title, &selected_aliases, evidence)
+        selected_aliases
+            .iter()
+            .any(|alias| model_selected_title_matches_owned_alias(title, alias, evidence))
+            || model_selected_title_is_unambiguous_alias_abbreviation(
+                context,
+                title,
+                &selected_aliases,
+                evidence,
+            )
+            || model_selected_compound_title_has_owned_identity(
+                title,
+                &selected_aliases,
+                parsed.release_group.as_deref(),
+                evidence,
+                coordinate_identifies_selected_targets,
+            )
     })
+}
+
+fn model_selected_title_matches_owned_alias(
+    title: &str,
+    alias: &str,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
+        || model_selected_alias_with_release_context(title, alias, evidence)
+        || model_selected_title_matches_named_alias_segment(title, alias)
+}
+
+/// Metadata titles commonly append a subtitle that release names omit. Trust
+/// that one-way abbreviation only when the raw name is substantial and is not
+/// itself the exact title of an adjacent entity. This avoids treating a base
+/// franchise title as a sequel or OVA merely because it is a shared prefix.
+fn model_selected_title_is_unambiguous_alias_abbreviation(
+    context: &AnimeCandidateScoringContext,
+    title: &str,
+    selected_aliases: &BTreeSet<&str>,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let title_tokens = semantic_identity_tokens(title);
+    if title_tokens.len() < 2 || title_tokens.concat().len() < 10 {
+        return false;
+    }
+    let selected_completion = selected_aliases.iter().any(|alias| {
+        let alias_tokens = semantic_identity_tokens(alias);
+        title_tokens.len() < alias_tokens.len()
+            && title_tokens.first() == alias_tokens.first()
+            && title_tokens
+                .iter()
+                .try_fold(0usize, |offset, token| {
+                    alias_tokens[offset..]
+                        .iter()
+                        .position(|candidate| candidate == token)
+                        .map(|position| offset + position + 1)
+                })
+                .is_some()
+    });
+    if !selected_completion {
+        return false;
+    }
+
+    !context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| !semantic_alias_scope_is_selected(alias, evidence))
+        .any(|alias| {
+            semantic_identity_alias_score(title, &alias.display).is_some_and(|score| score == 100)
+        })
+}
+
+/// Some metadata aliases contain a second complete title after a colon. Match
+/// that named title exactly (with harmless token-boundary differences) without
+/// accepting arbitrary franchise substrings.
+fn model_selected_title_matches_named_alias_segment(title: &str, alias: &str) -> bool {
+    let title_tokens = semantic_identity_tokens(title);
+    title_tokens.len() >= 3
+        && title_tokens.concat().len() >= 12
+        && alias
+            .split([':', '：', '|'])
+            .skip(1)
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .any(|segment| semantic_identity_tokens(segment).concat() == title_tokens.concat())
 }
 
 /// Accept a selected-entity alias followed only by technical packaging or a
@@ -3275,7 +3364,9 @@ fn model_selected_alias_with_release_context(
 fn model_selected_compound_title_has_owned_identity(
     title: &str,
     selected_aliases: &BTreeSet<&str>,
+    release_group: Option<&str>,
     evidence: &AnimeSemanticCandidateEvidence,
+    coordinate_identifies_selected_targets: bool,
 ) -> bool {
     let segments = title
         .split(" - ")
@@ -3288,15 +3379,24 @@ fn model_selected_compound_title_has_owned_identity(
 
     let mut matched_owned_alias = false;
     for segment in segments {
-        if selected_aliases.iter().any(|alias| {
-            semantic_identity_alias_score(segment, alias).is_some_and(|score| score == 100)
-                || model_selected_alias_with_release_context(segment, alias, evidence)
-        }) {
+        if selected_aliases
+            .iter()
+            .any(|alias| model_selected_title_matches_owned_alias(segment, alias, evidence))
+        {
             matched_owned_alias = true;
             continue;
         }
+        if release_group
+            .is_some_and(|group| normalize_anime_alias(group) == normalize_anime_alias(segment))
+        {
+            continue;
+        }
         let tokens = semantic_identity_tokens(segment);
-        if model_selected_compound_segment_is_release_context(&tokens, evidence) {
+        if model_selected_compound_segment_is_release_context(
+            &tokens,
+            evidence,
+            coordinate_identifies_selected_targets,
+        ) {
             continue;
         }
         return false;
@@ -3307,8 +3407,17 @@ fn model_selected_compound_title_has_owned_identity(
 fn model_selected_compound_segment_is_release_context(
     tokens: &[String],
     evidence: &AnimeSemanticCandidateEvidence,
+    coordinate_identifies_selected_targets: bool,
 ) -> bool {
     if model_selected_release_context_is_safe(tokens, evidence) {
+        return true;
+    }
+    if coordinate_identifies_selected_targets
+        && tokens.len() == 1
+        && tokens[0]
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
         return true;
     }
     let Some((first, remainder)) = tokens.split_first() else {
@@ -3473,12 +3582,16 @@ fn semantic_special_boundary_contradicts_selected_target(
     // An ordinary television episode cannot be replaced by a movie/OVA/special
     // merely because the franchise title is shared. Preserve legitimate words
     // such as "Special" when they are part of the selected entity's own title.
-    let selected_boundaries = context
+    let selected_aliases = context
         .scoped_aliases
         .iter()
         .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
         .map(|alias| alias.display.as_str())
         .chain(evidence.aliases.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let selected_boundaries = selected_aliases
+        .iter()
+        .copied()
         .flat_map(semantic_identity_tokens)
         .filter(|token| boundary_tokens.contains(&token.as_str()))
         .collect::<BTreeSet<_>>();
@@ -3499,6 +3612,26 @@ fn semantic_special_boundary_contradicts_selected_target(
         .filter(|alias| !semantic_alias_scope_is_selected(alias, evidence))
         .map(|alias| alias.display.as_str())
         .collect::<Vec<_>>();
+    let has_entity_specific_compound_title = parsed_titles.iter().any(|title| {
+        let substantive_segments = title
+            .split(" - ")
+            .map(str::trim)
+            .filter(|segment| {
+                semantic_identity_tokens(segment)
+                    .iter()
+                    .any(|token| !boundary_tokens.contains(&token.as_str()))
+            })
+            .collect::<Vec<_>>();
+        substantive_segments.len() >= 2
+            && substantive_segments.iter().all(|segment| {
+                selected_aliases
+                    .iter()
+                    .any(|alias| model_selected_title_matches_owned_alias(segment, alias, evidence))
+            })
+    });
+    if has_entity_specific_compound_title {
+        return false;
+    }
     parsed_titles.iter().any(|title| {
         let base = semantic_identity_tokens(title)
             .into_iter()
@@ -9419,7 +9552,7 @@ mod tests {
                     anilist_season_id: Some("tv".to_string()),
                 },
                 AnimeScopedAlias {
-                    display: "Owari no Seraph Specials".to_string(),
+                    display: "Owari no Seraph".to_string(),
                     source: "anilist_english".to_string(),
                     language: Some("en".to_string()),
                     season_number: Some(0),
@@ -9450,10 +9583,7 @@ mod tests {
             release_season_numbers: vec![0],
             episode_number_offset: 0,
             anilist_season_id: Some("specials".to_string()),
-            aliases: vec![
-                "Owari no Seraph Specials".to_string(),
-                "Owaranai Seraph".to_string(),
-            ],
+            aliases: vec!["Owari no Seraph".to_string(), "Owaranai Seraph".to_string()],
             numbering: AnimeSemanticNumberingEvidence::Seasonal,
             media_kind: AnimeSemanticMediaKindEvidence::Special,
             episode_numbers: vec![9],
@@ -9820,6 +9950,47 @@ mod tests {
     }
 
     #[test]
+    fn alm9_model_selected_identity_accepts_a_complete_named_alias_segment() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-named-alias-segment".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Senki Zesshou Symphogear G: Senki Zesshou Shinai Symphogear".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(2),
+                anilist_season_id: Some("symphogear-g".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 2,
+            release_season_numbers: vec![2],
+            episode_number_offset: 0,
+            anilist_season_id: Some("symphogear-g".to_string()),
+            aliases: vec![
+                "Senki Zesshou Symphogear G: Senki Zesshou Shinai Symphogear".to_string(),
+            ],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![2],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("Senki Zesshoushinai Symphogear - 02"),
+            &evidence,
+        ));
+        assert!(!model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("Senki Zesshou Symphogear GX - 11"),
+            &evidence,
+        ));
+    }
+
+    #[test]
     fn alm9_model_selected_movie_identity_rejects_plain_episode_suffixes() {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("semantic-movie-episode-suffix".to_string()),
@@ -9858,13 +10029,22 @@ mod tests {
         let context = AnimeCandidateScoringContext {
             graph_fingerprint: Some("semantic-adjacent-owned-prefix".to_string()),
             aliases: Vec::new(),
-            scoped_aliases: vec![AnimeScopedAlias {
-                display: "Baja no Studio: Baja no Mita Umi".to_string(),
-                source: "anilist_romaji".to_string(),
-                language: Some("ja-Latn".to_string()),
-                season_number: Some(0),
-                anilist_season_id: Some("baja-second".to_string()),
-            }],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Baja no Studio: Baja no Mita Umi".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("baja-second".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Baja no Studio".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("baja-first".to_string()),
+                },
+            ],
             targets: Vec::new(),
         };
         let evidence = AnimeSemanticCandidateEvidence {
@@ -9889,6 +10069,83 @@ mod tests {
             &context,
             &parse_anime_release_title("[PAS] Baja no Studio - v2 [BD 1080p AAC]"),
             &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_accepts_unambiguous_metadata_abbreviations() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-metadata-abbreviation".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Time Stranger Kyoko: Chocola ni Omakase!".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("kyoko-ova".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Sengoku Otome: Momoiro Paradox".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("adjacent".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("kyoko-ova".to_string()),
+            aliases: vec!["Time Stranger Kyoko: Chocola ni Omakase!".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Special,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title("[CF] Time Stranger Kyoko [VHS]"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_ignores_the_parsed_trailing_release_group() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-trailing-release-group".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Golgo 13".to_string(),
+                source: "anilist_romaji".to_string(),
+                language: Some("ja-Latn".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("golgo-movie".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("golgo-movie".to_string()),
+            aliases: vec!["Golgo 13".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+        let parsed = parse_anime_release_title("Golgo.13.1983.576p.BluRay.x264-HANDJOB.mkv");
+
+        assert_eq!(parsed.release_group.as_deref(), Some("HANDJOB"));
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context, &parsed, &evidence,
         ));
     }
 
@@ -9963,10 +10220,10 @@ mod tests {
             episode_number_offset: 0,
             anilist_season_id: Some("cerberus".to_string()),
             aliases: vec!["Seisen Cerberus: Ryuukoku no Fatalite".to_string()],
-            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
             media_kind: AnimeSemanticMediaKindEvidence::Episode,
-            episode_numbers: Vec::new(),
-            absolute_episode_numbers: Vec::new(),
+            episode_numbers: vec![13],
+            absolute_episode_numbers: vec![13],
             target_keys: vec!["S01E13".to_string()],
         };
 
