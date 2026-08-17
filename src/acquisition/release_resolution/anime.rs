@@ -2493,6 +2493,23 @@ fn semantic_identity_supported_by_release(
         })
         .max();
 
+    // The parser deliberately removes release-context suffixes such as
+    // `2nd Season` from title candidates. Preserve the identity carried by
+    // that suffix when metadata says the selected entity itself owns the same
+    // ordinal (for example `Tokyo Ghoul:re 2`) and the parsed base title
+    // exactly identifies its adjacent ordinal-less entity. This is not fuzzy
+    // recovery: every participating title and season value is explicit and
+    // server-owned.
+    if semantic_entity_owned_release_ordinal_disambiguates(
+        parsed,
+        evidence,
+        &parsed_titles,
+        &selected_aliases,
+        &competing_aliases,
+    ) {
+        return true;
+    }
+
     // A selected entity must normally explain the release better than adjacent
     // graph entities. Movies have no episode coordinate with which to break an
     // exact metadata-alias tie, so an exact raw alias plus the model-selected
@@ -2502,6 +2519,54 @@ fn semantic_identity_supported_by_release(
         || competing_score.is_none_or(|competing| {
             (selected_score >= 98 && competing < 98) || selected_score >= competing + 8
         })
+}
+
+fn semantic_entity_owned_release_ordinal_disambiguates(
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+    parsed_titles: &BTreeSet<String>,
+    selected_aliases: &BTreeSet<&str>,
+    competing_aliases: &BTreeSet<&str>,
+) -> bool {
+    if !matches!(evidence.numbering, AnimeSemanticNumberingEvidence::Seasonal)
+        || matches!(evidence.media_kind, AnimeSemanticMediaKindEvidence::Movie)
+    {
+        return false;
+    }
+
+    let explicit_ordinal = [
+        parsed.original_title.as_str(),
+        parsed.sonarr_facts.original_title.as_str(),
+    ]
+    .into_iter()
+    .find_map(|title| parse_season_number(&normalize_fullwidth_digits(title)))
+    .filter(|ordinal| *ordinal > 0 && evidence.release_season_numbers.contains(ordinal));
+    let Some(explicit_ordinal) = explicit_ordinal else {
+        return false;
+    };
+    let ordinal_token = explicit_ordinal.to_string();
+
+    selected_aliases.iter().any(|selected_alias| {
+        let selected_tokens = semantic_identity_tokens(selected_alias);
+        selected_tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| **token == ordinal_token)
+            .any(|(ordinal_index, _)| {
+                let mut base_tokens = selected_tokens.clone();
+                base_tokens.remove(ordinal_index);
+                competing_aliases.iter().any(|competing_alias| {
+                    let competing_tokens = semantic_identity_tokens(competing_alias);
+                    !competing_tokens.is_empty()
+                        && (base_tokens == competing_tokens
+                            || base_tokens.concat() == competing_tokens.concat())
+                        && parsed_titles.iter().any(|title| {
+                            semantic_identity_alias_score(title, competing_alias)
+                                .is_some_and(|score| score == 100)
+                        })
+                })
+            })
+    })
 }
 
 /// Permit an adjacent-entity alias tie only when the raw release coordinate
