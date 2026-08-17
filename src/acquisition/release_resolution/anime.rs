@@ -3097,6 +3097,8 @@ fn plan_model_selected_single_target_coverage(
     let parsed = parse_anime_release_title(&candidate.title);
     if !semantic_identity_supported_by_release(context, &parsed, evidence)
         || semantic_release_coordinate_contradicts_target(&parsed, target, evidence)
+        || semantic_release_year_contradicts_selected_entity(context, &parsed, evidence)
+        || semantic_special_boundary_contradicts_selected_target(context, &parsed, evidence)
     {
         return None;
     }
@@ -3111,7 +3113,18 @@ fn plan_model_selected_single_target_coverage(
         [] => None,
         [file] => {
             let file_parsed = parse_anime_release_title(&file.path);
-            if semantic_release_coordinate_contradicts_target(&file_parsed, target, evidence) {
+            if semantic_release_coordinate_contradicts_target(&file_parsed, target, evidence)
+                || semantic_release_year_contradicts_selected_entity(
+                    context,
+                    &file_parsed,
+                    evidence,
+                )
+                || semantic_special_boundary_contradicts_selected_target(
+                    context,
+                    &file_parsed,
+                    evidence,
+                )
+            {
                 return None;
             }
             Some(*file)
@@ -3182,6 +3195,89 @@ fn semantic_release_coordinate_contradicts_target(
             .iter()
             .filter_map(|number| number.checked_add(evidence.episode_number_offset))
             .all(|number| !allowed.contains(&number))
+}
+
+fn semantic_release_year_contradicts_selected_entity(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let release_years = semantic_identity_tokens(&parsed.original_title)
+        .into_iter()
+        .filter_map(|token| token.parse::<i32>().ok())
+        .filter(|year| (1950..=2100).contains(year))
+        .collect::<BTreeSet<_>>();
+    if release_years.is_empty() {
+        return false;
+    }
+    let entity_years = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str))
+        .flat_map(semantic_identity_tokens)
+        .filter_map(|token| token.parse::<i32>().ok())
+        .filter(|year| (1950..=2100).contains(year))
+        .collect::<BTreeSet<_>>();
+    !entity_years.is_empty() && release_years.is_disjoint(&entity_years)
+}
+
+fn semantic_special_boundary_contradicts_selected_target(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let boundary_tokens = ["movie", "ova", "oad", "ona", "special", "specials"];
+    let parsed_titles = semantic_parsed_title_candidates(parsed);
+    let release_boundaries = parsed_titles
+        .iter()
+        .flat_map(|title| semantic_identity_tokens(title))
+        .filter(|token| boundary_tokens.contains(&token.as_str()))
+        .collect::<BTreeSet<_>>();
+    if release_boundaries.is_empty() {
+        return false;
+    }
+
+    // An ordinary television episode cannot be replaced by a movie/OVA/special
+    // merely because the franchise title is shared. Preserve legitimate words
+    // such as "Special" when they are part of the selected entity's own title.
+    let selected_boundaries = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str))
+        .flat_map(semantic_identity_tokens)
+        .filter(|token| boundary_tokens.contains(&token.as_str()))
+        .collect::<BTreeSet<_>>();
+    if evidence.media_kind == AnimeSemanticMediaKindEvidence::Episode
+        && !release_boundaries.is_subset(&selected_boundaries)
+    {
+        return true;
+    }
+
+    // For special-like releases, remove only the generic boundary word and
+    // check whether the remaining franchise name also identifies an adjacent
+    // metadata entity. In that case the model has not selected an entity-
+    // specific title, so the generic marker cannot resolve the ambiguity.
+    let competing_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| !semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .collect::<Vec<_>>();
+    parsed_titles.iter().any(|title| {
+        let base = semantic_identity_tokens(title)
+            .into_iter()
+            .filter(|token| !boundary_tokens.contains(&token.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        !base.is_empty()
+            && competing_aliases.iter().any(|alias| {
+                semantic_identity_alias_score(&base, alias).is_some_and(|score| score >= 82)
+            })
+    })
 }
 
 fn plan_anime_semantic_evidence_attempt(
@@ -8964,6 +9060,206 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["S02E01", "S02E02"]
         );
+    }
+
+    #[test]
+    fn alm9_model_selected_coverage_rejects_explicit_entity_year_conflict() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-year-conflict".to_string()),
+            aliases: vec![
+                "Vampire Hunter D".to_string(),
+                "Vampire Hunter D: Bloodlust".to_string(),
+            ],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Vampire Hunter D (1985)".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("1985".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Vampire Hunter D: Bloodlust (2000)".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("bloodlust".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("bloodlust".to_string()),
+            aliases: vec!["Vampire Hunter D: Bloodlust (2000)".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["movie:bloodlust".to_string()],
+        };
+
+        assert!(semantic_release_year_contradicts_selected_entity(
+            &context,
+            &parse_anime_release_title("[naiyas] Vampire Hunter D (1985) [BD1080p]"),
+            &evidence,
+        ));
+        assert!(!semantic_release_year_contradicts_selected_entity(
+            &context,
+            &parse_anime_release_title("Vampire Hunter D: Bloodlust [1080p]"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_tv_episode_rejects_ova_boundary() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-tv-ova-conflict".to_string()),
+            aliases: vec!["Love Stage!!".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Love Stage!!".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("tv".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Love Stage!! OVA".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("ova".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("tv".to_string()),
+            aliases: vec!["Love Stage!!".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Episode,
+            episode_numbers: vec![5],
+            absolute_episode_numbers: vec![5],
+            target_keys: vec!["S01E05".to_string()],
+        };
+
+        assert!(semantic_special_boundary_contradicts_selected_target(
+            &context,
+            &parse_anime_release_title("[SS] Love Stage!! OVA"),
+            &evidence,
+        ));
+        assert!(!semantic_special_boundary_contradicts_selected_target(
+            &context,
+            &parse_anime_release_title("[HorribleSubs] Love Stage!! - 05 [480p].mkv"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_special_rejects_generic_adjacent_entity_boundary() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-special-boundary".to_string()),
+            aliases: vec!["Owari no Seraph".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Owari no Seraph".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("tv".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Owari no Seraph Specials".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("specials".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Owaranai Seraph".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("specials".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("specials".to_string()),
+            aliases: vec![
+                "Owari no Seraph Specials".to_string(),
+                "Owaranai Seraph".to_string(),
+            ],
+            numbering: AnimeSemanticNumberingEvidence::Seasonal,
+            media_kind: AnimeSemanticMediaKindEvidence::Special,
+            episode_numbers: vec![9],
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S00E09".to_string()],
+        };
+
+        assert!(semantic_special_boundary_contradicts_selected_target(
+            &context,
+            &parse_anime_release_title("Owari no Seraph - OAD [DVD]"),
+            &evidence,
+        ));
+        assert!(!semantic_special_boundary_contradicts_selected_target(
+            &context,
+            &parse_anime_release_title("Owari no Seraph Specials - Owaranai Seraph - 09 [1080p]"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_ova_keeps_entity_specific_boundary() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-entity-specific-ova".to_string()),
+            aliases: vec!["Amefuri Kozou".to_string()],
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Amefuri Kozou".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("rain-boy".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Black Jack".to_string(),
+                    source: "anilist_english".to_string(),
+                    language: Some("en".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("adjacent".to_string()),
+                },
+            ],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("rain-boy".to_string()),
+            aliases: vec!["Amefuri Kozou".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Ova,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["S00E01".to_string()],
+        };
+
+        assert!(!semantic_special_boundary_contradicts_selected_target(
+            &context,
+            &parse_anime_release_title("Amefuri Kozou OVA [DVD]"),
+            &evidence,
+        ));
     }
 
     #[test]
