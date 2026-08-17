@@ -2576,6 +2576,9 @@ fn semantic_coordinate_identifies_selected_targets(
                 .episode_numbers
                 .iter()
                 .copied()
+                .chain(semantic_explicit_release_episode_numbers(
+                    &parsed.original_title,
+                ))
                 .filter(|number| *number > 0)
                 .collect::<BTreeSet<_>>();
             if observed.is_empty() {
@@ -2848,7 +2851,15 @@ fn semantic_identity_alias_score(title: &str, alias: &str) -> Option<u16> {
         && title_tokens.starts_with(&alias_tokens)
         && alias_remainder_is_release_context(&title_tokens[alias_tokens.len()..])
     {
-        return Some(94);
+        let remainder = &title_tokens[alias_tokens.len()..];
+        // An alias that already owns the ordinal (`... re 2 Season`) is
+        // stronger than a neighbouring base alias that needs the release's
+        // numeric suffix to manufacture that ordinal (`... re` + `2 Season`).
+        return Some(if alias_remainder_adds_numbering_identity(remainder) {
+            94
+        } else {
+            98
+        });
     }
     if title_tokens.len() >= 2
         && title_tokens.len() < alias_tokens.len()
@@ -2911,6 +2922,16 @@ fn ordered_token_subsequence(needle: &[String], haystack: &[String]) -> bool {
         }
     }
     false
+}
+
+fn alias_remainder_adds_numbering_identity(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        token.chars().all(|ch| ch.is_ascii_digit())
+            || token.strip_prefix('s').is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+            })
+            || roman_numeral_value(token).is_some()
+    })
 }
 
 fn semantic_explicit_release_episode_numbers(input: &str) -> BTreeSet<i32> {
@@ -3394,6 +3415,15 @@ fn model_selected_entity_has_exact_release_identity(
     parsed: &AnimeParsedRelease,
     evidence: &AnimeSemanticCandidateEvidence,
 ) -> bool {
+    if evidence.media_kind == AnimeSemanticMediaKindEvidence::Movie
+        && DASH_EPISODE_RE.is_match(&normalize_fullwidth_digits(&parsed.original_title))
+        && !semantic_explicit_release_episode_numbers(&parsed.original_title).is_empty()
+    {
+        // The parser may expose a clean series-title candidate after stripping
+        // `- 07`, but that raw suffix is affirmative episodic evidence and
+        // cannot identify a movie merely because the franchise name matches.
+        return false;
+    }
     let selected_aliases = context
         .scoped_aliases
         .iter()
