@@ -1919,12 +1919,23 @@ fn macos_available_memory_bytes() -> Option<u64> {
 #[cfg(windows)]
 async fn collect_windows_resources(logical_cores: u32) -> PlatformResourceSnapshot {
     const SCRIPT: &str = "$cpu=Get-CimInstance Win32_Processor | Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors; $os=Get-CimInstance Win32_OperatingSystem | Select-Object Version,TotalVisibleMemorySize,FreePhysicalMemory; [pscustomobject]@{cpu=$cpu;os=$os}|ConvertTo-Json -Compress -Depth 3";
-    let value = run_bounded_command(
-        "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", SCRIPT],
-    )
-    .await
-    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    const OS_VERSION_SCRIPT: &str = "[Environment]::OSVersion.Version.ToString()";
+    let (value, environment_os_version) = tokio::join!(
+        run_bounded_command(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", SCRIPT],
+        ),
+        run_bounded_command(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                OS_VERSION_SCRIPT,
+            ],
+        ),
+    );
+    let value = value.and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
     let cpu = value.as_ref().and_then(|value| value.get("cpu"));
     let os = value.as_ref().and_then(|value| value.get("os"));
     let physical_cores = cpu
@@ -1949,10 +1960,11 @@ async fn collect_windows_resources(logical_cores: u32) -> PlatformResourceSnapsh
     PlatformResourceSnapshot {
         physical_cores,
         model,
-        os_version: os
-            .and_then(|value| value.get("Version"))
-            .and_then(Value::as_str)
-            .and_then(normalized_numeric_version),
+        os_version: preferred_numeric_version(
+            os.and_then(|value| value.get("Version"))
+                .and_then(Value::as_str),
+            environment_os_version.as_deref(),
+        ),
         memory: InferenceSystemMemory {
             total_bytes,
             available_bytes,
@@ -2079,6 +2091,12 @@ fn normalized_numeric_version(raw: &str) -> Option<String> {
             !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
         }))
     .then(|| value.to_string())
+}
+
+fn preferred_numeric_version(primary: Option<&str>, fallback: Option<&str>) -> Option<String> {
+    primary
+        .and_then(normalized_numeric_version)
+        .or_else(|| fallback.and_then(normalized_numeric_version))
 }
 
 fn parse_macos_vm_stat(raw: &str) -> Option<u64> {
@@ -2817,6 +2835,22 @@ mod tests {
 
     fn gib(value: u64) -> u64 {
         value * 1024 * 1024 * 1024
+    }
+
+    #[test]
+    fn alm6_windows_os_version_uses_environment_fallback_when_cim_is_absent() {
+        assert_eq!(
+            preferred_numeric_version(None, Some("10.0.26100.0\r\n")).as_deref(),
+            Some("10.0.26100.0")
+        );
+        assert_eq!(
+            preferred_numeric_version(Some("10.0.22631"), Some("10.0.26100")).as_deref(),
+            Some("10.0.22631")
+        );
+        assert_eq!(
+            preferred_numeric_version(Some("unavailable"), Some("also unavailable")),
+            None
+        );
     }
 
     fn host(os: &str, arch: &str, gpus: Vec<HostGpuInventory>) -> HostHardwareInventory {
