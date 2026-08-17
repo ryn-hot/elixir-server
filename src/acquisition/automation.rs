@@ -36,10 +36,13 @@ use crate::{
             AnimeCandidateInput, AnimeCandidateScore, AnimeCandidateScoringContext,
             AnimeCandidateTarget, AnimeCoverageOptions, AnimeFileCoveragePlan,
             AnimeMetadataGraphInput, AnimeReleaseFileInput, AnimeScopedAlias, AnimeSeasonMapping,
-            AnimeSemanticCandidateEvidence, AnimeSemanticMediaKindEvidence,
-            AnimeSemanticNumberingEvidence, anime_parser_diagnostics, build_anime_metadata_graph,
-            infer_anizip_season_number, plan_anime_file_coverage_with_options,
-            plan_anime_file_coverage_with_semantic_evidence, score_anime_candidate,
+            AnimeSemanticCandidateEvidence, AnimeSemanticCanonicalIdentity,
+            AnimeSemanticMediaKindEvidence, AnimeSemanticNumberingEvidence,
+            anime_parser_diagnostics, anime_semantic_canonical_identity,
+            build_anime_metadata_graph, infer_anizip_season_number,
+            plan_anime_file_coverage_with_batch_unique_semantic_evidence,
+            plan_anime_file_coverage_with_options, plan_anime_file_coverage_with_semantic_evidence,
+            score_anime_candidate, score_anime_candidate_with_batch_unique_semantic_plan,
             score_anime_candidate_with_verified_semantic_plan,
         },
         fingerprint::candidate_release_fingerprint,
@@ -1762,6 +1765,13 @@ struct AnimeCandidatePlanningInput {
     deterministic_coverage: Option<CandidateCoverageAnalysis>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAnimeBatchUniqueCoverage {
+    candidate_index: usize,
+    analysis: CandidateCoverageAnalysis,
+    provenance: AnimeMatchAssistProvenance,
+}
+
 async fn build_anime_candidate_release_plans_with_matching(
     pool: &sqlx::AnyPool,
     matching_service: &AnimeMatchingService,
@@ -1848,6 +1858,8 @@ async fn build_anime_candidate_release_plans_with_matching(
         .iter()
         .map(|item| item.deterministic_coverage.clone())
         .collect::<Vec<_>>();
+    let mut semantic_coverage_indices = BTreeSet::new();
+    let mut pending_batch_unique = Vec::new();
 
     if !deterministic_is_definitive {
         batch.anime_retryable_unresolved = true;
@@ -1926,20 +1938,34 @@ async fn build_anime_candidate_release_plans_with_matching(
                     batch.anime_match_assist = Some(provenance);
                     continue;
                 };
-                let Some(mut analysis) = analyze_anime_candidate_coverage_with_semantic_evidence(
+                let strict_analysis = analyze_anime_candidate_coverage_with_semantic_evidence(
                     subscription,
                     representative,
                     &targets,
                     &item.candidate,
                     &evidence,
-                ) else {
-                    mark_anime_semantic_coverage_fallback(
-                        &mut provenance,
-                        "semantic evidence did not produce deterministic coverage",
-                    );
-                    batch.anime_match_assist = Some(provenance);
-                    continue;
-                };
+                );
+                let (mut analysis, uses_batch_unique_identity) =
+                    if let Some(analysis) = strict_analysis {
+                        (analysis, false)
+                    } else if let Some(analysis) =
+                        analyze_anime_candidate_coverage_with_batch_unique_semantic_evidence(
+                            subscription,
+                            representative,
+                            &targets,
+                            &item.candidate,
+                            &evidence,
+                        )
+                    {
+                        (analysis, true)
+                    } else {
+                        mark_anime_semantic_coverage_fallback(
+                            &mut provenance,
+                            "semantic evidence did not produce deterministic coverage",
+                        );
+                        batch.anime_match_assist = Some(provenance);
+                        continue;
+                    };
                 if !anime_coverage_is_automatic(&analysis, &item.candidate, subscription) {
                     mark_anime_semantic_coverage_fallback(
                         &mut provenance,
@@ -1973,9 +1999,28 @@ async fn build_anime_candidate_release_plans_with_matching(
                     &mut analysis.selection.candidate,
                     &provenance,
                 );
-                batch.anime_match_assist = Some(provenance);
-                resolved_coverages[candidate_index] = Some(analysis);
+                if uses_batch_unique_identity {
+                    pending_batch_unique.push(PendingAnimeBatchUniqueCoverage {
+                        candidate_index,
+                        analysis,
+                        provenance,
+                    });
+                } else {
+                    batch.anime_match_assist = Some(provenance);
+                    resolved_coverages[candidate_index] = Some(analysis);
+                    semantic_coverage_indices.insert(candidate_index);
+                }
             }
+
+            apply_anime_semantic_batch_arbitration(
+                subscription,
+                &eligible,
+                &wanted_target_ids,
+                &mut resolved_coverages,
+                &mut semantic_coverage_indices,
+                pending_batch_unique,
+                &mut batch,
+            );
         } else {
             debug!(
                 subscription_id = %subscription.subscription_id,
@@ -2048,6 +2093,101 @@ async fn build_anime_candidate_release_plans_with_matching(
         .plans
         .sort_by(|left, right| compare_release_plans(right, left, subscription.route_policy));
     Ok(batch)
+}
+
+fn apply_anime_semantic_batch_arbitration(
+    subscription: &AcquisitionSubscription,
+    eligible: &[AnimeCandidatePlanningInput],
+    wanted_target_ids: &BTreeSet<Uuid>,
+    resolved_coverages: &mut [Option<CandidateCoverageAnalysis>],
+    semantic_coverage_indices: &mut BTreeSet<usize>,
+    pending: Vec<PendingAnimeBatchUniqueCoverage>,
+    batch: &mut CandidateReleasePlanBatch,
+) {
+    let already_covered = resolved_coverages
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, coverage)| {
+            let coverage = coverage.as_ref()?;
+            anime_coverage_is_automatic(
+                coverage,
+                &eligible.get(candidate_index)?.candidate,
+                subscription,
+            )
+            .then_some(coverage)
+        })
+        .flat_map(|coverage| coverage.covered_target_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let eligible_pending = pending
+        .iter()
+        .filter(|item| item.analysis.covered_target_ids == *wanted_target_ids)
+        .map(|item| item.candidate_index)
+        .collect::<Vec<_>>();
+    let accepted_pending = (wanted_target_ids.len() == 1
+        && wanted_target_ids.is_disjoint(&already_covered)
+        && eligible_pending.len() == 1)
+        .then(|| eligible_pending[0]);
+
+    for mut item in pending {
+        if accepted_pending == Some(item.candidate_index) {
+            batch.anime_match_assist = Some(item.provenance);
+            resolved_coverages[item.candidate_index] = Some(item.analysis);
+            semantic_coverage_indices.insert(item.candidate_index);
+        } else {
+            let detail = if !already_covered.is_disjoint(wanted_target_ids) {
+                "shortened anime alias was unnecessary after stronger batch coverage"
+            } else if !eligible_pending.contains(&item.candidate_index) {
+                "shortened anime alias did not cover the complete requested target"
+            } else {
+                "shortened anime alias was not unique across the candidate batch"
+            };
+            mark_anime_semantic_coverage_fallback(&mut item.provenance, detail);
+            batch.anime_match_assist = Some(item.provenance);
+        }
+    }
+
+    let exact_coverages = resolved_coverages
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, coverage)| {
+            let coverage = coverage.as_ref()?;
+            let candidate = &eligible.get(candidate_index)?.candidate;
+            (anime_semantic_canonical_identity(
+                &anime_candidate_input(candidate),
+                &subscription.title,
+            ) == AnimeSemanticCanonicalIdentity::Exact)
+                .then(|| coverage.covered_target_keys.clone())
+        })
+        .collect::<Vec<_>>();
+    if exact_coverages.is_empty() {
+        return;
+    }
+    let dominated = semantic_coverage_indices
+        .iter()
+        .copied()
+        .filter(|candidate_index| {
+            let Some(coverage) = resolved_coverages
+                .get(*candidate_index)
+                .and_then(Option::as_ref)
+            else {
+                return false;
+            };
+            let Some(candidate) = eligible.get(*candidate_index) else {
+                return false;
+            };
+            anime_semantic_canonical_identity(
+                &anime_candidate_input(&candidate.candidate),
+                &subscription.title,
+            ) == AnimeSemanticCanonicalIdentity::SubstantiveExtension
+                && exact_coverages
+                    .iter()
+                    .any(|exact| exact == &coverage.covered_target_keys)
+        })
+        .collect::<Vec<_>>();
+    for candidate_index in dominated {
+        resolved_coverages[candidate_index] = None;
+        semantic_coverage_indices.remove(&candidate_index);
+    }
 }
 
 pub(crate) fn anime_semantic_media_kinds(
@@ -3088,6 +3228,34 @@ fn analyze_anime_candidate_coverage_with_semantic_evidence(
     }
     let score =
         score_anime_candidate_with_verified_semantic_plan(&context, &input, evidence, &plan)?;
+    anime_candidate_coverage_analysis(subscription, candidate, targets, score, plan)
+}
+
+fn analyze_anime_candidate_coverage_with_batch_unique_semantic_evidence(
+    subscription: &AcquisitionSubscription,
+    representative: &AcquisitionTarget,
+    targets: &[AcquisitionTarget],
+    candidate: &AcquisitionCandidate,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<CandidateCoverageAnalysis> {
+    let context = anime_candidate_scoring_context(subscription, representative, targets)?;
+    let input = anime_candidate_input(candidate);
+    let files = anime_release_file_inputs(candidate);
+    let plan = plan_anime_file_coverage_with_batch_unique_semantic_evidence(
+        &context, &input, &files, evidence,
+    )
+    .map(|plan| {
+        bind_exact_single_anime_provider_file_with_semantic_evidence(
+            plan, &context, &input, &files, evidence,
+        )
+    })?;
+    if !plan.rejection_reasons.is_empty()
+        || plan.confidence == ReleaseConfidence::ReviewRequired
+        || plan.entries.is_empty()
+    {
+        return None;
+    }
+    let score = score_anime_candidate_with_batch_unique_semantic_plan(&context, &input, evidence)?;
     anime_candidate_coverage_analysis(subscription, candidate, targets, score, plan)
 }
 

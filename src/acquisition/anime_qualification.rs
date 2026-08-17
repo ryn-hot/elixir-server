@@ -50,7 +50,10 @@ use crate::{
             anime::{
                 ANIME_SHOKO_STYLE_RESOLVER_VERSION, AnimeCandidateInput,
                 AnimeCandidateScoringContext, AnimeCoverageOptions, AnimeFileCoveragePlan,
-                AnimeReleaseFileInput, model_selected_single_target_coverage_rejection_reason,
+                AnimeReleaseFileInput, AnimeSemanticCanonicalIdentity,
+                anime_semantic_canonical_identity,
+                model_selected_single_target_coverage_rejection_reason,
+                plan_anime_file_coverage_with_batch_unique_semantic_evidence,
                 plan_anime_file_coverage_with_options,
                 plan_anime_file_coverage_with_semantic_evidence,
             },
@@ -607,6 +610,12 @@ struct SemanticCaseCounters {
     selected_hypotheses: Vec<AnimeSemanticCorpusSelection>,
 }
 
+struct PendingBatchUniqueSemanticPlan {
+    candidate_index: usize,
+    selection_index: usize,
+    candidate_plan: QualificationCandidatePlan,
+}
+
 /// Run the frozen corpus through the current combined production architecture:
 /// deterministic fast path, bounded index-or-null semantic evidence, the same
 /// deterministic coverage planner, and unchanged fallback on every failure.
@@ -1009,6 +1018,8 @@ async fn run_semantic_corpus_cases(
                 == DeterministicMatchState::Definitive;
         let mut combined = baseline_resolution;
         let mut counters = SemanticCaseCounters::default();
+        let mut pending_batch_unique = Vec::new();
+        let mut semantic_selection_by_candidate = BTreeMap::new();
 
         if !deterministic_definitive {
             for (candidate_index, candidate) in input.acquisition_candidates.iter().enumerate() {
@@ -1082,17 +1093,18 @@ async fn run_semantic_corpus_cases(
                         });
                     continue;
                 };
-                let semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
+                let coverage_options = AnimeCoverageOptions {
+                    file_selection_supported: *input
+                        .route_context
+                        .file_selection_supported_by_candidate_key
+                        .get(&request_candidate.candidate_key)
+                        .context("route context lacks candidate file-selection key")?,
+                };
+                let strict_semantic_plan = plan_anime_file_coverage_with_semantic_evidence(
                     &input.scoring_context,
                     &candidate_input,
                     &files,
-                    AnimeCoverageOptions {
-                        file_selection_supported: *input
-                            .route_context
-                            .file_selection_supported_by_candidate_key
-                            .get(&request_candidate.candidate_key)
-                            .context("route context lacks candidate file-selection key")?,
-                    },
+                    coverage_options,
                     &evidence,
                 )
                 .map(|plan| {
@@ -1111,6 +1123,27 @@ async fn run_semantic_corpus_cases(
                         &files,
                         &evidence,
                     );
+                let weak_semantic_plan = if strict_semantic_plan.is_none() {
+                    plan_anime_file_coverage_with_batch_unique_semantic_evidence(
+                        &input.scoring_context,
+                        &candidate_input,
+                        &files,
+                        &evidence,
+                    )
+                    .map(|plan| {
+                        bind_exact_single_anime_provider_file_with_semantic_evidence(
+                            plan,
+                            &input.scoring_context,
+                            &candidate_input,
+                            &files,
+                            &evidence,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let uses_batch_unique_identity = weak_semantic_plan.is_some();
+                let semantic_plan = strict_semantic_plan.or(weak_semantic_plan);
                 let preference = language_preference(&input.request.target.audio_preference);
                 let assessment = assess_language_preference(
                     &preference,
@@ -1123,15 +1156,20 @@ async fn run_semantic_corpus_cases(
                     &preference,
                     &assessment,
                     candidate,
-                    model_selected_coverage_rejection,
+                    if uses_batch_unique_identity {
+                        None
+                    } else {
+                        model_selected_coverage_rejection
+                    },
                 );
-                let accepted = rejection_reasons.is_empty();
+                let accepted = rejection_reasons.is_empty() && !uses_batch_unique_identity;
                 for reason in &rejection_reasons {
                     *counters
                         .rejection_reason_counts
                         .entry(reason.clone())
                         .or_insert(0) += 1;
                 }
+                let selection_index = counters.selected_hypotheses.len();
                 counters
                     .selected_hypotheses
                     .push(AnimeSemanticCorpusSelection {
@@ -1147,11 +1185,36 @@ async fn run_semantic_corpus_cases(
                         &plan,
                         &assessment,
                     ));
+                    semantic_selection_by_candidate.insert(candidate_index, selection_index);
                     counters.accepted_evidence += 1;
+                } else if uses_batch_unique_identity
+                    && counters.selected_hypotheses[selection_index]
+                        .rejection_reasons
+                        .is_empty()
+                {
+                    let plan = semantic_plan.expect("pending batch-unique semantic plan");
+                    pending_batch_unique.push(PendingBatchUniqueSemanticPlan {
+                        candidate_index,
+                        selection_index,
+                        candidate_plan: candidate_plan_for_coverage(
+                            &request_candidate.candidate_key,
+                            &plan,
+                            &assessment,
+                        ),
+                    });
+                    semantic_selection_by_candidate.insert(candidate_index, selection_index);
                 } else {
                     counters.rejected_evidence += 1;
                 }
             }
+
+            apply_semantic_batch_arbitration(
+                &input,
+                &mut combined,
+                &mut counters,
+                pending_batch_unique,
+                &semantic_selection_by_candidate,
+            );
         }
 
         let final_plan = final_plan_for_resolution(&input.request, &combined)?;
@@ -1702,6 +1765,134 @@ fn semantic_evidence_rejection_reasons(
             .map(|reason| format!("planner_review:{reason}")),
     );
     reasons.into_iter().collect()
+}
+
+/// Apply the two complete-batch rules that cannot be decided safely while one
+/// candidate is being examined in isolation:
+///
+/// 1. a shortened selected alias is usable only when it is the sole candidate
+///    capable of filling the still-uncovered one-target request; and
+/// 2. for the same target, an exact canonical release dominates a model-only
+///    substantive extension such as `Cencoroll Connect` for `Cencoroll`.
+fn apply_semantic_batch_arbitration(
+    input: &QualificationCaseInput,
+    resolution: &mut QualificationResolutionState,
+    counters: &mut SemanticCaseCounters,
+    pending: Vec<PendingBatchUniqueSemanticPlan>,
+    semantic_selection_by_candidate: &BTreeMap<usize, usize>,
+) {
+    let wanted = input
+        .request
+        .target
+        .wanted_target_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let already_covered = resolution
+        .candidate_plans
+        .iter()
+        .flatten()
+        .flat_map(|plan| plan.target_keys.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let eligible_pending = pending
+        .iter()
+        .filter(|item| {
+            item.candidate_plan
+                .target_keys
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                == wanted
+        })
+        .map(|item| item.candidate_index)
+        .collect::<Vec<_>>();
+    let accepted_pending =
+        (wanted.len() == 1 && wanted.is_disjoint(&already_covered) && eligible_pending.len() == 1)
+            .then(|| eligible_pending[0]);
+
+    for item in pending {
+        if accepted_pending == Some(item.candidate_index) {
+            resolution.candidate_plans[item.candidate_index] = Some(item.candidate_plan);
+            let selection = &mut counters.selected_hypotheses[item.selection_index];
+            selection.accepted = true;
+            selection.rejection_reasons.clear();
+            counters.accepted_evidence += 1;
+        } else {
+            let reason = if !already_covered.is_disjoint(&wanted) {
+                "batch_unique_alias_prefix_not_needed"
+            } else if !eligible_pending.contains(&item.candidate_index) {
+                "batch_unique_alias_prefix_target_coverage_failed"
+            } else {
+                "batch_unique_alias_prefix_ambiguous"
+            };
+            reject_semantic_selection(counters, item.selection_index, reason, false);
+        }
+    }
+
+    let canonical_title = input.request.target.canonical_title.as_str();
+    let exact_coverages = resolution
+        .candidate_plans
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, plan)| {
+            let plan = plan.as_ref()?;
+            let candidate = input.acquisition_candidates.get(candidate_index)?;
+            (anime_semantic_canonical_identity(&anime_candidate_input(candidate), canonical_title)
+                == AnimeSemanticCanonicalIdentity::Exact)
+                .then(|| plan.target_keys.iter().cloned().collect::<BTreeSet<_>>())
+        })
+        .collect::<Vec<_>>();
+    if exact_coverages.is_empty() {
+        return;
+    }
+
+    let dominated = semantic_selection_by_candidate
+        .iter()
+        .filter_map(|(candidate_index, selection_index)| {
+            let plan = resolution.candidate_plans.get(*candidate_index)?.as_ref()?;
+            let candidate = input.acquisition_candidates.get(*candidate_index)?;
+            if anime_semantic_canonical_identity(&anime_candidate_input(candidate), canonical_title)
+                != AnimeSemanticCanonicalIdentity::SubstantiveExtension
+            {
+                return None;
+            }
+            let coverage = plan.target_keys.iter().cloned().collect::<BTreeSet<_>>();
+            exact_coverages
+                .iter()
+                .any(|exact| exact == &coverage)
+                .then_some((*candidate_index, *selection_index))
+        })
+        .collect::<Vec<_>>();
+    for (candidate_index, selection_index) in dominated {
+        resolution.candidate_plans[candidate_index] = None;
+        reject_semantic_selection(
+            counters,
+            selection_index,
+            "batch_exact_canonical_identity_dominated_extension",
+            true,
+        );
+    }
+}
+
+fn reject_semantic_selection(
+    counters: &mut SemanticCaseCounters,
+    selection_index: usize,
+    reason: &str,
+    was_accepted: bool,
+) {
+    let selection = &mut counters.selected_hypotheses[selection_index];
+    selection.accepted = false;
+    selection.rejection_reasons.push(reason.to_string());
+    selection.rejection_reasons.sort();
+    selection.rejection_reasons.dedup();
+    if was_accepted {
+        counters.accepted_evidence = counters.accepted_evidence.saturating_sub(1);
+    }
+    counters.rejected_evidence += 1;
+    *counters
+        .rejection_reason_counts
+        .entry(reason.to_string())
+        .or_insert(0) += 1;
 }
 
 /// Preserve raw corpus scoring while identifying frozen synthetic labels that

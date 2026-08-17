@@ -452,6 +452,16 @@ pub enum AnimeSemanticMediaKindEvidence {
     Ova,
 }
 
+/// Post-inference identity strength used only to arbitrate candidates that
+/// already selected the same server-authored target. This is deliberately not
+/// part of the model contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnimeSemanticCanonicalIdentity {
+    Exact,
+    SubstantiveExtension,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnimeCandidateTargetMatch {
@@ -1972,10 +1982,27 @@ pub fn score_anime_candidate_with_verified_semantic_plan(
     )
 }
 
+/// Score a plan admitted by complete-batch weak-alias arbitration. The
+/// identity exception remains private to this post-selection path and does not
+/// alter ordinary semantic scoring.
+pub(crate) fn score_anime_candidate_with_batch_unique_semantic_plan(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeCandidateScore> {
+    score_anime_candidate_with_semantic_evidence_mode(
+        context,
+        candidate,
+        evidence,
+        SemanticScoringMode::BatchUniqueAliasPrefix,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticScoringMode {
     Strict,
     CoverageWithFiles,
+    BatchUniqueAliasPrefix,
 }
 
 fn score_anime_candidate_with_semantic_evidence_mode(
@@ -2118,9 +2145,16 @@ fn semantic_scoring_inputs(
     // at least one alias owned by the selected canonical entity. Validate that
     // relationship before adding semantic aliases to the parsed release;
     // otherwise the injected alias would manufacture its own exact match.
-    if !semantic_identity_supported_by_release(context, &parsed, evidence)
-        && !(mode == SemanticScoringMode::CoverageWithFiles
-            && semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence))
+    let supplemental_identity = match mode {
+        SemanticScoringMode::Strict => false,
+        SemanticScoringMode::CoverageWithFiles => {
+            semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
+        }
+        SemanticScoringMode::BatchUniqueAliasPrefix => {
+            model_selected_title_has_batch_unique_alias_prefix(context, &parsed, evidence)
+        }
+    };
+    if !semantic_identity_supported_by_release(context, &parsed, evidence) && !supplemental_identity
     {
         return None;
     }
@@ -2219,7 +2253,7 @@ fn semantic_scoring_inputs(
             selected_keys.contains(target.target_key.as_str())
                 && (target.episode_number.is_some() || target.absolute_episode_number.is_some())
         });
-        if mode == SemanticScoringMode::Strict
+        if mode != SemanticScoringMode::CoverageWithFiles
             && evidence.numbering == AnimeSemanticNumberingEvidence::EntityOnly
             && matches!(
                 evidence.media_kind,
@@ -2715,6 +2749,73 @@ fn semantic_parsed_title_candidates(parsed: &AnimeParsedRelease) -> BTreeSet<Str
     parsed_titles
 }
 
+/// Classify how the untouched release title relates to the requested
+/// canonical title. Batch planning uses this only as a dominance rule between
+/// model-selected candidates for the same target: an exact canonical release
+/// may displace a substantive longer-title collision, while unrelated aliases
+/// and harmless packaging remain untouched.
+pub(crate) fn anime_semantic_canonical_identity(
+    candidate: &AnimeCandidateInput,
+    canonical_title: &str,
+) -> AnimeSemanticCanonicalIdentity {
+    let canonical_tokens = semantic_identity_tokens(canonical_title);
+    if canonical_tokens.is_empty() {
+        return AnimeSemanticCanonicalIdentity::Other;
+    }
+    let parsed = parse_anime_release_title(&candidate.title);
+    let title_tokens = semantic_parsed_title_candidates(&parsed)
+        .into_iter()
+        .map(|title| semantic_identity_tokens(&title))
+        .filter(|tokens| !tokens.is_empty())
+        .collect::<Vec<_>>();
+    let canonical_joined = canonical_tokens.concat();
+    if title_tokens
+        .iter()
+        .any(|tokens| tokens.concat() == canonical_joined)
+    {
+        return AnimeSemanticCanonicalIdentity::Exact;
+    }
+    if title_tokens.iter().any(|tokens| {
+        tokens.len() > canonical_tokens.len()
+            && tokens.starts_with(&canonical_tokens)
+            && tokens[canonical_tokens.len()..]
+                .iter()
+                .any(|token| semantic_canonical_extension_token_is_substantive(token))
+    }) {
+        return AnimeSemanticCanonicalIdentity::SubstantiveExtension;
+    }
+    AnimeSemanticCanonicalIdentity::Other
+}
+
+fn semantic_canonical_extension_token_is_substantive(token: &str) -> bool {
+    !matches!(
+        token,
+        "the"
+            | "animation"
+            | "dual"
+            | "audio"
+            | "dub"
+            | "dubbed"
+            | "multi"
+            | "sub"
+            | "subs"
+            | "subbed"
+            | "bd"
+            | "dvd"
+            | "pal"
+            | "ntsc"
+            | "bluray"
+            | "bdrip"
+            | "webrip"
+            | "web"
+            | "remux"
+            | "rip"
+            | "movie"
+    ) && !token
+        .parse::<i32>()
+        .is_ok_and(|number| (1900..=2099).contains(&number))
+}
+
 fn semantic_alias_scope_is_selected(
     alias: &AnimeScopedAlias,
     evidence: &AnimeSemanticCandidateEvidence,
@@ -3114,6 +3215,27 @@ fn plan_model_selected_single_target_coverage(
     try_plan_model_selected_single_target_coverage(context, candidate, files, evidence).ok()
 }
 
+/// Build the same single-target plan using only a shortened selected-entity
+/// alias. Callers must arbitrate this evidence across the complete candidate
+/// batch and accept it only when exactly one still-needed candidate qualifies.
+/// Keeping this entry point separate prevents a weak alias from changing any
+/// single-candidate, library, download-broker, or deterministic fallback path.
+pub(crate) fn plan_anime_file_coverage_with_batch_unique_semantic_evidence(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> Option<AnimeFileCoveragePlan> {
+    try_plan_model_selected_single_target_coverage_with_identity(
+        context,
+        candidate,
+        files,
+        evidence,
+        ModelSelectedIdentityRequirement::BatchUniqueAliasPrefix,
+    )
+    .ok()
+}
+
 /// Explain why the validated model-selected single-target path could not
 /// author coverage. This is consumed by the qualification harness so replay
 /// failures identify the exact deterministic safeguard involved.
@@ -3131,6 +3253,28 @@ fn try_plan_model_selected_single_target_coverage(
     candidate: &AnimeCandidateInput,
     files: &[AnimeReleaseFileInput],
     evidence: &AnimeSemanticCandidateEvidence,
+) -> Result<AnimeFileCoveragePlan, &'static str> {
+    try_plan_model_selected_single_target_coverage_with_identity(
+        context,
+        candidate,
+        files,
+        evidence,
+        ModelSelectedIdentityRequirement::Strict,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSelectedIdentityRequirement {
+    Strict,
+    BatchUniqueAliasPrefix,
+}
+
+fn try_plan_model_selected_single_target_coverage_with_identity(
+    context: &AnimeCandidateScoringContext,
+    candidate: &AnimeCandidateInput,
+    files: &[AnimeReleaseFileInput],
+    evidence: &AnimeSemanticCandidateEvidence,
+    identity_requirement: ModelSelectedIdentityRequirement,
 ) -> Result<AnimeFileCoveragePlan, &'static str> {
     if evidence.target_keys.len() != 1
         || matches!(
@@ -3153,10 +3297,17 @@ fn try_plan_model_selected_single_target_coverage(
         .find(|target| target.target_key == *target_key)
         .ok_or("selected_target_not_found")?;
     let parsed = parse_anime_release_title(&candidate.title);
-    if !semantic_identity_supported_by_release(context, &parsed, evidence)
-        && !semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
-        && !model_selected_entity_has_exact_release_identity(context, &parsed, evidence)
-    {
+    let identity_supported = match identity_requirement {
+        ModelSelectedIdentityRequirement::Strict => {
+            semantic_identity_supported_by_release(context, &parsed, evidence)
+                || semantic_identity_corroborated_by_unique_coordinate(context, &parsed, evidence)
+                || model_selected_entity_has_exact_release_identity(context, &parsed, evidence)
+        }
+        ModelSelectedIdentityRequirement::BatchUniqueAliasPrefix => {
+            model_selected_title_has_batch_unique_alias_prefix(context, &parsed, evidence)
+        }
+    };
+    if !identity_supported {
         return Err("release_identity_not_supported");
     }
     if semantic_release_coordinate_contradicts_target(&parsed, target, evidence) {
@@ -3208,7 +3359,15 @@ fn try_plan_model_selected_single_target_coverage(
         coverage_kind: anime_coverage_kind(ReleaseKind::Single),
         confidence: ReleaseConfidence::High,
         score: Some(100.0),
-        reason: "model_selected_entity_without_deterministic_contradiction".to_string(),
+        reason: match identity_requirement {
+            ModelSelectedIdentityRequirement::Strict => {
+                "model_selected_entity_without_deterministic_contradiction"
+            }
+            ModelSelectedIdentityRequirement::BatchUniqueAliasPrefix => {
+                "batch_unique_model_selected_alias_prefix_without_deterministic_contradiction"
+            }
+        }
+        .to_string(),
         state: ReleaseCoverageState::Planned,
     };
     Ok(anime_file_coverage_plan(
@@ -3263,6 +3422,45 @@ fn model_selected_entity_has_exact_release_identity(
                 coordinate_identifies_selected_targets,
             )
     })
+}
+
+/// A release may omit an entity subtitle (`Time Stranger Kyoko` versus
+/// `Time Stranger Kyouko: Chocola ni Omakase!`). This predicate identifies
+/// that narrow shape without promoting a title that is itself the exact alias
+/// of an adjacent entity. It is intentionally insufficient on its own: only a
+/// complete-batch caller may use the resulting plan, and only when one
+/// still-needed candidate qualifies.
+fn model_selected_title_has_batch_unique_alias_prefix(
+    context: &AnimeCandidateScoringContext,
+    parsed: &AnimeParsedRelease,
+    evidence: &AnimeSemanticCandidateEvidence,
+) -> bool {
+    let selected_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .chain(evidence.aliases.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if selected_aliases.is_empty() {
+        return false;
+    }
+    let competing_aliases = context
+        .scoped_aliases
+        .iter()
+        .filter(|alias| !semantic_alias_scope_is_selected(alias, evidence))
+        .map(|alias| alias.display.as_str())
+        .collect::<BTreeSet<_>>();
+
+    semantic_parsed_title_candidates(parsed)
+        .iter()
+        .any(|title| {
+            !competing_aliases.iter().any(|alias| {
+                semantic_identity_alias_score(title, alias).is_some_and(|score| score == 100)
+            }) && selected_aliases
+                .iter()
+                .any(|alias| semantic_title_is_substantial_alias_prefix(title, alias))
+        })
 }
 
 fn model_selected_title_matches_owned_alias(
@@ -10124,6 +10322,147 @@ mod tests {
             &parse_anime_release_title("Jungle Emperor - Symphonic Poem [Blu-Flash]"),
             &evidence,
         ));
+    }
+
+    #[test]
+    fn alm9_batch_unique_prefix_recovers_shortened_special_without_weakening_strict_identity() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-batch-prefix".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Time Stranger Kyouko: Chocola ni Omakase!".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("time-special".to_string()),
+                },
+                // A duplicated graph alias prevents ordinary identity from
+                // manufacturing uniqueness. The batch tier may still use the
+                // shorter raw title because it is not itself an adjacent
+                // entity's exact title.
+                AnimeScopedAlias {
+                    display: "Time Stranger Kyouko: Chocola ni Omakase!".to_string(),
+                    source: "graph_neighbor".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(1),
+                    anilist_season_id: Some("adjacent".to_string()),
+                },
+            ],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "special:time".to_string(),
+                canonical_key: None,
+                title: "Time Stranger Kyouko: Chocola ni Omakase!".to_string(),
+                season_number: Some(0),
+                anilist_season_id: Some("time-special".to_string()),
+                episode_number: None,
+                absolute_episode_number: Some(1),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("time-special".to_string()),
+            aliases: vec!["Time Stranger Kyoko: Chocola ni Omakase!".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Special,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["special:time".to_string()],
+        };
+        let candidate = rr3e_candidate("[CF] Time Stranger Kyoko [VHS] [45724292].avi");
+
+        assert!(
+            plan_model_selected_single_target_coverage(&context, &candidate, &[], &evidence)
+                .is_none()
+        );
+        assert!(
+            plan_anime_file_coverage_with_batch_unique_semantic_evidence(
+                &context,
+                &candidate,
+                &[],
+                &evidence,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn alm9_batch_unique_prefix_rejects_an_exact_adjacent_entity_title() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-batch-prefix-adjacent".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![
+                AnimeScopedAlias {
+                    display: "Baja no Studio: Baja no Mita Umi".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("baja-second".to_string()),
+                },
+                AnimeScopedAlias {
+                    display: "Baja no Studio".to_string(),
+                    source: "anilist_romaji".to_string(),
+                    language: Some("ja-Latn".to_string()),
+                    season_number: Some(0),
+                    anilist_season_id: Some("baja-first".to_string()),
+                },
+            ],
+            targets: vec![AnimeCandidateTarget {
+                target_key: "special:baja-second".to_string(),
+                canonical_key: None,
+                title: "Baja no Studio: Baja no Mita Umi".to_string(),
+                season_number: Some(0),
+                anilist_season_id: Some("baja-second".to_string()),
+                episode_number: None,
+                absolute_episode_number: Some(1),
+                tvdb_episode_id: None,
+                anidb_episode_id: None,
+            }],
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 0,
+            release_season_numbers: vec![0],
+            episode_number_offset: 0,
+            anilist_season_id: Some("baja-second".to_string()),
+            aliases: vec!["Baja no Studio: Baja no Mita Umi".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Special,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: vec!["special:baja-second".to_string()],
+        };
+
+        assert!(
+            plan_anime_file_coverage_with_batch_unique_semantic_evidence(
+                &context,
+                &rr3e_candidate("[PAS] Baja no Studio [BD 1080p qAAC]"),
+                &[],
+                &evidence,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn alm9_canonical_identity_distinguishes_exact_title_from_substantive_extension() {
+        assert_eq!(
+            anime_semantic_canonical_identity(
+                &rr3e_candidate("cencoroll.2009.dvdrip.x264.ac3.[daifuku]"),
+                "Cencoroll",
+            ),
+            AnimeSemanticCanonicalIdentity::Exact
+        );
+        assert_eq!(
+            anime_semantic_canonical_identity(
+                &rr3e_candidate("Cencoroll.Connect.1080p.WEB.x264-WKN.mp4"),
+                "Cencoroll",
+            ),
+            AnimeSemanticCanonicalIdentity::SubstantiveExtension
+        );
     }
 
     #[test]
