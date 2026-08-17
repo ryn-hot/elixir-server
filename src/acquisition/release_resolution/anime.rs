@@ -2676,6 +2676,8 @@ fn semantic_parsed_title_candidates(parsed: &AnimeParsedRelease) -> BTreeSet<Str
         .series_title
         .iter()
         .chain(&parsed.alt_titles)
+        .chain(&parsed.sonarr_facts.all_titles)
+        .chain(&parsed.anime_signal_facts.title_candidates)
         .chain(&parsed.anime_signal_facts.title_season_alias_candidates)
         .map(|title| title.as_str().to_string())
         .filter(|title| !title.trim().is_empty())
@@ -9548,6 +9550,42 @@ mod tests {
         assert!(model_selected_entity_has_exact_release_identity(
             &context,
             &parse_anime_release_title("Mahoutsukai no Yakusoku - 10"),
+            &evidence,
+        ));
+    }
+
+    #[test]
+    fn alm9_model_selected_identity_uses_all_raw_parser_title_candidates() {
+        let context = AnimeCandidateScoringContext {
+            graph_fingerprint: Some("semantic-full-title-evidence".to_string()),
+            aliases: Vec::new(),
+            scoped_aliases: vec![AnimeScopedAlias {
+                display: "Highlander: The Search for Vengeance".to_string(),
+                source: "anilist_english".to_string(),
+                language: Some("en".to_string()),
+                season_number: Some(1),
+                anilist_season_id: Some("highlander".to_string()),
+            }],
+            targets: Vec::new(),
+        };
+        let evidence = AnimeSemanticCandidateEvidence {
+            season_number: 1,
+            release_season_numbers: vec![1],
+            episode_number_offset: 0,
+            anilist_season_id: Some("highlander".to_string()),
+            aliases: vec!["Highlander: The Search for Vengeance".to_string()],
+            numbering: AnimeSemanticNumberingEvidence::EntityOnly,
+            media_kind: AnimeSemanticMediaKindEvidence::Movie,
+            episode_numbers: Vec::new(),
+            absolute_episode_numbers: Vec::new(),
+            target_keys: Vec::new(),
+        };
+
+        assert!(model_selected_entity_has_exact_release_identity(
+            &context,
+            &parse_anime_release_title(
+                "[Tech-Mod] Highlander - The Search for Vengeance [Director's Cut].mkv",
+            ),
             &evidence,
         ));
     }
