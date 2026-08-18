@@ -56,6 +56,12 @@ const INTEGRATED_NEGATIVE_CASE_COUNT: usize = 128;
 const INTEGRATED_MIN_RECOVERABLE_CASES: usize = 160;
 const INTEGRATED_TARGET_RECOVERABLE_CASES: usize = 256;
 const INTEGRATED_MIN_RELATION_COMPONENTS: usize = 160;
+const INTEGRATED_ACCEPTANCE_CASE_COUNT: usize = 1_200;
+const INTEGRATED_ACCEPTANCE_MATCH_CASE_COUNT: usize = 960;
+const INTEGRATED_ACCEPTANCE_NEGATIVE_CASE_COUNT: usize = 240;
+const INTEGRATED_ACCEPTANCE_MIN_RECOVERABLE_CASES: usize = 400;
+const INTEGRATED_ACCEPTANCE_TARGET_RECOVERABLE_CASES: usize = 480;
+const INTEGRATED_ACCEPTANCE_MIN_RELATION_COMPONENTS: usize = 300;
 const INTEGRATED_MAX_CASES_PER_COMPONENT: usize = 8;
 const INTEGRATED_CANDIDATE_COUNT: usize = 6;
 
@@ -69,6 +75,65 @@ pub struct AnimeTrainingCompileConfig {
 pub struct AnimeIntegratedDiagnosticCompileConfig {
     pub source_path: PathBuf,
     pub output_root: PathBuf,
+    pub profile: AnimeIntegratedCorpusProfile,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AnimeIntegratedCorpusProfile {
+    #[default]
+    CleanValidationDiagnosticV1,
+    CleanAcceptanceV1,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegratedCorpusSpec {
+    source_split: &'static str,
+    corpus_suffix: &'static str,
+    case_namespace: &'static str,
+    case_set: &'static str,
+    corpus_profile: QualificationCorpusProfile,
+    case_count: usize,
+    match_case_count: usize,
+    negative_case_count: usize,
+    minimum_recoverable_cases: usize,
+    target_recoverable_cases: usize,
+    minimum_relation_components: usize,
+    holdout_projected_or_scored: bool,
+}
+
+impl AnimeIntegratedCorpusProfile {
+    fn spec(self) -> IntegratedCorpusSpec {
+        match self {
+            Self::CleanValidationDiagnosticV1 => IntegratedCorpusSpec {
+                source_split: "validation",
+                corpus_suffix: "clean-integrated-validation-v1",
+                case_namespace: "clean-integrated-v1",
+                case_set: "development",
+                corpus_profile: QualificationCorpusProfile::CleanValidationDiagnosticV1,
+                case_count: INTEGRATED_DIAGNOSTIC_CASE_COUNT,
+                match_case_count: INTEGRATED_MATCH_CASE_COUNT,
+                negative_case_count: INTEGRATED_NEGATIVE_CASE_COUNT,
+                minimum_recoverable_cases: INTEGRATED_MIN_RECOVERABLE_CASES,
+                target_recoverable_cases: INTEGRATED_TARGET_RECOVERABLE_CASES,
+                minimum_relation_components: INTEGRATED_MIN_RELATION_COMPONENTS,
+                holdout_projected_or_scored: false,
+            },
+            Self::CleanAcceptanceV1 => IntegratedCorpusSpec {
+                source_split: "holdout",
+                corpus_suffix: "clean-acceptance-v1",
+                case_namespace: "clean-acceptance-v1",
+                case_set: "frozen",
+                corpus_profile: QualificationCorpusProfile::CleanAcceptanceV1,
+                case_count: INTEGRATED_ACCEPTANCE_CASE_COUNT,
+                match_case_count: INTEGRATED_ACCEPTANCE_MATCH_CASE_COUNT,
+                negative_case_count: INTEGRATED_ACCEPTANCE_NEGATIVE_CASE_COUNT,
+                minimum_recoverable_cases: INTEGRATED_ACCEPTANCE_MIN_RECOVERABLE_CASES,
+                target_recoverable_cases: INTEGRATED_ACCEPTANCE_TARGET_RECOVERABLE_CASES,
+                minimum_relation_components: INTEGRATED_ACCEPTANCE_MIN_RELATION_COMPONENTS,
+                holdout_projected_or_scored: true,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -343,15 +408,15 @@ struct IntegratedDiagnosticAudit {
     slice_counts: BTreeMap<String, usize>,
     projected_splits: Vec<String>,
     train_source_overlap: usize,
+    validation_source_overlap: usize,
     holdout_source_overlap: usize,
     forced_training_component_overlap: usize,
     holdout_projected_or_scored: bool,
 }
 
-/// Build a clean production-path diagnostic corpus solely from the already
-/// opened validation partition. Training and holdout examples are used only
-/// as identity sets for the contamination assertion; their labels are never
-/// projected into a case or scored.
+/// Build either the opened development projection or the one-shot sealed
+/// acceptance projection. Only the selected split is projected; every other
+/// split is used strictly as an identity set for contamination checks.
 pub fn compile_anime_integrated_diagnostic_corpus(
     config: AnimeIntegratedDiagnosticCompileConfig,
 ) -> Result<AnimeIntegratedDiagnosticCompileSummary> {
@@ -365,6 +430,7 @@ pub fn compile_anime_integrated_diagnostic_corpus(
     let source: TrainingSource = serde_json::from_slice(&source_bytes)
         .with_context(|| format!("decoding training source {}", config.source_path.display()))?;
     validate_source(&source)?;
+    let spec = config.profile.spec();
 
     let dataset_id = source.dataset_id.clone();
     let source_fingerprint = source.source_fingerprint.clone();
@@ -412,13 +478,15 @@ pub fn compile_anime_integrated_diagnostic_corpus(
     let mut releases = source
         .examples
         .into_iter()
-        .filter(|example| example.split == "validation" && example.example_kind == "positive")
+        .filter(|example| example.split == spec.source_split && example.example_kind == "positive")
         .map(diagnostic_release)
         .collect::<Result<Vec<_>>>()?;
     ensure!(
-        releases.len() >= INTEGRATED_DIAGNOSTIC_CASE_COUNT,
-        "validation partition has only {} positive releases; need at least {INTEGRATED_DIAGNOSTIC_CASE_COUNT}",
-        releases.len()
+        releases.len() >= spec.case_count,
+        "{} partition has only {} positive releases; need at least {}",
+        spec.source_split,
+        releases.len(),
+        spec.case_count
     );
     releases.sort_by(|left, right| {
         left.source_record_fingerprint
@@ -430,25 +498,33 @@ pub fn compile_anime_integrated_diagnostic_corpus(
     let mut recoverable_trials = Vec::new();
     let mut easy_trials = Vec::new();
     for &target_index in &target_order {
-        let trial = build_diagnostic_trial(&releases, target_index, false)?;
+        let trial = build_diagnostic_trial(
+            &releases,
+            target_index,
+            false,
+            spec.case_namespace,
+            spec.case_set,
+        )?;
         if trial.baseline_matches_expected {
-            if easy_trials.len() < INTEGRATED_MATCH_CASE_COUNT {
+            if easy_trials.len() < spec.match_case_count {
                 easy_trials.push(trial);
             }
         } else if !trial.baseline_has_candidate_plan {
-            if recoverable_trials.len() < INTEGRATED_MATCH_CASE_COUNT {
+            if recoverable_trials.len() < spec.match_case_count {
                 recoverable_trials.push(trial);
             }
         }
     }
     ensure!(
-        recoverable_trials.len() >= INTEGRATED_MIN_RECOVERABLE_CASES,
-        "clean validation contains only {} safely recoverable integrated cases; need at least {INTEGRATED_MIN_RECOVERABLE_CASES}",
-        recoverable_trials.len()
+        recoverable_trials.len() >= spec.minimum_recoverable_cases,
+        "clean {} contains only {} safely recoverable integrated cases; need at least {}",
+        spec.source_split,
+        recoverable_trials.len(),
+        spec.minimum_recoverable_cases
     );
 
-    let desired_recoverable = INTEGRATED_TARGET_RECOVERABLE_CASES.min(recoverable_trials.len());
-    let mut selected = Vec::<DiagnosticTrial>::with_capacity(INTEGRATED_DIAGNOSTIC_CASE_COUNT);
+    let desired_recoverable = spec.target_recoverable_cases.min(recoverable_trials.len());
+    let mut selected = Vec::<DiagnosticTrial>::with_capacity(spec.case_count);
     let mut component_case_counts = BTreeMap::<i64, usize>::new();
     let mut selected_target_ids = BTreeSet::<String>::new();
     take_diagnostic_trials(
@@ -457,23 +533,26 @@ pub fn compile_anime_integrated_diagnostic_corpus(
         &mut selected,
         &mut component_case_counts,
         &mut selected_target_ids,
+        INTEGRATED_MAX_CASES_PER_COMPONENT,
     );
-    let remaining_matches = INTEGRATED_MATCH_CASE_COUNT - selected.len();
+    let remaining_matches = spec.match_case_count - selected.len();
     take_diagnostic_trials(
         easy_trials,
         remaining_matches,
         &mut selected,
         &mut component_case_counts,
         &mut selected_target_ids,
+        INTEGRATED_MAX_CASES_PER_COMPONENT,
     );
     ensure!(
-        selected.len() == INTEGRATED_MATCH_CASE_COUNT,
-        "could select only {} clean matched cases; need {INTEGRATED_MATCH_CASE_COUNT}",
-        selected.len()
+        selected.len() == spec.match_case_count,
+        "could select only {} clean matched cases; need {}",
+        selected.len(),
+        spec.match_case_count
     );
 
     for &target_index in &target_order {
-        if selected.len() == INTEGRATED_DIAGNOSTIC_CASE_COUNT {
+        if selected.len() == spec.case_count {
             break;
         }
         let target = &releases[target_index];
@@ -486,7 +565,13 @@ pub fn compile_anime_integrated_diagnostic_corpus(
         {
             continue;
         }
-        let trial = build_diagnostic_trial(&releases, target_index, true)?;
+        let trial = build_diagnostic_trial(
+            &releases,
+            target_index,
+            true,
+            spec.case_namespace,
+            spec.case_set,
+        )?;
         if trial.baseline_has_candidate_plan {
             continue;
         }
@@ -497,14 +582,16 @@ pub fn compile_anime_integrated_diagnostic_corpus(
         selected.push(trial);
     }
     ensure!(
-        selected.len() == INTEGRATED_DIAGNOSTIC_CASE_COUNT,
-        "could select only {} clean integrated cases; need {INTEGRATED_DIAGNOSTIC_CASE_COUNT}",
-        selected.len()
+        selected.len() == spec.case_count,
+        "could select only {} clean integrated cases; need {}",
+        selected.len(),
+        spec.case_count
     );
     let relation_component_count = component_case_counts.len();
     ensure!(
-        relation_component_count >= INTEGRATED_MIN_RELATION_COMPONENTS,
-        "clean integrated projection covers only {relation_component_count} relation components; need at least {INTEGRATED_MIN_RELATION_COMPONENTS}"
+        relation_component_count >= spec.minimum_relation_components,
+        "clean integrated projection covers only {relation_component_count} relation components; need at least {}",
+        spec.minimum_relation_components
     );
     ensure!(
         component_case_counts
@@ -535,26 +622,38 @@ pub fn compile_anime_integrated_diagnostic_corpus(
             .iter()
             .map(|source_id| source_components[source_id.as_str()]),
     );
-    let train_overlap = selected_target_ids
+    let selected_source_ids = selected_target_ids
         .union(&selected_candidate_ids)
-        .filter(|source_id| split_source_ids["train"].contains(*source_id))
-        .count();
-    let holdout_overlap = selected_target_ids
-        .union(&selected_candidate_ids)
-        .filter(|source_id| split_source_ids["holdout"].contains(*source_id))
-        .count();
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let contamination_for = |split: &str| {
+        if split == spec.source_split {
+            0
+        } else {
+            selected_source_ids
+                .intersection(&split_source_ids[split])
+                .count()
+        }
+    };
+    let train_overlap = contamination_for("train");
+    let validation_overlap = contamination_for("validation");
+    let holdout_overlap = contamination_for("holdout");
     let forced_component_overlap = selected_component_ids
         .intersection(&forced_training_components)
         .count();
     ensure!(
-        train_overlap == 0 && holdout_overlap == 0 && forced_component_overlap == 0,
-        "clean integrated projection is contaminated: train={train_overlap}, holdout={holdout_overlap}, historyComponents={forced_component_overlap}"
+        train_overlap == 0
+            && validation_overlap == 0
+            && holdout_overlap == 0
+            && forced_component_overlap == 0,
+        "clean integrated projection is contaminated: train={train_overlap}, validation={validation_overlap}, holdout={holdout_overlap}, historyComponents={forced_component_overlap}"
     );
     ensure!(
-        selected_target_ids
-            .union(&selected_candidate_ids)
-            .all(|source_id| split_source_ids["validation"].contains(source_id)),
-        "clean integrated projection contains a non-validation source"
+        selected_source_ids
+            .iter()
+            .all(|source_id| split_source_ids[spec.source_split].contains(source_id)),
+        "clean integrated projection contains a source outside {}",
+        spec.source_split
     );
 
     let baseline_passed = selected
@@ -565,12 +664,14 @@ pub fn compile_anime_integrated_diagnostic_corpus(
     let recoverable_case_count = selected.iter().filter(|trial| trial.recoverable).count();
     let negative_case_count = selected.iter().filter(|trial| trial.negative).count();
     ensure!(
-        negative_case_count == INTEGRATED_NEGATIVE_CASE_COUNT,
-        "clean integrated projection has {negative_case_count} negatives"
+        negative_case_count == spec.negative_case_count,
+        "clean integrated projection has {negative_case_count} negatives; expected {}",
+        spec.negative_case_count
     );
     ensure!(
-        recoverable_case_count >= INTEGRATED_MIN_RECOVERABLE_CASES,
-        "clean integrated projection retained only {recoverable_case_count} recoverable cases"
+        recoverable_case_count >= spec.minimum_recoverable_cases,
+        "clean integrated projection retained only {recoverable_case_count} recoverable cases; need {}",
+        spec.minimum_recoverable_cases
     );
     let mut slice_counts = BTreeMap::<String, usize>::new();
     for trial in &selected {
@@ -585,24 +686,29 @@ pub fn compile_anime_integrated_diagnostic_corpus(
             .or_insert(0) += 1;
     }
 
-    let corpus_id = format!("{dataset_id}-clean-integrated-validation-v1");
+    let corpus_id = format!("{dataset_id}-{}", spec.corpus_suffix);
     let cases = selected
         .into_iter()
         .map(|trial| trial.case)
         .collect::<Vec<_>>();
-    let development = cases
+    let membership = cases
         .iter()
         .map(|case| case.case_id.clone())
         .collect::<Vec<_>>();
+    let (development, frozen) = if spec.case_set == "development" {
+        (membership, Vec::new())
+    } else {
+        (Vec::new(), membership)
+    };
     let corpus = QualificationCorpus {
         schema_version: 2,
         status: "frozen".to_string(),
         corpus_id: corpus_id.clone(),
-        profile: QualificationCorpusProfile::CleanValidationDiagnosticV1,
+        profile: spec.corpus_profile,
         sets: QualificationSets {
             smoke: Vec::new(),
             development,
-            frozen: Vec::new(),
+            frozen,
         },
         cases,
     };
@@ -627,8 +733,8 @@ pub fn compile_anime_integrated_diagnostic_corpus(
         source_fingerprint,
         corpus_id: corpus_id.clone(),
         corpus_sha256: corpus_sha256.clone(),
-        case_count: INTEGRATED_DIAGNOSTIC_CASE_COUNT,
-        matched_case_count: INTEGRATED_MATCH_CASE_COUNT,
+        case_count: spec.case_count,
+        matched_case_count: spec.match_case_count,
         negative_case_count,
         baseline_passed,
         baseline_failed,
@@ -649,11 +755,12 @@ pub fn compile_anime_integrated_diagnostic_corpus(
             &selected_candidate_ids,
         )?)?,
         slice_counts,
-        projected_splits: vec!["validation".to_string()],
+        projected_splits: vec![spec.source_split.to_string()],
         train_source_overlap: train_overlap,
+        validation_source_overlap: validation_overlap,
         holdout_source_overlap: holdout_overlap,
         forced_training_component_overlap: forced_component_overlap,
-        holdout_projected_or_scored: false,
+        holdout_projected_or_scored: spec.holdout_projected_or_scored,
     };
     write_canonical_json(&config.output_root.join("projection-audit.json"), &audit)?;
 
@@ -661,8 +768,8 @@ pub fn compile_anime_integrated_diagnostic_corpus(
         status: "ready".to_string(),
         dataset_id,
         corpus_id,
-        case_count: INTEGRATED_DIAGNOSTIC_CASE_COUNT,
-        matched_case_count: INTEGRATED_MATCH_CASE_COUNT,
+        case_count: spec.case_count,
+        matched_case_count: spec.match_case_count,
         negative_case_count,
         baseline_passed,
         baseline_failed,
@@ -780,6 +887,8 @@ fn build_diagnostic_trial(
     releases: &[DiagnosticRelease],
     target_index: usize,
     negative: bool,
+    case_namespace: &str,
+    case_set: &str,
 ) -> Result<DiagnosticTrial> {
     let target_release = releases
         .get(target_index)
@@ -798,7 +907,7 @@ fn build_diagnostic_trial(
     )?;
     let case_kind = if negative { "negative" } else { "match" };
     let case_digest = Sha256::digest(format!(
-        "clean-integrated-v1:{case_kind}:{}",
+        "{case_namespace}:{case_kind}:{}",
         target_release.base_release_id
     ));
     let case_digest = format!("{case_digest:x}");
@@ -914,7 +1023,7 @@ fn build_diagnostic_trial(
     };
     let mut case = QualificationCase {
         case_id,
-        set: "development".to_string(),
+        set: case_set.to_string(),
         slice: Some(if negative {
             "hard_negative".to_string()
         } else {
@@ -1110,6 +1219,7 @@ fn take_diagnostic_trials(
     selected: &mut Vec<DiagnosticTrial>,
     component_case_counts: &mut BTreeMap<i64, usize>,
     selected_target_ids: &mut BTreeSet<String>,
+    maximum_cases_per_component: usize,
 ) {
     let starting_len = selected.len();
     for trial in trials {
@@ -1120,7 +1230,7 @@ fn take_diagnostic_trials(
             .get(&trial.relation_component_id)
             .copied()
             .unwrap_or_default();
-        if count >= INTEGRATED_MAX_CASES_PER_COMPONENT
+        if count >= maximum_cases_per_component
             || selected_target_ids.contains(&trial.target_source_record_id)
         {
             continue;

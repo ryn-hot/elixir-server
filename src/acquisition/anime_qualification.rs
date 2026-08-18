@@ -88,6 +88,7 @@ use crate::acquisition::language_policy::CandidateLanguageEvidence;
 const MAX_QUALIFICATION_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const EXPECTED_CASE_COUNT: usize = 520;
 const CLEAN_VALIDATION_DIAGNOSTIC_CASE_COUNT: usize = 640;
+const CLEAN_ACCEPTANCE_CASE_COUNT: usize = 1_200;
 const QUALIFICATION_CORPUS_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_OUTPUT_SCHEMA_VERSION: u32 = 2;
 const QUALIFICATION_REPORT_SCHEMA_VERSION: u32 = 3;
@@ -205,6 +206,7 @@ enum QualificationCorpusProfile {
     #[default]
     Certification520,
     CleanValidationDiagnosticV1,
+    CleanAcceptanceV1,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2743,6 +2745,18 @@ fn validate_corpus_shape(corpus: &QualificationCorpus, raw: &[u8]) -> Result<()>
                 "clean validation diagnostic cases must all belong to development"
             );
         }
+        QualificationCorpusProfile::CleanAcceptanceV1 => {
+            ensure!(
+                corpus.cases.len() == CLEAN_ACCEPTANCE_CASE_COUNT,
+                "clean acceptance corpus must contain exactly {CLEAN_ACCEPTANCE_CASE_COUNT} cases"
+            );
+            ensure!(
+                corpus.sets.smoke.is_empty()
+                    && corpus.sets.development.is_empty()
+                    && corpus.sets.frozen.len() == CLEAN_ACCEPTANCE_CASE_COUNT,
+                "clean acceptance cases must all belong to frozen"
+            );
+        }
     }
     let membership = corpus
         .sets
@@ -2776,14 +2790,23 @@ fn validate_corpus_shape(corpus: &QualificationCorpus, raw: &[u8]) -> Result<()>
             "qualification case {} has invalid origin",
             case.case_id
         );
-        if corpus.profile == QualificationCorpusProfile::CleanValidationDiagnosticV1 {
+        if matches!(
+            corpus.profile,
+            QualificationCorpusProfile::CleanValidationDiagnosticV1
+                | QualificationCorpusProfile::CleanAcceptanceV1
+        ) {
+            let expected_set = match corpus.profile {
+                QualificationCorpusProfile::CleanValidationDiagnosticV1 => "development",
+                QualificationCorpusProfile::CleanAcceptanceV1 => "frozen",
+                QualificationCorpusProfile::Certification520 => unreachable!(),
+            };
             ensure!(
-                case.set == "development"
+                case.set == expected_set
                     && case.origin == "real"
                     && case.counterfactual_pair_id.is_none()
                     && case.counterfactual_mutation.is_none()
                     && !case.stability_subset,
-                "clean validation diagnostic case {} has certification-only state",
+                "clean semantic corpus case {} has incompatible certification state",
                 case.case_id
             );
         }

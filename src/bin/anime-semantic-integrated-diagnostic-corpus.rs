@@ -2,11 +2,13 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use elixir_server::acquisition::anime_qualification::training_dataset::{
-    AnimeIntegratedDiagnosticCompileConfig, compile_anime_integrated_diagnostic_corpus,
+    AnimeIntegratedCorpusProfile, AnimeIntegratedDiagnosticCompileConfig,
+    compile_anime_integrated_diagnostic_corpus,
 };
 
 const USAGE: &str = "usage: anime-semantic-integrated-diagnostic-corpus \
-  --source PATH --output-root PATH";
+  --source PATH --output-root PATH \
+  [--profile clean_validation_diagnostic_v1|clean_acceptance_v1]";
 
 fn main() {
     if let Err(error) = run() {
@@ -21,6 +23,7 @@ fn run() -> Result<()> {
         compile_anime_integrated_diagnostic_corpus(AnimeIntegratedDiagnosticCompileConfig {
             source_path: required_path(&arguments, "--source")?,
             output_root: required_path(&arguments, "--output-root")?,
+            profile: requested_profile(&arguments)?,
         })?;
     println!("{}", serde_json::to_string(&summary)?);
     Ok(())
@@ -29,7 +32,7 @@ fn run() -> Result<()> {
 fn parse_arguments(
     mut arguments: impl Iterator<Item = OsString>,
 ) -> Result<BTreeMap<String, PathBuf>> {
-    let allowed = ["--source", "--output-root"];
+    let allowed = ["--source", "--output-root", "--profile"];
     let mut parsed = BTreeMap::new();
     while let Some(raw_flag) = arguments.next() {
         if raw_flag == "--help" || raw_flag == "-h" {
@@ -53,10 +56,27 @@ fn parse_arguments(
         );
     }
     ensure!(
-        allowed.iter().all(|flag| parsed.contains_key(*flag)),
+        ["--source", "--output-root"]
+            .iter()
+            .all(|flag| parsed.contains_key(*flag)),
         "missing required arguments; {USAGE}"
     );
     Ok(parsed)
+}
+
+fn requested_profile(
+    arguments: &BTreeMap<String, PathBuf>,
+) -> Result<AnimeIntegratedCorpusProfile> {
+    let Some(value) = arguments.get("--profile") else {
+        return Ok(AnimeIntegratedCorpusProfile::CleanValidationDiagnosticV1);
+    };
+    match value.to_str() {
+        Some("clean_validation_diagnostic_v1") => {
+            Ok(AnimeIntegratedCorpusProfile::CleanValidationDiagnosticV1)
+        }
+        Some("clean_acceptance_v1") => Ok(AnimeIntegratedCorpusProfile::CleanAcceptanceV1),
+        _ => anyhow::bail!("unsupported integrated corpus profile; {USAGE}"),
+    }
 }
 
 fn required_path(arguments: &BTreeMap<String, PathBuf>, name: &str) -> Result<PathBuf> {
@@ -90,5 +110,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn integrated_diagnostic_cli_accepts_only_fixed_profiles() {
+        let accepted = parse_arguments(
+            [
+                OsString::from("--source"),
+                OsString::from("source.json"),
+                OsString::from("--output-root"),
+                OsString::from("output"),
+                OsString::from("--profile"),
+                OsString::from("clean_acceptance_v1"),
+            ]
+            .into_iter(),
+        )
+        .expect("acceptance arguments");
+        assert_eq!(
+            requested_profile(&accepted).expect("acceptance profile"),
+            AnimeIntegratedCorpusProfile::CleanAcceptanceV1
+        );
+
+        let mut rejected = accepted;
+        rejected.insert("--profile".to_string(), PathBuf::from("custom"));
+        assert!(requested_profile(&rejected).is_err());
     }
 }
