@@ -172,11 +172,9 @@ impl RetainedCode {
         }
     }
     pub(in crate::marketplace) async fn park_bytes(&mut self) -> Result<bool> {
-        if matches!(self.source, Provenance::Compiled { .. }) {
-            // Do not put imported-image ownership into the SourceJs byte cache.
-            // Compiled warm reuse needs its own bounded, measured lifetime.
-            return Ok(false);
-        }
+        // Retiring this job removes its imported-image reference BEFORE raw
+        // bytes can remain in the shared one-slot cache. A subsequent compiled
+        // call must authenticate history and rematch/reimport independently.
         super::super::cache::park(self.job_mut()).await
     }
     /// Optional migration + local readiness, NEVER ordinary invoke. A parsed

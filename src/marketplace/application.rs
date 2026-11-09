@@ -40,6 +40,8 @@ mod native_tests;
 pub(in crate::marketplace) use actions::{ActionKind, ActionReceipt, ActionStatus};
 #[cfg(test)]
 pub(in crate::marketplace) use native_tests::allocation as fixture_allocation;
+#[cfg(all(test, unix))]
+pub(in crate::marketplace) use native_tests::http::mutate_cached_fixture_bytes;
 mod task;
 #[cfg(test)]
 mod tests;

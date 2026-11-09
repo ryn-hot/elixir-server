@@ -715,7 +715,11 @@ async fn load_retained(
     };
     // All partial native work is retained in slot before the first native
     // side effect. A cancelled outer future cannot detach its cleanup.
-    let reuse_allowed = !compiled && stop.owner.is_some();
+    // The single cache holds signed INPUT BYTES only, including a compiled
+    // artifact. Compiler trust/history authentication above, native source
+    // matching and filesystem/export/import below remain fresh for every call.
+    // No image, job deadline, resource sample or SDK scope survives reuse.
+    let reuse_allowed = stop.owner.is_some();
     let mut opened = guarded(database, binding, stop, expires, async {
         if reuse_allowed {
             SourceQuarantineJob::open_installed_retained(
@@ -888,4 +892,6 @@ async fn load_retained(
 #[cfg(test)]
 pub(in crate::marketplace::grant_store::installation) mod tests;
 #[cfg(test)]
-pub(in crate::marketplace) use tests::compiled::{compiled_fixture_configuration, initialize_compiled_fixture, run_compiled_fixture};
+pub(in crate::marketplace) use tests::compiled::{
+    compiled_fixture_configuration, initialize_compiled_fixture, run_compiled_fixture,
+};

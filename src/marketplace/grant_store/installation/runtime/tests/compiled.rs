@@ -99,9 +99,77 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     let mut controller =
         InstalledController::open(db.clone(), secrets.clone(), config.clone()).await?;
     let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+    let cold_started = std::time::Instant::now();
     controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
     assert_eq!(controller.finish().await?.as_str(), "true");
-    assert!(revision(&db, instance).await? > 0);
+    let cold_elapsed = cold_started.elapsed();
+    let first_revision = revision(&db, instance).await?;
+    assert!(first_revision > 0);
+    let cached = cached_input_state(runtime.as_ref(), lane)
+        .await?
+        .context("compiled input bytes were not retained")?;
+
+    let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+    let warm_started = std::time::Instant::now();
+    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    assert_eq!(controller.finish().await?.as_str(), "true");
+    let warm_elapsed = warm_started.elapsed();
+    println!(
+        "compiled input-byte timing: cold_ms={} cached_ms={}; native rematch/filesystem/export/import retained",
+        cold_elapsed.as_millis(),
+        warm_elapsed.as_millis()
+    );
+    // The actual C fixture writes fixture=true on every normal call. The SDK
+    // intentionally returns a no-op acknowledgement for an unchanged value.
+    assert_eq!(
+        revision(&db, instance).await?,
+        first_revision,
+        "identical state_set must remain idempotent"
+    );
+    assert_eq!(
+        cached_input_state(runtime.as_ref(), lane).await?.as_ref(),
+        Some(&cached)
+    );
+
+    // A matching cache label/shape is not integrity or native authority. Change
+    // one artifact byte in the actual owned volume and require rejection before
+    // any SDK state write; a NEW explicit call may restore the original archive.
+    let before_tamper = revision(&db, instance).await?;
+    crate::marketplace::application::mutate_cached_fixture_bytes(
+        runtime.as_ref(),
+        lane,
+        worker,
+        elixir_marketplace::quarantine::QuarantinePurpose::Artifact,
+    )
+    .await?;
+    let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    let rejected = controller
+        .finish()
+        .await
+        .err()
+        .context("corrupt cached artifact reached execution")?;
+    if !format!("{rejected:#}").contains("native container filesystem rejected") {
+        return Err(rejected)
+            .context("cached artifact did not reach actual native integrity rejection");
+    }
+    controller.require_idle()?;
+    assert_eq!(
+        revision(&db, instance).await?,
+        before_tamper,
+        "corrupt cache produced SDK effects"
+    );
+    assert!(cached_input_state(runtime.as_ref(), lane).await?.is_none());
+    let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    assert_eq!(controller.finish().await?.as_str(), "true");
+    assert_eq!(
+        cached_input_state(runtime.as_ref(), lane).await?.as_ref(),
+        Some(&cached)
+    );
+    println!(
+        "compiled input-byte cache: original daemon images retired, native source/artifact/image rechecks retained; corrupted artifact rejected without SDK effects and restored only by a new call"
+    );
 
     let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
     controller.begin(
@@ -112,6 +180,10 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     wait_key(&db, instance, "cancel_started").await?;
     controller.cancel().await?;
     controller.require_idle()?;
+    assert!(
+        cached_input_state(runtime.as_ref(), lane).await?.is_none(),
+        "cancelled call cannot park its workspace"
+    );
     assert!(
         runtime
             .get_container_handle(&format!(
@@ -141,6 +213,10 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         "revoked installed binding retained native effects"
     );
     controller.require_idle()?;
+    assert!(
+        cached_input_state(runtime.as_ref(), lane).await?.is_none(),
+        "revoked call cannot park its workspace"
+    );
     controller.shutdown_cache().await?;
     drop(controller);
     drop(ControllerLease::acquire(lane)?);
@@ -157,6 +233,42 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         "installed compiled: actual stored-proof authentication/native rematch/reimport/controller/instance SQL-AES SDK, denied network/unapproved secret, original cancellation and live grant revocation passed; ACTIVE enrollment synthetic, no activation qualification"
     );
     Ok(())
+}
+
+// Metadata/cleanup observations only, never a source match or runtime ticket.
+async fn cached_input_state(runtime: &dyn RuntimeManager, lane: &Path) -> Result<Option<String>> {
+    use crate::runtime::model::{
+        ELIXIR_DEPLOYMENT_ID_LABEL, ELIXIR_MANAGED_LABEL, SourceCacheState,
+    };
+    let lease = ControllerLease::acquire(lane)?;
+    let deployment = lease.storage_namespace()?;
+    crate::marketplace::quarantine::image_reference::require_absent(&lease)?;
+    assert!(
+        runtime
+            .get_container_handle(&format!("elixir-marketplace-source-writer-{deployment}"))
+            .await?
+            .is_none(),
+        "raw cache retained a native process"
+    );
+    match runtime
+        .source_cache_state(
+            &format!("elixir-marketplace-source-{deployment}"),
+            &std::collections::HashMap::from([
+                (ELIXIR_MANAGED_LABEL.into(), "true".into()),
+                (ELIXIR_DEPLOYMENT_ID_LABEL.into(), deployment),
+                ("elixir.marketplace.volume".into(), "quarantine-v1".into()),
+                ("elixir.marketplace.cache_slot".into(), "source-v1".into()),
+            ]),
+        )
+        .await?
+    {
+        SourceCacheState::Absent => Ok(None),
+        SourceCacheState::Present(Some(key)) => {
+            let _: elixir_marketplace::identity::Digest = key.parse()?;
+            Ok(Some(key))
+        }
+        _ => bail!("compiled cache did not provide exactly owned bounded input bytes"),
+    }
 }
 
 pub(in crate::marketplace) fn compiled_fixture_configuration(

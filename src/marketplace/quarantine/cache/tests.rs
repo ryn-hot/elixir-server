@@ -185,6 +185,39 @@ fn cache_slot_is_restart_stable_but_cannot_adopt_a_replaced_lock() -> Result<()>
 }
 
 #[tokio::test]
+async fn compiled_cache_identity_binds_the_complete_signed_artifact_and_profile() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = super::super::build_inputs::tests::compiled_source(
+        &root.path().canonicalize()?.join("source"),
+    )
+    .await?;
+    let plan = &source.source.job.plan;
+    assert!(plan.workspace.artifact.is_some());
+    let image = format!("sha256:{}", "1".repeat(64));
+    let original = key(plan, &image)?;
+    let mut artifact = plan.clone();
+    artifact
+        .workspace
+        .artifact
+        .as_mut()
+        .context("compiled fixture artifact missing")?
+        .sha256 = Digest::of(b"different compiled bytes");
+    artifact.source_match.workspace = artifact.workspace.clone();
+    assert_ne!(original, key(&artifact, &image)?);
+    let mut profile = plan.clone();
+    profile.source_match.release.runtime_profile =
+        elixir_marketplace::records::RuntimeProfile::SourceJs;
+    assert_ne!(
+        original,
+        key(&profile, &image)?,
+        "data identity cannot cross runtime profiles"
+    );
+    assert_ne!(original, key(plan, &format!("sha256:{}", "2".repeat(64)))?);
+    // These are metadata/key comparisons, not source matching or execution.
+    Ok(())
+}
+
+#[tokio::test]
 async fn cache_hints_never_override_release_image_or_owned_cleanup() -> Result<()> {
     let root = tempfile::tempdir()?;
     let lease = ControllerLease::acquire(&root.path().canonicalize()?.join("lane"))?;

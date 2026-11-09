@@ -4,7 +4,12 @@ use super::*;
 use crate::runtime::model::{ELIXIR_DEPLOYMENT_ID_LABEL, ELIXIR_MANAGED_LABEL, SourceCacheState};
 use std::collections::HashMap;
 
-async fn mutate(runtime: &dyn RuntimeManager, lane: &Path, image: &str) -> Result<()> {
+pub(in crate::marketplace) async fn mutate(
+    runtime: &dyn RuntimeManager,
+    lane: &Path,
+    image: &str,
+    purpose: elixir_marketplace::quarantine::QuarantinePurpose,
+) -> Result<()> {
     // Retain the SAME global foreground lane until the helper is actually gone.
     let lease = ControllerLease::acquire(lane)?;
     let deployment = lease.storage_namespace()?;
@@ -38,6 +43,12 @@ async fn mutate(runtime: &dyn RuntimeManager, lane: &Path, image: &str) -> Resul
     // Preserve file size, physical allocation and ownership. The labels and
     // descriptor still match; only actual native byte verification can reject.
     const SCRIPT: &str = "const fs=require('node:fs'),fd=fs.openSync('/quarantine/package.blob',fs.constants.O_RDWR|fs.constants.O_NOFOLLOW);try{const before=fs.fstatSync(fd),b=Buffer.alloc(1);if(!before.isFile()||before.nlink!==1||before.size<1||fs.readSync(fd,b,0,1,0)!==1)throw Error('shape');b[0]^=1;if(fs.writeSync(fd,b,0,1,0)!==1)throw Error('write');fs.fsyncSync(fd);const after=fs.fstatSync(fd);if(before.ino!==after.ino||before.size!==after.size||before.blocks!==after.blocks||before.mode!==after.mode)throw Error('changed shape')}finally{fs.closeSync(fd)}";
+    let filename = match purpose {
+        elixir_marketplace::quarantine::QuarantinePurpose::Package => "package.blob",
+        elixir_marketplace::quarantine::QuarantinePurpose::Proof => "proof.blob",
+        elixir_marketplace::quarantine::QuarantinePurpose::Artifact => "artifact.blob",
+    };
+    let script = SCRIPT.replace("package.blob", filename);
     let created = docker(&[
         "create",
         "--pull=never",
@@ -70,7 +81,7 @@ async fn mutate(runtime: &dyn RuntimeManager, lane: &Path, image: &str) -> Resul
         image,
         "--max-old-space-size=16",
         "-e",
-        SCRIPT,
+        &script,
     ])
     .await;
     // Also discover an uncertain create reply, but never start that outcome.
@@ -143,7 +154,13 @@ pub(super) async fn qualify(
 ) -> Result<()> {
     let (lane, image) = workspace;
     let before = sdk_rows(database).await?;
-    mutate(runtime, lane, image).await?;
+    mutate(
+        runtime,
+        lane,
+        image,
+        elixir_marketplace::quarantine::QuarantinePurpose::Package,
+    )
+    .await?;
     // Same-shaped cache metadata still claims a hit. This must fail before SDK
     // effects, dispose the poisoned bytes, and never replay code automatically.
     let mut denied = state.marketplace.begin_installed_call(

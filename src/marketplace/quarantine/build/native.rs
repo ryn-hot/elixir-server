@@ -4,6 +4,7 @@
 use super::*;
 use crate::runtime::docker::DockerRuntimeManager;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::FutureExt;
 
 mod retained;
 
@@ -296,7 +297,7 @@ async fn native_variants_with_runtime(
         // Do not duplicate the whole multi-phase state on each async wrapper's
         // stack. In particular the filesystem-negative path has more wrappers
         // than the direct runtime case; both retain the same cleanup owner.
-        let operation=Box::pin(async {
+        let operation=std::panic::AssertUnwindSafe(Box::pin(async {
             if (variant=="container-image-installed" || variant.starts_with("container-image-activation")) && (!updating||update_checkpoint.is_none()) {
                 Box::pin(crate::marketplace::grant_store::installation::runtime::initialize_compiled_fixture(
                     runtime.clone(),&root,&lane,&image,&deployment)).await?;
@@ -485,7 +486,7 @@ async fn native_variants_with_runtime(
             if fs_exists(&lane.join("build-inputs/releases/.pending")) {bail!("build staging retained payload files after joined cleanup");}
             println!("offline native build {variant}: exact original source owner, package/proof-only staging, no activation claim");
             Ok::<_,anyhow::Error>(())
-        }).await;
+        })).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("native build fixture panicked; original cleanup remains required")));
         // Exact source-role recovery only. Keep any uncertain fence for audit;
         // never force-reset it or infer process retirement from a missing name.
         let cleanup = Box::pin(async {

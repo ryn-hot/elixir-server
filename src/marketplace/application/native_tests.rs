@@ -28,7 +28,7 @@ use futures_util::FutureExt;
 use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use tokio::time::{sleep, timeout};
 mod automatic;
-mod http;
+pub(super) mod http;
 
 const MIB: u64 = 1024 * 1024;
 const SOURCE: &str = "import{state,getSecret}from'@elixir/sdk/v1';export async function invoke(){return{cursor:await state.get('cursor'),key:await getSecret('source_api')}}export async function migrate(){await state.set('cursor',(await state.get('cursor')??0)+1)}export async function checkReady(){return(await state.get('cursor'))===1&&(await getSecret('source_api'))==='credential-private'}";

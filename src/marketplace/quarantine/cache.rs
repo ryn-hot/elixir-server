@@ -172,6 +172,13 @@ pub(super) async fn park(job: &mut SourceQuarantineJob) -> Result<bool> {
     }
     let runtime = job.runtime.clone();
     job.retire_in_place(runtime.as_ref(), false).await?;
+    // The retained volume is data, not a way to park a native actor or passive
+    // daemon-image owner. Unknown cleanup must keep the original lane fenced.
+    if Fence::load(&job._lease)?.is_some() {
+        bail!("raw source cache cannot retain a native activity fence");
+    }
+    #[cfg(unix)]
+    image_reference::require_absent(&job._lease)?;
     Ok(true)
 }
 
