@@ -108,6 +108,7 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     let cold_elapsed = cold_started.elapsed();
     let first_revision = revision(&db, instance).await?;
     assert!(first_revision > 0);
+    let mut expected_revision = first_revision;
     let cached = cached_input_state(runtime.as_ref(), lane)
         .await?
         .context("compiled input bytes were not retained")?;
@@ -139,17 +140,21 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         println!(
             "compiled image-cache reuse: fresh job/source/artifact/grants; identical passive reference; original foreground lane released"
         );
-        Box::pin(qualify_idle_expiry(
-            &controller,
-            runtime.as_ref(),
-            first_image.as_ref().unwrap(),
-        ))
-        .await?;
-        let binding =
-            InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
-        controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
-        assert_eq!(controller.finish().await?.as_str(), "true");
-        assert_ne!(controller.image_cache_snapshot().await?, first_image);
+        let active_recovery =
+            std::env::var("ELIXIR_TEST_COMPILED_ACTIVE_RECOVERY").as_deref() == Ok("1");
+        if !active_recovery {
+            Box::pin(qualify_idle_expiry(
+                &controller,
+                runtime.as_ref(),
+                first_image.as_ref().unwrap(),
+            ))
+            .await?;
+            let binding =
+                InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+            controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+            assert_eq!(controller.finish().await?.as_str(), "true");
+            assert_ne!(controller.image_cache_snapshot().await?, first_image);
+        }
 
         // Retire this parent's owners before starting a separate real process.
         // The child then fills its own actual cache and exits without Drop.
@@ -162,8 +167,21 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
             root,
             (home, &id, instance),
             deployment,
+            if active_recovery {
+                RestartPhase::Active
+            } else {
+                RestartPhase::Finished
+            },
         ))
         .await?;
+        if active_recovery {
+            expected_revision = revision(&db, instance).await?;
+            assert_eq!(
+                expected_revision,
+                first_revision + 1,
+                "the committed crash marker must survive, without replaying any SDK effects"
+            );
+        }
         let binding =
             InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
         let capsule = binding.material(&db).await?;
@@ -215,7 +233,7 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     // intentionally returns a no-op acknowledgement for an unchanged value.
     assert_eq!(
         revision(&db, instance).await?,
-        first_revision,
+        expected_revision,
         "identical state_set must remain idempotent"
     );
     assert_eq!(
@@ -396,6 +414,32 @@ async fn qualify_idle_expiry(
 
 const RESTART_CHILD: &str = "marketplace::grant_store::installation::runtime::tests::compiled::actual_compiled_cache_restart_child";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestartPhase {
+    Finished,
+    Active,
+}
+impl RestartPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Active => "active",
+        }
+    }
+    fn marker(self, root: &Path) -> PathBuf {
+        root.join(format!("cache-restart-{}-ready.json", self.name()))
+    }
+}
+// Observations only. Parsing this never constructs a verified image or owner.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartObservation {
+    image: Digest,
+    operation: String,
+    pid: u32,
+    active: bool,
+}
+
 async fn qualify_abrupt_restart(
     db: &Database,
     secrets: &SecretsManager,
@@ -403,6 +447,7 @@ async fn qualify_abrupt_restart(
     root: &Path,
     coordinates: (Uuid, &ExtensionId, Uuid),
     deployment: &str,
+    phase: RestartPhase,
 ) -> Result<InstalledController> {
     let (home, id, instance) = coordinates;
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
@@ -435,28 +480,61 @@ async fn qualify_abrupt_restart(
         .env("ELIXIR_TEST_CACHE_RESTART_HOME", home.to_string())
         .env("ELIXIR_TEST_CACHE_RESTART_EXTENSION", id.as_str())
         .env("ELIXIR_TEST_CACHE_RESTART_INSTANCE", instance.to_string())
-        .env("ELIXIR_TEST_CACHE_RESTART_DEPLOYMENT", deployment);
+        .env("ELIXIR_TEST_CACHE_RESTART_DEPLOYMENT", deployment)
+        .env("ELIXIR_TEST_CACHE_RESTART_PHASE", phase.name());
     let mut child = command.spawn()?;
     let pid = child
         .id()
         .context("cache restart child has no process identity")?;
-    let status = match tokio::time::timeout(Duration::from_secs(240), child.wait()).await {
-        Ok(status) => status?,
+    let marker = phase.marker(root);
+    let ready = tokio::time::timeout(Duration::from_secs(240), async {
+        if phase == RestartPhase::Finished {
+            return Ok::<_, anyhow::Error>(Some(child.wait().await?));
+        }
+        loop {
+            if let Some(status) = child.try_wait()? {
+                bail!("active cache child exited before its ready marker: {status}");
+            }
+            if marker.is_file() {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let status = match ready {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            child.start_kill()?;
+            child.wait().await?;
+            return Err(error);
+        }
         Err(error) => {
             child.start_kill()?;
             child.wait().await?;
             return Err(error).context("cache restart child timed out and was joined");
         }
     };
-    assert!(status.success(), "cache restart child failed: {status}");
-    let marker = root.join("cache-restart-child-ready.json");
+    if let Some(status) = status {
+        assert!(status.success(), "cache restart child failed: {status}");
+    }
     assert!(std::fs::metadata(&marker)?.len() <= 4096);
-    let (previous, actual_pid): ((Digest, String, u64), u32) =
-        serde_json::from_slice(&std::fs::read(&marker)?)?;
-    assert_eq!(actual_pid, pid);
+    let previous: RestartObservation = serde_json::from_slice(&std::fs::read(&marker)?)?;
+    assert_eq!(previous.pid, pid);
+    assert_eq!(previous.active, phase == RestartPhase::Active);
+    if phase == RestartPhase::Active {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(
+            ControllerLease::acquire_for_recovery(&config.lane).is_err(),
+            "active native source did not retain its actual foreground owner"
+        );
+        child.start_kill()?;
+        let status = child.wait().await?;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
     config
         .runtime
-        .inspect_marketplace_import_image(previous.0)
+        .inspect_marketplace_import_image(previous.image)
         .await?;
     assert!(
         config
@@ -479,30 +557,43 @@ async fn qualify_abrupt_restart(
     assert!(
         config
             .runtime
-            .inspect_marketplace_import_image(previous.0)
+            .inspect_marketplace_import_image(previous.image)
             .await
             .is_err()
     );
     let binding = InstalledBinding::load(db, home, id, instance, standing_tests::limit()).await?;
-    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    let revision_before = revision(db, instance).await?;
+    let arguments = if phase == RestartPhase::Active {
+        RuntimeJson::from_value(json!({"verify_crash":true}))?
+    } else {
+        RuntimeJson::parse(b"null")?
+    };
+    controller.begin(binding, limits(), arguments)?;
     assert_eq!(controller.finish().await?.as_str(), "true");
+    assert_eq!(revision(db, instance).await?, revision_before);
     let fresh = controller
         .image_cache_snapshot()
         .await?
         .context("post-restart call did not fill a new actual cache")?;
-    assert_eq!(fresh.0, previous.0);
+    assert_eq!(fresh.0, previous.image);
     assert_ne!(
-        fresh.1, previous.1,
+        fresh.1, previous.operation,
         "restart reused the dead process's cache owner"
     );
-    println!(
-        "compiled image-cache abrupt restart: _exit without Drop; original journal retired at reopen; no restored authority; fresh source/native call and new cache owner passed"
-    );
+    if phase == RestartPhase::Active {
+        println!(
+            "compiled image-cache active crash: committed native SDK marker, live foreground owner, exact child SIGKILL joined; actual controller reconciled native work and image journal; fresh verified call reads preserved encrypted state without replay"
+        );
+    } else {
+        println!(
+            "compiled image-cache abrupt restart: _exit without Drop; original journal retired at reopen; no restored authority; fresh source/native call and new cache owner passed"
+        );
+    }
     Ok(controller)
 }
 
 #[tokio::test]
-#[ignore = "subprocess only: isolated existing compiled fixture; actual native cache then _exit without Rust cleanup"]
+#[ignore = "subprocess only: isolated existing compiled fixture; finished _exit or SIGKILL during actual native SDK work"]
 async fn actual_compiled_cache_restart_child() -> Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     assert_eq!(std::env::var("ELIXIR_TEST_COMPILED_IMAGE_CACHE")?, "1");
@@ -516,6 +607,11 @@ async fn actual_compiled_cache_restart_child() -> Result<()> {
     let id: ExtensionId = std::env::var("ELIXIR_TEST_CACHE_RESTART_EXTENSION")?.parse()?;
     let instance: Uuid = std::env::var("ELIXIR_TEST_CACHE_RESTART_INSTANCE")?.parse()?;
     let deployment = std::env::var("ELIXIR_TEST_CACHE_RESTART_DEPLOYMENT")?;
+    let phase = match std::env::var("ELIXIR_TEST_CACHE_RESTART_PHASE")?.as_str() {
+        "finished" => RestartPhase::Finished,
+        "active" => RestartPhase::Active,
+        _ => bail!("explicit supported child restart phase required"),
+    };
     let worker = std::env::var("ELIXIR_MARKETPLACE_WORKER_IMAGE")?;
     let runtime = crate::marketplace::quarantine::build::fixture_runtime(true, true)?;
     let db = grant_tests::connect(&root.join("retained-build.sqlite")).await?;
@@ -534,27 +630,75 @@ async fn actual_compiled_cache_restart_child() -> Result<()> {
     )
     .await?;
     let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
-    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
-    assert_eq!(controller.finish().await?.as_str(), "true");
-    controller.require_idle()?;
-    let snapshot = controller
-        .image_cache_snapshot()
-        .await?
-        .context("child has no actual image reference")?;
-    assert!(
-        cached_input_state(runtime.as_ref(), &root.join("lane"))
+    let arguments = if phase == RestartPhase::Active {
+        RuntimeJson::from_value(json!({"crash":true}))?
+    } else {
+        RuntimeJson::parse(b"null")?
+    };
+    controller.begin(binding, limits(), arguments)?;
+    let observation = if phase == RestartPhase::Active {
+        wait_key(&db, instance, "crash_started").await?;
+        assert!(controller.require_idle().is_err());
+        // The slot is actually borrowed by the live call; do NOT acquire its
+        // mutex/snapshot or mint provenance from this cleanup-journal data.
+        let path = root.join("lane/compiled-image-cache/image-cache.request");
+        assert!(
+            std::fs::metadata(&path)?.len()
+                <= elixir_marketplace::container_image::reference::MAX_REQUEST_BYTES as u64
+        );
+        let request = elixir_marketplace::container_image::reference::ReferenceRequest::parse(
+            &std::fs::read(path)?,
+        )?;
+        runtime
+            .inspect_marketplace_import_image(request.image.config)
+            .await?;
+        RestartObservation {
+            image: request.image.config,
+            operation: request.operation_id,
+            pid: std::process::id(),
+            active: true,
+        }
+    } else {
+        assert_eq!(controller.finish().await?.as_str(), "true");
+        controller.require_idle()?;
+        let snapshot = controller
+            .image_cache_snapshot()
             .await?
-            .is_some()
-    );
-    runtime.inspect_marketplace_import_image(snapshot.0).await?;
+            .context("child has no actual image reference")?;
+        assert!(
+            cached_input_state(runtime.as_ref(), &root.join("lane"))
+                .await?
+                .is_some()
+        );
+        runtime.inspect_marketplace_import_image(snapshot.0).await?;
+        RestartObservation {
+            image: snapshot.0,
+            operation: snapshot.1,
+            pid: std::process::id(),
+            active: false,
+        }
+    };
+    let ready = phase.marker(&root);
+    assert!(!ready.exists());
+    let pending = ready.with_extension("next");
     let mut marker = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(root.join("cache-restart-child-ready.json"))?;
-    marker.write_all(&canonical::to_vec(&(snapshot, std::process::id()))?)?;
+        .open(&pending)?;
+    marker.write_all(&canonical::to_vec(&observation)?)?;
     marker.sync_all()?;
+    std::fs::rename(pending, ready)?; // publish complete bytes atomically
     std::fs::File::open(&root)?.sync_all()?;
+    if phase == RestartPhase::Active {
+        println!(
+            "compiled image-cache child: native SDK crash marker committed; active call retained; waiting for parent SIGKILL"
+        );
+        std::io::stdout().flush()?;
+        std::future::pending::<()>().await;
+        controller.require_idle()?;
+        unreachable!("active crash child must be killed, not gracefully finished");
+    }
     println!(
         "compiled image-cache child: actual SDK call and native retirement completed; exiting without Drop"
     );

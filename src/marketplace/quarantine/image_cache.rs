@@ -104,10 +104,77 @@ impl Core {
             .mode(0o400)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.lease.directory().join(name))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        File::open(self.lease.directory())?.sync_all()?;
+        let written = (|| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            File::open(self.lease.directory())?.sync_all()
+        })();
+        if let Err(error) = written {
+            // No native keeper has been started by this write. A failed NEW
+            // request must not poison the empty slot with an unparseable file.
+            // For a clearing tombstone, original request/retired controls have
+            // not been removed yet. Delete only OUR created inode; uncertainty
+            // preserves the fence rather than unlinking somebody else's data.
+            if let Err(cleanup) = self.retire_failed_write(name, &file) {
+                return Err(error).context(format!(
+                    "cache control write failed; its incomplete file also requires recovery: {cleanup:#}"
+                ));
+            }
+            return Err(error.into());
+        }
         Ok(file)
+    }
+    fn retire_failed_write(&self, name: &str, file: &File) -> Result<()> {
+        self.current()?;
+        if ![REQUEST, CLEARING].contains(&name) {
+            bail!("invalid failed cache write role");
+        }
+        // A late keeper may have read a complete request before fsync failed.
+        // Exclude it and reject ANY attempted native work before unlinking.
+        // CLEARING's caller already holds this same keeper lock until return.
+        let _keeper = if name == REQUEST {
+            let keeper = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(self.lease.directory().join("image-cache.lock"))?;
+            let metadata = keeper.metadata()?;
+            if !metadata.is_file()
+                || metadata.len() != 0
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                bail!("failed cache write cannot acquire its private keeper lock");
+            }
+            keeper.try_lock()?;
+            for control in CONTROLS.into_iter().chain([CLEARING]) {
+                match std::fs::symlink_metadata(self.lease.directory().join(control)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        bail!("failed request has native/retirement controls; preserving its fence")
+                    }
+                }
+            }
+            Some(keeper)
+        } else {
+            None
+        };
+        let original = file.metadata()?;
+        let actual = std::fs::symlink_metadata(self.lease.directory().join(name))?;
+        if !actual.is_file()
+            || original.nlink() != 1
+            || actual.dev() != original.dev()
+            || actual.ino() != original.ino()
+        {
+            bail!("failed cache write lost its original inode; preserving controls");
+        }
+        std::fs::remove_file(self.lease.directory().join(name))?;
+        File::open(self.lease.directory())?.sync_all()?;
+        Ok(())
     }
 }
 

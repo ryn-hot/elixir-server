@@ -83,6 +83,201 @@ fn cleanup_fixture() -> Result<(tempfile::TempDir, Slot)> {
     ))
 }
 
+#[test]
+fn failed_write_cleanup_preserves_a_replaced_inode_and_existing_controls() -> Result<()> {
+    let (_root, slot) = cleanup_fixture()?;
+    let directory = slot.core.lease.directory();
+    let request = std::fs::read(directory.join(REQUEST))?;
+    assert!(
+        slot.core
+            .write_body(REQUEST, b"must not replace existing data")
+            .is_err()
+    );
+    assert_eq!(std::fs::read(directory.join(REQUEST))?, request);
+    let original = slot.core.write_body(CLEARING, b"original")?;
+    std::fs::rename(
+        directory.join(CLEARING),
+        directory.join("original-private-control"),
+    )?;
+    std::fs::write(directory.join(CLEARING), b"foreign replacement")?;
+    assert!(slot.core.retire_failed_write(CLEARING, &original).is_err());
+    assert_eq!(
+        std::fs::read(directory.join(CLEARING))?,
+        b"foreign replacement"
+    );
+    assert_eq!(
+        std::fs::read(directory.join("original-private-control"))?,
+        b"original"
+    );
+    Ok(())
+}
+
+#[test]
+fn kernel_file_limit_failures_do_not_poison_new_cache_controls() -> Result<()> {
+    // RLIMIT_FSIZE and SIGXFSZ are process-wide: never change the server/test
+    // runner's limits. Only a single explicitly selected child gets the limit.
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "marketplace::quarantine::image_cache::tests::kernel_file_limit_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear();
+    if let Some(directory) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", directory);
+    }
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "bounded write-failure child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("kernel EFBIG: empty/partial request and clearing writes retired without replacing original controls"));
+    Ok(())
+}
+
+#[test]
+fn failed_request_rollback_excludes_a_live_keeper_and_preserves_attempted_work() -> Result<()> {
+    for attempted in [false, true] {
+        let (_root, slot) = cleanup_fixture()?;
+        let directory = slot.core.lease.directory();
+        std::fs::remove_file(directory.join(REQUEST))?;
+        std::fs::remove_file(directory.join("image-cache.retired"))?;
+        let original = slot
+            .core
+            .write_body(REQUEST, b"incomplete original request")?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("image-cache.lock"))?;
+        if attempted {
+            std::fs::write(
+                directory.join("image-cache.attempt"),
+                b"uncertain native attempt",
+            )?;
+        } else {
+            lock.try_lock()?;
+        }
+        assert!(slot.core.retire_failed_write(REQUEST, &original).is_err());
+        assert_eq!(
+            std::fs::read(directory.join(REQUEST))?,
+            b"incomplete original request"
+        );
+        drop(lock);
+        if attempted {
+            assert_eq!(
+                std::fs::read(directory.join("image-cache.attempt"))?,
+                b"uncertain native attempt"
+            );
+        } else {
+            slot.core.retire_failed_write(REQUEST, &original)?;
+            assert!(!directory.join(REQUEST).exists());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "single subprocess only: actual kernel file-size limits, filesystem transitions; not native authority or disk-full proof"]
+async fn kernel_file_limit_child() -> Result<()> {
+    struct Limit {
+        previous: libc::rlimit,
+        handler: libc::sighandler_t,
+    }
+    impl Limit {
+        fn set(bytes: u64) -> Result<Self> {
+            let mut previous = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut previous) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let handler = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+            if handler == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let limit = Self { previous, handler };
+            let cap = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: limit.previous.rlim_max,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &cap) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(limit)
+        }
+    }
+    impl Drop for Limit {
+        fn drop(&mut self) {
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &self.previous) },
+                0
+            );
+            assert_ne!(
+                unsafe { libc::signal(libc::SIGXFSZ, self.handler) },
+                libc::SIG_ERR
+            );
+        }
+    }
+    let (_root, mut slot) = cleanup_fixture()?;
+    let request = slot.pending.as_ref().unwrap().request.clone();
+    let bytes = canonical::to_vec(&request)?;
+    for role in [REQUEST, CLEARING] {
+        for cap in [0, 64] {
+            if role == REQUEST {
+                std::fs::remove_file(slot.core.lease.directory().join(REQUEST))?;
+                std::fs::remove_file(slot.core.lease.directory().join("image-cache.retired"))?;
+                slot.pending.as_mut().unwrap().file = None;
+            }
+            let error = {
+                let _limit = Limit::set(cap)?;
+                slot.core
+                    .write_body(role, &bytes)
+                    .err()
+                    .context("kernel limit did not reject cache write")?
+            };
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(|e| e.raw_os_error()),
+                Some(libc::EFBIG)
+            );
+            assert!(
+                !slot.core.lease.directory().join(role).exists(),
+                "failed write poisoned {role}"
+            );
+            if role == REQUEST {
+                slot.pending.as_mut().unwrap().file = Some(slot.core.write(&request)?);
+                let mut retired = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(slot.core.lease.directory().join("image-cache.retired"))?;
+                retired.write_all(&request.receipt()?)?;
+                retired.sync_all()?;
+            } else {
+                assert_eq!(slot.core.read(REQUEST, MAX_REQUEST_BYTES)?.1, bytes);
+            }
+            assert_eq!(
+                slot.core.read("image-cache.retired", 4096)?.1,
+                request.receipt()?
+            );
+        }
+    }
+    // Fake retired controls here qualify filesystem recovery only. There is
+    // deliberately no Anchor, verified image or native retirement capability.
+    slot.clear().await?;
+    assert!(slot.pending.is_none() && slot.entry.is_none());
+    println!(
+        "kernel EFBIG: empty/partial request and clearing writes retired without replacing original controls"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn terminal_clearing_survives_removed_request_and_missing_earlier_controls() -> Result<()> {
     let (_root, mut slot) = cleanup_fixture()?;
