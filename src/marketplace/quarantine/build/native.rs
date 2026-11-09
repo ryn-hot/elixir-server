@@ -151,6 +151,11 @@ async fn native_variants_with_handoff(
 async fn actual_owned_rebuilt_imported_container_invocation_sdk_and_cleanup() -> Result<()> {
     native_variants_with_runtime(&["container-image-runtime"], true, true, true, true, true).await
 }
+#[tokio::test]
+#[ignore = "explicit actual original-source/image plus account/grant/instance SQL/AES SDK; synthetic metadata/source observations, no activation"]
+async fn actual_owned_compiled_invocation_uses_real_grants_and_stops_on_revocation() -> Result<()> {
+    native_variants_with_runtime(&["container-image-grants"], true, true, true, true, true).await
+}
 async fn native_variants_with_runtime(
     variants: &[&str],
     filesystem: bool,
@@ -218,6 +223,7 @@ async fn native_variants_with_runtime(
                 .args([toolchain.as_str(),if variant=="drop-before-build"{"match"}else{variant}]).kill_on_drop(true).output()).await??;
             if !fixture.status.success() || fixture.stdout.len()>2*1024*1024 {bail!("offline compiled fixture failed");}
             let value:serde_json::Value=canonical::parse(&fixture.stdout,2*1024*1024)?;
+            let grant_fixture=(variant=="container-image-grants").then(||value.clone());
             let artifact=STANDARD.decode(value["artifact_base64"].as_str().context("candidate fixture missing")?)?;
             let (release,package,proof)=crate::marketplace::quarantine::tests::decode_fixture(value)?;
             let plan=SourceQuarantinePlan::for_release(&release,Some(0),&SourceJobBudget{memory_bytes:256*MIB,cpu_millicores:200,
@@ -313,7 +319,10 @@ async fn native_variants_with_runtime(
                                     // NOT publisher execution. The passive image must
                                     // remain owned across this distinct root operation.
                                     returned.source.job.measure_host(original_expires).await?.report()?;
-                                    if execute {
+                                    if let Some(fixture)=grant_fixture.as_ref() {
+                                        returned=crate::marketplace::grant_store::invocation::native_tests::run_compiled(
+                                            returned,&image,fixture,&root,&package,&proof,&deployment).await?;
+                                    } else if execute {
                                         let view=image.runtime_view(&returned)?;
                                         view.check()?;
                                         let mut broker=ContainerBroker { source: returned.execution_descriptor(), native: None, calls: 0, retired: false };

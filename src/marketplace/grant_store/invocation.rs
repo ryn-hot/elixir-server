@@ -2,7 +2,9 @@
 //! activation. There is deliberately no public route or automatic caller.
 use super::*;
 use crate::marketplace::{
-    quarantine::execution::Broker, search::Selection, worker::PublicSourceObservation,
+    quarantine::execution::{Broker, NativeInvocation},
+    search::Selection,
+    worker::PublicSourceObservation,
 };
 use elixir_marketplace::source_execution::{RuntimeJson, SourceExecutionLimits, SourceSdkReply};
 
@@ -51,9 +53,13 @@ struct LocalInvocation<'a> {
     summary: elixir_marketplace::source_job::SourceMatchSummary,
     expires: tokio::time::Instant,
     checked: Option<tokio::time::Instant>,
+    native: Option<NativeInvocation>,
 }
 impl LocalInvocation<'_> {
     fn source_current(&self) -> Result<()> {
+        if let Some(native) = &self.native {
+            native.require_invoke(&self.descriptor)?;
+        }
         if tokio::time::Instant::now() >= self.expires || Utc::now() >= self.actor.expires {
             bail!("owner source invocation expired");
         }
@@ -64,6 +70,26 @@ impl LocalInvocation<'_> {
 }
 #[async_trait::async_trait]
 impl Broker for LocalInvocation<'_> {
+    fn native_started(&mut self, invocation: NativeInvocation) -> Result<()> {
+        self.source_current()?;
+        if self.native.is_some() {
+            bail!("owner invocation already owns its native executor");
+        }
+        invocation.require_invoke(&self.descriptor)?;
+        self.native = Some(invocation);
+        Ok(())
+    }
+    async fn retire_effects(&mut self) -> Result<()> {
+        // No HTTP/gateway children in this local-only broker. The executor's
+        // scope must already have been revoked; process retirement is joined
+        // independently by the original source job, never inferred here.
+        if let Some(native) = self.native.take() {
+            if native.check().is_ok() {
+                bail!("owner SDK scope remained live after its native exchange");
+            }
+        }
+        Ok(())
+    }
     async fn current(&mut self) -> Result<()> {
         self.source_current()?;
         // Periodic durable/publisher checks are shared across frames, not
@@ -88,6 +114,11 @@ impl Broker for LocalInvocation<'_> {
     }
     async fn request(&mut self, raw: &RuntimeJson, maximum: usize) -> Result<SourceSdkReply> {
         self.source_current()?;
+        self.native
+            .as_ref()
+            .context("owner SDK requires its actual native executor")?
+            .current()
+            .await?;
         // Every effect rechecks actor/home/grant/instance in its own actual
         // transaction, even when the polling observation is still fresh.
         sdk::LocalScope {
@@ -119,6 +150,40 @@ impl GrantCheckedQuarantine {
         database: &Database,
         secrets: &SecretsManager,
         call: OwnerInvocation,
+    ) -> Result<RuntimeJson> {
+        self.invoke_owner_bound(
+            selected,
+            database,
+            secrets,
+            call,
+            #[cfg(unix)]
+            None,
+        )
+        .await
+    }
+    /// The image must come from this exact source job's actual reproduction and
+    /// import. A grant, signed config digest or persisted summary cannot supply it.
+    /// This remains a private explicit foreground action, NOT installed activation.
+    #[cfg(unix)]
+    pub(in crate::marketplace) async fn invoke_compiled_for_owner(
+        &mut self,
+        image: &crate::marketplace::quarantine::image_reference::RuntimeImage,
+        selected: &mut Selection,
+        database: &Database,
+        secrets: &SecretsManager,
+        call: OwnerInvocation,
+    ) -> Result<RuntimeJson> {
+        image.require_source(self.source.source())?;
+        self.invoke_owner_bound(selected, database, secrets, call, Some(image))
+            .await
+    }
+    async fn invoke_owner_bound(
+        &mut self,
+        selected: &mut Selection,
+        database: &Database,
+        secrets: &SecretsManager,
+        call: OwnerInvocation,
+        #[cfg(unix)] image: Option<&crate::marketplace::quarantine::image_reference::RuntimeImage>,
     ) -> Result<RuntimeJson> {
         self.ensure_current(database).await?;
         if call.review_id != self.requested.review_id()?
@@ -161,8 +226,22 @@ impl GrantCheckedQuarantine {
             summary: self.source.source().summary().clone(),
             expires: self.source.source().expires(),
             checked: None,
+            native: None,
         };
         broker.current().await?;
+        #[cfg(unix)]
+        let result = if let Some(image) = image {
+            self.source
+                .source_mut()
+                .invoke_container(image, call.limits, &call.arguments, &mut broker)
+                .await?
+        } else {
+            self.source
+                .source_mut()
+                .invoke_source(call.limits, &call.arguments, &mut broker)
+                .await?
+        };
+        #[cfg(not(unix))]
         let result = self
             .source
             .source_mut()
@@ -177,4 +256,4 @@ impl GrantCheckedQuarantine {
 }
 
 #[cfg(all(test, unix))]
-mod native_tests;
+pub(in crate::marketplace) mod native_tests;

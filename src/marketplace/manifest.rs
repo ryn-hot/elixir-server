@@ -34,6 +34,11 @@ pub struct ManifestCheckedQuarantine {
     permissions: Vec<String>,
 }
 impl ManifestCheckedQuarantine {
+    /// Move the ORIGINAL checked workspace back to its native owner. This
+    /// drops manifest presentation/selection data, never creates new evidence.
+    pub(super) fn into_source(self) -> SourceMatchedQuarantine {
+        self.source
+    }
     /// Refresh availability only; package, manifest, job deadline and requested
     /// permissions do not change. The observation must bind this same source.
     pub fn refresh_public_source(
