@@ -210,6 +210,18 @@ impl LiveConfig {
             120,
         )?;
         bounded(
+            "providers.source_request_timeout_seconds",
+            self.providers.source_request_timeout_seconds,
+            1,
+            120,
+        )?;
+        bounded(
+            "providers.source_hard_timeout_seconds",
+            self.providers.source_hard_timeout_seconds,
+            self.providers.source_request_timeout_seconds,
+            120,
+        )?;
+        bounded(
             "providers.response_bytes",
             self.providers.response_bytes,
             1_024,
@@ -377,6 +389,9 @@ impl Default for LiveRecoveryLimits {
 pub struct LiveProviderLimits {
     pub request_timeout_seconds: u64,
     pub hard_timeout_seconds: u64,
+    /// Includes native source verification/admission/startup, not just socket I/O.
+    pub source_request_timeout_seconds: u64,
+    pub source_hard_timeout_seconds: u64,
     pub response_bytes: u64,
     pub concurrency_per_provider: u32,
     pub concurrency_per_user: u32,
@@ -387,6 +402,8 @@ impl Default for LiveProviderLimits {
         Self {
             request_timeout_seconds: 5,
             hard_timeout_seconds: 15,
+            source_request_timeout_seconds: 45,
+            source_hard_timeout_seconds: 60,
             response_bytes: 2_097_152,
             concurrency_per_provider: 4,
             concurrency_per_user: 8,
@@ -882,6 +899,34 @@ fn valid_dns_probe_host(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_callback_deadlines_are_separate_bounded_and_backward_compatible() {
+        let limits: super::LiveProviderLimits = serde_json::from_value(serde_json::json!({
+            "request_timeout_seconds":5,"hard_timeout_seconds":15
+        }))
+        .unwrap();
+        assert_eq!(
+            (limits.request_timeout_seconds, limits.hard_timeout_seconds),
+            (5, 15)
+        );
+        assert_eq!(
+            (
+                limits.source_request_timeout_seconds,
+                limits.source_hard_timeout_seconds
+            ),
+            (45, 60)
+        );
+        for (request, hard) in [(0, 60), (121, 121), (45, 44), (45, 121)] {
+            let mut config = super::LiveConfig::default();
+            config.providers.source_request_timeout_seconds = request;
+            config.providers.source_hard_timeout_seconds = hard;
+            assert!(config.validate().is_err(), "{request}/{hard}");
+        }
+        let mut config = super::LiveConfig::default();
+        config.providers.source_request_timeout_seconds = 1;
+        config.providers.source_hard_timeout_seconds = 1;
+        config.validate().unwrap();
+    }
     use serde_json::json;
 
     use super::*;

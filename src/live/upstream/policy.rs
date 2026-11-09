@@ -8,7 +8,7 @@ use reqwest::Url;
 
 use super::error::{Result, UpstreamErrorCode};
 
-const MAX_URL_BYTES: usize = 4_096;
+pub(super) const MAX_URL_BYTES: usize = 4_096;
 const MAX_RULES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub struct PrivateLanGate {
 }
 
 impl PrivateLanGate {
-    fn permits(self) -> bool {
+    pub(super) fn permits(self) -> bool {
         self.server_enabled
             && self.provider_permission
             && self.descriptor_requested
@@ -125,6 +125,9 @@ pub struct DestinationRule {
     host: String,
     port: u16,
     exact_path: String,
+    // Configured SDK requests bind the WHOLE canonical URL, including query.
+    // Existing Live rules retain their original path/authority semantics.
+    exact_url: Option<Box<str>>,
     network_scope: NetworkScope,
     allow_fetch: bool,
     authority_wide: bool,
@@ -169,11 +172,26 @@ impl DestinationRule {
             host,
             port,
             exact_path: exact_path.to_string(),
+            exact_url: None,
             network_scope,
             allow_fetch,
             authority_wide: false,
             allow_local_destination: false,
         })
+    }
+
+    pub(super) fn for_exact_lan_url(url: &Url) -> Result<Self> {
+        let mut rule = Self::new(
+            url.scheme(),
+            url.host_str().ok_or(UpstreamErrorCode::HostForbidden)?,
+            url.port_or_known_default()
+                .ok_or(UpstreamErrorCode::PortForbidden)?,
+            url.path(),
+            NetworkScope::PrivateLan,
+            true,
+        )?;
+        rule.exact_url = Some(url.as_str().into());
+        Ok(rule)
     }
 
     pub(crate) fn for_private_provider_authority(
@@ -197,6 +215,7 @@ impl DestinationRule {
             host,
             port,
             exact_path: "/".to_string(),
+            exact_url: None,
             network_scope: NetworkScope::PrivateLan,
             allow_fetch: true,
             authority_wide: true,
@@ -212,6 +231,10 @@ impl DestinationRule {
         self.allow_fetch
             && self.same_authority(target)
             && (self.authority_wide || self.exact_path == target.url.path())
+            && self
+                .exact_url
+                .as_ref()
+                .is_none_or(|exact| exact.as_ref() == target.url.as_str())
     }
 
     fn permits_private_gateway_hostname(&self, target: &ValidatedUrl) -> bool {

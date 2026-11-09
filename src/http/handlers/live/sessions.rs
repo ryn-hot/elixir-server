@@ -4688,6 +4688,7 @@ mod tests {
             classifier: ClassifierConfig::default(),
             playback: crate::config::PlaybackConfig::default(),
             media_interactions: MediaInteractionsConfig::default(),
+            marketplace: crate::config::MarketplaceConfig::default(),
             live: LiveConfig {
                 enabled: true,
                 catalog_enabled: true,

@@ -11179,6 +11179,7 @@ mod tests {
             seccomp_profile: None,
             apparmor_profile: None,
             prohibit_docker_socket: true,
+            sdk_state_limit_bytes: None,
             prohibit_host_media_mounts: true,
         }
     }
@@ -11215,6 +11216,7 @@ mod tests {
                 nano_cpus: Some(1_000_000_000),
                 seccomp_profile: None,
                 apparmor_profile: None,
+                ..Default::default()
             },
         }
     }
@@ -12156,7 +12158,7 @@ mod tests {
     #[tokio::test]
     async fn prism_runtime_smoke_records_private_egress_policy_evidence() {
         let warnings = vec![
-            "prism:FetchLocalhost: Prism source fetch blocked private network destination: 127.0.0.1"
+            "prism:fetch-localhost: Prism source fetch blocked private network destination: 127.0.0.1"
                 .to_string(),
         ];
         let outcome = certify_prism_runtime_smoke(

@@ -319,6 +319,12 @@ impl EgressConnector for ProtectedConnector {
         connect_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> UpstreamResult<Response> {
+        // Control v2 carries no entity body and the worker accepts GET/HEAD
+        // only. Reject before any control I/O: never silently omit a body or
+        // pretend this transport implements the source SDK's POST contract.
+        if request.body.is_some() || !matches!(request.method.as_str(), "GET" | "HEAD") {
+            return Err(UpstreamErrorCode::EgressRejected.into());
+        }
         let headers = request
             .headers
             .iter()
@@ -377,3 +383,6 @@ fn header(headers: &reqwest::header::HeaderMap, name: &str) -> UpstreamResult<St
         .map(str::to_string)
         .ok_or_else(|| UpstreamErrorCode::EgressRejected.into())
 }
+
+#[cfg(test)]
+mod tests;

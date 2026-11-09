@@ -749,6 +749,19 @@ pub struct ExtensionStore<'a> {
     pool: &'a AnyPool,
 }
 
+mod global_secrets;
+
+// Trusted SQL expressions only, never request data. An installed namespace is
+// restricted even if its journal OR its SDK head is missing. Generic secret
+// writers must not race snapshot/rollback or adopt pending marketplace state.
+fn legacy_secret_guard(scope: &str, scope_id: &str) -> String {
+    format!(
+        "({scope}<>'instance' OR (NOT EXISTS(SELECT 1 FROM marketplace_instance_sdk_state s WHERE s.instance_id={scope_id} AND (s.purpose IS NULL OR s.purpose<>'foreground')) AND NOT EXISTS(SELECT 1 FROM marketplace_sdk_namespaces n WHERE (n.namespace_id={scope_id} OR n.instance_id={scope_id}) AND n.purpose<>'foreground') AND NOT EXISTS(SELECT 1 FROM extension_instances i JOIN marketplace_installations m ON m.extension_id=i.extension_id WHERE i.instance_id={scope_id}) AND NOT EXISTS(SELECT 1 FROM extension_instances i JOIN marketplace_installation_metadata m ON m.extension_id=i.extension_id WHERE i.instance_id={scope_id})))"
+    )
+}
+const MARKETPLACE_SECRET_WRITE: &str =
+    "marketplace instance secrets require the reviewed installation lifecycle";
+
 impl<'a> ExtensionStore<'a> {
     pub fn new(pool: &'a AnyPool) -> Self {
         Self { pool }
@@ -807,6 +820,15 @@ impl<'a> ExtensionStore<'a> {
         let unavailable_providers = if enabled {
             Vec::new()
         } else {
+            // Acquire the writer position before reading revocation targets.
+            // SQLite cannot safely upgrade a reader while native authority
+            // holds another writer. This does not change choices or timestamps;
+            // the actual enabled write below advances its choice counter once.
+            sqlx::query("UPDATE extensions SET installed_at=installed_at WHERE extension_id=$1")
+                .bind(extension_id)
+                .execute(&mut *transaction)
+                .await
+                .context("locking extension before disabling providers")?;
             let rows = sqlx::query::<sqlx::Any>(
                 "SELECT p.provider_id, p.instance_id, i.extension_id, p.capability \
                  FROM providers p \
@@ -926,6 +948,16 @@ impl<'a> ExtensionStore<'a> {
         let unavailable_providers = if enabled {
             Vec::new()
         } else {
+            // Lock before the first read, not a deferred reader-to-writer
+            // upgrade. The no-op timestamp write does not advance choices;
+            // provider targets and the actual OFF still share one transaction.
+            sqlx::query(
+                "UPDATE extension_instances SET updated_at=updated_at WHERE instance_id=$1",
+            )
+            .bind(instance_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .context("locking instance before disabling providers")?;
             let rows = sqlx::query::<sqlx::Any>(
                 "SELECT p.provider_id, p.instance_id, i.extension_id, p.capability \
                  FROM providers p \
@@ -1028,11 +1060,27 @@ impl<'a> ExtensionStore<'a> {
     ) -> Result<()> {
         match scope_id {
             Some(scope_id) => {
-                sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE scope = $1 AND scope_id = $2")
+                let query = format!(
+                    "DELETE FROM secrets WHERE scope=$1 AND scope_id=$2 AND {}",
+                    legacy_secret_guard("secrets.scope", "secrets.scope_id")
+                );
+                sqlx::query::<sqlx::Any>(&query)
                     .bind(scope.as_str())
                     .bind(scope_id.to_string())
                     .execute(self.pool)
                     .await?;
+                let check = format!(
+                    "SELECT CAST(CASE WHEN {} THEN 0 ELSE 1 END AS BIGINT)",
+                    legacy_secret_guard("$1", "$2")
+                );
+                let protected: i64 = sqlx::query_scalar(&check)
+                    .bind(scope.as_str())
+                    .bind(scope_id.to_string())
+                    .fetch_one(self.pool)
+                    .await?;
+                if protected != 0 {
+                    anyhow::bail!(MARKETPLACE_SECRET_WRITE);
+                }
             }
             None => {
                 sqlx::query::<sqlx::Any>(
@@ -1055,6 +1103,14 @@ impl<'a> ExtensionStore<'a> {
                    SELECT 1
                    FROM extension_instances
                    WHERE extension_instances.instance_id = secrets.scope_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM marketplace_sdk_namespaces
+                   WHERE marketplace_sdk_namespaces.namespace_id = secrets.scope_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM marketplace_instance_sdk_state
+                   WHERE marketplace_instance_sdk_state.instance_id = secrets.scope_id
                )",
         )
         .execute(self.pool)
@@ -3045,18 +3101,64 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn upsert_secret(&self, data: &NewSecret) -> Result<()> {
-        sqlx::query::<sqlx::Any>(
-            "INSERT INTO secrets (secret_id, scope, scope_id, key, value_encrypted, rotatable) VALUES ($1, $2, $3, $4, $5, $6) \n             ON CONFLICT(scope, scope_id, key) DO UPDATE SET value_encrypted = excluded.value_encrypted, rotatable = excluded.rotatable",
-        )
-        .bind(data.secret_id.to_string())
+        if data.scope == SecretScope::Global && data.scope_id.is_none() {
+            global_secrets::write(self.pool, data, true).await?;
+            return Ok(());
+        }
+        let query = format!(
+            "INSERT INTO secrets(secret_id,scope,scope_id,key,value_encrypted,rotatable) SELECT $1,$2,$3,$4,$5,$6 WHERE {} ON CONFLICT(scope,scope_id,key) DO UPDATE SET value_encrypted=excluded.value_encrypted,rotatable=excluded.rotatable WHERE {}",
+            legacy_secret_guard("$2", "$3"),
+            legacy_secret_guard("secrets.scope", "secrets.scope_id")
+        );
+        let written = sqlx::query::<sqlx::Any>(&query)
+            .bind(data.secret_id.to_string())
+            .bind(data.scope.as_str())
+            .bind(data.scope_id.map(|id| id.to_string()))
+            .bind(&data.key)
+            .bind(&data.value_encrypted)
+            .bind(data.rotatable)
+            .execute(self.pool)
+            .await?;
+        if written.rows_affected() != 1 {
+            anyhow::bail!(MARKETPLACE_SECRET_WRITE);
+        }
+        Ok(())
+    }
+
+    /// Create only: a losing concurrent initializer must never rotate a key.
+    /// Returns false for an existing logical key, never permission to overwrite.
+    pub async fn insert_secret_if_absent(&self, data: &NewSecret) -> Result<bool> {
+        if data.scope == SecretScope::Global && data.scope_id.is_none() {
+            return global_secrets::write(self.pool, data, false).await;
+        }
+        let query = format!(
+            "INSERT INTO secrets(secret_id,scope,scope_id,key,value_encrypted,rotatable) SELECT $1,$2,$3,$4,$5,$6 WHERE {} ON CONFLICT(scope,scope_id,key) DO NOTHING",
+            legacy_secret_guard("$2", "$3")
+        );
+        let written = sqlx::query(&query)
+            .bind(data.secret_id.to_string())
+            .bind(data.scope.as_str())
+            .bind(data.scope_id.map(|id| id.to_string()))
+            .bind(&data.key)
+            .bind(&data.value_encrypted)
+            .bind(data.rotatable)
+            .execute(self.pool)
+            .await?;
+        if written.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let allowed: i64 = sqlx::query_scalar(&format!(
+            "SELECT CAST(CASE WHEN {} THEN 1 ELSE 0 END AS BIGINT)",
+            legacy_secret_guard("$1", "$2")
+        ))
         .bind(data.scope.as_str())
         .bind(data.scope_id.map(|id| id.to_string()))
-        .bind(&data.key)
-        .bind(&data.value_encrypted)
-        .bind(data.rotatable)
-        .execute(self.pool)
+        .fetch_one(self.pool)
         .await?;
-        Ok(())
+        if allowed != 1 {
+            anyhow::bail!(MARKETPLACE_SECRET_WRITE);
+        }
+        Ok(false)
     }
 
     pub async fn get_secret(
@@ -3065,25 +3167,28 @@ impl<'a> ExtensionStore<'a> {
         scope_id: Option<Uuid>,
         key: &str,
     ) -> Result<Option<Secret>> {
-        let row = if let Some(scope_id) = scope_id {
+        let rows = if let Some(scope_id) = scope_id {
             sqlx::query(
-                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id = $2 AND key = $3 LIMIT 1",
+                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id = $2 AND key = $3 LIMIT 2",
             )
             .bind(scope.as_str())
             .bind(scope_id.to_string())
             .bind(key)
-            .fetch_optional(self.pool)
+            .fetch_all(self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id IS NULL AND key = $2 LIMIT 1",
+                "SELECT secret_id, scope, CAST(scope_id AS TEXT) as scope_id, key, value_encrypted, CAST(created_at AS TEXT) as created_at, CAST(CASE WHEN rotatable THEN 1 ELSE 0 END AS BIGINT) as rotatable FROM secrets WHERE scope = $1 AND scope_id IS NULL AND key = $2 LIMIT 2",
             )
             .bind(scope.as_str())
             .bind(key)
-            .fetch_optional(self.pool)
+            .fetch_all(self.pool)
             .await?
         };
-        row.map(|row| map_secret(&row)).transpose()
+        if rows.len() > 1 {
+            anyhow::bail!(global_secrets::AMBIGUOUS);
+        }
+        rows.first().map(map_secret).transpose()
     }
 
     pub async fn get_secret_by_id(&self, secret_id: Uuid) -> Result<Option<Secret>> {
@@ -3142,10 +3247,17 @@ impl<'a> ExtensionStore<'a> {
     }
 
     pub async fn delete_secret(&self, secret_id: Uuid) -> Result<()> {
-        sqlx::query::<sqlx::Any>("DELETE FROM secrets WHERE secret_id = $1")
+        let query = format!(
+            "DELETE FROM secrets WHERE secret_id=$1 AND {}",
+            legacy_secret_guard("secrets.scope", "secrets.scope_id")
+        );
+        let written = sqlx::query::<sqlx::Any>(&query)
             .bind(secret_id.to_string())
             .execute(self.pool)
             .await?;
+        if written.rows_affected() == 0 {
+            self.require_legacy_secret_id(secret_id).await?;
+        }
         Ok(())
     }
 
@@ -3155,14 +3267,34 @@ impl<'a> ExtensionStore<'a> {
         value_encrypted: &str,
         rotatable: bool,
     ) -> Result<()> {
-        sqlx::query::<sqlx::Any>(
-            "UPDATE secrets SET value_encrypted = $1, rotatable = $2 WHERE secret_id = $3",
-        )
-        .bind(value_encrypted)
-        .bind(rotatable)
-        .bind(secret_id.to_string())
-        .execute(self.pool)
-        .await?;
+        let query = format!(
+            "UPDATE secrets SET value_encrypted=$1,rotatable=$2 WHERE secret_id=$3 AND {}",
+            legacy_secret_guard("secrets.scope", "secrets.scope_id")
+        );
+        let written = sqlx::query::<sqlx::Any>(&query)
+            .bind(value_encrypted)
+            .bind(rotatable)
+            .bind(secret_id.to_string())
+            .execute(self.pool)
+            .await?;
+        if written.rows_affected() == 0 {
+            self.require_legacy_secret_id(secret_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn require_legacy_secret_id(&self, secret_id: Uuid) -> Result<()> {
+        let query = format!(
+            "SELECT COUNT(*) FROM secrets WHERE secret_id=$1 AND NOT {}",
+            legacy_secret_guard("secrets.scope", "secrets.scope_id")
+        );
+        let protected: i64 = sqlx::query_scalar(&query)
+            .bind(secret_id.to_string())
+            .fetch_one(self.pool)
+            .await?;
+        if protected != 0 {
+            anyhow::bail!(MARKETPLACE_SECRET_WRITE);
+        }
         Ok(())
     }
 
@@ -6936,6 +7068,94 @@ mod tests {
                 .is_empty()
         );
         Ok(())
+    }
+
+    // Real independent SQLite connections, not a single-connection in-memory
+    // pool. OFF must wait for the writer BEFORE reading its provider targets.
+    async fn sqlite_off_waits_for_writer(instance: bool) -> Result<()> {
+        use tokio::time::{Duration, timeout};
+
+        for journal in ["delete", "wal"] {
+            let root = tempfile::tempdir()?;
+            let config = DatabaseConfig {
+                url: format!("sqlite://{}", root.path().join("controls.sqlite").display()),
+                max_connections: 2,
+                ..DatabaseConfig::default()
+            };
+            let database = Database::connect(&config).await?;
+            database.run_migrations().await?;
+            sqlx::query(&format!("PRAGMA journal_mode={journal}"))
+                .execute(&database.pool)
+                .await?;
+            let store = ExtensionStore::new(&database.pool);
+            let (instance_id, provider_id) = seed_ready_live_provider(&store).await?;
+            if instance {
+                store.set_instance_enabled(instance_id, false).await?;
+            } else {
+                store.set_extension_enabled("example.live", false).await?;
+            }
+            let other = Database::connect(&config).await?;
+            let mut writer = database.pool.begin().await?;
+            let (sql, key) = if instance {
+                (
+                    "UPDATE extension_instances SET enabled=TRUE WHERE instance_id=$1",
+                    instance_id.to_string(),
+                )
+            } else {
+                (
+                    "UPDATE extensions SET enabled=TRUE WHERE extension_id=$1",
+                    "example.live".to_owned(),
+                )
+            };
+            sqlx::query(sql).bind(key).execute(&mut *writer).await?;
+            let (started, pending) = tokio::sync::oneshot::channel();
+            let mut task = tokio::spawn(async move {
+                let store = ExtensionStore::new(&other.pool);
+                let _ = started.send(());
+                let result = if instance {
+                    store.set_instance_enabled(instance_id, false).await
+                } else {
+                    store.set_extension_enabled("example.live", false).await
+                };
+                other.pool.close().await;
+                result
+            });
+            pending.await?;
+            let observation = timeout(Duration::from_millis(100), &mut task).await;
+            // Release the actual writer and join the original task even if an
+            // old reader-to-writer implementation incorrectly returned early.
+            writer.commit().await?;
+            let change = match observation {
+                Err(_) => task.await??,
+                Ok(result) => {
+                    result??;
+                    anyhow::bail!("OFF did not wait for the original SQLite {journal} writer");
+                }
+            };
+            assert_eq!(change.unavailable_providers.len(), 1, "{journal}");
+            assert_eq!(change.unavailable_providers[0].provider_id, provider_id);
+            assert!(store.list_ready_live_catalog_providers().await?.is_empty());
+            let retry = if instance {
+                store.set_instance_enabled(instance_id, false).await?
+            } else {
+                store.set_extension_enabled("example.live", false).await?
+            };
+            assert!(retry.unavailable_providers.is_empty());
+            database.pool.close().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_instance_off_waits_for_native_writer_without_losing_revocation_targets()
+    -> Result<()> {
+        sqlite_off_waits_for_writer(true).await
+    }
+
+    #[tokio::test]
+    async fn sqlite_extension_off_waits_for_native_writer_without_losing_revocation_targets()
+    -> Result<()> {
+        sqlite_off_waits_for_writer(false).await
     }
 
     #[tokio::test]

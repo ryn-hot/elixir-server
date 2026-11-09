@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,21 +11,43 @@ use tokio::process::Command;
 use tokio::time::{Duration as TokioDuration, Instant, sleep, timeout};
 use uuid::Uuid;
 
-use crate::runtime::RuntimeManager;
 use crate::runtime::model::{
-    CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerPublishedPort, ContainerRuntimeMount,
-    ContainerRuntimeSecurityState, ContainerRuntimeState, ContainerRuntimeTmpfsMount,
-    ContainerSpec, ContainerState, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
-    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL,
-    OwnedDirectoryVolumeSpec, PortMapping, PrivateFileVolumeSpec, VolumeMount,
+    CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerLogOptions, ContainerPublishedPort,
+    ContainerRuntimeLogConfig, ContainerRuntimeMount, ContainerRuntimeSecurityState,
+    ContainerRuntimeState, ContainerRuntimeTmpfsMount, ContainerRuntimeUlimit,
+    ContainerSecurityOptions, ContainerSpec, ContainerState, ContainerTmpfsMount,
+    ELIXIR_DEPLOYMENT_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL,
+    ELIXIR_MANAGED_LABEL, FixedMarketplaceVolumeSpec, OwnedDirectoryVolumeSpec, PortMapping,
+    PrivateActorInspection, PrivateFileVolumeSpec, QuarantineMarketplaceVolumeSpec, VolumeMount,
     VolumeMountSourceKind,
 };
+use crate::runtime::packet_network::{PacketNetworkInspection, PacketNetworkSpec, immutable_id};
+use crate::runtime::{PrivateProcessStdio, RuntimeManager};
+#[cfg(unix)]
+mod application_gateway;
+mod application_http;
+mod build_output;
+mod image_labels;
+mod image_import;
+mod measurement;
+#[cfg(unix)]
+mod provider;
+#[cfg(unix)]
+mod provider_guard;
+#[cfg(unix)]
+mod provider_observation;
+#[cfg(unix)]
+mod provider_worker;
+mod source_recovery;
 
 const REQUIRED_LABELS: [&str; 2] = [ELIXIR_INSTANCE_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL];
 const DOCKER_PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DockerRuntimeManager {
     docker_bin: String,
+    #[cfg(unix)]
+    import_profile:Option<std::sync::Arc<crate::runtime::image_import::Profile>>,
+    immutable_image_labels: tokio::sync::Mutex<image_labels::Cache>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,9 +134,109 @@ pub fn describe_docker_runtime_failure(
 }
 
 impl DockerRuntimeManager {
+    fn require_quarantine_exit_owner(
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<()> {
+        if !immutable_id(&handle.id)
+            || required.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || required
+                .get("elixir.marketplace.isolation")
+                .map(String::as_str)
+                != Some("quarantine-v1")
+            || required
+                .get(CONTAINER_SPEC_HASH_LABEL)
+                .is_none_or(String::is_empty)
+        {
+            bail!("native exit verification requires a specific owned quarantine");
+        }
+        Ok(())
+    }
+    fn verify_quarantine_exit(
+        value: &Value,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<()> {
+        Self::require_quarantine_exit_owner(handle, required)?;
+        Self::verify_private_native_exit(value, handle, required)
+    }
+    fn verify_private_native_exit(
+        value: &Value,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<()> {
+        let state = Self::extract_state(value)?;
+        let labels = Self::extract_labels(value);
+        if state.id != handle.id
+            || state.name != handle.name
+            || state.running
+            || required
+                .iter()
+                .any(|(key, expected)| labels.get(key) != Some(expected))
+            || value.pointer("/Config/OpenStdin").and_then(Value::as_bool) != Some(true)
+            || value.pointer("/Config/Tty").and_then(Value::as_bool) != Some(false)
+            || value.pointer("/State/Status").and_then(Value::as_str) != Some("exited")
+            || value.pointer("/State/ExitCode").and_then(Value::as_i64) != Some(0)
+            || value.pointer("/State/Pid").and_then(Value::as_i64) != Some(0)
+            || value.pointer("/State/Error").and_then(Value::as_str) != Some("")
+            || ["Running", "Paused", "Restarting", "OOMKilled", "Dead"]
+                .iter()
+                .any(|field| {
+                    value
+                        .pointer(&format!("/State/{field}"))
+                        .and_then(Value::as_bool)
+                        != Some(false)
+                })
+        {
+            bail!("owned native quarantine did not exit successfully");
+        }
+        Ok(())
+    }
+    /// Fixed local network operations only. Bound both streams before parsing
+    /// even if a collision/foreign network carries huge labels or membership.
+    async fn packet_network_capture(
+        &self,
+        args: &[String],
+    ) -> Result<(std::process::ExitStatus, String, String)> {
+        use tokio::io::AsyncReadExt;
+        async fn read(
+            mut stream: impl tokio::io::AsyncRead + Unpin,
+            limit: u64,
+        ) -> Result<Vec<u8>> {
+            let mut bytes = vec![];
+            (&mut stream)
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() as u64 > limit {
+                bail!("marketplace network output exceeds its bound");
+            }
+            Ok(bytes)
+        }
+        let mut child = Command::new(&self.docker_bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take().context("missing network stdout")?;
+        let stderr = child.stderr.take().context("missing network stderr")?;
+        let (out, err, status) = timeout(Duration::from_secs(10), async {
+            tokio::try_join!(read(stdout, 65536), read(stderr, 4096), async {
+                child.wait().await.map_err(anyhow::Error::from)
+            })
+        })
+        .await
+        .context("marketplace network command deadline")??;
+        Ok((status, String::from_utf8(out)?, String::from_utf8(err)?))
+    }
     pub fn new(docker_bin: Option<String>) -> Self {
         Self {
             docker_bin: docker_bin.unwrap_or_else(|| "docker".to_string()),
+            #[cfg(unix)]
+            import_profile:None,
+            immutable_image_labels: Default::default(),
         }
     }
 
@@ -287,6 +410,339 @@ impl DockerRuntimeManager {
         Ok(())
     }
 
+    fn validate_fixed_marketplace_volume_spec(spec: &FixedMarketplaceVolumeSpec) -> Result<()> {
+        Self::validate_owned_directory_volume_spec(&OwnedDirectoryVolumeSpec {
+            name: spec.name.clone(),
+            image: spec.image.clone(),
+            owner_uid: 10004,
+            owner_gid: 10004,
+            labels: spec.labels.clone(),
+        })?;
+        if !spec.name.starts_with("elixir-marketplace-")
+            || !crate::marketplace::runtime::image_is_pinned(&spec.image)
+            || !(64..=256).contains(&spec.memory_limit_mb)
+            || !(1..=100).contains(&spec.cpu_millicores)
+            || spec.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || spec
+                .labels
+                .get("elixir.marketplace.volume")
+                .map(String::as_str)
+                != Some("fixed-v1")
+            || !spec
+                .labels
+                .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                .is_some_and(|id| !id.is_empty())
+        {
+            bail!("invalid fixed marketplace volume identity");
+        }
+        Ok(())
+    }
+
+    fn verify_fixed_marketplace_volume(
+        value: &Value,
+        spec: &FixedMarketplaceVolumeSpec,
+    ) -> Result<()> {
+        Self::verify_owned_local_volume(value, &spec.name, &spec.labels)
+    }
+
+    fn verify_owned_local_volume(
+        value: &Value,
+        name: &str,
+        labels: &HashMap<String, String>,
+    ) -> Result<()> {
+        let options = value.get("Options");
+        if value.get("Name").and_then(Value::as_str) != Some(name)
+            || value.get("Driver").and_then(Value::as_str) != Some("local")
+            || value.get("Scope").and_then(Value::as_str) != Some("local")
+            || !options.is_some_and(|options| {
+                options.is_null()
+                    || options
+                        .as_object()
+                        .is_some_and(|options| options.is_empty())
+            })
+            || !Self::private_volume_labels_match(value, labels)
+        {
+            bail!("marketplace volume backend or ownership differs from its specification");
+        }
+        Ok(())
+    }
+
+    fn validate_quarantine_marketplace_volume_spec(
+        spec: &QuarantineMarketplaceVolumeSpec,
+    ) -> Result<()> {
+        Self::validate_owned_directory_volume_spec(&OwnedDirectoryVolumeSpec {
+            name: spec.name.clone(),
+            image: spec.image.clone(),
+            owner_uid: 10004,
+            owner_gid: 10004,
+            labels: spec.labels.clone(),
+        })?;
+        spec.workspace.validate()?;
+        crate::marketplace::runtime::SourceJobLimits::new(
+            spec.memory_limit_mb
+                .checked_mul(1024 * 1024)
+                .context("source quarantine memory overflow")?,
+            spec.cpu_millicores,
+        )?;
+        if !spec.name.starts_with("elixir-marketplace-source-")
+            || !crate::marketplace::runtime::image_is_pinned(&spec.image)
+            || spec.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || spec
+                .labels
+                .get("elixir.marketplace.volume")
+                .map(String::as_str)
+                != Some("quarantine-v1")
+            || !spec
+                .labels
+                .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                .is_some_and(|id| !id.is_empty())
+        {
+            bail!("invalid source quarantine volume identity");
+        }
+        Ok(())
+    }
+
+    /// Stable helper name + ownership checks prevent abandoned initialization
+    /// jobs accumulating or writing concurrently after a controller crash.
+    async fn recover_quarantine_provisioner(
+        &self,
+        spec: &QuarantineMarketplaceVolumeSpec,
+    ) -> Result<()> {
+        let name = format!("{}-provision", spec.name);
+        if let Some(handle) = self.get_container_handle(&name).await? {
+            let value = self.inspect_container(&handle.id).await?;
+            let labels = Self::extract_labels(&value);
+            if labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+                || labels.get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                    != spec.labels.get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                || labels
+                    .get("elixir.marketplace.storage_job")
+                    .map(String::as_str)
+                    != Some("quarantine-v1")
+                || labels.get("elixir.marketplace.storage_name") != Some(&spec.name)
+            {
+                bail!("refusing to stop an unowned source quarantine provisioner");
+            }
+            self.run_capture_with_timeout(
+                &["rm".to_owned(), "-f".to_owned(), handle.id],
+                Some(Duration::from_secs(15)),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn quarantine_marketplace_volume_job(
+        &self,
+        spec: &QuarantineMarketplaceVolumeSpec,
+        initialize: bool,
+    ) -> Result<()> {
+        let name = format!("{}-provision", spec.name);
+        let mut args = vec![
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--name".to_owned(),
+            name,
+            "--pull=never".to_owned(),
+            "--network=none".to_owned(),
+            "--read-only".to_owned(),
+            "--cap-drop=ALL".to_owned(),
+            "--security-opt=no-new-privileges".to_owned(),
+            format!("--memory={}m", spec.memory_limit_mb),
+            format!("--memory-swap={}m", spec.memory_limit_mb),
+            format!(
+                "--cpus={}.{:03}",
+                spec.cpu_millicores / 1000,
+                spec.cpu_millicores % 1000
+            ),
+            "--pids-limit=32".to_owned(),
+            "--log-driver=none".to_owned(),
+            "--shm-size=1m".to_owned(),
+            "--ulimit=core=0:0".to_owned(),
+            "--ulimit=nofile=256:256".to_owned(),
+            "--tmpfs=/tmp:size=8m,noexec,nosuid,nodev".to_owned(),
+            format!("--user={}", if initialize { "0:0" } else { "10004:10004" }),
+        ];
+        let mut labels = spec.labels.clone();
+        labels.insert(
+            "elixir.marketplace.storage_job".to_owned(),
+            "quarantine-v1".to_owned(),
+        );
+        labels.insert(
+            "elixir.marketplace.storage_name".to_owned(),
+            spec.name.clone(),
+        );
+        let mut labels = labels.iter().collect::<Vec<_>>();
+        labels.sort_by_key(|(key, _)| *key);
+        for (key, value) in labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        if initialize {
+            args.push("--cap-add=CHOWN".to_owned());
+        }
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=volume,source={},target=/quarantine,volume-nocopy{}",
+                spec.name,
+                if initialize { "" } else { ",readonly" }
+            ),
+            "--entrypoint=/usr/bin/timeout".to_owned(),
+            spec.image.clone(),
+            "--signal=KILL".to_owned(),
+            "--".to_owned(),
+            format!("{}s", spec.workspace.timeout_seconds.min(180)),
+            "/usr/local/bin/node".to_owned(),
+            "--max-old-space-size=16".to_owned(),
+            "/opt/elixir-marketplace/src/provision-quarantine.mjs".to_owned(),
+            if initialize { "initialize" } else { "inspect" }.to_owned(),
+            String::from_utf8(elixir_marketplace::canonical::to_vec(&spec.workspace)?)?,
+        ]);
+        let result = self
+            .run_capture_with_timeout(
+                &args,
+                Some(Duration::from_secs(spec.workspace.timeout_seconds.min(180))),
+            )
+            .await;
+        if result.is_err() {
+            self.recover_quarantine_provisioner(spec).await?;
+        }
+        let output =
+            result.context("source quarantine provisioning failed; existing data was not reset")?;
+        let report: Value = serde_json::from_str(&output.stdout)?;
+        let reservation = spec.workspace.volume_reservation_bytes()?;
+        let slots = spec.workspace.descriptors()?;
+        if report.get("reservationBytes").and_then(Value::as_u64) != Some(reservation)
+            || !report
+                .get("allocatedBytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|bytes| bytes > 0 && bytes <= reservation)
+            || report
+                .get("files")
+                .and_then(Value::as_object)
+                .map(|files| files.len())
+                != Some(slots.len())
+            || slots.iter().any(|slot| {
+                report
+                    .get("files")
+                    .and_then(|files| files.get(slot.purpose.name()))
+                    .and_then(Value::as_u64)
+                    != Some(slot.blob.size)
+            })
+        {
+            bail!("source quarantine allocation differs from its reservation");
+        }
+        Ok(())
+    }
+
+    async fn fixed_marketplace_volume_job(
+        &self,
+        spec: &FixedMarketplaceVolumeSpec,
+        initialize: bool,
+    ) -> Result<()> {
+        let token = Uuid::new_v4().to_string();
+        let name = format!("elixir-marketplace-storage-{token}");
+        let memory_mb = if initialize { spec.memory_limit_mb } else { 64 };
+        let memory = format!("--memory={memory_mb}m");
+        let swap = format!("--memory-swap={memory_mb}m");
+        let cpu = format!("--cpus=0.{:03}", spec.cpu_millicores);
+        let mut args = [
+            "run",
+            "--rm",
+            "--name",
+            &name,
+            "--pull=never",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            &memory,
+            &swap,
+            &cpu,
+            if initialize {
+                "--pids-limit=32"
+            } else {
+                "--pids-limit=16"
+            },
+            "--log-driver=none",
+            "--shm-size=1m",
+            "--ulimit=core=0:0",
+            "--ulimit=nofile=256:256",
+            "--tmpfs=/tmp:size=8m,noexec,nosuid,nodev",
+            "--label",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        args.push(format!("elixir.marketplace.storage_job={token}"));
+        args.extend([
+            "--label".to_owned(),
+            format!("{ELIXIR_MANAGED_LABEL}=true"),
+            "--user".to_owned(),
+            if initialize { "0:0" } else { "10004:10004" }.to_owned(),
+        ]);
+        if initialize {
+            args.extend(["--cap-add=CHOWN".to_owned()]);
+        }
+        args.extend([
+            "--mount".to_owned(),
+            format!(
+                "type=volume,source={},target=/state,volume-nocopy{}",
+                spec.name,
+                if initialize { "" } else { ",readonly" }
+            ),
+            "--entrypoint=/usr/local/bin/node".to_owned(),
+            spec.image.clone(),
+            format!(
+                "--max-old-space-size={}",
+                if initialize {
+                    (memory_mb / 4).min(48)
+                } else {
+                    16
+                }
+            ),
+            format!(
+                "/opt/elixir-marketplace/src/{}-fixed-state.mjs",
+                if initialize { "initialize" } else { "inspect" }
+            ),
+        ]);
+        let result = self
+            .run_capture_with_timeout(
+                &args,
+                Some(Duration::from_secs(if initialize { 120 } else { 30 })),
+            )
+            .await;
+        if result.is_err() {
+            // A CLI timeout does not prove the container stopped. Remove only
+            // this exact freshly labelled helper, never the persistent volume.
+            if let Ok(value) = self.inspect_container(&name).await {
+                if Self::extract_labels(&value).get("elixir.marketplace.storage_job")
+                    == Some(&token)
+                {
+                    self.run_capture_with_timeout(
+                        &["rm".to_owned(), "-f".to_owned(), name],
+                        Some(Duration::from_secs(10)),
+                    )
+                    .await
+                    .context("stopping failed marketplace storage helper")?;
+                }
+            }
+        }
+        let output = result
+            .context("marketplace storage verification failed; existing data was not reset")?;
+        let report: Value = serde_json::from_str(&output.stdout)
+            .context("invalid marketplace allocation report")?;
+        if report.get("fileBytes").and_then(Value::as_u64) != Some(192 * 1024 * 1024)
+            || !report
+                .get("allocatedBytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|bytes| (384 * 1024 * 1024..=416 * 1024 * 1024).contains(&bytes))
+        {
+            bail!("marketplace allocation exceeds its fixed reservation");
+        }
+        Ok(())
+    }
+
     pub async fn server_version(&self) -> Result<String> {
         let args = vec![
             "version".to_string(),
@@ -310,6 +766,12 @@ impl DockerRuntimeManager {
     }
 
     pub async fn inspect_image_metadata(&self, image: &str) -> Result<DockerImageMetadata> {
+        Ok(Self::image_metadata(
+            &self.inspect_image_value(image).await?,
+        ))
+    }
+
+    async fn inspect_image_value(&self, image: &str) -> Result<Value> {
         let stdout = self
             .run_stdout(&[
                 "image".to_string(),
@@ -319,10 +781,16 @@ impl DockerRuntimeManager {
             .await?;
         let values: Vec<Value> =
             serde_json::from_str(&stdout).context("parsing docker image inspect output")?;
-        let value = values
+        if values.len() != 1 {
+            bail!("docker image inspect did not return exactly one image");
+        }
+        values
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("docker image inspect returned no entries"))?;
+            .ok_or_else(|| anyhow::anyhow!("docker image inspect returned no entries"))
+    }
+
+    fn image_metadata(value: &Value) -> DockerImageMetadata {
         let repo_digests = value
             .get("RepoDigests")
             .and_then(Value::as_array)
@@ -347,10 +815,10 @@ impl DockerRuntimeManager {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        Ok(DockerImageMetadata {
+        DockerImageMetadata {
             repo_digests,
             labels,
-        })
+        }
     }
 
     pub async fn copy_named_volume_path_to_host(
@@ -500,14 +968,34 @@ impl DockerRuntimeManager {
         let args = vec![
             "ps".to_string(),
             "-a".to_string(),
+            "--no-trunc".to_string(),
             "--filter".to_string(),
-            format!("name=^/{}$", name),
+            Self::container_identity_filter(name),
             "--format".to_string(),
             "{{.ID}}".to_string(),
         ];
         let stdout = self.run_stdout(&args).await?;
-        let id = stdout.lines().next().map(|s| s.trim().to_string());
-        Ok(id.filter(|s| !s.is_empty()))
+        Self::parse_container_identity(name, &stdout)
+    }
+
+    fn container_identity_filter(reference: &str) -> String {
+        if immutable_id(reference) {
+            format!("id={reference}")
+        } else {
+            format!("name=^/{reference}$")
+        }
+    }
+
+    fn parse_container_identity(reference: &str, output: &str) -> Result<Option<String>> {
+        let mut rows = output.lines().map(str::trim).filter(|row| !row.is_empty());
+        let id = rows.next();
+        if rows.next().is_some()
+            || id
+                .is_some_and(|id| !immutable_id(id) || (immutable_id(reference) && reference != id))
+        {
+            bail!("container identity lookup did not return one exact immutable identity");
+        }
+        Ok(id.map(str::to_owned))
     }
 
     async fn create_named_volume_helper(
@@ -662,6 +1150,222 @@ impl DockerRuntimeManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn require_quarantine_writer(
+        value: &Value,
+        handle: &ContainerHandle,
+    ) -> Result<ContainerState> {
+        let state = Self::extract_state(value)?;
+        let labels = Self::extract_labels(value);
+        let deployment = labels
+            .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 64
+                    && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            .context("native quarantine deployment is unavailable")?;
+        if !immutable_id(&handle.id)
+            || handle.name != handle.id
+            || state.id != handle.id
+            || state.name != format!("elixir-marketplace-source-writer-{deployment}")
+            || labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || labels
+                .get("elixir.marketplace.isolation")
+                .map(String::as_str)
+                != Some("quarantine-v1")
+            || labels.get(ELIXIR_EXTENSION_ID_LABEL).map(String::as_str)
+                != Some("elixir-marketplace-source")
+            || labels.get(ELIXIR_INSTANCE_ID_LABEL)
+                != Some(&format!("marketplace-source-{deployment}"))
+            || value
+                .pointer("/State/Running")
+                .and_then(Value::as_bool)
+                .is_none()
+            || !matches!(
+                state.status.as_str(),
+                "created" | "running" | "paused" | "exited" | "dead"
+            )
+            || matches!(state.status.as_str(), "running" | "paused") != state.running
+        {
+            bail!("refusing immediate stop of an unowned or ambiguous native quarantine writer");
+        }
+        Ok(state)
+    }
+
+    fn require_source_writer_spec(spec: &ContainerSpec) -> Result<()> {
+        if crate::marketplace::runtime::build::is_command(&spec.command) {
+            crate::marketplace::runtime::build::validate_spec(spec)?;
+            crate::marketplace::runtime::source_writer::SourceWriterIntent::capture(spec)?;
+            container_resource_args(&spec.security)?;
+            return Ok(());
+        }
+        let deployment = spec
+            .labels
+            .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+            .filter(|v| {
+                !v.is_empty()
+                    && v.len() <= 64
+                    && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            .context("source writer deployment missing")?;
+        if spec.name != format!("elixir-marketplace-source-writer-{deployment}")
+            || spec.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || spec
+                .labels
+                .get("elixir.marketplace.isolation")
+                .map(String::as_str)
+                != Some("quarantine-v1")
+            || spec
+                .labels
+                .get(ELIXIR_EXTENSION_ID_LABEL)
+                .map(String::as_str)
+                != Some("elixir-marketplace-source")
+            || spec.labels.get(ELIXIR_INSTANCE_ID_LABEL)
+                != Some(&format!("marketplace-source-{deployment}"))
+            || !crate::marketplace::runtime::image_is_pinned(&spec.image)
+            || spec.network_mode.as_deref() != Some("none")
+            || !spec.aliases.is_empty()
+            || !spec.ports.is_empty()
+            || !spec.env.is_empty()
+            || !spec.cap_add.is_empty()
+            || !spec.devices.is_empty()
+            || !spec.sysctls.is_empty()
+            || spec.volumes.len() != 1
+            || spec.volumes[0].source_kind != VolumeMountSourceKind::NamedVolume
+            || spec.volumes[0].host_path != format!("elixir-marketplace-source-{deployment}")
+            || spec.volumes[0].container_path != "/quarantine"
+            || !spec.security.read_only_rootfs
+            || !spec.security.no_new_privileges
+            || spec.security.user.as_deref() != Some("10004:10004")
+            || !crate::marketplace::runtime::source_writer::supported_command(&spec.command)
+        {
+            bail!("create-only source writer requires its closed offline profile");
+        }
+        container_resource_args(&spec.security)?;
+        Ok(())
+    }
+    fn verify_unstarted_source_writer(
+        value: &Value,
+        handle: &ContainerHandle,
+        spec: &ContainerSpec,
+        limits: &crate::marketplace::runtime::SourceJobLimits,
+    ) -> Result<()> {
+        let state = Self::require_quarantine_writer(value, handle)?;
+        if state.name != spec.name || state.status != "created" || state.running {
+            bail!("source execution requires a never-started immutable container");
+        }
+        Self::verify_source_start_intent(value, spec)?;
+        let actual = Self::extract_runtime_state(value);
+        if crate::marketplace::runtime::build::is_command(&spec.command) {
+            return crate::marketplace::runtime::build::verify_configuration(spec, &actual, limits);
+        }
+        let volume = &spec.volumes[0];
+        crate::marketplace::runtime::verify_quarantine_configuration(
+            spec,
+            &actual,
+            limits,
+            &volume.host_path,
+            spec.security
+                .file_size_limit_bytes
+                .context("source file limit missing")?,
+            volume.read_only,
+        )
+    }
+
+    fn verify_source_start_intent(value: &Value, spec: &ContainerSpec) -> Result<()> {
+        Self::verify_private_start_intent(
+            value,
+            spec,
+            "/opt/elixir-marketplace/bin/elixir-marketplace-launcher",
+        )
+    }
+    fn verify_private_start_intent(
+        value: &Value,
+        spec: &ContainerSpec,
+        entrypoint: &str,
+    ) -> Result<()> {
+        if value.pointer("/Config/Cmd") != Some(&serde_json::to_value(&spec.command)?)
+            || value.pointer("/Config/Entrypoint") != Some(&serde_json::json!([entrypoint]))
+            || value
+                .pointer("/HostConfig/RestartPolicy/Name")
+                .and_then(Value::as_str)
+                != Some("no")
+            || value.pointer("/HostConfig/Init").and_then(Value::as_bool) != Some(false)
+            || value.pointer("/HostConfig/PidMode").and_then(Value::as_str) != Some("")
+            || value.pointer("/HostConfig/IpcMode").and_then(Value::as_str) != Some("private")
+            || !matches!(
+                value
+                    .pointer("/HostConfig/UsernsMode")
+                    .and_then(Value::as_str),
+                Some("" | "private")
+            )
+        {
+            bail!("source start command, launcher or namespace policy differs");
+        }
+        // No image/daemon environment may add process hooks or preload code.
+        // These are the only ambient variables in the pinned worker contract;
+        // extension settings/secrets travel through the private SDK, not OCI.
+        let env = value
+            .pointer("/Config/Env")
+            .and_then(Value::as_array)
+            .context("source environment is unavailable")?;
+        let mut keys = HashSet::new();
+        for item in env {
+            let (key, _) = item
+                .as_str()
+                .and_then(|v| v.split_once('='))
+                .context("source environment is malformed")?;
+            let rust_build = spec
+                .command
+                .first()
+                .is_some_and(|mode| mode == "--build-run")
+                && matches!(key, "RUSTUP_HOME" | "CARGO_HOME" | "RUST_VERSION");
+            if (!matches!(key, "PATH" | "NODE_VERSION" | "YARN_VERSION") && !rust_build)
+                || !keys.insert(key)
+            {
+                bail!("source environment contains an unexpected or duplicate setting");
+            }
+        }
+        for pointer in ["/HostConfig/Devices", "/HostConfig/DeviceRequests"] {
+            if !matches!(value.pointer(pointer), Some(Value::Null))
+                && !value
+                    .pointer(pointer)
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            {
+                bail!("source start contains unapproved host devices");
+            }
+        }
+        // Docker's `Binds` also encodes named volumes supplied with -v. Match
+        // the exact desired mapping, not merely an empty field. The independent
+        // actual-Mounts check still requires type=volume and this volume name;
+        // a host bind at the same destination is never accepted.
+        let binds = match value.pointer("/HostConfig/Binds") {
+            Some(Value::Null) => Vec::new(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("invalid source mount mapping")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => bail!("source mount mapping is unavailable"),
+        };
+        if binds != spec.volumes.iter().map(format_volume).collect::<Vec<_>>() {
+            bail!("source mount mapping differs from its exact approved volume");
+        }
+        match value.pointer("/HostConfig/Sysctls") {
+            // Docker omits its empty optional sysctls map. This is the OCI
+            // empty configuration, not a missing kernel/state measurement.
+            None | Some(Value::Null) => {}
+            Some(Value::Object(values)) if values.is_empty() => {}
+            _ => bail!("source start contains unexpected sysctls"),
+        }
+        Ok(())
     }
 
     fn extract_mounts(value: &Value) -> Vec<ContainerMount> {
@@ -826,8 +1530,101 @@ impl DockerRuntimeManager {
             .pointer("/HostConfig/NanoCpus")
             .and_then(Value::as_i64)
             .filter(|value| *value > 0);
+        let memory_swap_limit_bytes = value
+            .pointer("/HostConfig/MemorySwap")
+            .and_then(Value::as_i64);
+        let shared_memory_bytes = value.pointer("/HostConfig/ShmSize").and_then(Value::as_i64);
+        let privileged = value
+            .pointer("/HostConfig/Privileged")
+            .and_then(Value::as_bool);
+        let cap_add = value
+            .pointer("/HostConfig/CapAdd")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let log_config = value.pointer("/HostConfig/LogConfig").and_then(|config| {
+            let driver = config.get("Type")?.as_str()?.to_owned();
+            let options = config
+                .get("Config")?
+                .as_object()?
+                .iter()
+                .map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            Some(ContainerRuntimeLogConfig { driver, options })
+        });
+        let core_limits = value
+            .pointer("/HostConfig/Ulimits")
+            .and_then(Value::as_array)
+            .map(|limits| {
+                limits
+                    .iter()
+                    .filter(|limit| limit.get("Name").and_then(Value::as_str) == Some("core"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let core_dump_limit = if core_limits.len() == 1 {
+            core_limits[0]
+                .get("Soft")
+                .and_then(Value::as_i64)
+                .zip(core_limits[0].get("Hard").and_then(Value::as_i64))
+                .map(|(soft, hard)| ContainerRuntimeUlimit { soft, hard })
+        } else {
+            None
+        };
+        let file_limits = value
+            .pointer("/HostConfig/Ulimits")
+            .and_then(Value::as_array)
+            .map(|limits| {
+                limits
+                    .iter()
+                    .filter(|limit| limit.get("Name").and_then(Value::as_str) == Some("nofile"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let open_files_limit = if file_limits.len() == 1 {
+            file_limits[0]
+                .get("Soft")
+                .and_then(Value::as_i64)
+                .zip(file_limits[0].get("Hard").and_then(Value::as_i64))
+                .map(|(soft, hard)| ContainerRuntimeUlimit { soft, hard })
+        } else {
+            None
+        };
+        let size_limits = value
+            .pointer("/HostConfig/Ulimits")
+            .and_then(Value::as_array)
+            .map(|limits| {
+                limits
+                    .iter()
+                    .filter(|limit| limit.get("Name").and_then(Value::as_str) == Some("fsize"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let file_size_limit = if size_limits.len() == 1 {
+            size_limits[0]
+                .get("Soft")
+                .and_then(Value::as_i64)
+                .zip(size_limits[0].get("Hard").and_then(Value::as_i64))
+                .map(|(soft, hard)| ContainerRuntimeUlimit { soft, hard })
+        } else {
+            None
+        };
 
         ContainerRuntimeSecurityState {
+            image_reference: value
+                .pointer("/Config/Image")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            image_id: value
+                .get("Image")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             user,
             read_only_rootfs,
             no_new_privileges,
@@ -838,6 +1635,16 @@ impl DockerRuntimeManager {
             nano_cpus,
             seccomp_profile,
             apparmor_profile,
+            memory_swap_limit_bytes,
+            log_config,
+            shared_memory_bytes,
+            core_dump_limit,
+            open_files_limit,
+            file_size_limit,
+            stdin_open: value.pointer("/Config/OpenStdin").and_then(Value::as_bool),
+            tty: value.pointer("/Config/Tty").and_then(Value::as_bool),
+            privileged,
+            cap_add,
         }
     }
 
@@ -883,6 +1690,132 @@ impl DockerRuntimeManager {
             published_ports: Self::extract_published_ports(value),
             security: Self::extract_runtime_security(value),
         }
+    }
+
+    fn extract_private_actor(value: &Value) -> Result<PrivateActorInspection> {
+        fn strings(value: &Value, path: &str) -> Result<Vec<String>> {
+            match value.pointer(path).context("missing private actor array")? {
+                Value::Null => Ok(vec![]),
+                Value::Array(values) => values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("invalid private actor array")
+                    })
+                    .collect(),
+                _ => bail!("invalid private actor array"),
+            }
+        }
+        fn count(value: &Value, path: &str) -> Result<usize> {
+            match value.pointer(path).unwrap_or(&Value::Null) {
+                Value::Null => Ok(0),
+                Value::Array(values) => Ok(values.len()),
+                _ => bail!("invalid private actor collection"),
+            }
+        }
+        let text = |path: &str| {
+            value
+                .pointer(path)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("missing private actor setting")
+        };
+        let state = Self::extract_state(value)?;
+        // Do not let the general compatibility parser discard malformed caps.
+        strings(value, "/HostConfig/CapAdd")?;
+        strings(value, "/HostConfig/CapDrop")?;
+        if strings(value, "/HostConfig/SecurityOpt")?
+            .iter()
+            .any(|option| {
+                !matches!(
+                    option.as_str(),
+                    "no-new-privileges" | "no-new-privileges:true"
+                )
+            })
+        {
+            bail!("private actor has unexpected security options");
+        }
+        match value.pointer("/HostConfig/Tmpfs").unwrap_or(&Value::Null) {
+            Value::Null => {}
+            Value::Object(values) if values.is_empty() => {}
+            _ => bail!("private actor may not have tmpfs mounts"),
+        }
+        value
+            .pointer("/State/Running")
+            .and_then(Value::as_bool)
+            .context("missing private actor running state")?;
+        let sysctls = match value.pointer("/HostConfig/Sysctls").unwrap_or(&Value::Null) {
+            Value::Null => BTreeMap::new(),
+            Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        value
+                            .as_str()
+                            .context("invalid private actor sysctl")?
+                            .to_owned(),
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            _ => bail!("invalid private actor sysctls"),
+        };
+        let network_rows = value
+            .pointer("/NetworkSettings/Networks")
+            .and_then(Value::as_object)
+            .context("missing private actor networks")?;
+        if network_rows.len() > 2 {
+            bail!("unexpected private actor network count");
+        }
+        let attachment_ids = |field: &str| -> Result<BTreeMap<String, String>> {
+            network_rows
+                .iter()
+                .map(|(name, row)| {
+                    let row = row
+                        .as_object()
+                        .context("invalid private actor network attachment")?;
+                    let id = match row.get(field) {
+                        None | Some(Value::Null) => String::new(),
+                        Some(Value::String(value)) => value.clone(),
+                        _ => bail!("invalid private actor network identity"),
+                    };
+                    Ok((name.clone(), id))
+                })
+                .collect()
+        };
+        let network_ids = attachment_ids("NetworkID")?;
+        let endpoint_ids = attachment_ids("EndpointID")?;
+        let mut networks = network_rows.keys().cloned().collect::<Vec<_>>();
+        networks.sort();
+        if !value
+            .get("Mounts")
+            .and_then(Value::as_array)
+            .context("missing private actor mounts")?
+            .is_empty()
+        {
+            bail!("private actor may not have mounts");
+        }
+        Ok(PrivateActorInspection {
+            id: state.id,
+            running: state.running,
+            runtime: Self::extract_runtime_state(value),
+            command: strings(value, "/Config/Cmd")?,
+            entrypoint: strings(value, "/Config/Entrypoint")?,
+            environment: strings(value, "/Config/Env")?,
+            pid_mode: text("/HostConfig/PidMode")?,
+            ipc_mode: text("/HostConfig/IpcMode")?,
+            userns_mode: text("/HostConfig/UsernsMode")?,
+            device_count: count(value, "/HostConfig/Devices")?,
+            device_request_count: count(value, "/HostConfig/DeviceRequests")?,
+            bind_count: count(value, "/HostConfig/Binds")?,
+            sysctls,
+            networks,
+            network_ids,
+            endpoint_ids,
+            restart_policy: text("/HostConfig/RestartPolicy/Name")?,
+        })
     }
 
     fn mount_matches(desired: &VolumeMount, actual: &ContainerMount) -> bool {
@@ -1023,6 +1956,20 @@ impl DockerRuntimeManager {
         &self,
         container_name: &str,
     ) -> Result<Option<ContainerRuntimeState>> {
+        // Immutable handles must not be resolved through Docker's *name*
+        // filter, nor inspected through a reusable name after a separate check.
+        // Preserve the existing optional-name API for ordinary callers.
+        if container_name.len() == 64
+            && container_name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            let inspect = self.inspect_container(container_name).await?;
+            if Self::extract_state(&inspect)?.id != container_name {
+                bail!("immutable container inspection identity differs");
+            }
+            return Ok(Some(Self::extract_runtime_state(&inspect)));
+        }
         if self.find_container_id(container_name).await?.is_none() {
             return Ok(None);
         }
@@ -1400,14 +2347,67 @@ impl DockerRuntimeManager {
     }
 
     async fn create_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
+        self.create_container_mode(spec, true).await
+    }
+    async fn create_container_mode(
+        &self,
+        spec: &ContainerSpec,
+        start: bool,
+    ) -> Result<ContainerHandle> {
+        self.create_container_entrypoint(spec, start, None).await
+    }
+    async fn create_container_entrypoint(
+        &self,
+        spec: &ContainerSpec,
+        start: bool,
+        entrypoint: Option<&str>,
+    ) -> Result<ContainerHandle> {
         Self::ensure_required_labels(&spec.labels)?;
+        let resource_args = container_resource_args(&spec.security)?;
 
-        let mut args = vec![
-            "run".to_string(),
-            "-d".to_string(),
-            "--name".to_string(),
-            spec.name.clone(),
-        ];
+        let mut args = if start {
+            vec!["run".to_owned(), "-d".to_owned()]
+        } else {
+            vec!["create".to_owned()]
+        };
+        args.extend(["--name".to_owned(), spec.name.clone()]);
+        if matches!(
+            spec.labels
+                .get("elixir.marketplace.isolation")
+                .map(String::as_str),
+            Some(
+                "fixed-v1"
+                    | "quarantine-v1"
+                    | "packet-v1"
+                    | "measurement-v1"
+                    | "application-http-v1"
+                    | "application-gateway-v1"
+                    | "provider-v1"
+            )
+        ) {
+            args.push("--pull=never".to_owned());
+        }
+        if !spec.security.init_process
+            && matches!(
+                spec.labels
+                    .get("elixir.marketplace.isolation")
+                    .map(String::as_str),
+                Some(
+                    "quarantine-v1"
+                        | "packet-v1"
+                        | "measurement-v1"
+                        | "application-http-v1"
+                        | "application-gateway-v1"
+                )
+            )
+        {
+            // Preserve legacy native topology, never a daemon-global default.
+            // An explicitly fingerprinted reaper is selected via resource_args.
+            args.push("--init=false".to_owned());
+        }
+        if let Some(entrypoint) = entrypoint {
+            args.extend(["--entrypoint".to_owned(), entrypoint.to_owned()]);
+        }
 
         if let Some(network_mode) = spec.network_mode.as_ref() {
             args.push("--network".to_string());
@@ -1515,6 +2515,7 @@ impl DockerRuntimeManager {
             args.push("--memory".to_string());
             args.push(format!("{memory_limit_mb}m"));
         }
+        args.extend(resource_args);
 
         if let Some(pids_limit) = spec.security.pids_limit {
             args.push("--pids-limit".to_string());
@@ -1546,8 +2547,8 @@ impl DockerRuntimeManager {
 
         let stdout = self.run_stdout(&args).await?;
         let id = stdout.lines().next().unwrap_or_default().to_string();
-        if id.trim().is_empty() {
-            bail!("docker run did not return a container id");
+        if id.trim().is_empty() || (!start && !immutable_id(&id)) {
+            bail!("native container creation omitted its required identity");
         }
 
         Ok(ContainerHandle {
@@ -1642,10 +2643,768 @@ impl DockerRuntimeManager {
     }
 }
 
+/// Only these fixed entry points may run as the independent helper UID.
+/// No peer/request can supply a command, environment, UID or image feature.
+enum IndependentMarketplaceFetch<'a> {
+    Connectivity,
+    SourcePreflight,
+    RadicleSource,
+    SdkHttp,
+    SdkHttpStream,
+    Metadata(&'a [elixir_marketplace::identity::PublicKey]),
+    Security(&'a [elixir_marketplace::identity::PublicKey]),
+    Evidence(&'a [elixir_marketplace::identity::PublicKey]),
+}
+impl IndependentMarketplaceFetch<'_> {
+    fn supports_feature(&self, actual: Option<&str>, exact: &str) -> bool {
+        match self {
+            Self::Metadata(_) => matches!(actual, Some("1" | "2" | "3")),
+            Self::Security(_) => matches!(actual, Some("2" | "3")),
+            Self::Evidence(_) => actual == Some("3"),
+            _ => actual == Some(exact),
+        }
+    }
+}
+impl DockerRuntimeManager {
+    async fn exec_independent_marketplace_fetch(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+        purpose: IndependentMarketplaceFetch<'_>,
+    ) -> Result<PrivateProcessStdio> {
+        if !immutable_id(&handle.id)
+            || required.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || required
+                .get("elixir.marketplace.isolation")
+                .map(String::as_str)
+                != Some("fixed-v1")
+            || !required.contains_key(CONTAINER_SPEC_HASH_LABEL)
+        {
+            bail!("independent fetch requires a specific managed marketplace worker");
+        }
+        let value = self.inspect_container(&handle.id).await?;
+        let state = Self::extract_state(&value)?;
+        let labels = Self::extract_labels(&value);
+        let security = Self::extract_runtime_security(&value);
+        let network = value
+            .pointer("/HostConfig/NetworkMode")
+            .and_then(Value::as_str);
+        let isolated = network == Some("none")
+            || network
+                .and_then(|mode| mode.strip_prefix("container:"))
+                .is_some_and(immutable_id);
+        if state.id != handle.id
+            || state.name != handle.name
+            || !state.running
+            || required
+                .iter()
+                .any(|(key, value)| labels.get(key) != Some(value))
+            || !isolated
+            || value.pointer("/HostConfig/PidMode").and_then(Value::as_str) != Some("")
+            || security.user.as_deref() != Some("10004:10004")
+            || !security.read_only_rootfs
+            || !security.no_new_privileges
+            || security.privileged != Some(false)
+            || !security.cap_add.is_empty()
+            || !security
+                .cap_drop
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case("ALL"))
+            || security.tty != Some(false)
+        {
+            bail!("independent fetch worker identity or isolation differs");
+        }
+        let image = value
+            .get("Image")
+            .and_then(Value::as_str)
+            .context("missing fetch image identity")?;
+        if !image.strip_prefix("sha256:").is_some_and(immutable_id) {
+            bail!("independent fetch image is not immutable");
+        }
+        let (feature, version, argument) = match purpose {
+            IndependentMarketplaceFetch::Connectivity => (
+                "elixir.marketplace.worker.connectivity_probe",
+                "2",
+                "--connectivity-probe",
+            ),
+            IndependentMarketplaceFetch::SourcePreflight => (
+                "elixir.marketplace.worker.source_preflight",
+                "2",
+                "--source-preflight",
+            ),
+            IndependentMarketplaceFetch::RadicleSource => (
+                "elixir.marketplace.worker.radicle_source",
+                "2",
+                "--radicle-source",
+            ),
+            IndependentMarketplaceFetch::SdkHttp => {
+                ("elixir.marketplace.worker.sdk_http", "1", "--sdk-http")
+            }
+            IndependentMarketplaceFetch::SdkHttpStream => (
+                "elixir.marketplace.worker.sdk_http_stream",
+                "1",
+                "--sdk-http-stream",
+            ),
+            IndependentMarketplaceFetch::Metadata(keys)
+            | IndependentMarketplaceFetch::Security(keys)
+            | IndependentMarketplaceFetch::Evidence(keys) => {
+                if !(1..=4).contains(&keys.len()) {
+                    bail!("invalid independent metadata issuer keys");
+                }
+                // Bind the independent helper to this worker's actual configured
+                // issuer scope, never keys from a candidate or peer response.
+                let command = value
+                    .pointer("/Config/Cmd")
+                    .and_then(Value::as_array)
+                    .context("missing metadata worker configuration")?;
+                if command.len() > 12 || command.len() % 2 != 0 {
+                    bail!("invalid metadata worker configuration");
+                }
+                let configured = command
+                    .chunks_exact(2)
+                    .filter(|pair| pair[0].as_str() == Some("--issuer-key"))
+                    .map(|pair| {
+                        pair[1]
+                            .as_str()
+                            .context("invalid configured issuer key")?
+                            .parse::<elixir_marketplace::identity::PublicKey>()
+                            .map_err(Into::into)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if configured != keys {
+                    bail!("independent metadata issuer keys differ from worker");
+                }
+                elixir_marketplace::evidence::IssuerPolicy::new(keys.iter().copied())?;
+                (
+                    "elixir.marketplace.worker.metadata_verifier",
+                    if matches!(purpose, IndependentMarketplaceFetch::Evidence(_)) {
+                        "3"
+                    } else if matches!(purpose, IndependentMarketplaceFetch::Security(_)) {
+                        "2"
+                    } else {
+                        "1"
+                    },
+                    "--metadata-verifier",
+                )
+            }
+        };
+        let features = self.image_labels(image).await?;
+        let actual = features.get(feature).map(String::as_str);
+        if !purpose.supports_feature(actual, version) {
+            bail!("marketplace image lacks the independent fetch feature");
+        }
+        let mut command = Command::new(&self.docker_bin);
+        command.args([
+            "exec",
+            "-i",
+            "--user",
+            "10005:10005",
+            &handle.id,
+            "/opt/elixir-marketplace/bin/elixir-marketplace-launcher",
+            argument,
+        ]);
+        if let IndependentMarketplaceFetch::Metadata(keys)
+        | IndependentMarketplaceFetch::Security(keys)
+        | IndependentMarketplaceFetch::Evidence(keys) = purpose
+        {
+            for key in keys {
+                command.args(["--issuer-key", &key.to_string()]);
+            }
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        Ok(PrivateProcessStdio {
+            input: child.stdin.take().context("missing fetch stdin")?,
+            output: child.stdout.take().context("missing fetch stdout")?,
+            diagnostics: Some(child.stderr.take().context("missing fetch stderr")?),
+            child,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl RuntimeManager for DockerRuntimeManager {
+    #[cfg(unix)]
+    fn marketplace_import_profile(&self)->Option<std::sync::Arc<crate::runtime::image_import::Profile>> {self.import_profile.clone()}
+    async fn marketplace_daemon_id(&self)->Result<String> {self.image_import_daemon_id().await}
+    async fn inspect_marketplace_import_image(&self,image:elixir_marketplace::identity::Digest)->Result<Vec<u8>> {self.image_import_inspect(image).await}
+    #[cfg(unix)]
+    async fn provider_transport(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<crate::runtime::provider_observation::ProviderTransport> {
+        self.observe_provider_transport(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn probe_provider_exit(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+        ipv6: bool,
+    ) -> Result<()> {
+        self.observe_provider_exit(handle, profile, ipv6).await
+    }
+    #[cfg(unix)]
+    async fn provider_namespace(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<u64> {
+        self.provider_native_namespace(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn create_provider_worker(
+        &self,
+        profile: &crate::marketplace::provider::WorkerProfile,
+        attempt: crate::marketplace::provider::WorkerCreateAttempt,
+    ) -> Result<crate::runtime::provider_creation::WorkerCreation> {
+        self.create_provider_worker_actor(profile, attempt).await
+    }
+    #[cfg(unix)]
+    async fn launch_provider_worker(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::WorkerProfile,
+        attempt: crate::marketplace::provider::WorkerStartAttempt,
+    ) -> Result<PrivateProcessStdio> {
+        self.launch_provider_worker_actor(handle, profile, attempt)
+            .await
+    }
+    #[cfg(unix)]
+    async fn inspect_unstarted_provider_worker(
+        &self,
+        profile: &crate::marketplace::provider::WorkerProfile,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_provider_worker_actor(profile).await
+    }
+    #[cfg(unix)]
+    async fn stop_provider_worker(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::WorkerProfile,
+    ) -> Result<()> {
+        self.stop_provider_worker_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn remove_provider_worker(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::WorkerProfile,
+    ) -> Result<()> {
+        self.remove_provider_worker_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn create_provider_guard(
+        &self,
+        profile: &crate::marketplace::provider::GuardProfile,
+        attempt: crate::marketplace::provider::GuardCreateAttempt,
+    ) -> Result<crate::runtime::provider_creation::GuardCreation> {
+        self.create_provider_guard_actor(profile, attempt).await
+    }
+    #[cfg(unix)]
+    async fn launch_provider_guard(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::GuardProfile,
+        attempt: crate::marketplace::provider::GuardStartAttempt,
+    ) -> Result<PrivateProcessStdio> {
+        self.launch_provider_guard_actor(handle, profile, attempt)
+            .await
+    }
+    #[cfg(unix)]
+    async fn inspect_provider_guard(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::GuardProfile,
+    ) -> Result<PrivateActorInspection> {
+        self.inspect_provider_guard_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn inspect_unstarted_provider_guard(
+        &self,
+        profile: &crate::marketplace::provider::GuardProfile,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_provider_guard_actor(profile).await
+    }
+    #[cfg(unix)]
+    async fn stop_provider_guard(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::GuardProfile,
+    ) -> Result<()> {
+        self.stop_provider_guard_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn remove_provider_guard(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::GuardProfile,
+    ) -> Result<()> {
+        self.remove_provider_guard_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn create_provider(
+        &self,
+        profile: &crate::marketplace::provider::Profile,
+        attempt: crate::marketplace::provider::CreateAttempt,
+    ) -> Result<crate::runtime::provider_creation::ProviderCreation> {
+        self.create_provider_actor(profile, attempt).await
+    }
+    #[cfg(unix)]
+    async fn launch_provider(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+        attempt: crate::marketplace::provider::StartAttempt,
+    ) -> Result<PrivateProcessStdio> {
+        self.launch_provider_actor(handle, profile, attempt).await
+    }
+    #[cfg(unix)]
+    async fn inspect_provider(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<ContainerState> {
+        self.inspect_provider_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn inspect_unstarted_provider(
+        &self,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_provider_actor(profile).await
+    }
+    #[cfg(unix)]
+    async fn stop_provider(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<()> {
+        self.stop_provider_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn remove_provider(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::provider::Profile,
+    ) -> Result<()> {
+        self.remove_provider_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn create_application_gateway(
+        &self,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+        attempt: crate::marketplace::application_egress::GatewayCreateAttempt,
+    ) -> Result<crate::runtime::gateway_creation::GatewayCreation> {
+        self.create_application_gateway_actor(profile, attempt)
+            .await
+    }
+    #[cfg(unix)]
+    async fn start_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<()> {
+        self.start_application_gateway_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn inspect_unstarted_application_gateway(
+        &self,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_application_gateway_actor(profile)
+            .await
+    }
+    #[cfg(unix)]
+    async fn attach_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<PrivateProcessStdio> {
+        self.attach_application_gateway_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn stop_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<()> {
+        self.stop_application_gateway_actor(handle, profile).await
+    }
+    #[cfg(unix)]
+    async fn observe_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<crate::marketplace::application_egress::ApplicationGatewayObservation> {
+        self.observe_application_gateway_actor(handle, profile, None)
+            .await
+    }
+    #[cfg(unix)]
+    async fn observe_unchanged_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+        original: &crate::marketplace::application_egress::ApplicationGatewayObservation,
+    ) -> Result<crate::marketplace::application_egress::ApplicationGatewayObservation> {
+        self.observe_application_gateway_actor(handle, profile, Some(original))
+            .await
+    }
+    #[cfg(unix)]
+    async fn remove_application_gateway(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::application_egress::ApplicationGatewayProfile,
+    ) -> Result<()> {
+        self.remove_application_gateway_actor(handle, profile).await
+    }
+    async fn create_application_http(
+        &self,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+        attempt: crate::marketplace::runtime::application_http::HttpCreateAttempt,
+    ) -> Result<crate::runtime::http_creation::HttpCreation> {
+        self.create_application_http_actor(profile, attempt).await
+    }
+    async fn start_application_http(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<()> {
+        self.start_application_http_actor(handle, profile).await
+    }
+    async fn inspect_unstarted_application_http(
+        &self,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_application_http_actor(profile).await
+    }
+    async fn attach_application_http(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<PrivateProcessStdio> {
+        self.attach_application_http_actor(handle, profile).await
+    }
+    async fn confirm_application_http_success(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<()> {
+        self.confirm_application_http_actor(handle, profile).await
+    }
+    async fn stop_application_http(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<()> {
+        self.stop_application_http_actor(handle, profile).await
+    }
+    async fn remove_application_http(
+        &self,
+        handle: &ContainerHandle,
+        profile: &crate::marketplace::runtime::application_http::ApplicationHttpProfile,
+    ) -> Result<()> {
+        self.remove_application_http_actor(handle, profile).await
+    }
+    async fn create_host_measurement(
+        &self,
+        spec: &crate::runtime::measurement::MeasurementSpec,
+    ) -> Result<ContainerHandle> {
+        self.create_measurement_actor(spec).await
+    }
+    async fn start_host_measurement(
+        &self,
+        handle: &ContainerHandle,
+        spec: &crate::runtime::measurement::MeasurementSpec,
+    ) -> Result<()> {
+        self.start_measurement_actor(handle, spec).await
+    }
+    async fn confirm_host_measurement_success(
+        &self,
+        handle: &ContainerHandle,
+        spec: &crate::runtime::measurement::MeasurementSpec,
+    ) -> Result<()> {
+        let value = self.inspect_container(&handle.id).await?;
+        Self::require_measurement_actor(
+            &value,
+            &ContainerHandle {
+                id: handle.id.clone(),
+                name: handle.id.clone(),
+            },
+        )?;
+        Self::verify_private_native_exit(&value, handle, &spec.spec().labels)
+    }
+    async fn stop_host_measurement(&self, handle: &ContainerHandle) -> Result<()> {
+        self.stop_measurement_actor(handle).await
+    }
+    async fn inspect_packet_uplink(
+        &self,
+        reference: &str,
+    ) -> Result<Option<PacketNetworkInspection>> {
+        if !immutable_id(reference)
+            && (!reference.starts_with("elixir-marketplace-uplink-")
+                || reference.len() > 100
+                || !reference
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            bail!("invalid marketplace network reference");
+        }
+        let args = vec![
+            "network".to_owned(),
+            "inspect".to_owned(),
+            "--format".to_owned(),
+            "{{json .}}".to_owned(),
+            reference.to_owned(),
+        ];
+        let (status, out, err) = self.packet_network_capture(&args).await?;
+        if !status.success() {
+            if err.contains("No such network")
+                || err.contains(&format!("network {reference} not found"))
+            {
+                return Ok(None);
+            }
+            bail!("marketplace network inspection failed");
+        }
+        let actual = PacketNetworkInspection::parse(&serde_json::from_str(&out)?)?;
+        if (immutable_id(reference) && actual.id != reference)
+            || (!immutable_id(reference) && actual.name != reference)
+        {
+            bail!("marketplace network identity differs");
+        }
+        Ok(Some(actual))
+    }
+    async fn ensure_packet_uplink(
+        &self,
+        spec: &PacketNetworkSpec,
+    ) -> Result<PacketNetworkInspection> {
+        if let Some(actual) = self.inspect_packet_uplink(spec.name()).await? {
+            spec.verify(&actual)?;
+            return Ok(actual);
+        }
+        let mut args = vec![
+            "network".to_owned(),
+            "create".to_owned(),
+            "--driver=bridge".to_owned(),
+            "--ipv4=true".to_owned(),
+            format!("--ipv6={}", spec.ipv6()),
+        ];
+        if spec.internal() {
+            args.push("--internal".to_owned());
+        }
+        for (key, value) in spec.options() {
+            args.extend(["--opt".to_owned(), format!("{key}={value}")]);
+        }
+        let mut labels = spec.labels().into_iter().collect::<Vec<_>>();
+        labels.sort();
+        for (key, value) in labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        args.push(spec.name().to_owned());
+        let (status, out, _) = self.packet_network_capture(&args).await?;
+        if !status.success() {
+            bail!("marketplace network creation failed; no replacement attempted");
+        }
+        let id = out.trim();
+        if !immutable_id(id) {
+            bail!("marketplace network creation omitted immutable ID");
+        }
+        let actual = self
+            .inspect_packet_uplink(id)
+            .await?
+            .context("created marketplace network missing")?;
+        spec.verify(&actual)?;
+        if !actual.members.is_empty() {
+            bail!("created marketplace network has unexpected members");
+        }
+        Ok(actual)
+    }
+    async fn remove_packet_uplink(&self, spec: &PacketNetworkSpec, id: &str) -> Result<()> {
+        if !immutable_id(id) {
+            bail!("marketplace network removal requires immutable ID");
+        }
+        let Some(actual) = self.inspect_packet_uplink(id).await? else {
+            return Ok(());
+        };
+        spec.verify(&actual)?;
+        if !actual.members.is_empty() {
+            bail!("cannot remove an occupied marketplace uplink");
+        }
+        let (status, _, _) = self
+            .packet_network_capture(&["network".to_owned(), "rm".to_owned(), id.to_owned()])
+            .await?;
+        if !status.success() {
+            bail!("marketplace network removal failed");
+        }
+        Ok(())
+    }
+    async fn create_isolated_packet_actor(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
+        let mode = spec
+            .network_mode
+            .as_deref()
+            .context("packet actor requires explicit namespace")?;
+        if mode != "none" {
+            if !immutable_id(mode)
+                || spec
+                    .labels
+                    .get("elixir.marketplace.packet.uplink")
+                    .map(String::as_str)
+                    != Some(mode)
+            {
+                bail!("packet actor requires its immutable owned uplink");
+            }
+            let actual = self
+                .inspect_packet_uplink(mode)
+                .await?
+                .context("packet uplink missing")?;
+            let deployment = spec
+                .labels
+                .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                .context("missing uplink deployment")?;
+            PacketNetworkSpec::new(deployment, actual.ipv6, actual.internal)?.verify(&actual)?;
+            if !actual.members.is_empty() {
+                bail!("packet actor uplink is occupied");
+            }
+        }
+        if spec
+            .labels
+            .get("elixir.marketplace.isolation")
+            .map(String::as_str)
+            != Some("packet-v1")
+            || spec.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+        {
+            bail!("packet actor creation requires the isolated managed profile");
+        }
+        // Never perform general conflicting-container cleanup or replacement.
+        // A racing create/name collision fails; the caller owns recovery.
+        self.create_container(spec).await
+    }
+
+    async fn create_quarantine_marketplace_writer(
+        &self,
+        spec: &ContainerSpec,
+    ) -> Result<ContainerHandle> {
+        Self::require_source_writer_spec(spec)?;
+        // No general conflict cleanup, implicit restart, image pull or network
+        // creation. Reuse this attempt's name only after positive stopped and
+        // managed-role inspection of the previous immutable writer.
+        if let Some(old) = self.get_container_handle(&spec.name).await? {
+            let value = self.inspect_container(&old.id).await?;
+            let identity = ContainerHandle {
+                id: old.id.clone(),
+                name: old.id.clone(),
+            };
+            let state = Self::require_quarantine_writer(&value, &identity)?;
+            let labels = Self::extract_labels(&value);
+            if state.name != spec.name
+                || state.running
+                || labels.get(ELIXIR_DEPLOYMENT_ID_LABEL)
+                    != spec.labels.get(ELIXIR_DEPLOYMENT_ID_LABEL)
+            {
+                bail!("source create refuses a running or different owned writer");
+            }
+            self.remove_container(&identity).await?;
+        }
+        // Return the CID immediately, before further inspection can fail.
+        self.create_container_mode(spec, false).await
+    }
+
+    async fn start_quarantine_marketplace_writer(
+        &self,
+        handle: &ContainerHandle,
+        spec: &ContainerSpec,
+        limits: &crate::marketplace::runtime::SourceJobLimits,
+    ) -> Result<()> {
+        Self::require_source_writer_spec(spec)?;
+        limits.validate()?;
+        let value = self.inspect_container(&handle.id).await?;
+        Self::verify_unstarted_source_writer(&value, handle, spec, limits)?;
+        self.run_capture(&["start".to_owned(), handle.id.clone()])
+            .await?;
+        Ok(())
+    }
+    async fn inspect_unstarted_quarantine_marketplace_writer(
+        &self,
+        intent: &crate::marketplace::runtime::source_writer::SourceWriterIntent,
+    ) -> Result<ContainerHandle> {
+        self.inspect_unstarted_source_creation(intent).await
+    }
+    async fn inspect_private_actor(
+        &self,
+        handle: &ContainerHandle,
+    ) -> Result<PrivateActorInspection> {
+        if handle.id.len() != 64
+            || !handle
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("private actor inspection requires an immutable container ID");
+        }
+        let value = self.inspect_container(&handle.id).await?;
+        let result = Self::extract_private_actor(&value)?;
+        if result.id != handle.id || result.runtime.name != handle.name {
+            bail!("private actor identity changed");
+        }
+        Ok(result)
+    }
     async fn image_labels(&self, image: &str) -> Result<HashMap<String, String>> {
-        Ok(self.inspect_image_metadata(image).await?.labels)
+        if !image_labels::immutable_reference(image) {
+            return Ok(self.inspect_image_metadata(image).await?.labels);
+        }
+        // Only image configuration is immutable. This is deliberately not a
+        // cache of running containers, native profiles, ownership or authority.
+        // Serialize a miss so concurrent source/HTTP owners share one query.
+        let mut cache = self.immutable_image_labels.lock().await;
+        if let Some(labels) = cache.get(image) {
+            return Ok(labels);
+        }
+        let actual = self.inspect_image_value(image).await?;
+        image_labels::require_identity(image, &actual)?;
+        let labels = Self::image_metadata(&actual).labels;
+        cache.insert(image, &labels);
+        Ok(labels)
+    }
+    async fn local_image_id(&self, reference: &str) -> Result<String> {
+        if reference.is_empty()
+            || reference.len() > 512
+            || reference.starts_with('-')
+            || !reference.is_ascii()
+            || reference
+                .bytes()
+                .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            || (reference.starts_with("sha256:")
+                && !reference.strip_prefix("sha256:").is_some_and(immutable_id))
+        {
+            bail!("invalid local platform image reference");
+        }
+        let output = self
+            .run_stdout_with_timeout(
+                &[
+                    "image".into(),
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.Id}}".into(),
+                    "--".into(),
+                    reference.into(),
+                ],
+                DOCKER_PROBE_COMMAND_TIMEOUT,
+            )
+            .await?;
+        let id = output.trim();
+        if !id
+            .strip_prefix("sha256:")
+            .is_some_and(crate::runtime::packet_network::immutable_id)
+            || (reference.starts_with("sha256:") && reference != id)
+        {
+            bail!("local platform image identity is not exact");
+        }
+        Ok(id.to_owned())
     }
 
     async fn ensure_network(&self, name: &str) -> Result<()> {
@@ -1674,6 +3433,8 @@ impl RuntimeManager for DockerRuntimeManager {
     }
 
     async fn ensure_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
+        // Validate before any network creation or managed-container replacement.
+        container_resource_args(&spec.security)?;
         if spec.name.trim().is_empty() {
             bail!("container name is required");
         }
@@ -1932,6 +3693,306 @@ impl RuntimeManager for DockerRuntimeManager {
         Ok(())
     }
 
+    async fn ensure_fixed_marketplace_volume(
+        &self,
+        spec: &FixedMarketplaceVolumeSpec,
+    ) -> Result<()> {
+        Self::validate_fixed_marketplace_volume_spec(spec)?;
+        let image = self.inspect_image_metadata(&spec.image).await?;
+        if image
+            .labels
+            .get("elixir.marketplace.worker.schema")
+            .map(String::as_str)
+            != Some("1")
+            || image
+                .labels
+                .get("elixir.marketplace.worker.fixed_state")
+                .map(String::as_str)
+                != Some("1")
+        {
+            bail!("immutable image does not declare the fixed marketplace storage contract");
+        }
+        if let Some(existing) = self.inspect_named_volume(&spec.name).await? {
+            Self::verify_fixed_marketplace_volume(&existing, spec)?;
+            return self.fixed_marketplace_volume_job(spec, false).await;
+        }
+        let mut args = vec![
+            "volume".to_owned(),
+            "create".to_owned(),
+            "--driver=local".to_owned(),
+        ];
+        let mut labels = spec.labels.iter().collect::<Vec<_>>();
+        labels.sort_by_key(|(key, _)| *key);
+        for (key, value) in labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        args.push(spec.name.clone());
+        if self.run_stdout(&args).await?.trim() != spec.name {
+            bail!("unexpected marketplace volume identity");
+        }
+        let value = self
+            .inspect_named_volume(&spec.name)
+            .await?
+            .context("marketplace volume disappeared after creation")?;
+        Self::verify_fixed_marketplace_volume(&value, spec)?;
+        // The initializer has an exclusive new-file claim. A concurrent creator
+        // cannot overwrite another initializer's state. Failed/partial volumes
+        // remain bounded and unavailable; never delete established state here.
+        self.fixed_marketplace_volume_job(spec, true).await
+    }
+
+    async fn ensure_quarantine_marketplace_volume(
+        &self,
+        spec: &QuarantineMarketplaceVolumeSpec,
+    ) -> Result<()> {
+        Self::validate_quarantine_marketplace_volume_spec(spec)?;
+        let image = self.inspect_image_metadata(&spec.image).await?;
+        if image
+            .labels
+            .get("elixir.marketplace.worker.schema")
+            .map(String::as_str)
+            != Some("1")
+            || image
+                .labels
+                .get("elixir.marketplace.worker.quarantine")
+                .map(String::as_str)
+                != Some("1")
+        {
+            bail!("immutable image does not declare the source quarantine contract");
+        }
+        // The caller holds the shared expensive-job lease and has stopped any
+        // old writer before this method. Recover an interrupted root helper too.
+        self.recover_quarantine_provisioner(spec).await?;
+        if let Some(existing) = self.inspect_named_volume(&spec.name).await? {
+            Self::verify_owned_local_volume(&existing, &spec.name, &spec.labels)?;
+            return self.quarantine_marketplace_volume_job(spec, false).await;
+        }
+        let mut args = vec![
+            "volume".to_owned(),
+            "create".to_owned(),
+            "--driver=local".to_owned(),
+        ];
+        let mut labels = spec.labels.iter().collect::<Vec<_>>();
+        labels.sort_by_key(|(key, _)| *key);
+        for (key, value) in labels {
+            args.extend(["--label".to_owned(), format!("{key}={value}")]);
+        }
+        args.push(spec.name.clone());
+        if self.run_stdout(&args).await?.trim() != spec.name {
+            bail!("unexpected source quarantine volume identity");
+        }
+        let volume = self
+            .inspect_named_volume(&spec.name)
+            .await?
+            .context("source quarantine volume disappeared")?;
+        Self::verify_owned_local_volume(&volume, &spec.name, &spec.labels)?;
+        self.quarantine_marketplace_volume_job(spec, true).await
+    }
+
+    async fn create_marketplace_build_output_volume(&self, slot: &str) -> Result<()> {
+        self.create_build_output_volume(slot).await
+    }
+    async fn remove_marketplace_build_output_volume(&self, slot: &str) -> Result<()> {
+        self.remove_build_output_volume(slot).await
+    }
+    async fn cleanup_idle_marketplace_build_output(&self, slot: &str) -> Result<()> {
+        self.remove_build_output_volume(slot).await
+    }
+
+    async fn attach_private_stdio(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        if handle.id.len() != 64
+            || !handle.id.bytes().all(|b| b.is_ascii_hexdigit())
+            || required.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+            || !matches!(
+                required
+                    .get("elixir.marketplace.isolation")
+                    .map(String::as_str),
+                Some(
+                    "fixed-v1"
+                        | "quarantine-v1"
+                        | "packet-v1"
+                        | "connectivity-v1"
+                        | "measurement-v1"
+                        | "application-http-v1"
+                        | "application-gateway-v1"
+                )
+            )
+            || !required.contains_key(CONTAINER_SPEC_HASH_LABEL)
+        {
+            bail!("private streams require a specific managed marketplace worker");
+        }
+        let value = self.inspect_container(&handle.id).await?;
+        let state = Self::extract_state(&value)?;
+        let labels = Self::extract_labels(&value);
+        if state.id != handle.id
+            || state.name != handle.name
+            || !state.running
+            || required
+                .iter()
+                .any(|(key, value)| labels.get(key) != Some(value))
+            || value.pointer("/Config/OpenStdin").and_then(Value::as_bool) != Some(true)
+            || value.pointer("/Config/Tty").and_then(Value::as_bool) != Some(false)
+        {
+            bail!("private process ownership or stream configuration differs");
+        }
+        let mut child = Command::new(&self.docker_bin)
+            .args(["attach", "--sig-proxy=false", &handle.id])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        Ok(PrivateProcessStdio {
+            input: child.stdin.take().context("missing private stdin")?,
+            output: child.stdout.take().context("missing private stdout")?,
+            diagnostics: Some(child.stderr.take().context("missing private diagnostics")?),
+            child,
+        })
+    }
+
+    async fn confirm_quarantine_marketplace_success(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<()> {
+        Self::require_quarantine_exit_owner(handle, required)?;
+        let value = self.inspect_container(&handle.id).await?;
+        Self::verify_quarantine_exit(&value, handle, required)
+    }
+
+    async fn exec_marketplace_connectivity_probe(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::Connectivity,
+        )
+        .await
+    }
+
+    async fn exec_marketplace_source_preflight(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::SourcePreflight,
+        )
+        .await
+    }
+    async fn exec_marketplace_radicle_source(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::RadicleSource,
+        )
+        .await
+    }
+
+    async fn exec_marketplace_sdk_http(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::SdkHttp,
+        )
+        .await
+    }
+
+    async fn exec_marketplace_sdk_http_stream(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::SdkHttpStream,
+        )
+        .await
+    }
+
+    async fn exec_marketplace_metadata_verifier(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+        issuer_keys: &[elixir_marketplace::identity::PublicKey],
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::Metadata(issuer_keys),
+        )
+        .await
+    }
+    async fn exec_marketplace_security_verifier(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+        issuer_keys: &[elixir_marketplace::identity::PublicKey],
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::Security(issuer_keys),
+        )
+        .await
+    }
+
+    async fn exec_marketplace_evidence_verifier(
+        &self,
+        handle: &ContainerHandle,
+        required: &HashMap<String, String>,
+        issuer_keys: &[elixir_marketplace::identity::PublicKey],
+    ) -> Result<PrivateProcessStdio> {
+        self.exec_independent_marketplace_fetch(
+            handle,
+            required,
+            IndependentMarketplaceFetch::Evidence(issuer_keys),
+        )
+        .await
+    }
+
+    async fn source_cache_state(
+        &self,
+        name: &str,
+        required_labels: &HashMap<String, String>,
+    ) -> Result<crate::runtime::model::SourceCacheState> {
+        use crate::runtime::model::SourceCacheState;
+        let Some(volume) = self.inspect_named_volume(name).await? else {
+            return Ok(SourceCacheState::Absent);
+        };
+        Self::verify_owned_local_volume(&volume, name, required_labels)?;
+        let label = volume
+            .get("Labels")
+            .and_then(|labels| labels.get("elixir.marketplace.source_cache"))
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 71)
+            .filter(|value| {
+                value
+                    .parse::<elixir_marketplace::identity::Digest>()
+                    .is_ok()
+            })
+            .map(str::to_owned);
+        Ok(SourceCacheState::Present(label))
+    }
+
     async fn private_file_volume_owned(
         &self,
         name: &str,
@@ -2010,6 +4071,41 @@ impl RuntimeManager for DockerRuntimeManager {
         let args = vec!["stop".to_string(), handle.id.clone()];
         self.run_capture(&args).await?;
         Ok(())
+    }
+
+    async fn stop_quarantine_marketplace_writer(&self, handle: &ContainerHandle) -> Result<()> {
+        if !immutable_id(&handle.id) || handle.name != handle.id {
+            bail!("immediate native stop requires an immutable container identity");
+        }
+        timeout(Duration::from_secs(15), async {
+            let value = self.inspect_container(&handle.id).await?;
+            if !Self::require_quarantine_writer(&value, handle)?.running {
+                return Ok(());
+            }
+            // Offline verification has no approved application state to flush.
+            // Partial quarantine bytes remain unapproved and must be rehashed.
+            // Do not rely on TERM handling by a container's unattached PID 1.
+            let attempt = self
+                .run_capture_with_timeout(
+                    &[
+                        "kill".to_owned(),
+                        "--signal=KILL".to_owned(),
+                        handle.id.clone(),
+                    ],
+                    Some(DOCKER_PROBE_COMMAND_TIMEOUT),
+                )
+                .await;
+            let value = self.inspect_container(&handle.id).await?;
+            if Self::require_quarantine_writer(&value, handle)?.running {
+                attempt?;
+                bail!("native quarantine writer remains running after immediate stop");
+            }
+            // A racing natural exit is also success, but only after positively
+            // inspecting this exact owned identity as stopped, never by text.
+            Ok(())
+        })
+        .await
+        .context("immediate native quarantine stop deadline exceeded")?
     }
 
     async fn rename_container(
@@ -2431,10 +4527,124 @@ fn format_volume(volume: &VolumeMount) -> String {
 
 fn format_tmpfs(tmpfs: &ContainerTmpfsMount) -> String {
     let path = tmpfs.path.trim();
-    match tmpfs.size_mb {
-        Some(size_mb) => format!("{path}:size={size_mb}m"),
-        None => path.to_string(),
+    let mut options = Vec::new();
+    if let Some(size) = tmpfs.size_mb {
+        options.push(format!("size={size}m"));
     }
+    if let Some(uid) = tmpfs.owner_uid {
+        options.push(format!("uid={uid}"));
+    }
+    if let Some(gid) = tmpfs.owner_gid {
+        options.push(format!("gid={gid}"));
+    }
+    if let Some(mode) = tmpfs.mode {
+        options.push(format!("mode={mode:o}"));
+    }
+    if tmpfs.no_exec {
+        options.push("noexec".to_string());
+    } else if matches!(path, "/build-source" | "/scratch") {
+        // Builder profiles require an explicit kernel exec option; omission
+        // may retain Docker's noexec tmpfs default. Other profiles are unchanged.
+        options.push("exec".to_string());
+    }
+    if tmpfs.no_suid {
+        options.push("nosuid".to_string());
+    }
+    if tmpfs.no_dev {
+        options.push("nodev".to_string());
+    }
+    if options.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}:{}", options.join(","))
+    }
+}
+
+fn container_resource_args(security: &ContainerSecurityOptions) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    if security.init_process {
+        args.push("--init=true".to_owned());
+    }
+    if let Some(swap) = security.memory_swap_limit_mb {
+        let memory = security
+            .memory_limit_mb
+            .filter(|value| *value > 0)
+            .context("memory-swap requires a positive memory limit")?;
+        if swap < memory || swap > (i64::MAX as u64) / (1024 * 1024) {
+            bail!("invalid total memory-plus-swap limit");
+        }
+        args.extend(["--memory-swap".to_string(), format!("{swap}m")]);
+    }
+    if let Some(size) = security.shared_memory_mb {
+        if size == 0 || size > (i64::MAX as u64) / (1024 * 1024) {
+            bail!("invalid shared-memory limit");
+        }
+        args.extend(["--shm-size".to_string(), format!("{size}m")]);
+    }
+    if security.disable_core_dumps {
+        args.extend(["--ulimit".to_string(), "core=0:0".to_string()]);
+    }
+    if let Some(limit) = security.open_files_limit {
+        if !(16..=1_048_576).contains(&limit) {
+            bail!("invalid container open-file limit");
+        }
+        args.extend(["--ulimit".to_owned(), format!("nofile={limit}:{limit}")]);
+    }
+    if let Some(limit) = security.file_size_limit_bytes {
+        // RLIMIT_FSIZE=0 is the strictest valid limit: deny regular-file writes.
+        if limit > i64::MAX as u64 {
+            bail!("invalid container file-size limit");
+        }
+        args.extend(["--ulimit".to_owned(), format!("fsize={limit}:{limit}")]);
+    }
+    if security.stdin_open {
+        args.push("--interactive".to_owned());
+    }
+    match &security.log_options {
+        Some(ContainerLogOptions::Disabled) => {
+            args.extend(["--log-driver".to_string(), "none".to_string()])
+        }
+        Some(ContainerLogOptions::BoundedJson {
+            max_size_mb,
+            max_files,
+        }) => {
+            if *max_size_mb == 0 || *max_files == 0 {
+                bail!("bounded container logs require positive size and file limits");
+            }
+            args.extend([
+                "--log-driver".to_string(),
+                "json-file".to_string(),
+                "--log-opt".to_string(),
+                format!("max-size={max_size_mb}m"),
+                "--log-opt".to_string(),
+                format!("max-file={max_files}"),
+            ]);
+        }
+        None => {}
+    }
+    for tmpfs in &security.tmpfs {
+        // A sticky temporary directory is valid (for example /tmp=1777).
+        // Never accept setuid, setgid or bits outside the permission/sticky mask.
+        if tmpfs.mode.is_some_and(|mode| mode & !0o1777 != 0) {
+            bail!("invalid tmpfs permission mode");
+        }
+        if tmpfs.size_mb == Some(0) {
+            bail!("tmpfs size must be positive");
+        }
+        if (tmpfs.owner_uid.is_some()
+            || tmpfs.owner_gid.is_some()
+            || tmpfs.mode.is_some()
+            || tmpfs.no_exec
+            || tmpfs.no_suid
+            || tmpfs.no_dev)
+            && (tmpfs.path.is_empty()
+                || !tmpfs.path.starts_with('/')
+                || tmpfs.path.contains([':', ',', '\n', '\r']))
+        {
+            bail!("invalid hardened tmpfs path");
+        }
+    }
+    Ok(args)
 }
 
 fn format_port(port: &PortMapping) -> Option<String> {
@@ -2451,12 +4661,307 @@ fn format_port(port: &PortMapping) -> Option<String> {
     }
 }
 
+#[cfg(all(test, unix))]
+mod application_gateway_tests;
+#[cfg(test)]
+mod local_image_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::model::ContainerSecurityOptions;
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn native_quarantine_success_requires_owned_immutable_identity_and_natural_exit() -> Result<()>
+    {
+        let handle = ContainerHandle {
+            id: "a".repeat(64),
+            name: "native-exit-test".into(),
+        };
+        let labels = HashMap::from([
+            (ELIXIR_MANAGED_LABEL.into(), "true".into()),
+            (
+                "elixir.marketplace.isolation".into(),
+                "quarantine-v1".into(),
+            ),
+            (CONTAINER_SPEC_HASH_LABEL.into(), "test-only".into()),
+        ]);
+        let good = json!({"Id":handle.id,"Name":format!("/{}",handle.name),"Config":{"Labels":labels,"OpenStdin":true,"Tty":false},
+            "State":{"Status":"exited","Running":false,"Paused":false,"Restarting":false,"OOMKilled":false,"Dead":false,"Pid":0,"ExitCode":0,"Error":""}});
+        DockerRuntimeManager::verify_quarantine_exit(&good, &handle, &labels)?;
+        for (path, bad) in [
+            ("/Id", json!("b".repeat(64))),
+            ("/Name", json!("/foreign")),
+            ("/Config/OpenStdin", json!(false)),
+            ("/Config/Tty", json!(true)),
+            ("/Config/Labels/elixir.managed", json!("false")),
+            ("/State/Status", json!("created")),
+            ("/State/ExitCode", json!(1)),
+            ("/State/ExitCode", Value::Null),
+            ("/State/Pid", json!(42)),
+            ("/State/Error", json!("launch failed")),
+            ("/State/Running", json!(true)),
+            ("/State/Paused", json!(true)),
+            ("/State/Restarting", json!(true)),
+            ("/State/OOMKilled", json!(true)),
+            ("/State/Dead", json!(true)),
+        ] {
+            let mut value = good.clone();
+            *value
+                .pointer_mut(path)
+                .context("exit fixture field missing")? = bad;
+            assert!(
+                DockerRuntimeManager::verify_quarantine_exit(&value, &handle, &labels).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            DockerRuntimeManager::verify_quarantine_exit(&good, &handle, &HashMap::new()).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn independent_marketplace_evidence_requires_v3_and_future_features_are_not_assumed_compatible()
+    {
+        for version in [
+            None,
+            Some("0"),
+            Some("1"),
+            Some("2"),
+            Some("3"),
+            Some("4"),
+            Some("03"),
+        ] {
+            assert_eq!(
+                IndependentMarketplaceFetch::Metadata(&[]).supports_feature(version, "1"),
+                matches!(version, Some("1" | "2" | "3"))
+            );
+            assert_eq!(
+                IndependentMarketplaceFetch::Security(&[]).supports_feature(version, "2"),
+                matches!(version, Some("2" | "3"))
+            );
+            assert_eq!(
+                IndependentMarketplaceFetch::Evidence(&[]).supports_feature(version, "3"),
+                version == Some("3")
+            );
+            assert_eq!(
+                IndependentMarketplaceFetch::SdkHttp.supports_feature(version, "1"),
+                version == Some("1")
+            );
+            assert_eq!(
+                IndependentMarketplaceFetch::SdkHttpStream.supports_feature(version, "1"),
+                version == Some("1")
+            );
+            assert_eq!(
+                IndependentMarketplaceFetch::Connectivity.supports_feature(version, "2"),
+                version == Some("2")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_marketplace_fetch_entry_points_reject_unowned_handles_before_cli() {
+        let runtime = DockerRuntimeManager::new(Some("/must-not-run-marketplace-fixture".into()));
+        let handle = ContainerHandle {
+            id: "a".repeat(64),
+            name: "marketplace-test".into(),
+        };
+        let good = HashMap::from([
+            (ELIXIR_MANAGED_LABEL.to_owned(), "true".to_owned()),
+            (
+                "elixir.marketplace.isolation".to_owned(),
+                "fixed-v1".to_owned(),
+            ),
+            (CONTAINER_SPEC_HASH_LABEL.to_owned(), "test-only".to_owned()),
+        ]);
+        for key in [
+            ELIXIR_MANAGED_LABEL,
+            "elixir.marketplace.isolation",
+            CONTAINER_SPEC_HASH_LABEL,
+        ] {
+            let mut labels = good.clone();
+            labels.remove(key);
+            for purpose in [
+                IndependentMarketplaceFetch::Connectivity,
+                IndependentMarketplaceFetch::SourcePreflight,
+                IndependentMarketplaceFetch::RadicleSource,
+                IndependentMarketplaceFetch::SdkHttp,
+                IndependentMarketplaceFetch::SdkHttpStream,
+                IndependentMarketplaceFetch::Metadata(&[]),
+                IndependentMarketplaceFetch::Security(&[]),
+                IndependentMarketplaceFetch::Evidence(&[]),
+            ] {
+                let error = runtime
+                    .exec_independent_marketplace_fetch(&handle, &labels, purpose)
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("specific managed marketplace worker")
+                );
+            }
+        }
+        let mut mutable_handle = handle;
+        mutable_handle.id = "mutable-container-name".into();
+        assert!(
+            runtime
+                .exec_marketplace_sdk_http(&mutable_handle, &good)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("specific managed marketplace worker")
+        );
+        assert!(
+            runtime
+                .exec_marketplace_sdk_http_stream(&mutable_handle, &good)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("specific managed marketplace worker")
+        );
+        assert!(
+            runtime
+                .exec_marketplace_metadata_verifier(&mutable_handle, &good, &[])
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("specific managed marketplace worker")
+        );
+        assert!(
+            runtime
+                .exec_marketplace_source_preflight(&mutable_handle, &good)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("specific managed marketplace worker")
+        );
+        assert!(
+            runtime
+                .exec_marketplace_connectivity_probe(&mutable_handle, &good)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("specific managed marketplace worker")
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_network_capture_bounds_output_and_does_not_reflect_diagnostics() -> Result<()> {
+        let runtime = DockerRuntimeManager::new(Some("node".to_owned()));
+        let started = Instant::now();
+        for script in [
+            "process.stdout.write('x'.repeat(70000));setInterval(()=>{},1000)",
+            "process.stderr.write('x'.repeat(5000));setInterval(()=>{},1000)",
+        ] {
+            assert!(
+                runtime
+                    .packet_network_capture(&["--eval".to_owned(), script.to_owned()])
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let (status, out, err) = runtime
+            .packet_network_capture(&["--eval".to_owned(), "process.stdout.write('{}')".to_owned()])
+            .await?;
+        assert!(status.success());
+        assert_eq!(out, "{}");
+        assert!(err.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn private_actor_inspection_rejects_malformed_or_hidden_isolation_settings() -> Result<()> {
+        let good = json!({
+            "Id":"a".repeat(64), "Name":"/private-packet-test",
+            "State":{"Running":true, "Status":"running"},
+            "Config":{"Cmd":["--epoch","test"], "Entrypoint":["/actor"],
+                "Env":["PATH=/usr/bin"]},
+            "HostConfig":{"CapAdd":["NET_ADMIN"], "CapDrop":["ALL"],
+                "SecurityOpt":["no-new-privileges:true"],
+                "PidMode":"", "IpcMode":"private", "UsernsMode":"",
+                "Devices":null, "DeviceRequests":null, "Binds":null,
+                "Sysctls":null, "Tmpfs":null,
+                "RestartPolicy":{"Name":"no"}},
+            "Mounts":[], "NetworkSettings":{"Networks":{"none":{}}}
+        });
+        let actual = DockerRuntimeManager::extract_private_actor(&good)?;
+        assert!(actual.running);
+        assert_eq!(actual.networks, ["none"]);
+        assert_eq!(
+            actual.device_count + actual.device_request_count + actual.bind_count,
+            0
+        );
+        assert!(actual.sysctls.is_empty());
+        let mut omitted = good.clone();
+        for field in ["Devices", "DeviceRequests", "Binds", "Sysctls", "Tmpfs"] {
+            omitted["HostConfig"].as_object_mut().unwrap().remove(field);
+        }
+        DockerRuntimeManager::extract_private_actor(&omitted)?;
+        // Moby omits these optional fields when empty; explicit null/empty
+        // values must be equivalent, while malformed values must never vanish.
+        for path in ["Devices", "DeviceRequests", "Binds"] {
+            for value in [Value::Null, json!([])] {
+                let mut optional = good.clone();
+                optional["HostConfig"][path] = value;
+                DockerRuntimeManager::extract_private_actor(&optional)?;
+            }
+        }
+        for path in ["Sysctls", "Tmpfs"] {
+            for value in [Value::Null, json!({})] {
+                let mut optional = good.clone();
+                optional["HostConfig"][path] = value;
+                DockerRuntimeManager::extract_private_actor(&optional)?;
+            }
+        }
+        for (path, malformed) in [
+            ("/HostConfig/CapAdd", json!(["NET_ADMIN", 123])),
+            ("/HostConfig/CapDrop", json!(["ALL", {}])),
+            ("/HostConfig/SecurityOpt", json!(["no-new-privileges", 123])),
+            (
+                "/HostConfig/SecurityOpt",
+                json!(["no-new-privileges", "seccomp:unconfined"]),
+            ),
+            ("/HostConfig/Devices", json!({})),
+            ("/HostConfig/DeviceRequests", json!(true)),
+            ("/HostConfig/Binds", json!("/host:/guest")),
+            ("/HostConfig/Sysctls", json!({"net.ipv4.ip_forward":true})),
+            ("/HostConfig/Sysctls", json!([])),
+            ("/Config/Cmd", json!([false])),
+            ("/Config/Entrypoint", json!("/bin/sh")),
+            ("/Config/Env", json!([null])),
+            ("/HostConfig/PidMode", Value::Null),
+            ("/HostConfig/IpcMode", json!(false)),
+            ("/HostConfig/UsernsMode", json!([])),
+            ("/HostConfig/RestartPolicy/Name", Value::Null),
+            ("/NetworkSettings/Networks", Value::Null),
+            ("/Mounts", Value::Null),
+            ("/Mounts", json!([{"unexpected":true}])),
+            ("/State/Running", json!("true")),
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(path).unwrap() = malformed;
+            assert!(
+                DockerRuntimeManager::extract_private_actor(&bad).is_err(),
+                "{path}"
+            );
+        }
+        for value in [json!([]), json!({"/tmp":"size=1m"}), json!(true)] {
+            let mut bad = good.clone();
+            bad["HostConfig"]["Tmpfs"] = value;
+            assert!(DockerRuntimeManager::extract_private_actor(&bad).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn port_mapping_formats() {
@@ -2867,6 +5372,7 @@ mod tests {
     fn runtime_state_extracts_mounts_network_mode_labels_and_published_ports() {
         let inspect = json!({
             "Name": "/elx-qbittorrent",
+            "Image": "sha256:resolved-local-id",
             "HostConfig": {
                 "NetworkMode": "container:elx-qbittorrent-vpn",
                 "ReadonlyRootfs": true,
@@ -2876,10 +5382,17 @@ mod tests {
                     "/tmp": "size=64m"
                 },
                 "Memory": 536870912,
+                "MemorySwap": 536870912,
+                "ShmSize": 1048576,
+                "Privileged": false,
+                "CapAdd": [],
+                "LogConfig": {"Type":"none","Config":{}},
+                "Ulimits": [{"Name":"core","Soft":0,"Hard":0}],
                 "PidsLimit": 128,
                 "NanoCpus": 1000000000
             },
             "Config": {
+                "Image": "example@sha256:pinned-registry-digest",
                 "User": "1000:1000",
                 "Labels": {
                     "elixir.instance_id": "abc",
@@ -2941,6 +5454,14 @@ mod tests {
             }]
         );
         assert_eq!(state.security.user.as_deref(), Some("1000:1000"));
+        assert_eq!(
+            state.security.image_reference.as_deref(),
+            Some("example@sha256:pinned-registry-digest")
+        );
+        assert_eq!(
+            state.security.image_id.as_deref(),
+            Some("sha256:resolved-local-id")
+        );
         assert!(state.security.read_only_rootfs);
         assert!(state.security.no_new_privileges);
         assert_eq!(state.security.cap_drop, vec!["ALL".to_string()]);
@@ -2948,6 +5469,15 @@ mod tests {
         assert_eq!(state.security.tmpfs[0].path, "/tmp");
         assert_eq!(state.security.tmpfs[0].options.as_deref(), Some("size=64m"));
         assert_eq!(state.security.memory_limit_bytes, Some(536870912));
+        assert_eq!(state.security.memory_swap_limit_bytes, Some(536870912));
+        assert_eq!(state.security.shared_memory_bytes, Some(1048576));
+        assert_eq!(state.security.privileged, Some(false));
+        assert!(state.security.cap_add.is_empty());
+        assert_eq!(state.security.log_config.as_ref().unwrap().driver, "none");
+        assert_eq!(
+            state.security.core_dump_limit,
+            Some(ContainerRuntimeUlimit { soft: 0, hard: 0 })
+        );
         assert_eq!(state.security.pids_limit, Some(128));
         assert_eq!(state.security.nano_cpus, Some(1000000000));
         assert_eq!(
@@ -2974,6 +5504,226 @@ mod tests {
             DockerRuntimeManager::managed_container_filter(),
             "label=elixir.managed=true"
         );
+    }
+
+    #[test]
+    fn marketplace_immutable_container_lookup_uses_id_filter_and_rejects_substitutions()
+    -> Result<()> {
+        let id = "a".repeat(64);
+        assert_eq!(
+            DockerRuntimeManager::container_identity_filter(&id),
+            format!("id={id}")
+        );
+        assert_eq!(
+            DockerRuntimeManager::container_identity_filter("owned-source"),
+            "name=^/owned-source$"
+        );
+        assert_eq!(
+            DockerRuntimeManager::parse_container_identity(&id, &format!("{id}\n"))?,
+            Some(id.clone())
+        );
+        assert!(DockerRuntimeManager::parse_container_identity(&id, "")?.is_none());
+        assert!(DockerRuntimeManager::parse_container_identity(&id, &"b".repeat(64)).is_err());
+        assert!(DockerRuntimeManager::parse_container_identity(&id, "short-id").is_err());
+        assert!(
+            DockerRuntimeManager::parse_container_identity(
+                "owned-source",
+                &format!("{id}\n{}\n", "b".repeat(64))
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn marketplace_immediate_stop_requires_exact_native_role_and_positive_state() -> Result<()> {
+        let id = "a".repeat(64);
+        let handle = ContainerHandle {
+            id: id.clone(),
+            name: id.clone(),
+        };
+        let fixture = serde_json::json!({
+            "Id":id,"Name":"/elixir-marketplace-source-writer-owned",
+            "State":{"Status":"running","Running":true},
+            "Config":{"Labels":{
+                "elixir.managed":"true","elixir.deployment_id":"owned",
+                "elixir.extension_id":"elixir-marketplace-source","elixir.instance_id":"marketplace-source-owned",
+                "elixir.marketplace.isolation":"quarantine-v1"
+            }}
+        });
+        assert!(DockerRuntimeManager::require_quarantine_writer(&fixture, &handle)?.running);
+        let mut stopped = fixture.clone();
+        stopped["State"]["Status"] = "exited".into();
+        stopped["State"]["Running"] = false.into();
+        assert!(!DockerRuntimeManager::require_quarantine_writer(&stopped, &handle)?.running);
+        for pointer in [
+            "/Id",
+            "/Name",
+            "/Config/Labels/elixir.managed",
+            "/Config/Labels/elixir.deployment_id",
+            "/Config/Labels/elixir.extension_id",
+            "/Config/Labels/elixir.instance_id",
+            "/Config/Labels/elixir.marketplace.isolation",
+            "/State/Status",
+        ] {
+            let mut wrong = fixture.clone();
+            *wrong.pointer_mut(pointer).unwrap() = "foreign".into();
+            assert!(
+                DockerRuntimeManager::require_quarantine_writer(&wrong, &handle).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut unknown = fixture.clone();
+        unknown["State"].as_object_mut().unwrap().remove("Running");
+        assert!(DockerRuntimeManager::require_quarantine_writer(&unknown, &handle).is_err());
+        let mut contradictory = fixture.clone();
+        contradictory["State"]["Running"] = false.into();
+        assert!(DockerRuntimeManager::require_quarantine_writer(&contradictory, &handle).is_err());
+        let named = ContainerHandle {
+            id: handle.id.clone(),
+            name: "elixir-marketplace-source-writer-owned".into(),
+        };
+        assert!(DockerRuntimeManager::require_quarantine_writer(&fixture, &named).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_start_intent_rejects_hooks_restart_and_host_namespace_drift() -> Result<()> {
+        let mut spec = scoped_spec("source", "owned");
+        spec.command = vec!["--source-eval".into(), "{}".into()];
+        let fixture = serde_json::json!({
+            "Config": {
+                "Cmd":spec.command,
+                "Entrypoint":["/opt/elixir-marketplace/bin/elixir-marketplace-launcher"],
+                "Env":["PATH=/usr/local/bin:/usr/bin:/bin","NODE_VERSION=24.16.0","YARN_VERSION=1.22.22"]
+            },
+            "HostConfig": {
+                "RestartPolicy":{"Name":"no"},"Init":false,"PidMode":"","IpcMode":"private","UsernsMode":"",
+                "Devices":[],"DeviceRequests":null,"Binds":null,"Sysctls":null
+            }
+        });
+        DockerRuntimeManager::verify_source_start_intent(&fixture, &spec)?;
+        let mut omitted_empty_sysctls = fixture.clone();
+        omitted_empty_sysctls["HostConfig"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Sysctls");
+        DockerRuntimeManager::verify_source_start_intent(&omitted_empty_sysctls, &spec)?;
+        for (pointer, wrong) in [
+            (
+                "/Config/Cmd",
+                serde_json::json!(["--source-eval", "{\"wrong\":true}"]),
+            ),
+            ("/Config/Entrypoint", serde_json::json!(["/bin/sh"])),
+            (
+                "/Config/Env",
+                serde_json::json!(["NODE_OPTIONS=--require=/quarantine/package.blob"]),
+            ),
+            (
+                "/Config/Env",
+                serde_json::json!(["PATH=/bin", "PATH=/quarantine"]),
+            ),
+            (
+                "/HostConfig/RestartPolicy/Name",
+                serde_json::json!("always"),
+            ),
+            ("/HostConfig/Init", serde_json::json!(true)),
+            ("/HostConfig/PidMode", serde_json::json!("host")),
+            ("/HostConfig/IpcMode", serde_json::json!("host")),
+            ("/HostConfig/UsernsMode", serde_json::json!("host")),
+            ("/HostConfig/Devices", serde_json::json!([{}])),
+            ("/HostConfig/DeviceRequests", serde_json::json!([{}])),
+            ("/HostConfig/Binds", serde_json::json!(["/:/host"])),
+            (
+                "/HostConfig/Sysctls",
+                serde_json::json!({"net.ipv4.ip_forward":"1"}),
+            ),
+        ] {
+            let mut actual = fixture.clone();
+            *actual.pointer_mut(pointer).unwrap() = wrong;
+            assert!(
+                DockerRuntimeManager::verify_source_start_intent(&actual, &spec).is_err(),
+                "{pointer}"
+            );
+        }
+        for pointer in ["/Config/Env", "/HostConfig/Devices", "/HostConfig/Init"] {
+            let mut actual = fixture.clone();
+            *actual.pointer_mut(pointer).unwrap() = serde_json::json!("unknown");
+            assert!(DockerRuntimeManager::verify_source_start_intent(&actual, &spec).is_err());
+        }
+        // The generic Docker argument builder uses -v for named volumes too.
+        // Accept only that exact closed mapping, including its read-only mode.
+        spec.volumes = vec![VolumeMount {
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: "elixir-marketplace-source-owned".into(),
+            container_path: "/quarantine".into(),
+            read_only: true,
+        }];
+        let mut mounted = fixture.clone();
+        mounted["HostConfig"]["Binds"] =
+            serde_json::json!(["elixir-marketplace-source-owned:/quarantine:ro"]);
+        DockerRuntimeManager::verify_source_start_intent(&mounted, &spec)?;
+        for binds in [
+            serde_json::json!(null),
+            serde_json::json!(["/tmp:/quarantine:ro"]),
+            serde_json::json!(["foreign:/quarantine:ro"]),
+            serde_json::json!(["elixir-marketplace-source-owned:/quarantine"]),
+            serde_json::json!([
+                "elixir-marketplace-source-owned:/quarantine:ro",
+                "elixir-marketplace-source-owned:/quarantine:ro"
+            ]),
+        ] {
+            mounted["HostConfig"]["Binds"] = binds;
+            assert!(DockerRuntimeManager::verify_source_start_intent(&mounted, &spec).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn create_only_source_writer_accepts_verified_executor_but_not_arbitrary_commands() -> Result<()>
+    {
+        let mut spec = scoped_spec("marketplace-source-owned", "owned");
+        spec.name = "elixir-marketplace-source-writer-owned".into();
+        spec.image = format!("sha256:{}", "a".repeat(64));
+        spec.network_mode = Some("none".into());
+        spec.aliases.clear();
+        spec.labels
+            .insert(ELIXIR_MANAGED_LABEL.into(), "true".into());
+        spec.labels.insert(
+            ELIXIR_EXTENSION_ID_LABEL.into(),
+            "elixir-marketplace-source".into(),
+        );
+        spec.labels.insert(
+            "elixir.marketplace.isolation".into(),
+            "quarantine-v1".into(),
+        );
+        spec.volumes = vec![VolumeMount {
+            source_kind: VolumeMountSourceKind::NamedVolume,
+            host_path: "elixir-marketplace-source-owned".into(),
+            container_path: "/quarantine".into(),
+            read_only: true,
+        }];
+        spec.security.user = Some("10004:10004".into());
+        spec.security.read_only_rootfs = true;
+        spec.security.no_new_privileges = true;
+        for mode in [
+            "--source-match",
+            "--build-inputs-check",
+            "--source-eval",
+            "--source-eval-verified",
+        ] {
+            spec.command = vec![mode.into(), "{}".into()];
+            DockerRuntimeManager::require_source_writer_spec(&spec)?;
+        }
+        for mode in [
+            "/bin/sh",
+            "--self-test-source-eval-verified",
+            "--unknown-source",
+        ] {
+            spec.command = vec![mode.into(), "{}".into()];
+            assert!(DockerRuntimeManager::require_source_writer_spec(&spec).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -3171,6 +5921,190 @@ mod tests {
             sysctls: HashMap::new(),
             security: ContainerSecurityOptions::default(),
         }
+    }
+
+    #[test]
+    fn fixed_marketplace_volumes_reject_mutable_images_foreign_owners_and_nonlocal_options() {
+        let spec = FixedMarketplaceVolumeSpec {
+            name: "elixir-marketplace-fixture".to_owned(),
+            image: format!("sha256:{}", "1".repeat(64)),
+            memory_limit_mb: 256,
+            cpu_millicores: 100,
+            labels: HashMap::from([
+                (ELIXIR_MANAGED_LABEL.to_owned(), "true".to_owned()),
+                (ELIXIR_DEPLOYMENT_ID_LABEL.to_owned(), "fixture".to_owned()),
+                (
+                    "elixir.marketplace.volume".to_owned(),
+                    "fixed-v1".to_owned(),
+                ),
+            ]),
+        };
+        DockerRuntimeManager::validate_fixed_marketplace_volume_spec(&spec).unwrap();
+        for (memory_limit_mb, cpu_millicores) in
+            [(0, 100), (63, 100), (257, 100), (256, 0), (256, 101)]
+        {
+            assert!(
+                DockerRuntimeManager::validate_fixed_marketplace_volume_spec(
+                    &FixedMarketplaceVolumeSpec {
+                        memory_limit_mb,
+                        cpu_millicores,
+                        ..spec.clone()
+                    }
+                )
+                .is_err()
+            );
+        }
+        DockerRuntimeManager::validate_fixed_marketplace_volume_spec(&FixedMarketplaceVolumeSpec {
+            memory_limit_mb: 128,
+            cpu_millicores: 50,
+            ..spec.clone()
+        })
+        .unwrap();
+        let valid = serde_json::json!({"Name":spec.name,"Driver":"local","Scope":"local","Options":null,"Labels":spec.labels});
+        DockerRuntimeManager::verify_fixed_marketplace_volume(&valid, &spec).unwrap();
+        for (field, replacement) in [
+            ("Name", serde_json::json!("other")),
+            ("Driver", serde_json::json!("plugin")),
+            ("Scope", serde_json::json!("global")),
+            ("Options", serde_json::json!({"device":"/unowned"})),
+            ("Labels", serde_json::json!({})),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = replacement;
+            assert!(
+                DockerRuntimeManager::verify_fixed_marketplace_volume(&changed, &spec).is_err()
+            );
+        }
+        assert!(
+            DockerRuntimeManager::validate_fixed_marketplace_volume_spec(
+                &FixedMarketplaceVolumeSpec {
+                    image: "mutable:latest".to_owned(),
+                    ..spec
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn quarantine_volume_requires_its_own_closed_profile_and_immutable_image() {
+        use elixir_marketplace::{
+            identity::Digest, quarantine::QuarantineWorkspace, records::Blob,
+        };
+        let blob = Blob {
+            sha256: Digest::of(b"fixture"),
+            size: 7,
+        };
+        let spec = QuarantineMarketplaceVolumeSpec {
+            name: "elixir-marketplace-source-fixture".to_owned(),
+            image: format!("sha256:{}", "1".repeat(64)),
+            memory_limit_mb: 64,
+            cpu_millicores: 100,
+            workspace: QuarantineWorkspace {
+                schema_version: 1,
+                release_id: Digest::of(b"release"),
+                package: blob.clone(),
+                proof: blob,
+                artifact: None,
+                timeout_seconds: 60,
+            },
+            labels: HashMap::from([
+                (ELIXIR_MANAGED_LABEL.to_owned(), "true".to_owned()),
+                (ELIXIR_DEPLOYMENT_ID_LABEL.to_owned(), "fixture".to_owned()),
+                (
+                    "elixir.marketplace.volume".to_owned(),
+                    "quarantine-v1".to_owned(),
+                ),
+            ]),
+        };
+        DockerRuntimeManager::validate_quarantine_marketplace_volume_spec(&spec).unwrap();
+        for cpu_millicores in [500, 1000] {
+            DockerRuntimeManager::validate_quarantine_marketplace_volume_spec(
+                &QuarantineMarketplaceVolumeSpec {
+                    cpu_millicores,
+                    ..spec.clone()
+                },
+            )
+            .unwrap();
+        }
+        for bad in [
+            QuarantineMarketplaceVolumeSpec {
+                image: "elixir-marketplace:latest".to_owned(),
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                memory_limit_mb: 0,
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                cpu_millicores: 0,
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                cpu_millicores: 1001,
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                memory_limit_mb: u64::MAX,
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                memory_limit_mb: 257,
+                ..spec.clone()
+            },
+            QuarantineMarketplaceVolumeSpec {
+                name: "unrelated-volume".to_owned(),
+                ..spec.clone()
+            },
+        ] {
+            assert!(
+                DockerRuntimeManager::validate_quarantine_marketplace_volume_spec(&bad).is_err()
+            );
+        }
+        let mut bad = spec.clone();
+        bad.workspace.package.size = 0;
+        assert!(DockerRuntimeManager::validate_quarantine_marketplace_volume_spec(&bad).is_err());
+        let mut bad = spec;
+        bad.labels.insert(
+            "elixir.marketplace.volume".to_owned(),
+            "fixed-v1".to_owned(),
+        );
+        assert!(DockerRuntimeManager::validate_quarantine_marketplace_volume_spec(&bad).is_err());
+    }
+
+    #[test]
+    fn private_stream_and_file_limits_are_explicit_and_duplicate_limits_remain_unknown() {
+        let security = ContainerSecurityOptions {
+            stdin_open: true,
+            file_size_limit_bytes: Some(201326592),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_resource_args(&security).unwrap(),
+            ["--ulimit", "fsize=201326592:201326592", "--interactive"]
+        );
+        assert_eq!(
+            container_resource_args(&ContainerSecurityOptions {
+                file_size_limit_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap(),
+            ["--ulimit", "fsize=0:0"]
+        );
+        assert!(
+            container_resource_args(&ContainerSecurityOptions {
+                file_size_limit_bytes: Some(i64::MAX as u64 + 1),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        let state = DockerRuntimeManager::extract_runtime_security(
+            &serde_json::json!({"Config":{"OpenStdin":true,"Tty":false},
+            "HostConfig":{"Ulimits":[{"Name":"fsize","Soft":1,"Hard":1},{"Name":"fsize","Soft":2,"Hard":2}]}}),
+        );
+        assert!(state.file_size_limit.is_none());
+        assert_eq!(state.stdin_open, Some(true));
+        assert_eq!(state.tty, Some(false));
     }
 
     #[tokio::test]
@@ -3393,6 +6327,7 @@ mod tests {
         hardened.security.tmpfs.push(ContainerTmpfsMount {
             path: "/tmp".to_string(),
             size_mb: Some(64),
+            ..Default::default()
         });
         hardened.security.apparmor_profile = Some("prism-default".to_string());
         crate::runtime::model::apply_container_spec_fingerprint(&mut baseline);
@@ -3402,6 +6337,166 @@ mod tests {
             baseline.labels.get(CONTAINER_SPEC_HASH_LABEL),
             hardened.labels.get(CONTAINER_SPEC_HASH_LABEL)
         );
+    }
+
+    #[test]
+    fn explicit_resource_controls_compile_to_bounded_docker_flags() {
+        let reaper = ContainerSecurityOptions {
+            init_process: true,
+            ..Default::default()
+        };
+        assert_eq!(container_resource_args(&reaper).unwrap(), ["--init=true"]);
+        assert!(
+            !serde_json::to_string(&ContainerSecurityOptions::default())
+                .unwrap()
+                .contains("init_process")
+        );
+        let security = ContainerSecurityOptions {
+            memory_limit_mb: Some(256),
+            memory_swap_limit_mb: Some(256),
+            shared_memory_mb: Some(1),
+            disable_core_dumps: true,
+            log_options: Some(ContainerLogOptions::Disabled),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_resource_args(&security).unwrap(),
+            [
+                "--memory-swap",
+                "256m",
+                "--shm-size",
+                "1m",
+                "--ulimit",
+                "core=0:0",
+                "--log-driver",
+                "none"
+            ]
+        );
+        let bounded = ContainerSecurityOptions {
+            log_options: Some(ContainerLogOptions::BoundedJson {
+                max_size_mb: 1,
+                max_files: 2,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            container_resource_args(&bounded).unwrap(),
+            [
+                "--log-driver",
+                "json-file",
+                "--log-opt",
+                "max-size=1m",
+                "--log-opt",
+                "max-file=2"
+            ]
+        );
+        let tmpfs = ContainerTmpfsMount {
+            path: "/state".to_owned(),
+            size_mb: Some(192),
+            owner_uid: Some(10004),
+            owner_gid: Some(10004),
+            mode: Some(0o700),
+            no_exec: true,
+            no_suid: true,
+            no_dev: true,
+        };
+        assert_eq!(
+            format_tmpfs(&tmpfs),
+            "/state:size=192m,uid=10004,gid=10004,mode=700,noexec,nosuid,nodev"
+        );
+        let sticky = ContainerTmpfsMount {
+            path: "/tmp".into(),
+            mode: Some(0o1777),
+            ..tmpfs
+        };
+        assert_eq!(
+            format_tmpfs(&sticky),
+            "/tmp:size=192m,uid=10004,gid=10004,mode=1777,noexec,nosuid,nodev"
+        );
+        container_resource_args(&ContainerSecurityOptions {
+            tmpfs: vec![sticky.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+        for mode in [0o2777, 0o4777, 0o10000, u16::MAX] {
+            assert!(
+                container_resource_args(&ContainerSecurityOptions {
+                    tmpfs: vec![ContainerTmpfsMount {
+                        mode: Some(mode),
+                        ..sticky.clone()
+                    }],
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            container_resource_args(&ContainerSecurityOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_resource_controls_fail_before_docker_side_effects() {
+        for security in [
+            ContainerSecurityOptions {
+                memory_swap_limit_mb: Some(256),
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                memory_limit_mb: Some(256),
+                memory_swap_limit_mb: Some(128),
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                shared_memory_mb: Some(0),
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                log_options: Some(ContainerLogOptions::BoundedJson {
+                    max_size_mb: 0,
+                    max_files: 2,
+                }),
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                log_options: Some(ContainerLogOptions::BoundedJson {
+                    max_size_mb: 1,
+                    max_files: 0,
+                }),
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                tmpfs: vec![ContainerTmpfsMount {
+                    path: "/bad:exec".to_owned(),
+                    no_exec: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ContainerSecurityOptions {
+                tmpfs: vec![ContainerTmpfsMount {
+                    mode: Some(0o7777),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ] {
+            assert!(container_resource_args(&security).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_or_unlimited_inspect_controls_are_not_normalized_into_safe_values() {
+        let unknown = DockerRuntimeManager::extract_runtime_security(&json!({"HostConfig":{
+            "MemorySwap":-1,"LogConfig":{"Type":"none","Config":{"malformed":1}},
+            "Ulimits":[{"Name":"core","Soft":0,"Hard":0},{"Name":"core","Soft":-1,"Hard":-1}]
+        }}));
+        assert_eq!(unknown.memory_swap_limit_bytes, Some(-1));
+        assert!(unknown.log_config.is_none());
+        assert!(unknown.core_dump_limit.is_none());
+        assert_eq!(unknown.privileged, None);
     }
 
     #[test]

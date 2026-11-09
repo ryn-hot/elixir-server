@@ -7,8 +7,11 @@ use super::MIGRATOR;
 
 const POSTGRES_0042: &str = include_str!("postgres/0042_layered_scraper_source_registry.sql");
 const POSTGRES_0056: &str = include_str!("postgres/0056_live_streaming.sql");
+const POSTGRES_0069: &str = include_str!("postgres/0069_marketplace_sdk_namespace_owners.sql");
+const POSTGRES_0071: &str = include_str!("postgres/0071_marketplace_instance_journals.sql");
+const POSTGRES_0072: &str = include_str!("postgres/0072_marketplace_choice_revisions.sql");
 
-const ADAPTED_VERSIONS: &[i64] = &[1, 6, 8, 14, 24, 26, 41, 42, 47, 50, 56];
+const ADAPTED_VERSIONS: &[i64] = &[1, 6, 8, 14, 24, 26, 41, 42, 47, 50, 56, 69, 71, 72];
 const SQLITE_BOOLEAN_DEFAULT_FALSE: &str = "BOOLEAN NOT NULL DEFAULT 0";
 const SQLITE_BOOLEAN_DEFAULT_TRUE: &str = "BOOLEAN NOT NULL DEFAULT 1";
 
@@ -63,6 +66,9 @@ fn adapt(migration: &Migration) -> Result<(Migration, bool)> {
         }
         42 => sql = POSTGRES_0042.to_string(),
         56 => sql = POSTGRES_0056.to_string(),
+        69 => sql = POSTGRES_0069.to_string(),
+        71 => sql = POSTGRES_0071.to_string(),
+        72 => sql = POSTGRES_0072.to_string(),
         _ => {}
     }
 

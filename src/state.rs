@@ -54,6 +54,7 @@ pub struct AppState {
     pub mdns_active: Arc<AtomicBool>,
     pub orchestrator: Arc<OrchestratorService>,
     pub live: Arc<LiveService>,
+    pub marketplace: crate::marketplace::service::MarketplaceService,
 }
 
 impl AppState {
@@ -225,6 +226,23 @@ impl AppState {
                 .is_ok(),
             "anime inference repair target is initialized exactly once"
         );
+        #[cfg(unix)]
+        let marketplace = crate::marketplace::service::MarketplaceService::with_local_http(
+            settings.live.allow_private_lan_sources,
+            playback_jobs.clone(),
+        );
+        #[cfg(not(unix))]
+        let marketplace = crate::marketplace::service::MarketplaceService::default();
+        #[cfg(unix)]
+        let live = Arc::new(LiveService::new_with_runtime_and_marketplace(
+            settings.live.clone(),
+            settings.environment.clone(),
+            database.clone(),
+            secrets.clone(),
+            orchestrator.runtime_manager(),
+            marketplace.clone(),
+        ));
+        #[cfg(not(unix))]
         let live = Arc::new(LiveService::new_with_runtime(
             settings.live.clone(),
             settings.environment.clone(),
@@ -254,6 +272,7 @@ impl AppState {
             mdns_active: Arc::new(AtomicBool::new(false)),
             orchestrator: Arc::new(orchestrator),
             live,
+            marketplace,
         }
     }
 }

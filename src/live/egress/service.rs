@@ -1828,6 +1828,7 @@ fn compile_live_topology(
             tmpfs: vec![ContainerTmpfsMount {
                 path: "/tmp".to_string(),
                 size_mb: Some(16),
+                ..Default::default()
             }],
             memory_limit_mb: Some(config.worker_memory_mb),
             pids_limit: Some(config.worker_pids_limit),

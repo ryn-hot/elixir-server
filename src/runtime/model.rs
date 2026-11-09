@@ -59,13 +59,57 @@ pub struct ContainerSecurityOptions {
     pub seccomp_profile: Option<String>,
     #[serde(default)]
     pub apparmor_profile: Option<String>,
+    /// Total RAM plus swap. Equal to memory_limit_mb disables container swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap_limit_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_options: Option<ContainerLogOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_core_dumps: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_files_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_limit_bytes: Option<u64>,
+    /// Keep the private process input pipe open until a trusted controller
+    /// attaches. No TTY is allocated. Existing service specs remain unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdin_open: bool,
+    /// Reap orphaned native watchdogs. Omission preserves existing frozen
+    /// specifications; the caller must explicitly select this PID1 topology.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub init_process: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerLogOptions {
+    Disabled,
+    BoundedJson { max_size_mb: u32, max_files: u16 },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerTmpfsMount {
     pub path: String,
     #[serde(default)]
     pub size_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_gid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u16>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_exec: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_suid: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_dev: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +146,37 @@ pub struct OwnedDirectoryVolumeSpec {
     pub owner_uid: u32,
     pub owner_gid: u32,
     pub labels: HashMap<String, String>,
+}
+
+/// Controller-owned fixed catalog storage; no peer paths, scripts or UID
+/// overrides. Only the immutable worker image's bundled initializer may run.
+#[derive(Debug, Clone)]
+pub struct FixedMarketplaceVolumeSpec {
+    pub name: String,
+    pub image: String,
+    pub memory_limit_mb: u64,
+    pub cpu_millicores: u32,
+    pub labels: HashMap<String, String>,
+}
+
+/// One controller-owned foreground source workspace. The closed descriptor
+/// supplies sizes/digests only, never paths, scripts, mounts or reset authority.
+#[derive(Debug, Clone)]
+pub struct QuarantineMarketplaceVolumeSpec {
+    pub name: String,
+    pub image: String,
+    pub memory_limit_mb: u64,
+    pub cpu_millicores: u32,
+    pub workspace: elixir_marketplace::quarantine::QuarantineWorkspace,
+    pub labels: HashMap<String, String>,
+}
+
+/// Untrusted cache metadata, never a byte-verification or execution receipt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SourceCacheState {
+    Unsupported,
+    Absent,
+    Present(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -168,8 +243,35 @@ pub struct ContainerRuntimeState {
     pub security: ContainerRuntimeSecurityState,
 }
 
+/// Raw runtime observations, not a protection/ownership capability. The packet
+/// controller validates these against its immutable desired profile.
+#[derive(Debug, Clone)]
+pub struct PrivateActorInspection {
+    pub id: String,
+    pub running: bool,
+    pub runtime: ContainerRuntimeState,
+    pub command: Vec<String>,
+    pub entrypoint: Vec<String>,
+    pub environment: Vec<String>,
+    pub pid_mode: String,
+    pub ipc_mode: String,
+    pub userns_mode: String,
+    pub device_count: usize,
+    pub device_request_count: usize,
+    pub bind_count: usize,
+    pub sysctls: BTreeMap<String, String>,
+    pub networks: Vec<String>,
+    pub network_ids: BTreeMap<String, String>,
+    pub endpoint_ids: BTreeMap<String, String>,
+    pub restart_policy: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContainerRuntimeSecurityState {
+    #[serde(default)]
+    pub image_reference: Option<String>,
+    #[serde(default)]
+    pub image_id: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
@@ -190,6 +292,38 @@ pub struct ContainerRuntimeSecurityState {
     pub seccomp_profile: Option<String>,
     #[serde(default)]
     pub apparmor_profile: Option<String>,
+    #[serde(default)]
+    pub memory_swap_limit_bytes: Option<i64>,
+    #[serde(default)]
+    pub log_config: Option<ContainerRuntimeLogConfig>,
+    #[serde(default)]
+    pub shared_memory_bytes: Option<i64>,
+    #[serde(default)]
+    pub core_dump_limit: Option<ContainerRuntimeUlimit>,
+    #[serde(default)]
+    pub open_files_limit: Option<ContainerRuntimeUlimit>,
+    #[serde(default)]
+    pub file_size_limit: Option<ContainerRuntimeUlimit>,
+    #[serde(default)]
+    pub stdin_open: Option<bool>,
+    #[serde(default)]
+    pub tty: Option<bool>,
+    #[serde(default)]
+    pub privileged: Option<bool>,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRuntimeLogConfig {
+    pub driver: String,
+    pub options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRuntimeUlimit {
+    pub soft: i64,
+    pub hard: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,4 +408,28 @@ pub fn container_spec_fingerprint(spec: &ContainerSpec) -> String {
     blake3::hash(canonical.to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    #[test]
+    fn absent_new_limits_preserve_legacy_security_fingerprint_shape() {
+        assert_eq!(
+            serde_json::to_value(ContainerSecurityOptions::default()).unwrap(),
+            serde_json::json!({
+                "user":null,"read_only_rootfs":false,"no_new_privileges":false,"tmpfs":[],"memory_limit_mb":null,
+                "pids_limit":null,"cpu_quota":null,"seccomp_profile":null,"apparmor_profile":null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ContainerTmpfsMount {
+                path: "/tmp".to_owned(),
+                size_mb: Some(64),
+                ..Default::default()
+            })
+            .unwrap(),
+            serde_json::json!({"path":"/tmp","size_mb":64})
+        );
+    }
 }

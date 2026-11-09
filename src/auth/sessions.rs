@@ -1040,7 +1040,7 @@ fn parse_uuid(value: &str) -> Result<Uuid, AuthSessionError> {
     Uuid::parse_str(value).map_err(|_| AuthSessionError::InvalidState("UUID"))
 }
 
-fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, AuthSessionError> {
+pub(crate) fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, AuthSessionError> {
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
         return Ok(timestamp.with_timezone(&Utc));
     }

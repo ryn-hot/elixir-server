@@ -13,7 +13,7 @@ use crate::{
     auth::revocation::{AuthorizationRevocationEvent, AuthorizationRevocationNotifier},
     config::RunEnvironment,
     db::models::SecretScope,
-    extensions::store::ExtensionStore,
+    extensions::store::{ExtensionStore, NewSecret},
     secrets::SecretsManager,
 };
 
@@ -264,6 +264,11 @@ pub struct LiveService {
     pool: sqlx::AnyPool,
     secrets: Arc<SecretsManager>,
     runtime_manager: Option<Arc<dyn crate::runtime::RuntimeManager>>,
+    #[cfg(unix)]
+    marketplace: Option<(
+        crate::db::Database,
+        crate::marketplace::service::MarketplaceService,
+    )>,
     lease_repository: ControlLeaseRepository,
     redactor: Arc<LiveRedactor>,
     allow_loopback_providers: bool,
@@ -309,6 +314,28 @@ impl LiveService {
         )
     }
 
+    /// Shares the application's original execution owner, not a second runtime
+    /// or a readiness reconstructed from provider metadata.
+    #[cfg(unix)]
+    pub(crate) fn new_with_runtime_and_marketplace(
+        config: LiveConfig,
+        environment: RunEnvironment,
+        database: crate::db::Database,
+        secrets: Arc<SecretsManager>,
+        runtime_manager: Arc<dyn crate::runtime::RuntimeManager>,
+        marketplace: crate::marketplace::service::MarketplaceService,
+    ) -> Self {
+        let mut service = Self::new_with_runtime(
+            config,
+            environment,
+            database.pool.clone(),
+            secrets,
+            runtime_manager,
+        );
+        service.marketplace = Some((database, marketplace));
+        service
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         config: LiveConfig,
@@ -338,6 +365,8 @@ impl LiveService {
             pool,
             secrets,
             runtime_manager,
+            #[cfg(unix)]
+            marketplace: None,
             lease_repository,
             redactor: Arc::new(LiveRedactor::default()),
             allow_loopback_providers,
@@ -490,6 +519,16 @@ impl LiveService {
             Some(
                 self.provider_client
                     .get_or_try_init(|| async {
+                        #[cfg(unix)]
+                        if let Some((database, marketplace)) = &self.marketplace {
+                            return LiveProviderClient::new_with_marketplace(
+                                database.clone(),
+                                marketplace.clone(),
+                                self.config.providers.clone(),
+                                self.redactor.clone(),
+                            )
+                            .map(Arc::new);
+                        }
                         #[cfg(test)]
                         {
                             if self.allow_loopback_providers {
@@ -1314,24 +1353,29 @@ impl LiveService {
             .secrets
             .encrypt(encoded.as_str())
             .map_err(LiveServiceError::SecretStore)?;
+        let data = NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Global,
+            scope_id: None,
+            key: key.to_owned(),
+            value_encrypted: encrypted,
+            rotatable: true,
+        };
         for attempt in 0..8u64 {
-            let result = sqlx::query(
-                "INSERT INTO secrets
-                    (secret_id, scope, scope_id, key, value_encrypted, rotatable)
-                 VALUES ($1, 'global', NULL, $2, $3, TRUE)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(key)
-            .bind(&encrypted)
-            .execute(&self.pool)
-            .await;
+            let result = ExtensionStore::new(&self.pool)
+                .insert_secret_if_absent(&data)
+                .await;
             match result {
                 Ok(_) => return Ok(()),
-                Err(error) if attempt < 7 && transient_database_lock(&error) => {
+                Err(error)
+                    if attempt < 7
+                        && error
+                            .downcast_ref::<sqlx::Error>()
+                            .is_some_and(transient_database_lock) =>
+                {
                     tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
                 }
-                Err(error) => return Err(LiveServiceError::SecretStore(error.into())),
+                Err(error) => return Err(LiveServiceError::SecretStore(error)),
             }
         }
         Err(LiveServiceError::Crypto(LiveCryptoError::EncryptionFailed))
@@ -1492,6 +1536,65 @@ mod tests {
         assert!(protected.raw_enabled);
         assert!(protected.effective_enabled);
         assert!(protected.dependency_ready);
+    }
+
+    #[tokio::test]
+    async fn development_key_reload_preserves_ids_ciphertexts_and_old_envelopes() -> Result<()> {
+        let database = test_database().await?;
+        let secrets = Arc::new(SecretsManager::from_key_bytes([63; 32], false));
+        let config = LiveConfig {
+            enabled: true,
+            ..LiveConfig::default()
+        };
+        let first = LiveService::new(
+            config.clone(),
+            RunEnvironment::Development,
+            database.pool.clone(),
+            secrets.clone(),
+        )
+        .load_crypto()
+        .await?;
+        let context = super::super::crypto::EnvelopeContext::new(
+            super::super::crypto::EnvelopePurpose::WorkerDescriptor,
+            "fixture",
+            "record",
+            "payload",
+        )?;
+        let envelope = first.crypto.encrypt(
+            context,
+            &super::super::crypto::SecretBytes::from_utf8("keep across reload".into()),
+        )?;
+        let store = ExtensionStore::new(&database.pool);
+        let before = store
+            .list_secrets(Some(SecretScope::Global), None, None)
+            .await?
+            .into_iter()
+            .map(|s| (s.secret_id, s.value_encrypted))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(before.len(), 3);
+        let second = LiveService::new(
+            config,
+            RunEnvironment::Development,
+            database.pool.clone(),
+            secrets,
+        )
+        .load_crypto()
+        .await?;
+        let after = store
+            .list_secrets(Some(SecretScope::Global), None, None)
+            .await?
+            .into_iter()
+            .map(|s| (s.secret_id, s.value_encrypted))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            before, after,
+            "initialization must not rotate or append existing keys"
+        );
+        assert_eq!(
+            second.crypto.decrypt(context, &envelope)?.expose_secret(),
+            b"keep across reload"
+        );
+        Ok(())
     }
 
     #[tokio::test]

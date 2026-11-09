@@ -72,7 +72,7 @@ use crate::{
     state::AppState,
 };
 
-fn test_settings_with_db() -> Settings {
+pub(crate) fn test_settings_with_db() -> Settings {
     let master_key = general_purpose::STANDARD.encode([0u8; 32]);
     Settings {
         environment: RunEnvironment::Development,
@@ -93,6 +93,7 @@ fn test_settings_with_db() -> Settings {
         classifier: ClassifierConfig::default(),
         playback: crate::config::PlaybackConfig::default(),
         media_interactions: MediaInteractionsConfig::default(),
+        marketplace: crate::config::MarketplaceConfig::default(),
         live: crate::live::config::LiveConfig::default(),
         network: crate::config::NetworkConfig::default(),
     }
@@ -360,7 +361,7 @@ fn timing_budget_from_env(name: &str, default_ms: u64) -> Duration {
         .unwrap_or_else(|| Duration::from_millis(default_ms))
 }
 
-fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
+pub(crate) fn test_artwork_service(settings: &Settings) -> Result<ArtworkService> {
     ArtworkService::new(
         settings.library.artwork_cache_dir.clone(),
         settings.metadata.request_timeout_seconds,
@@ -3312,6 +3313,150 @@ async fn setup_download_broker_test_app() -> Result<(Router, sqlx::AnyPool, Stri
     let token = state.auth_service.issue_access_token(Uuid::new_v4())?.token;
     let app = router(state);
     Ok((app, db_pool, token))
+}
+
+#[tokio::test]
+async fn marketplace_search_routes_require_current_owner_auth_and_never_bootstrap_networking()
+-> Result<()> {
+    let directory = tempdir()?;
+    let mut settings = test_settings_with_db();
+    settings.database.url = format!(
+        "sqlite://{}",
+        directory.path().join("marketplace-http.sqlite").display()
+    );
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let auth = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let state = AppState::new(
+        settings,
+        database,
+        auth,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    );
+    let service = state.marketplace.clone();
+    let app = router(state);
+    let body = json!({"query":{"text":"example","tags":["movies"],"limit":20}}).to_string();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/marketplace/search")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let signup=app.clone().oneshot(Request::post("/api/v1/auth/signup").header("content-type","application/json")
+        .body(Body::from(json!({"email":"marketplace-search-fixture@example.test","password":"fixture-password-only"}).to_string()))?).await?;
+    assert!(signup.status().is_success());
+    let tokens: Value =
+        serde_json::from_slice(&body::to_bytes(signup.into_body(), 64 * 1024).await?)?;
+    let token = tokens["access_token"]
+        .as_str()
+        .context("missing test account access token")?;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/marketplace/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/marketplace/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"query":{"text":"example","tags":["live","movies"],"limit":20}})
+                        .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/marketplace/search?token={token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/marketplace/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from("x".repeat(4097)))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // A direct reference has its own bounded, owner-only preview route. No
+    // connected protected worker means no verification or implicit fallback.
+    let vector: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/elixir_marketplace/tests/fixtures/protocol-v1.json"
+    )))?;
+    let reference = json!({"schema_version":1,"publisher":vector["publisher"],
+        "release":vector["release"],"head":vector["head"]})
+    .to_string();
+    for (token_header, data, expected) in [
+        (false, reference.clone(), StatusCode::UNAUTHORIZED),
+        (true, reference.clone(), StatusCode::SERVICE_UNAVAILABLE),
+        (
+            true,
+            "{\"schema_version\":1,\"schema_version\":2}".into(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            true,
+            "x".repeat(elixir_marketplace::publication::MAX_PUBLICATION_BYTES + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let mut request =
+            Request::post("/api/v1/marketplace/import").header("content-type", "application/json");
+        if token_header {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app.clone().oneshot(request.body(Body::from(data))?).await?;
+        assert_eq!(response.status(), expected);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/marketplace/import?token={token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(reference))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/marketplace/search/{}", Uuid::new_v4()))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        service.snapshot().phase,
+        crate::marketplace::service::RuntimePhase::NotConnected
+    );
+    service.shutdown().await?;
+    Ok(())
 }
 
 async fn seed_download_broker_provider(
@@ -26393,6 +26538,84 @@ async fn extensions_rollback_plan_previews_availability() -> Result<()> {
         "expected rollback_runtime action"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_secret_api_concurrent_create_preserves_winner_and_rotates_same_id() -> Result<()> {
+    let (app, state, _instance) = setup_generic_control_surface_extension().await?;
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 0..8 {
+        let app = app.clone();
+        requests.spawn(async move {
+            let response = app.oneshot(Request::post("/api/v1/extensions/secrets")
+                .header("content-type","application/json")
+                .body(Body::from(json!({"scope":"global","key":"concurrent_global_key","value":format!("candidate-{index}"),"rotatable":true}).to_string()))?).await?;
+            let status = response.status();
+            let payload: Value = serde_json::from_slice(&body::to_bytes(response.into_body(),65536).await?)?;
+            Ok::<_,anyhow::Error>((index,status,payload))
+        });
+    }
+    let mut winner = None;
+    let mut conflicts = 0;
+    while let Some(result) = requests.join_next().await {
+        let (index, status, payload) = result??;
+        if status == StatusCode::OK {
+            assert!(winner.is_none(), "only one create may win");
+            winner = Some((
+                index,
+                payload["secretId"]
+                    .as_str()
+                    .context("created secret ID")?
+                    .to_owned(),
+            ));
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+            conflicts += 1;
+        }
+    }
+    assert_eq!(conflicts, 7);
+    let (index, id) = winner.context("one create winner")?;
+    let store = ExtensionStore::new(&state.db_pool);
+    let before = store
+        .get_secret(SecretScope::Global, None, "concurrent_global_key")
+        .await?
+        .context("created global key")?;
+    assert_eq!(before.secret_id.to_string(), id);
+    assert_eq!(
+        state.secrets.decrypt(&before.value_encrypted)?,
+        format!("candidate-{index}")
+    );
+    let response = app
+        .oneshot(
+            Request::post(format!("/api/v1/extensions/secrets/{id}/rotate"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"value":"rotated-global-value"}).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let current = store
+        .get_secret(SecretScope::Global, None, "concurrent_global_key")
+        .await?
+        .context("rotated global key")?;
+    assert_eq!(current.secret_id, before.secret_id);
+    assert_eq!(
+        state.secrets.decrypt(&current.value_encrypted)?,
+        "rotated-global-value"
+    );
+    assert_eq!(
+        store
+            .list_secrets(
+                Some(SecretScope::Global),
+                None,
+                Some("concurrent_global_key")
+            )
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 

@@ -1,4 +1,5 @@
-use axum::{Json, extract::State};
+use crate::http::auth::CurrentPrincipal;
+use axum::{Json, extract::State, http::HeaderMap};
 
 use crate::{
     http::error::{ApiError, ApiResult},
@@ -11,7 +12,7 @@ use crate::{
         DownloadProtectionStatus, DownloadProtectionSwitchRequest,
         DownloadProtectionSwitchResponse, DownloadProviderPresetCatalog,
         QbittorrentListenPortSyncApplyResponse, QbittorrentListenPortSyncPlan,
-        QbittorrentListenPortSyncStatus,
+        QbittorrentListenPortSyncStatus, VpnProfilePurpose,
         apply_download_protection_first_run_choice_with_orchestrated_apply,
         cloudflare_warp_diagnostics, cloudflare_warp_disclosure, download_provider_preset_catalog,
         ensure_cloudflare_warp_profile, import_openvpn_profile, import_wireguard_profile,
@@ -176,18 +177,32 @@ pub async fn profiles(
 
 pub async fn import_wireguard(
     State(state): State<AppState>,
+    principal: Result<CurrentPrincipal, ApiError>,
+    headers: HeaderMap,
     Json(request): Json<DownloadNetworkProfileImportRequest>,
 ) -> ApiResult<Json<DownloadNetworkProfileImportResponse>> {
+    let marketplace_connection = request.purpose == VpnProfilePurpose::MarketplaceNetwork;
+    if request.purpose != VpnProfilePurpose::Downloads {
+        super::marketplace::authorize_network_configuration(&state, &principal?, &headers).await?;
+    }
     let response = import_wireguard_profile(&state.db_pool, &state.secrets, request)
         .await
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if marketplace_connection {
+        state.marketplace.connection_configuration_changed();
+    }
     Ok(Json(response))
 }
 
 pub async fn import_openvpn(
     State(state): State<AppState>,
+    principal: Result<CurrentPrincipal, ApiError>,
+    headers: HeaderMap,
     Json(request): Json<DownloadNetworkProfileImportRequest>,
 ) -> ApiResult<Json<DownloadNetworkProfileImportResponse>> {
+    if request.purpose != VpnProfilePurpose::Downloads {
+        super::marketplace::authorize_network_configuration(&state, &principal?, &headers).await?;
+    }
     let response = import_openvpn_profile(&state.db_pool, &state.secrets, request)
         .await
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -197,6 +212,9 @@ pub async fn import_openvpn(
 pub async fn provider_presets() -> ApiResult<Json<DownloadProviderPresetCatalog>> {
     Ok(Json(download_provider_preset_catalog()))
 }
+
+#[cfg(test)]
+mod marketplace_tests;
 
 pub async fn qbittorrent_listen_port_sync(
     State(state): State<AppState>,

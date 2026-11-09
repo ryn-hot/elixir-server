@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
@@ -10,6 +10,9 @@ use rand_core::{OsRng, RngCore};
 use crate::config::{RunEnvironment, Settings};
 
 const ENCRYPTED_PREFIX: &str = "enc:v1:";
+// Deliberately contains ':' after the legacy prefix: a generic decrypt must
+// reject this as invalid base64, even in plaintext-tolerant development mode.
+const BOUND_PREFIX: &str = "enc:v1:bound:";
 const MASTER_KEY_FILENAME: &str = "secrets.key";
 
 #[derive(Clone)]
@@ -60,37 +63,62 @@ impl SecretsManager {
     }
 
     pub fn encrypt(&self, plaintext: &str) -> Result<String> {
+        self.encrypt_payload(plaintext, b"", ENCRYPTED_PREFIX)
+    }
+
+    /// Cryptographic data binding only, never permission or runtime authority.
+    pub(crate) fn encrypt_bound(&self, plaintext: &str, associated: &[u8]) -> Result<String> {
+        if associated.is_empty() {
+            bail!("bound secret context must not be empty");
+        }
+        self.encrypt_payload(plaintext, associated, BOUND_PREFIX)
+    }
+
+    /// Stable private request correlation, not authentication or authorization.
+    /// A purpose-separated HKDF key avoids putting guessable password hashes
+    /// in journals. Context and payload are separately length-delimited.
+    pub(crate) fn request_fingerprint(&self, context: &[u8], payload: &[u8]) -> Result<[u8; 32]> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        if context.is_empty() {
+            bail!("request fingerprint context must not be empty");
+        }
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        hkdf::Hkdf::<Sha256>::new(Some(b"elixir/secrets/request-fingerprint/v1"), &self.key)
+            .expand(b"hmac-sha256/request-id", key.as_mut())
+            .map_err(|_| anyhow!("deriving private request fingerprint key failed"))?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_ref())
+            .map_err(|_| anyhow!("initializing private request fingerprint failed"))?;
+        mac.update(&(context.len() as u64).to_be_bytes());
+        mac.update(context);
+        mac.update(&(payload.len() as u64).to_be_bytes());
+        mac.update(payload);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    fn encrypt_payload(&self, plaintext: &str, associated: &[u8], prefix: &str) -> Result<String> {
         let cipher = Aes256Gcm::new_from_slice(&self.key).context("initializing secrets cipher")?;
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: associated,
+                },
+            )
             .map_err(|_| anyhow!("encrypting secret failed"))?;
         let mut payload = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
         payload.extend_from_slice(&nonce_bytes);
         payload.extend_from_slice(&ciphertext);
         let encoded = general_purpose::STANDARD.encode(payload);
-        Ok(format!("{ENCRYPTED_PREFIX}{encoded}"))
+        Ok(format!("{prefix}{encoded}"))
     }
 
     pub fn decrypt(&self, value: &str) -> Result<String> {
         if let Some(encoded) = value.strip_prefix(ENCRYPTED_PREFIX) {
-            let payload = general_purpose::STANDARD
-                .decode(encoded)
-                .context("decoding encrypted secret")?;
-            if payload.len() < 12 {
-                bail!("encrypted secret payload is too short");
-            }
-            let (nonce_bytes, ciphertext) = payload.split_at(12);
-            if let Ok(value) = decrypt_with_key(self.key, nonce_bytes, ciphertext) {
-                return Ok(value);
-            }
-            for key in &self.fallback_keys {
-                if let Ok(value) = decrypt_with_key(*key, nonce_bytes, ciphertext) {
-                    return Ok(value);
-                }
-            }
-            bail!("decrypting secret failed");
+            return self.decrypt_payload(encoded, b"");
         }
 
         if self.allow_plaintext {
@@ -102,6 +130,40 @@ impl SecretsManager {
 
     pub fn is_encrypted(value: &str) -> bool {
         value.starts_with(ENCRYPTED_PREFIX)
+    }
+
+    pub(crate) fn is_bound(value: &str) -> bool {
+        value.starts_with(BOUND_PREFIX)
+    }
+
+    /// No plaintext or unbound-ciphertext fallback, including development.
+    pub(crate) fn decrypt_bound(&self, value: &str, associated: &[u8]) -> Result<String> {
+        if associated.is_empty() {
+            bail!("bound secret context must not be empty");
+        }
+        let encoded = value
+            .strip_prefix(BOUND_PREFIX)
+            .context("bound encrypted secret required")?;
+        self.decrypt_payload(encoded, associated)
+    }
+
+    fn decrypt_payload(&self, encoded: &str, associated: &[u8]) -> Result<String> {
+        let payload = general_purpose::STANDARD
+            .decode(encoded)
+            .context("decoding encrypted secret")?;
+        if payload.len() < 12 {
+            bail!("encrypted secret payload is too short");
+        }
+        let (nonce_bytes, ciphertext) = payload.split_at(12);
+        if let Ok(value) = decrypt_with_key(self.key, nonce_bytes, ciphertext, associated) {
+            return Ok(value);
+        }
+        for key in &self.fallback_keys {
+            if let Ok(value) = decrypt_with_key(*key, nonce_bytes, ciphertext, associated) {
+                return Ok(value);
+            }
+        }
+        bail!("decrypting secret failed");
     }
 }
 
@@ -182,10 +244,21 @@ fn legacy_master_key_paths(storage_root: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn decrypt_with_key(key: [u8; 32], nonce_bytes: &[u8], ciphertext: &[u8]) -> Result<String> {
+fn decrypt_with_key(
+    key: [u8; 32],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+    associated: &[u8],
+) -> Result<String> {
     let cipher = Aes256Gcm::new_from_slice(&key).context("initializing secrets cipher")?;
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad: associated,
+            },
+        )
         .map_err(|_| anyhow!("decrypting secret failed"))?;
     String::from_utf8(plaintext).context("secret is not valid utf-8")
 }
@@ -230,6 +303,97 @@ fn decode_master_key(raw: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_fingerprints_are_private_stable_context_separated_and_unambiguous() -> Result<()> {
+        let manager = SecretsManager::from_key_bytes([61; 32], false);
+        let id = manager.request_fingerprint(b"context-a", b"low-entropy-password")?;
+        // Independent Node/OpenSSL HKDF/HMAC vector freezes the private retry
+        // format; accidental key/context/framing changes must not go unnoticed.
+        assert_eq!(
+            id,
+            [
+                3, 9, 104, 220, 59, 162, 193, 97, 151, 189, 241, 84, 223, 115, 111, 41, 225, 150,
+                125, 135, 252, 253, 208, 211, 188, 198, 187, 165, 184, 238, 244, 115
+            ]
+        );
+        assert_eq!(
+            id,
+            manager.request_fingerprint(b"context-a", b"low-entropy-password")?
+        );
+        assert_ne!(
+            id,
+            manager.request_fingerprint(b"context-b", b"low-entropy-password")?
+        );
+        assert_ne!(id, manager.request_fingerprint(b"context-a", b"different")?);
+        assert_ne!(
+            id,
+            SecretsManager::from_key_bytes([62; 32], false)
+                .request_fingerprint(b"context-a", b"low-entropy-password")?
+        );
+        assert_ne!(
+            manager.request_fingerprint(b"a", b"bc")?,
+            manager.request_fingerprint(b"ab", b"c")?
+        );
+        assert!(manager.request_fingerprint(b"", b"input").is_err());
+        // No changes to existing ciphertext format or its ordinary decoder.
+        let cipher = manager.encrypt("legacy")?;
+        assert_eq!(manager.decrypt(&cipher)?, "legacy");
+        Ok(())
+    }
+
+    #[test]
+    fn bound_ciphertexts_require_their_exact_context_and_never_fall_back_to_legacy_or_plaintext()
+    -> Result<()> {
+        for development in [false, true] {
+            let manager = SecretsManager::from_key_bytes([61; 32], development);
+            let cipher = manager.encrypt_bound("private value", b"context-a")?;
+            assert_eq!(
+                manager.decrypt_bound(&cipher, b"context-a")?,
+                "private value"
+            );
+            assert!(manager.decrypt_bound(&cipher, b"context-b").is_err());
+            assert!(manager.decrypt(&cipher).is_err());
+            assert!(
+                manager
+                    .decrypt_bound(&manager.encrypt("private value")?, b"context-a")
+                    .is_err()
+            );
+            assert!(
+                manager
+                    .decrypt_bound("private value", b"context-a")
+                    .is_err()
+            );
+            assert!(manager.encrypt_bound("private value", b"").is_err());
+            assert!(manager.decrypt_bound(&cipher, b"").is_err());
+            assert!(
+                !format!(
+                    "{:#}",
+                    manager.decrypt_bound(&cipher, b"wrong").unwrap_err()
+                )
+                .contains("private value")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_ciphertexts_keep_development_key_rotation_support_without_weakening_context_checks()
+    -> Result<()> {
+        let old = SecretsManager::from_key_bytes([62; 32], false);
+        let cipher = old.encrypt_bound("rotation value", b"context")?;
+        let manager = SecretsManager {
+            key: [63; 32],
+            fallback_keys: vec![[62; 32]],
+            allow_plaintext: false,
+        };
+        assert_eq!(
+            manager.decrypt_bound(&cipher, b"context")?,
+            "rotation value"
+        );
+        assert!(manager.decrypt_bound(&cipher, b"wrong").is_err());
+        Ok(())
+    }
 
     #[test]
     fn encrypts_and_decrypts() -> Result<()> {

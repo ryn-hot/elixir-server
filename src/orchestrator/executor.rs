@@ -621,11 +621,18 @@ impl<'a> Executor<'a> {
         _networking: Option<ManifestNetworking>,
         aliases: Vec<String>,
     ) -> Result<()> {
+        // Public runtime creation must consume verified execution + scoped
+        // grants, never this legacy image/secret/environment path.
+        crate::extensions::permissions::require_legacy_extension_id(&extension_id)?;
         let instance = self
             .store
             .get_instance(instance_id)
             .await?
             .ok_or_else(|| anyhow!("instance {} not found", instance_id))?;
+        crate::extensions::permissions::require_legacy_extension_id(&instance.extension_id)?;
+        if instance.extension_id != extension_id {
+            bail!("runtime extension does not own the target instance");
+        }
         let extension = self
             .store
             .get_extension(&extension_id)
@@ -5615,6 +5622,7 @@ fn container_security_options(security: &ManifestRuntimeSecurity) -> ContainerSe
             .map(|tmpfs| ContainerTmpfsMount {
                 path: tmpfs.path.clone(),
                 size_mb: tmpfs.size_mb,
+                ..Default::default()
             })
             .collect(),
         memory_limit_mb: security.memory_limit_mb,
@@ -5622,6 +5630,7 @@ fn container_security_options(security: &ManifestRuntimeSecurity) -> ContainerSe
         cpu_quota: security.cpu_quota.clone(),
         seccomp_profile: security.seccomp_profile.clone(),
         apparmor_profile: security.apparmor_profile.clone(),
+        ..Default::default()
     }
 }
 
@@ -7815,6 +7824,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_runtime_ids_cannot_enter_the_legacy_secret_or_docker_path() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let directory = TempDir::new()?;
+        let paths = RuntimePaths::from_roots(
+            directory
+                .path()
+                .join("extensions")
+                .to_string_lossy()
+                .as_ref(),
+            directory.path().to_string_lossy().as_ref(),
+        );
+        let secrets = SecretsManager::from_key_bytes([3; 32], false);
+        let executor = Executor::new(&database.pool, &probe, &drivers, &runtime, paths, &secrets);
+        let spec: ManifestRuntime = serde_json::from_value(
+            json!({"type":"container","image":"unverified:latest","env":[{"name":"API_KEY","from_secret":"global:downloader_key"}]}),
+        )?;
+        let error = executor
+            .ensure_runtime_running(
+                Uuid::new_v4(),
+                "elx:publisher/source".into(),
+                "default".into(),
+                spec.clone(),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("verified marketplace pipeline"));
+        assert!(runtime.last_spec().is_none());
+        insert_extension(&store, "elx:publisher/source", json!({})).await?;
+        let id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id: id,
+                extension_id: "elx:publisher/source".into(),
+                instance_name: "default".into(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let error = executor
+            .ensure_runtime_running(
+                id,
+                "elixir.modules.qbittorrent".into(),
+                "default".into(),
+                spec,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("verified marketplace pipeline"));
+        assert!(runtime.last_spec().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_env_optional_secret_is_omitted_until_configured() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -7928,6 +7998,7 @@ mod tests {
                 cpu_quota: Some("1.0".to_string()),
                 seccomp_profile: Some("default".to_string()),
                 apparmor_profile: Some("prism-default".to_string()),
+                sdk_state_limit_bytes: None,
                 prohibit_docker_socket: true,
                 prohibit_host_media_mounts: true,
             },
@@ -10943,6 +11014,7 @@ mod tests {
             format!("stop:{base_name}"),
             format!("rename:{base_name}->{rollback_name}"),
             "ensure_container".to_string(),
+            format!("get:{base_name}"),
         ];
         assert_eq!(runtime.calls(), expected);
         Ok(())

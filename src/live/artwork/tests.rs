@@ -239,6 +239,46 @@ async fn setup(
 }
 
 #[tokio::test]
+async fn explicit_public_destination_denial_blocks_cached_artwork_without_a_second_fetch()
+-> AnyResult<()> {
+    let (database, _native, images, service, provider, home, profile) =
+        setup(LiveArtworkLimits::default()).await?;
+    let request = || {
+        fetch_request(
+            provider,
+            home,
+            profile,
+            1,
+            images.port,
+            "/image.png",
+            "deny-cache",
+        )
+    };
+    let cancellation = CancellationToken::new();
+    service.fetch(request(), &cancellation).await?;
+    assert!(service.fetch(request(), &cancellation).await?.cache_hit);
+    assert_eq!(images.count("/image.png"), 1);
+    for host in ["127.0.0.1", "artwork.live.test"] {
+        sqlx::query("INSERT INTO live_provider_destination_rules (
+        id,home_id,provider_id,scheme,normalized_host,port,exact_path,network_scope,
+        allow_fetch,allow_credentials,allow_client_disclosure,revision,created_by_actor_snapshot
+        ) VALUES ($1,$2,$3,'http',$5,$4,'/image.png','public',FALSE,FALSE,FALSE,1,'cache-denial-test')")
+        .bind(Uuid::new_v4().to_string()).bind(home.to_string()).bind(provider.to_string())
+        .bind(i64::from(images.port)).bind(host).execute(&database.pool).await?;
+        if host == "127.0.0.1" {
+            // Rules match the requested hostname, not its resolved address.
+            assert!(service.fetch(request(), &cancellation).await?.cache_hit);
+        }
+    }
+    for _ in 0..2 {
+        let error = service.fetch(request(), &cancellation).await.unwrap_err();
+        assert_eq!(error.code(), LiveArtworkErrorCode::PolicyDenied);
+    }
+    assert_eq!(images.count("/image.png"), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn s14_artwork_fetch_redirect_decode_and_cache_without_manual_rules() -> AnyResult<()> {
     let (_database, provider_fixture, images, service, provider, home, profile) =
         setup(LiveArtworkLimits::default()).await?;

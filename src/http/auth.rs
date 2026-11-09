@@ -49,6 +49,34 @@ pub struct CurrentPrincipal {
 }
 
 impl CurrentPrincipal {
+    #[cfg(test)]
+    pub(crate) fn fixture_owner(
+        user_id: Uuid,
+        home_id: Uuid,
+        profile_id: Uuid,
+        account_session_id: Uuid,
+        capability_revision: i64,
+        expires: DateTime<Utc>,
+        capabilities: CapabilitySet,
+    ) -> Self {
+        Self {
+            user_id,
+            home_id,
+            profile_id,
+            account_session_id,
+            capability_revision,
+            csrf_revision: 1,
+            role: HomeRole::Owner,
+            profile_type: ProfileType::Account,
+            profile_display_name: "owner fixture".into(),
+            remember_device: false,
+            session_expires_at: expires,
+            access_expires_at: expires,
+            transport: AccountAuthTransport::Bearer,
+            capabilities,
+        }
+    }
+
     pub fn has_capability(&self, capability: Capability) -> bool {
         self.capabilities.contains(capability)
     }

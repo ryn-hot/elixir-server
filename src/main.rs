@@ -238,6 +238,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Elixir server listening on http://{}", addr);
 
     let background_shutdown = CancellationToken::new();
+    let marketplace_startup =
+        elixir_server::marketplace::startup::spawn_configured(&state, background_shutdown.clone());
+    #[cfg(unix)]
+    let installed_startup = elixir_server::marketplace::installed_startup::spawn_configured(
+        &state,
+        background_shutdown.clone(),
+    );
     let live_lease_task = tokio::spawn(
         state
             .live
@@ -257,13 +264,51 @@ async fn main() -> anyhow::Result<()> {
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown({
             let background_shutdown = background_shutdown.clone();
+            let marketplace = state.marketplace.clone();
             async move {
                 shutdown_signal().await;
+                marketplace.request_stop();
                 background_shutdown.cancel();
             }
         })
         .await;
+    state.marketplace.request_stop();
     background_shutdown.cancel();
+    if let Some(mut startup) = marketplace_startup {
+        // Recovery can be joining its 75-second cleanup receipt. Preserve that
+        // join instead of aborting it and losing confirmation during shutdown.
+        match tokio::time::timeout(std::time::Duration::from_secs(85), &mut startup).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_))) => {} // reported immediately by the startup task
+            Ok(Err(error)) => tracing::error!(error=%error, "marketplace startup task failed"),
+            Err(_) => {
+                startup.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), startup).await;
+                tracing::error!(
+                    "marketplace startup cancellation was not confirmed before its deadline"
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    if let Some(mut startup) = installed_startup {
+        match tokio::time::timeout(std::time::Duration::from_secs(85), &mut startup).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(error=%error,"installed startup waiter failed"),
+            Err(_) => {
+                // Only abort the borrower; the actual open/recovery task stays
+                // retained in MarketplaceService and is joined below.
+                startup.abort();
+                let _ = startup.await;
+                tracing::error!(
+                    "installed startup wait exceeded shutdown deadline; original recovery remains owned"
+                );
+            }
+        }
+    }
+    if let Err(error) = state.marketplace.shutdown().await {
+        tracing::error!(error=%error, "marketplace cleanup was not confirmed during shutdown");
+    }
     match tokio::time::timeout(std::time::Duration::from_secs(10), live_lease_task).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {

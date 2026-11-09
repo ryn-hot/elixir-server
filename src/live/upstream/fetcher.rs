@@ -212,6 +212,7 @@ impl UpstreamFetcher {
                     PreparedRequest {
                         method: request.method.reqwest(),
                         headers,
+                        body: None,
                     },
                     total_deadline,
                 )

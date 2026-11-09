@@ -492,6 +492,9 @@ impl PlaybackJobManager {
         }
     }
 
+    /// Starts and seek/restart transitions, including admission, old-process
+    /// cleanup and hardware fallback, through first-segment readiness. Unlike
+    /// optional background admission, this does not count steady playback.
     pub fn startup_queue_len(&self) -> usize {
         self.startup_queue_len.load(Ordering::Relaxed)
     }
@@ -508,6 +511,7 @@ impl PlaybackJobManager {
         mut plan: PlaybackJobPlan,
         logical_start_seconds: f32,
     ) -> Result<TranscodeHandle> {
+        let _startup_queue_guard = StartupQueueGuard::new(self.startup_queue_len.clone());
         plan.params.seek_seconds = logical_start_seconds;
         if let Some(handle) = self.existing_handle(plan.session_id).await? {
             return Ok(handle);
@@ -521,6 +525,7 @@ impl PlaybackJobManager {
         session_id: Uuid,
         logical_position_seconds: f32,
     ) -> Result<TranscodeHandle> {
+        let _startup_queue_guard = StartupQueueGuard::new(self.startup_queue_len.clone());
         let entry = self
             .jobs
             .get(&session_id)
@@ -985,7 +990,8 @@ impl PlaybackJobManager {
         plan: PlaybackJobPlan,
         initial_state: PlaybackJobState,
     ) -> Result<TranscodeHandle> {
-        let _startup_queue_guard = StartupQueueGuard::new(self.startup_queue_len.clone());
+        // The public start/restart caller retains its startup guard across
+        // this entire attempt AND any hardware/software fallback between them.
         let session_id = plan.session_id;
         let temp_dir = self.make_temp_dir(session_id).await?;
         let log_path = temp_dir.join("ffmpeg.log");
@@ -2266,6 +2272,62 @@ mod tests {
             },
         );
         Ok((manager, database))
+    }
+
+    #[tokio::test]
+    async fn foreground_start_and_seek_protection_precedes_job_wait_and_retires_on_cancel()
+    -> Result<()> {
+        let (manager, _database) = test_manager().await?;
+        let manager = Arc::new(manager);
+        let directory = tempdir()?;
+        let session = Uuid::new_v4();
+        manager
+            .insert_test_job(session, directory.path().to_path_buf(), 0)
+            .await;
+        assert_eq!(manager.startup_queue_len(), 0);
+        assert!(
+            manager.has_latency_sensitive_work(),
+            "steady playback still blocks optional work"
+        );
+        let entry = manager
+            .jobs
+            .get(&session)
+            .context("managed test job")?
+            .value()
+            .clone();
+        for restart in [false, true] {
+            // Both public operations must protect playback BEFORE waiting for
+            // the job lock, persisting a seek or cleaning up its old process.
+            // Holding this lock also proves neither test launches ffmpeg.
+            let held = entry.lock().await;
+            let plan = held.plan.clone();
+            let worker = manager.clone();
+            let task = tokio::spawn(async move {
+                if restart {
+                    worker.restart_at(session, 10.0).await
+                } else {
+                    worker.start(plan, 0.0).await
+                }
+            });
+            let observed = time::timeout(Duration::from_secs(2), async {
+                while manager.startup_queue_len() == 0 {
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            task.abort();
+            let joined = task.await;
+            observed.context("start/seek guard was not held before waiting")?;
+            assert!(matches!(joined, Err(error) if error.is_cancelled()));
+            assert_eq!(
+                manager.startup_queue_len(),
+                0,
+                "cancel must release the original guard"
+            );
+            assert_eq!(held.state, PlaybackJobState::Running);
+            assert!(manager.has_latency_sensitive_work());
+        }
+        Ok(())
     }
 
     #[tokio::test]

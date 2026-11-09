@@ -22,6 +22,28 @@ use crate::extensions::auto_managed::{is_nzbget_extension_id, is_qbittorrent_ext
 use crate::extensions::store::{ExtensionStore, NewSecret};
 use crate::runtime::model::ContainerSpec;
 use crate::secrets::SecretsManager;
+mod marketplace;
+pub(crate) use marketplace::{
+    marketplace_http_profile, marketplace_network_material, reserve_marketplace_network_identity,
+};
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VpnProfilePurpose {
+    #[default]
+    Downloads,
+    MarketplaceHttp,
+    MarketplaceNetwork,
+}
+impl VpnProfilePurpose {
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Downloads => "managed_downloaders",
+            Self::MarketplaceHttp => "marketplace_http",
+            Self::MarketplaceNetwork => "marketplace_network",
+        }
+    }
+}
 
 pub use crate::network::gateway::{
     CloudflareWarpGatewayRuntime, GatewayRuntime, GluetunOpenvpnGatewayRuntime,
@@ -208,6 +230,8 @@ pub struct DownloadProtectionProfilesResponse {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadNetworkProfileImportRequest {
+    #[serde(default)]
+    pub purpose: VpnProfilePurpose,
     #[serde(default)]
     pub profile_id: Option<String>,
     #[serde(default)]
@@ -777,6 +801,12 @@ pub async fn list_download_network_profiles(
     let profiles = list_stored_download_network_profiles(pool)
         .await?
         .into_iter()
+        .filter(|profile| {
+            !matches!(
+                profile.scope.as_str(),
+                "marketplace_http" | "marketplace_network"
+            )
+        })
         .map(|profile| profile.summary())
         .collect();
     Ok(DownloadProtectionProfilesResponse { profiles })
@@ -1113,7 +1143,12 @@ pub async fn active_managed_downloader_runtime(
     let Some(profile) = load_active_download_network_profile(pool).await? else {
         return Ok(ActiveManagedDownloaderRuntime::NoStoredProfile);
     };
-    if !profile.enabled {
+    if !profile.enabled
+        || matches!(
+            profile.scope.as_str(),
+            "marketplace_http" | "marketplace_network"
+        )
+    {
         bail!(
             "active download network profile '{}' is disabled",
             profile.id
@@ -1196,6 +1231,10 @@ pub(crate) async fn active_live_egress_profile(
         return Ok(None);
     };
     if !profile.enabled
+        || matches!(
+            profile.scope.as_str(),
+            "marketplace_http" | "marketplace_network"
+        )
         || !profile.strict
         || profile.status != DownloadProtectionState::Protected
         || !live_profile_component(&profile.id)
@@ -1205,6 +1244,14 @@ pub(crate) async fn active_live_egress_profile(
         return Ok(None);
     }
 
+    project_egress_profile(pool, secrets, profile).await
+}
+
+async fn project_egress_profile(
+    pool: &AnyPool,
+    secrets: &SecretsManager,
+    profile: StoredDownloadNetworkProfile,
+) -> Result<Option<ActiveLiveEgressProfile>> {
     let projected = match profile.kind {
         DownloadNetworkProfileKind::WireguardConfig => {
             let Some(config_secret_ref) =
@@ -1942,6 +1989,16 @@ async fn import_config_profile(
     if !request.strict {
         bail!("imported protected downloader profiles must use strict mode");
     }
+    if request.purpose == VpnProfilePurpose::MarketplaceNetwork
+        && (request.gateway_image.is_some()
+            || request.forwarded_port.is_some()
+            || request.username.is_some()
+            || request.password.is_some())
+    {
+        bail!(
+            "marketplace network imports accept only a dedicated WireGuard configuration; deployment owns images and packet policy"
+        );
+    }
 
     let mut checks = match kind {
         DownloadNetworkProfileKind::WireguardConfig => validate_wireguard_config_text(config),
@@ -1953,22 +2010,12 @@ async fn import_config_profile(
         _ => Vec::new(),
     };
     let blocker = first_import_blocker(&checks);
+    marketplace::validate_import(pool, secrets, &profile_id, request.purpose, &kind, config)
+        .await?;
     let config_secret_name = profile_import_secret_key(&profile_id, config_secret_key);
     let config_secret_ref = format!("global:{config_secret_name}");
 
     let store = ExtensionStore::new(pool);
-    store
-        .upsert_secret(&NewSecret {
-            secret_id: Uuid::new_v4(),
-            scope: SecretScope::Global,
-            scope_id: None,
-            key: config_secret_name,
-            value_encrypted: secrets.encrypt(config)?,
-            rotatable: true,
-        })
-        .await
-        .context("storing imported VPN config secret")?;
-
     let mut config_json = serde_json::json!({
         "importMethod": "paste",
         "secretRef": config_secret_ref,
@@ -2004,6 +2051,7 @@ async fn import_config_profile(
         &profile_id,
         &name,
         &kind,
+        request.purpose.scope(),
         request.strict,
         request.provider.as_deref(),
         gateway_runtime,
@@ -2015,6 +2063,19 @@ async fn import_config_profile(
         },
     )
     .await?;
+    // Establish immutable profile purpose BEFORE touching its deterministic
+    // secret key, including competing first imports under the same profile ID.
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Global,
+            scope_id: None,
+            key: config_secret_name,
+            value_encrypted: secrets.encrypt(config)?,
+            rotatable: true,
+        })
+        .await
+        .context("storing imported VPN config secret")?;
     upsert_profile_secret_ref(pool, &profile_id, config_secret_key, &config_secret_ref).await?;
 
     if kind == DownloadNetworkProfileKind::OpenvpnConfig {
@@ -4497,29 +4558,34 @@ async fn upsert_imported_download_profile(
     profile_id: &str,
     name: &str,
     kind: &DownloadNetworkProfileKind,
+    scope: &str,
     strict: bool,
     provider: Option<&str>,
     gateway_runtime: &str,
     config_json: &serde_json::Value,
     status: DownloadProtectionState,
 ) -> Result<()> {
-    sqlx::query::<sqlx::Any>(
+    let changed = sqlx::query::<sqlx::Any>(
         "INSERT INTO download_network_profiles (id, name, kind, enabled, strict, scope, provider, gateway_runtime, config_json, status, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = TRUE, strict = excluded.strict, scope = excluded.scope, provider = excluded.provider, gateway_runtime = excluded.gateway_runtime, config_json = excluded.config_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP",
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, enabled = TRUE, strict = excluded.strict, scope = excluded.scope, provider = excluded.provider, gateway_runtime = excluded.gateway_runtime, config_json = excluded.config_json, status = excluded.status, updated_at = CURRENT_TIMESTAMP
+         WHERE (CASE WHEN download_network_profiles.scope IN ('marketplace_http','marketplace_network') THEN download_network_profiles.scope ELSE 'managed_downloaders' END)=excluded.scope AND (excluded.scope NOT IN ('marketplace_http','marketplace_network') OR download_network_profiles.kind=excluded.kind)",
     )
     .bind(profile_id)
     .bind(name)
     .bind(profile_kind_as_str(kind))
     .bind(true)
     .bind(strict)
-    .bind("managed_downloaders")
+    .bind(scope)
     .bind(provider.map(str::trim).filter(|value| !value.is_empty()))
     .bind(gateway_runtime)
     .bind(serde_json::to_string(config_json)?)
     .bind(protection_state_as_str(status))
     .execute(pool)
     .await
-    .context("upserting imported download network profile")?;
+    .context("upserting imported download network profile")?.rows_affected();
+    if changed != 1 {
+        bail!("VPN profile purpose or protocol changed during import");
+    }
     Ok(())
 }
 
@@ -4534,6 +4600,7 @@ async fn upsert_external_only_first_run_profile(
         profile_id,
         name,
         &DownloadNetworkProfileKind::ExternalOnly,
+        "managed_downloaders",
         false,
         None,
         "",
@@ -8043,6 +8110,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
             &database.pool,
             &secrets,
             DownloadNetworkProfileImportRequest {
+                purpose: VpnProfilePurpose::Downloads,
                 profile_id: Some("phase6-wireguard".to_string()),
                 name: Some("Phase 6 WireGuard".to_string()),
                 provider: Some("custom".to_string()),
@@ -8092,6 +8160,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
             &database.pool,
             &secrets,
             DownloadNetworkProfileImportRequest {
+                purpose: VpnProfilePurpose::Downloads,
                 profile_id: Some("airvpn-forwarded".to_string()),
                 name: Some("AirVPN Forwarded".to_string()),
                 provider: Some("airvpn".to_string()),
@@ -8129,6 +8198,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
             &database.pool,
             &secrets,
             DownloadNetworkProfileImportRequest {
+                purpose: VpnProfilePurpose::Downloads,
                 profile_id: Some("phase6-openvpn".to_string()),
                 name: Some("Phase 6 OpenVPN".to_string()),
                 provider: Some("custom".to_string()),

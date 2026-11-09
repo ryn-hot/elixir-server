@@ -2,6 +2,7 @@ pub mod gateway;
 pub mod protection;
 pub mod registry;
 pub mod vpn;
+pub(crate) mod vpn_identity;
 pub mod wan;
 
 use anyhow::Result;

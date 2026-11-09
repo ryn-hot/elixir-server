@@ -257,7 +257,8 @@ fn context() -> ProviderRequestContext {
     ProviderRequestContext {
         locale: "en-US".to_string(),
         timezone: "America/Chicago".to_string(),
-        now: Utc.with_ymd_and_hms(2026, 7, 10, 20, 0, 0).unwrap(),
+        // During the synthetic Stremio event, not three days before it starts.
+        now: Utc.with_ymd_and_hms(2026, 7, 13, 20, 0, 0).unwrap(),
     }
 }
 

@@ -18,6 +18,40 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .route("/api/v1/settings", get(handlers::settings::settings))
         .route(
+            "/api/v1/marketplace/settings",
+            get(handlers::marketplace::settings)
+                .patch(handlers::marketplace::update_settings)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/marketplace/connection/retry",
+            post(handlers::marketplace::retry_connection)
+                .layer(axum::extract::DefaultBodyLimit::max(256)),
+        )
+        .route(
+            "/api/v1/marketplace/connection/provider",
+            axum::routing::patch(handlers::marketplace::update_provider_setup)
+                .layer(axum::extract::DefaultBodyLimit::max(2048)),
+        )
+        .route(
+            "/api/v1/marketplace/search",
+            post(handlers::marketplace::start_search)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/marketplace/import",
+            post(handlers::marketplace::import_preview).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    elixir_marketplace::publication::MAX_PUBLICATION_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/marketplace/search/:id",
+            get(handlers::marketplace::search_view),
+        )
+        .merge(marketplace_data_routes(&state))
+        .route(
             "/api/v1/settings/anime-inference",
             get(handlers::settings::anime_inference_settings)
                 .patch(handlers::settings::update_anime_inference_settings),
@@ -723,5 +757,37 @@ pub fn router(state: AppState) -> Router {
         )
 }
 
+fn marketplace_data_routes(state: &AppState) -> Router<AppState> {
+    #[cfg(unix)]
+    {
+        let routes = Router::new()
+            .merge(handlers::marketplace::installation_read_routes())
+            .route(
+                "/api/v1/marketplace/install/targets",
+                post(handlers::marketplace::targets)
+                    .layer(axum::extract::DefaultBodyLimit::max(4096))
+                    .layer(axum::middleware::map_response(
+                        handlers::marketplace::private_response,
+                    )),
+            );
+        if state
+            .settings
+            .marketplace
+            .installation_management_configured()
+        {
+            routes.merge(handlers::marketplace::installation_routes())
+        } else {
+            routes
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state;
+        Router::new()
+    }
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{test_artwork_service, test_settings_with_db};

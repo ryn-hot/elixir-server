@@ -9,6 +9,7 @@ mod service;
 mod worker;
 
 pub(crate) use connector::ProtectedEgressTransport;
+pub(crate) use material::{PreparedMaterialFile, prepare_gateway_material_from_secret_values};
 pub(crate) use policy::validate_effective_policy;
 pub use policy::{
     EffectiveEgressPolicy, EgressPolicyMode, EgressPolicySelectionError, EgressPolicySource,

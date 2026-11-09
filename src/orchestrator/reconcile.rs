@@ -14,6 +14,7 @@ use crate::db::models::{
 };
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::permissions::require_legacy_extension_id;
 use crate::extensions::required_secrets::{
     missing_required_secrets_for_instance, required_secrets_from_runtime,
 };
@@ -412,7 +413,10 @@ impl<'a> Reconciler<'a> {
                 );
                 break;
             }
-            if !instance.enabled {
+            // Reserved public IDs belong only to the verified marketplace
+            // lifecycle, never legacy Docker activation. This is exclusion,
+            // not a claim of valid installed code or positive runtime health.
+            if !instance.enabled || require_legacy_extension_id(&instance.extension_id).is_err() {
                 continue;
             }
 
@@ -837,6 +841,13 @@ impl<'a> Reconciler<'a> {
                     continue;
                 }
             };
+
+            // Source providers have no Docker HTTP endpoint. Leave health,
+            // lifecycle and admission with their actual native owner instead
+            // of repeatedly trying a forbidden legacy-container restart.
+            if require_legacy_extension_id(&instance.extension_id).is_err() {
+                continue;
+            }
 
             let extension = match extensions.get(&instance.extension_id) {
                 Some(extension) if extension.enabled => extension,
@@ -1877,6 +1888,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_marketplace_instances_and_providers_never_enter_docker_reconciliation()
+    -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        // Deliberately not a valid installed capsule. Namespace exclusion must
+        // not create native authority, even for corrupt or forged legacy rows.
+        let id = "elx:reserved/source";
+        store.upsert_extension(&NewExtension {
+            extension_id: id.into(), name: "Reserved source".into(), version: "1.0.0".into(),
+            kind: ExtensionKind::Module, publisher_name: None, signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Verified, package_hash: None, enabled: true,
+            manifest_json: json!({"id":id,"name":"Reserved source","version":"1.0.0","kind":"module",
+                "runtime":{"type":"container","image":"never-start:1","service_name":"never-start"},
+                "provides":[{"capability":"live.catalog_provider","slot":"default","implementation":"source-js-v1"}]}),
+        }).await?;
+        let mut instances = HashMap::new();
+        let provider_instance = Uuid::new_v4();
+        for instance_id in [provider_instance, Uuid::new_v4()] {
+            store
+                .create_instance(&NewExtensionInstance {
+                    instance_id,
+                    extension_id: id.into(),
+                    instance_name: instance_id.to_string(),
+                    config_json: None,
+                    enabled: true,
+                })
+                .await?;
+            instances.insert(instance_id, store.get_instance(instance_id).await?.unwrap());
+        }
+        let provider_id = Uuid::new_v4();
+        let endpoint = json!({"type":"source-js-v1"});
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id: provider_instance,
+                capability: "live.catalog_provider".into(),
+                slot_id: "default".into(),
+                cardinality: SlotCardinality::Many,
+                implementation: Some("source-js-v1".into()),
+                scope_json: None,
+                endpoint_json: Some(endpoint.clone()),
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        let providers = store.list_provider_details().await?;
+        let extensions = HashMap::from([(id.to_string(), store.get_extension(id).await?.unwrap())]);
+        let runtime = RestartCaptureRuntime::new(container_name(provider_instance), false);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let root = TempDir::new()?;
+        let paths =
+            RuntimePaths::from_roots(root.path().to_str().unwrap(), root.path().to_str().unwrap());
+        let secrets = SecretsManager::from_key_bytes([7; 32], true);
+        let config = ReconcileConfig {
+            interval: Duration::from_secs(1),
+            retry_attempts: 1,
+            retry_backoff: Duration::ZERO,
+            startup_settle: Duration::ZERO,
+            lock_ttl: Duration::from_secs(60),
+            mode: ReconcileMode::SteadyState,
+        };
+        let reconciler = Reconciler::new(
+            &database.pool,
+            &probe,
+            &runtime,
+            &drivers,
+            paths,
+            &secrets,
+            "unused:1".into(),
+            None,
+            DownloaderPerformanceProfile::Balanced,
+            &config,
+        );
+        let mut step = 0;
+        let mut manifests = HashMap::new();
+        assert!(
+            !reconciler
+                .reconcile_standalone_module_instances(
+                    Uuid::new_v4(),
+                    &mut step,
+                    &providers,
+                    &instances,
+                    &extensions,
+                    &mut manifests
+                )
+                .await?
+        );
+        reconciler
+            .reconcile_providers(
+                Uuid::new_v4(),
+                &mut step,
+                &providers,
+                &instances,
+                &extensions,
+                &mut manifests,
+            )
+            .await?;
+        assert_eq!(step, 0);
+        assert!(runtime.calls().is_empty());
+        assert!(manifests.is_empty());
+        let current = store
+            .list_providers(None)
+            .await?
+            .into_iter()
+            .find(|p| p.provider_id == provider_id)
+            .unwrap();
+        assert_eq!(current.health_state, ProviderHealthState::Healthy);
+        assert_eq!(current.endpoint_json, Some(endpoint));
+        assert!(current.last_healthcheck_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn binding_dependency_readiness_waits_for_arr_downloader_target() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -2290,6 +2414,7 @@ mod tests {
                         "image": "example/test:1",
                         "service_name": "svc-test"
                     },
+                    "provides": [{ "capability": "test.runtime", "slot": "default", "implementation": "fixture" }],
                     "networking": {
                         "service_port": {
                             "scheme": "http",
@@ -2403,6 +2528,7 @@ mod tests {
                         "image": "example/test:1",
                         "service_name": "elx-test"
                     },
+                    "provides": [{ "capability": "test.runtime", "slot": "default", "implementation": "fixture" }],
                     "networking": {
                         "service_port": {
                             "scheme": "http",

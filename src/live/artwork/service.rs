@@ -399,8 +399,43 @@ impl ArtworkInner {
             return Err(LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied));
         }
         let mut digest = Sha256::new();
-        digest.update(b"live-artwork-public-session-v1");
+        digest.update(b"live-artwork-public-session-v2");
         digest.update(request.source.expose().as_bytes());
+        // Public artwork needs no manual allow rule. An explicit public
+        // destination denial must nevertheless take effect before cache use.
+        // A positive rule grants no credentials or private-network access.
+        let host = source
+            .host_str()
+            .ok_or_else(|| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = source
+            .port_or_known_default()
+            .ok_or_else(|| LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied))?;
+        let rule: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT CAST(CASE WHEN allow_fetch THEN 1 ELSE 0 END AS BIGINT),revision
+             FROM live_provider_destination_rules
+             WHERE home_id=$1 AND provider_id=$2 AND scheme=$3 AND normalized_host=$4
+               AND port=$5 AND exact_path=$6 AND network_scope='public' LIMIT 1",
+        )
+        .bind(request.scope.home_id.to_string())
+        .bind(request.provider_id.to_string())
+        .bind(source.scheme())
+        .bind(host)
+        .bind(i64::from(port))
+        .bind(source.path())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| LiveArtworkError::new(LiveArtworkErrorCode::Internal))?;
+        if let Some((allow, revision)) = rule {
+            if allow != 1 || revision < 1 {
+                return Err(LiveArtworkError::new(LiveArtworkErrorCode::PolicyDenied));
+            }
+            digest.update([1]);
+            digest.update(revision.to_be_bytes());
+        } else {
+            digest.update([0]);
+        }
         let policy = DestinationPolicy::for_public_session(
             Vec::new(),
             source.scheme() == "http",

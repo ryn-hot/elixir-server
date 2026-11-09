@@ -2775,8 +2775,8 @@ pub async fn create_secret(
         .map_err(|err| ApiError::internal(err.to_string()))?;
 
     let secret_id = Uuid::new_v4();
-    store
-        .upsert_secret(&NewSecret {
+    let created = store
+        .insert_secret_if_absent(&NewSecret {
             secret_id,
             scope,
             scope_id,
@@ -2786,6 +2786,9 @@ pub async fn create_secret(
         })
         .await
         .map_err(ApiError::from)?;
+    if !created {
+        return Err(ApiError::conflict("secret already exists"));
+    }
 
     let secret = store
         .get_secret_by_id(secret_id)

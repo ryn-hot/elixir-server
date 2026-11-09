@@ -50,7 +50,13 @@ pub struct LiveProviderSnapshot {
     actions: BTreeSet<ProviderOperation>,
     permissions: BTreeSet<String>,
     config: Value,
-    endpoint: ProviderRuntimeEndpoint,
+    endpoint: ProviderTransport,
+}
+#[derive(Clone)]
+enum ProviderTransport {
+    Http(ProviderRuntimeEndpoint),
+    #[cfg(unix)]
+    Source(crate::marketplace::service::SourceProviderDescriptor),
 }
 
 impl LiveProviderSnapshot {
@@ -88,7 +94,18 @@ impl LiveProviderSnapshot {
         &self,
         operation: ProviderOperation,
     ) -> Result<Url, ProviderDirectoryError> {
-        self.endpoint.operation_url(operation)
+        match &self.endpoint {
+            ProviderTransport::Http(endpoint) => endpoint.operation_url(operation),
+            #[cfg(unix)]
+            ProviderTransport::Source(_) => Err(invalid_snapshot()),
+        }
+    }
+    #[cfg(unix)]
+    pub(super) fn source(&self) -> Option<&crate::marketplace::service::SourceProviderDescriptor> {
+        match &self.endpoint {
+            ProviderTransport::Source(source) => Some(source),
+            _ => None,
+        }
     }
 }
 
@@ -174,6 +191,11 @@ impl std::error::Error for ProviderDirectoryError {}
 pub struct LiveProviderDirectory {
     pool: AnyPool,
     allow_loopback: bool,
+    #[cfg(unix)]
+    source: Option<(
+        crate::db::Database,
+        crate::marketplace::service::MarketplaceService,
+    )>,
 }
 
 impl LiveProviderDirectory {
@@ -181,6 +203,8 @@ impl LiveProviderDirectory {
         Self {
             pool,
             allow_loopback: false,
+            #[cfg(unix)]
+            source: None,
         }
     }
 
@@ -189,7 +213,29 @@ impl LiveProviderDirectory {
         Self {
             pool,
             allow_loopback: true,
+            #[cfg(unix)]
+            source: None,
         }
+    }
+    #[cfg(unix)]
+    pub(crate) fn with_marketplace(
+        database: crate::db::Database,
+        marketplace: crate::marketplace::service::MarketplaceService,
+    ) -> Self {
+        Self {
+            pool: database.pool.clone(),
+            allow_loopback: false,
+            source: Some((database, marketplace)),
+        }
+    }
+    #[cfg(unix)]
+    pub(super) fn source_runtime(
+        &self,
+    ) -> Option<&(
+        crate::db::Database,
+        crate::marketplace::service::MarketplaceService,
+    )> {
+        self.source.as_ref()
     }
 
     pub async fn discover(&self) -> Result<Vec<LiveProviderSnapshot>, ProviderDirectoryError> {
@@ -211,6 +257,21 @@ impl LiveProviderDirectory {
                 ),
             }
         }
+        #[cfg(unix)]
+        if let Some((database, marketplace)) = &self.source {
+            let source = marketplace.source_providers(database).await.map_err(|_| {
+                ProviderDirectoryError::new(ProviderDirectoryErrorCode::StoreUnavailable)
+            })?;
+            for descriptor in source {
+                let provider_id = descriptor.provider;
+                match snapshot_from_source(descriptor) {
+                    Ok(snapshot) => providers.push(snapshot),
+                    Err(error) => {
+                        tracing::warn!(%provider_id, error_code=?error.code(), "excluding invalid source Live provider snapshot")
+                    }
+                }
+            }
+        }
         Ok(providers)
     }
 
@@ -218,6 +279,16 @@ impl LiveProviderDirectory {
         &self,
         provider_id: Uuid,
     ) -> Result<LiveProviderSnapshot, ProviderDirectoryError> {
+        #[cfg(unix)]
+        if let Some((database, marketplace)) = &self.source {
+            if let Some(descriptor) = marketplace
+                .source_provider(database, provider_id)
+                .await
+                .map_err(|_| ProviderDirectoryError::new(ProviderDirectoryErrorCode::NotReady))?
+            {
+                return snapshot_from_source(descriptor);
+            }
+        }
         let ready = ExtensionStore::new(&self.pool)
             .get_ready_live_catalog_provider(provider_id)
             .await
@@ -245,6 +316,11 @@ fn snapshot_from_ready(
     ready: ReadyLiveCatalogProvider,
     allow_loopback: bool,
 ) -> Result<LiveProviderSnapshot, ProviderDirectoryError> {
+    // Public identities never gain an HTTP transport from legacy labels,
+    // provider flags or a database URL. Their installed pipeline is separate.
+    if ready.extension_id.starts_with("elx:") {
+        return Err(invalid_snapshot());
+    }
     let implementation = ready
         .provider
         .implementation
@@ -368,7 +444,62 @@ fn snapshot_from_ready(
         actions,
         permissions,
         config,
-        endpoint,
+        endpoint: ProviderTransport::Http(endpoint),
+    })
+}
+
+#[cfg(unix)]
+fn snapshot_from_source(
+    source: crate::marketplace::service::SourceProviderDescriptor,
+) -> Result<LiveProviderSnapshot, ProviderDirectoryError> {
+    let mut actions = BTreeSet::new();
+    for action in &source.scope.actions {
+        let operation = match action.as_str() {
+            "catalog" => ProviderOperation::Catalog,
+            "meta" => ProviderOperation::Meta,
+            "resolve" => ProviderOperation::Resolve,
+            "refresh" => ProviderOperation::Refresh,
+            _ => return Err(invalid_snapshot()),
+        };
+        if !actions.insert(operation) {
+            return Err(invalid_snapshot());
+        }
+    }
+    for required in [
+        ProviderOperation::Catalog,
+        ProviderOperation::Meta,
+        ProviderOperation::Resolve,
+    ] {
+        if !actions.contains(&required) {
+            return Err(invalid_snapshot());
+        }
+    }
+    let types: Vec<LiveItemType> = serde_json::from_value(json!(source.scope.live_item_types))
+        .map_err(|_| invalid_snapshot())?;
+    let protocols: Vec<StreamProtocol> =
+        serde_json::from_value(json!(source.scope.stream_protocols))
+            .map_err(|_| invalid_snapshot())?;
+    let contract = ProviderContract::new(types, protocols).map_err(map_contract_error)?;
+    let permissions = source.permissions.iter().cloned().collect::<BTreeSet<_>>();
+    if !permissions.contains(LIVE_CATALOG_READ_PERMISSION)
+        || !permissions.contains(LIVE_STREAM_RESOLVE_PERMISSION)
+    {
+        return Err(invalid_snapshot());
+    }
+    validate_provider_config(&source.config).map_err(map_contract_error)?;
+    Ok(LiveProviderSnapshot {
+        provider_id: source.provider,
+        instance_id: source.instance,
+        extension_id: source.extension.to_string(),
+        extension_version: source.version.clone(),
+        implementation: source.implementation.clone(),
+        trust_level: ExtensionTrustLevel::Community,
+        contract,
+        revision: ProviderRevision(*source.revision.as_bytes()),
+        actions,
+        permissions,
+        config: source.config.clone(),
+        endpoint: ProviderTransport::Source(source),
     })
 }
 
@@ -483,4 +614,27 @@ fn invalid_snapshot() -> ProviderDirectoryError {
 
 fn map_contract_error(_: ContractError) -> ProviderDirectoryError {
     invalid_snapshot()
+}
+
+#[cfg(all(test, unix))]
+mod source_tests {
+    use super::*;
+    #[tokio::test]
+    async fn public_identity_cannot_acquire_http_transport_from_legacy_readiness()
+    -> anyhow::Result<()> {
+        let database = super::super::tests::test_database().await?;
+        let (_, id) = super::super::tests::seed_provider(&database, 8110, json!({})).await?;
+        let mut ready = ExtensionStore::new(&database.pool)
+            .get_ready_live_catalog_provider(id)
+            .await?
+            .unwrap();
+        snapshot_from_ready(ready.clone(), true)?;
+        ready.extension_id = "elx:forged-public".into();
+        assert_eq!(
+            snapshot_from_ready(ready, true).unwrap_err().code(),
+            ProviderDirectoryErrorCode::InvalidSnapshot
+        );
+        database.pool.close().await;
+        Ok(())
+    }
 }

@@ -6,6 +6,9 @@ use sqlx::Row;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+mod marketplace_journals;
+mod marketplace_namespace;
+
 use crate::{
     acquisition::{
         imports::{
@@ -47,6 +50,56 @@ use crate::{
     },
 };
 
+#[tokio::test]
+async fn sqlite_any_integer_values_and_returning_never_truncate_wide_counters() -> Result<()> {
+    let database = Database::connect(&DatabaseConfig {
+        url: "sqlite::memory:".into(),
+        max_connections: 1,
+        ..DatabaseConfig::default()
+    })
+    .await?;
+    sqlx::query("CREATE TABLE wide_integer_fixture(value BIGINT NOT NULL)")
+        .execute(&database.pool)
+        .await?;
+    for value in [
+        i64::MIN,
+        i32::MIN as i64 - 1,
+        i32::MIN as i64,
+        0,
+        i32::MAX as i64,
+        i32::MAX as i64 + 1,
+        9_007_199_254_740_990,
+        9_007_199_254_740_991,
+        i64::MAX,
+    ] {
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO wide_integer_fixture(value) VALUES($1) RETURNING value",
+        )
+        .bind(value)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(returned, value);
+        let row=sqlx::query("SELECT value,value+0 AS computed,CAST(value AS TEXT) AS exact FROM wide_integer_fixture")
+            .fetch_one(&database.pool).await?;
+        assert_eq!(row.try_get::<i64, _>("value")?, value);
+        assert_eq!(row.try_get::<i64, _>("computed")?, value);
+        assert_eq!(row.try_get::<String, _>("exact")?.parse::<i64>()?, value);
+        if let Ok(small) = i32::try_from(value) {
+            assert_eq!(row.try_get::<i32, _>("value")?, small);
+        } else {
+            assert!(row.try_get::<i32, _>("value").is_err());
+        }
+        sqlx::query("DELETE FROM wide_integer_fixture")
+            .execute(&database.pool)
+            .await?;
+    }
+    let null: Option<i64> = sqlx::query_scalar("SELECT CAST(NULL AS BIGINT)")
+        .fetch_one(&database.pool)
+        .await?;
+    assert!(null.is_none());
+    Ok(())
+}
+
 #[test]
 fn alm8_postgres_pool_automatically_reserves_the_identity_coordinator_connection() {
     assert_eq!(
@@ -87,6 +140,64 @@ fn postgres_migrator_through(version: i64) -> Result<sqlx::migrate::Migrator> {
         ignore_missing: migrator.ignore_missing,
         locking: migrator.locking,
     })
+}
+
+#[tokio::test]
+async fn marketplace_installation_migration_preserves_grants_and_backfills_revocation_epoch()
+-> Result<()> {
+    let database = Database::connect(&DatabaseConfig {
+        url: "sqlite::memory:".to_owned(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    })
+    .await?;
+    migrator_through(64).run(&database.pool).await?;
+    let user = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,email,password_hash) VALUES ($1,'marketplace-epoch@example.test','fixture')")
+        .bind(user.to_string())
+        .execute(&database.pool)
+        .await?;
+    let owner = crate::auth::home_profiles::HomeProfileRepository::new(&database.pool)
+        .ensure_owner_home(user)
+        .await?;
+    for (id, revision, enabled) in [
+        ("fixture.enabled", 7_i64, true),
+        ("fixture.revoked", 9_i64, false),
+    ] {
+        sqlx::query("INSERT INTO marketplace_extension_grants (extension_id,home_id,revision,enabled,automatic_updates,review_json,review_id,mutation_id,approved_by_user_id) VALUES ($1,$2,$3,$4,FALSE,'{}',$5,$6,$7)")
+            .bind(id).bind(owner.home.id.to_string()).bind(revision).bind(enabled)
+            .bind(format!("sha256:{}", "0".repeat(64))).bind(Uuid::new_v4().to_string()).bind(user.to_string())
+            .execute(&database.pool).await?;
+    }
+    migrator_through(65).run(&database.pool).await?;
+    let state: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT extension_id,revision,revocation_revision,review_json FROM marketplace_extension_grants ORDER BY extension_id")
+        .fetch_all(&database.pool).await?;
+    assert_eq!(
+        state,
+        vec![
+            ("fixture.enabled".to_owned(), 7, 0, "{}".to_owned()),
+            ("fixture.revoked".to_owned(), 9, 9, "{}".to_owned()),
+        ]
+    );
+    let budget: (i64, i64, i64) = sqlx::query_as("SELECT revision,entries,encoded_bytes FROM marketplace_installation_budget WHERE singleton=1")
+        .fetch_one(&database.pool).await?;
+    assert_eq!(budget, (0, 0, 0));
+    let operational: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM marketplace_installations),(SELECT COUNT(*) FROM extensions),(SELECT COUNT(*) FROM extension_instances)")
+        .fetch_one(&database.pool).await?;
+    assert_eq!(
+        operational,
+        (0, 0, 0),
+        "migration never stages or activates code"
+    );
+    sqlx::query("UPDATE marketplace_extension_grants SET revocation_revision=-1")
+        .execute(&database.pool)
+        .await
+        .expect_err("negative epoch must be rejected");
+    migrator_through(65).run(&database.pool).await?;
+    let rerun: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT extension_id,revision,revocation_revision,review_json FROM marketplace_extension_grants ORDER BY extension_id")
+        .fetch_all(&database.pool).await?;
+    assert_eq!(state, rerun, "migration rerun must not change approvals");
+    Ok(())
 }
 
 #[test]

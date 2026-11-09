@@ -17,6 +17,9 @@ pub const LIVE_STREAM_RESOLVE_PERMISSION: &str = "live.stream.resolve";
 pub const LIVE_ARTWORK_FETCH_PERMISSION: &str = "live.artwork.fetch";
 pub const LIVE_NETWORK_PRIVATE_PERMISSION: &str = "live.network.private";
 
+mod lan;
+pub use lan::{ManifestControlLanEndpoint, ManifestLanEndpointAccess};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub id: String,
@@ -216,6 +219,7 @@ impl ExtensionManifest {
 
         if let Some(control_surface) = &self.control_surface {
             control_surface.validate()?;
+            lan::validate(control_surface, &self.permissions)?;
         }
         validate_live_account_configuration(self)?;
         if let Some(owner_release) = &self.owner_release {
@@ -715,6 +719,9 @@ pub struct ManifestRuntimeSecurity {
     pub pids_limit: Option<u64>,
     #[serde(default)]
     pub cpu_quota: Option<String>,
+    /// Public SDK persistent state only; absent/zero does not grant storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_state_limit_bytes: Option<u64>,
     #[serde(default)]
     pub seccomp_profile: Option<String>,
     #[serde(default)]
@@ -727,6 +734,12 @@ pub struct ManifestRuntimeSecurity {
 
 impl ManifestRuntimeSecurity {
     fn validate(&self) -> Result<()> {
+        if self
+            .sdk_state_limit_bytes
+            .is_some_and(|bytes| bytes > 16 * 1024 * 1024 || bytes % (1024 * 1024) != 0)
+        {
+            bail!("runtime.security.sdk_state_limit_bytes must be 0–16 whole MiB");
+        }
         if let Some(user) = self.user.as_deref() {
             ensure_non_empty(user, "runtime.security.user")?;
             if user.trim() == "0" || user.trim().eq_ignore_ascii_case("root") {
@@ -1554,6 +1567,10 @@ pub struct ManifestControlOwnedSetting {
     pub default: Option<serde_json::Value>,
     #[serde(default)]
     pub advanced: bool,
+    /// Signed restriction declaration only. Runtime access additionally needs
+    /// explicit current owner configuration and independent native authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_endpoint: Option<ManifestControlLanEndpoint>,
 }
 
 impl ManifestControlOwnedSetting {
@@ -2661,9 +2678,30 @@ fn validate_live_catalog_provider_contract(
         bail!("live.catalog_provider modules must not declare download requirements");
     }
 
-    validate_live_endpoint(provide.endpoint.as_ref())?;
-    validate_live_healthcheck(provide.healthcheck.as_ref())?;
-    if let Some(networking) = manifest.networking.as_ref() {
+    let source_endpoint = provide
+        .endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.r#type == "source-js-v1");
+    if source_endpoint {
+        let endpoint = provide.endpoint.as_ref().expect("source endpoint");
+        if !manifest.id.starts_with("elx:")
+            || provide.healthcheck.is_some()
+            || manifest.networking.is_some()
+            || endpoint.base_url.is_some()
+            || endpoint.scheme.is_some()
+            || endpoint.host.is_some()
+            || endpoint.port.is_some()
+            || endpoint.base_path.is_some()
+        {
+            bail!(
+                "source-js-v1 live providers require a public identity and no HTTP endpoint, healthcheck or networking fields"
+            );
+        }
+    } else {
+        validate_live_endpoint(provide.endpoint.as_ref())?;
+        validate_live_healthcheck(provide.healthcheck.as_ref())?;
+    }
+    if !source_endpoint && let Some(networking) = manifest.networking.as_ref() {
         let endpoint = provide.endpoint.as_ref().expect("validated live endpoint");
         let endpoint_scheme = endpoint.scheme.as_deref().expect("validated live scheme");
         let endpoint_port = endpoint.port.expect("validated live port");
@@ -3777,6 +3815,46 @@ runtime:
         let manifest: ExtensionManifest = serde_json::from_value(value)?;
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    #[test]
+    fn marketplace_source_live_endpoint_has_no_legacy_network_or_health_fields() -> Result<()> {
+        let mut source = valid_live_manifest_json();
+        source["id"] = json!("elx:source-test");
+        source.as_object_mut().unwrap().remove("networking");
+        source["runtime"].as_object_mut().unwrap().remove("image");
+        source["runtime"]["profile"] = json!("source-js-v1");
+        source["provides"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("healthcheck");
+        source["provides"][0]["endpoint"] = json!({"type":"source-js-v1"});
+        validate_manifest_json(source.clone())?;
+        let mut cases = Vec::new();
+        let mut legacy = source.clone();
+        legacy["id"] = json!("example.live");
+        cases.push(legacy);
+        let mut health = source.clone();
+        health["provides"][0]["healthcheck"] = json!({"type":"http","path":"/health"});
+        cases.push(health);
+        let mut networking = source.clone();
+        networking["networking"] = valid_live_manifest_json()["networking"].clone();
+        cases.push(networking);
+        for (field, value) in [
+            ("base_url", json!("http://example.test")),
+            ("host", json!("example.test")),
+            ("port", json!(8110)),
+            ("scheme", json!("http")),
+            ("base_path", json!("/")),
+        ] {
+            let mut mixed = source.clone();
+            mixed["provides"][0]["endpoint"][field] = value;
+            cases.push(mixed);
+        }
+        for invalid in cases {
+            assert!(validate_manifest_json(invalid).is_err());
+        }
+        Ok(())
     }
 
     #[test]

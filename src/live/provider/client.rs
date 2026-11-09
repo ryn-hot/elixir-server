@@ -37,6 +37,20 @@ use super::directory::{
 
 const MAX_PROVIDER_REQUEST_BYTES: usize = 1024 * 1024;
 
+// The trusted transport snapshot chooses the budget. No peer/body/URL can
+// select a source allowance for ordinary HTTP or raise native resource limits.
+fn transport_timeouts(limits: &LiveProviderLimits, source: bool) -> (Duration, Duration) {
+    let (request, hard) = if source {
+        (
+            limits.source_request_timeout_seconds,
+            limits.source_hard_timeout_seconds,
+        )
+    } else {
+        (limits.request_timeout_seconds, limits.hard_timeout_seconds)
+    };
+    (Duration::from_secs(request), Duration::from_secs(hard))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderClientBuildError {
     InvalidLimits,
@@ -122,9 +136,25 @@ pub struct LiveProviderClient {
     provider_permits: SemaphoreRegistry<Uuid>,
     user_permits: SemaphoreRegistry<Uuid>,
     redactor: Arc<LiveRedactor>,
+    // Negative-only ordering witness; never permission or native evidence.
+    #[cfg(all(test, unix))]
+    source_dispatch_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl LiveProviderClient {
+    #[cfg(unix)]
+    pub(crate) fn new_with_marketplace(
+        database: crate::db::Database,
+        marketplace: crate::marketplace::service::MarketplaceService,
+        limits: LiveProviderLimits,
+        redactor: Arc<LiveRedactor>,
+    ) -> Result<Self, ProviderClientBuildError> {
+        Self::new_with_directory(
+            LiveProviderDirectory::with_marketplace(database, marketplace),
+            limits,
+            redactor,
+        )
+    }
     pub fn new(
         pool: sqlx::AnyPool,
         limits: LiveProviderLimits,
@@ -149,6 +179,9 @@ impl LiveProviderClient {
     ) -> Result<Self, ProviderClientBuildError> {
         if !(1..=60).contains(&limits.request_timeout_seconds)
             || !(limits.request_timeout_seconds..=120).contains(&limits.hard_timeout_seconds)
+            || !(1..=120).contains(&limits.source_request_timeout_seconds)
+            || !(limits.source_request_timeout_seconds..=120)
+                .contains(&limits.source_hard_timeout_seconds)
             || !(1_024..=16 * 1024 * 1024).contains(&limits.response_bytes)
             || !(1..=64).contains(&limits.concurrency_per_provider)
             || !(1..=256).contains(&limits.concurrency_per_user)
@@ -172,6 +205,8 @@ impl LiveProviderClient {
             user_permits: SemaphoreRegistry::new(limits.concurrency_per_user as usize),
             limits,
             redactor,
+            #[cfg(all(test, unix))]
+            source_dispatch_attempts: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -366,11 +401,16 @@ impl LiveProviderClient {
         cancellation: &CancellationToken,
     ) -> Result<Zeroizing<Vec<u8>>, ProviderInvocationError> {
         let call = self.call_inner(provider, user_id, operation, body);
+        #[cfg(unix)]
+        let source = provider.source().is_some();
+        #[cfg(not(unix))]
+        let source = false;
+        let (_, hard) = transport_timeouts(&self.limits, source);
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(ProviderInvocationError::Cancelled),
             result = tokio::time::timeout(
-                Duration::from_secs(self.limits.hard_timeout_seconds),
+                hard,
                 call,
             ) => result.unwrap_or(Err(ProviderInvocationError::HardTimeout)),
         }
@@ -408,6 +448,19 @@ impl LiveProviderClient {
             _user: user_permit,
         };
 
+        #[cfg(unix)]
+        if let Some(source) = provider.source() {
+            let result = self.call_source(source, user_id, operation, body).await;
+            // The native binding also pins/rechecks this revision before code,
+            // every SDK effect and result delivery. This check classifies stale
+            // responses; it is not the authority for executing a new release.
+            self.directory
+                .verify(provider)
+                .await
+                .map_err(map_directory_error)?;
+            return result;
+        }
+
         let url = provider
             .operation_url(operation)
             .map_err(map_directory_error)?;
@@ -441,6 +494,312 @@ impl LiveProviderClient {
                 parse_provider_failure(&body, &self.redactor).map_err(map_contract_response)?;
             Err(ProviderInvocationError::Provider(failure))
         }
+    }
+
+    #[cfg(unix)]
+    async fn call_source(
+        &self,
+        source: &crate::marketplace::service::SourceProviderDescriptor,
+        user: Option<Uuid>,
+        operation: ProviderOperation,
+        body: Option<Vec<u8>>,
+    ) -> Result<Zeroizing<Vec<u8>>, ProviderInvocationError> {
+        let (database, marketplace) = self
+            .directory
+            .source_runtime()
+            .ok_or(ProviderInvocationError::NotReady)?;
+        source_member(database, user, source.home).await?;
+        let value = tokio::time::timeout(transport_timeouts(&self.limits, true).0, async {
+            let turn = marketplace
+                .source_provider_turn()
+                .await
+                .map_err(|_| ProviderInvocationError::NotReady)?;
+            // Admission is not membership or execution authority. A queued
+            // request must not use a membership check from before its wait.
+            source_member(database, user, source.home).await?;
+            let request = body
+                .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+                .transpose()
+                .map_err(|_| {
+                    ProviderInvocationError::InvalidRequest(ContractErrorCode::InvalidShape)
+                })?;
+            let arguments =
+                elixir_marketplace::source_execution::RuntimeJson::from_value(serde_json::json!({
+                    "schema_version": 1,
+                    "capability": "live.catalog_provider",
+                    "operation": operation,
+                    "request": request
+                }))
+                .map_err(|_| {
+                    ProviderInvocationError::InvalidRequest(ContractErrorCode::LimitExceeded)
+                })?;
+            #[cfg(all(test, unix))]
+            self.source_dispatch_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut call = marketplace
+                .begin_source_provider_call(source, arguments, turn)
+                .map_err(|_| ProviderInvocationError::NotReady)?;
+            call.finish()
+                .await
+                .map_err(|_| ProviderInvocationError::Transport)
+        })
+        .await
+        .map_err(|_| ProviderInvocationError::RequestTimeout)??;
+        source_member(database, user, source.home).await?;
+        self.parse_source_response(&value)
+    }
+
+    #[cfg(unix)]
+    fn parse_source_response(
+        &self,
+        value: &elixir_marketplace::source_execution::RuntimeJson,
+    ) -> Result<Zeroizing<Vec<u8>>, ProviderInvocationError> {
+        // RuntimeJson has already rejected duplicate keys/depth/node/number
+        // overflows. Keep the existing per-operation Live response parsers.
+        if value.accounted_bytes() > self.response_limit + 4096 {
+            return Err(ProviderInvocationError::ResponseTooLarge);
+        }
+        let response: SourceResponse = serde_json::from_str(value.as_str())
+            .map_err(|_| ProviderInvocationError::Contract(ContractErrorCode::InvalidShape))?;
+        if response.schema_version != 1
+            || (response.status != 200 && !(400..600).contains(&response.status))
+        {
+            return Err(ProviderInvocationError::Contract(
+                ContractErrorCode::InvalidShape,
+            ));
+        }
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&response.body)
+                .map_err(|_| ProviderInvocationError::Contract(ContractErrorCode::InvalidShape))?,
+        );
+        if bytes.len() > self.response_limit {
+            return Err(ProviderInvocationError::ResponseTooLarge);
+        }
+        if response.status == 200 {
+            Ok(bytes)
+        } else {
+            Err(ProviderInvocationError::Provider(
+                parse_provider_failure(&bytes, &self.redactor).map_err(map_contract_response)?,
+            ))
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceResponse {
+    schema_version: u32,
+    status: u16,
+    body: serde_json::Value,
+}
+
+#[cfg(unix)]
+async fn source_member(
+    database: &crate::db::Database,
+    user: Option<Uuid>,
+    home: Uuid,
+) -> Result<(), ProviderInvocationError> {
+    if let Some(user) = user {
+        let allowed:i64=sqlx::query_scalar("SELECT CAST(CASE WHEN EXISTS(SELECT 1 FROM home_members WHERE home_id=$1 AND user_id=$2 AND status='active') THEN 1 ELSE 0 END AS BIGINT)")
+            .bind(home.to_string()).bind(user.to_string()).fetch_one(&database.pool).await.map_err(|_|ProviderInvocationError::NotReady)?;
+        if user.is_nil() || allowed != 1 {
+            return Err(ProviderInvocationError::NotReady);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod source_response_tests {
+    use super::*;
+    use elixir_marketplace::source_execution::RuntimeJson;
+
+    #[test]
+    fn source_timeouts_do_not_widen_http_or_override_explicit_source_limits() {
+        let mut limits = LiveProviderLimits::default();
+        assert_eq!(
+            transport_timeouts(&limits, false),
+            (Duration::from_secs(5), Duration::from_secs(15))
+        );
+        assert_eq!(
+            transport_timeouts(&limits, true),
+            (Duration::from_secs(45), Duration::from_secs(60))
+        );
+        limits.source_request_timeout_seconds = 2;
+        limits.source_hard_timeout_seconds = 3;
+        assert_eq!(
+            transport_timeouts(&limits, true),
+            (Duration::from_secs(2), Duration::from_secs(3))
+        );
+        assert_eq!(
+            (
+                limits.concurrency_per_provider,
+                limits.concurrency_per_user,
+                limits.response_bytes
+            ),
+            (4, 8, 2_097_152)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_member_revocation_is_checked_before_dispatch_not_only_after_result()
+    -> anyhow::Result<()> {
+        use crate::{config::DatabaseConfig, db::Database};
+        use std::sync::atomic::Ordering;
+        // Real migrated membership SQL + actual coordination; synthetic
+        // descriptor and NO controller/native executor. A dispatch counter
+        // distinguishes this denial from unconfigured-executor NotReady.
+        let database = Database::connect(&DatabaseConfig {
+            url: "sqlite::memory:".into(),
+            max_connections: 1,
+            connect_timeout_seconds: 5,
+        })
+        .await?;
+        database.run_migrations().await?;
+        let owner = Uuid::new_v4();
+        let viewer = Uuid::new_v4();
+        let home = Uuid::new_v4();
+        for user in [owner, viewer] {
+            sqlx::query("INSERT INTO users(id,email,password_hash) VALUES($1,$2,$3)")
+                .bind(user.to_string())
+                .bind(format!("{user}@example.invalid"))
+                .bind("negative-only-fixture")
+                .execute(&database.pool)
+                .await?;
+        }
+        sqlx::query("INSERT INTO homes(id,owner_user_id,name) VALUES($1,$2,$3)")
+            .bind(home.to_string())
+            .bind(owner.to_string())
+            .bind("Queue membership fixture")
+            .execute(&database.pool)
+            .await?;
+        sqlx::query("INSERT INTO home_members(id,home_id,user_id,role,status) VALUES($1,$2,$3,'viewer','active')")
+            .bind(Uuid::new_v4().to_string()).bind(home.to_string()).bind(viewer.to_string())
+            .execute(&database.pool).await?;
+        let marketplace = crate::marketplace::service::MarketplaceService::default();
+        let mut limits = crate::live::config::LiveConfig::default().providers;
+        limits.request_timeout_seconds = 10;
+        limits.hard_timeout_seconds = 20;
+        let client = LiveProviderClient::new_with_marketplace(
+            database.clone(),
+            marketplace.clone(),
+            limits,
+            Arc::new(LiveRedactor::default()),
+        )?;
+        let vector: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/elixir_marketplace/tests/fixtures/protocol-v1.json"
+        )))?;
+        let descriptor = crate::marketplace::service::SourceProviderDescriptor {
+            provider: Uuid::new_v4(),
+            home,
+            instance: Uuid::new_v4(),
+            extension: serde_json::from_value(
+                vector["release"]["payload"]["extension_id"].clone(),
+            )?,
+            version: "1.0.0".into(),
+            implementation: "source-js-v1".into(),
+            scope: crate::extensions::manifest::ManifestProviderScope::default(),
+            permissions: vec![],
+            config: serde_json::json!({}),
+            revision: elixir_marketplace::identity::Digest::of(b"negative-only source descriptor"),
+        };
+        let held = marketplace.source_provider_turn().await?;
+        let mut queued = Box::pin(client.call_source(
+            &descriptor,
+            Some(viewer),
+            ProviderOperation::Catalogs,
+            None,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if marketplace.fixture_source_call_slots_used() == 2 { break; }
+                tokio::select! {
+                    result = queued.as_mut() => panic!("call completed before queue witness: {result:?}"),
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
+        }).await?;
+        assert_eq!(client.source_dispatch_attempts.load(Ordering::SeqCst), 0);
+        sqlx::query("UPDATE home_members SET status='suspended' WHERE home_id=$1 AND user_id=$2")
+            .bind(home.to_string())
+            .bind(viewer.to_string())
+            .execute(&database.pool)
+            .await?;
+        // Do not mistake a queue/request timeout for an authorization check.
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await?
+            .unwrap_err();
+        assert_eq!(error, ProviderInvocationError::NotReady);
+        assert_eq!(
+            client.source_dispatch_attempts.load(Ordering::SeqCst),
+            0,
+            "removed member reached the installed dispatcher"
+        );
+        assert_eq!(marketplace.fixture_source_call_slots_used(), 0);
+        // A still-authorized request DOES reach dispatch before failing closed
+        // on the deliberately missing controller. This is not native proof.
+        sqlx::query("UPDATE home_members SET status='active' WHERE home_id=$1 AND user_id=$2")
+            .bind(home.to_string())
+            .bind(viewer.to_string())
+            .execute(&database.pool)
+            .await?;
+        assert_eq!(
+            client
+                .call_source(&descriptor, Some(viewer), ProviderOperation::Catalogs, None)
+                .await
+                .unwrap_err(),
+            ProviderInvocationError::NotReady
+        );
+        assert_eq!(client.source_dispatch_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(marketplace.fixture_source_call_slots_used(), 0);
+        database.pool.close().await;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn source_response_is_closed_bounded_and_uses_existing_failure_parser() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let mut limits = crate::live::config::LiveConfig::default().providers;
+        limits.response_bytes = 1024;
+        let client =
+            LiveProviderClient::new(pool, limits, Arc::new(LiveRedactor::default())).unwrap();
+        for value in [
+            serde_json::json!({"schema_version":2,"status":200,"body":{}}),
+            serde_json::json!({"schema_version":1,"status":201,"body":{}}),
+            serde_json::json!({"schema_version":1,"status":302,"body":{}}),
+            serde_json::json!({"schema_version":1,"status":600,"body":{}}),
+            serde_json::json!({"schema_version":1,"status":200,"body":{},"extra":true}),
+            serde_json::json!({"schema_version":1,"status":200}),
+            serde_json::json!({"schema_version":1,"status":400,"body":{"arbitrary":"publisher text"}}),
+        ] {
+            assert!(
+                client
+                    .parse_source_response(&RuntimeJson::from_value(value).unwrap())
+                    .is_err()
+            );
+        }
+        let value = RuntimeJson::from_value(
+            serde_json::json!({"schema_version":1,"status":200,"body":{"ok":true}}),
+        )
+        .unwrap();
+        assert_eq!(
+            &*client.parse_source_response(&value).unwrap(),
+            b"{\"ok\":true}"
+        );
+        let value = RuntimeJson::from_value(
+            serde_json::json!({"schema_version":1,"status":200,"body":{"large":"x".repeat(1024)}}),
+        )
+        .unwrap();
+        assert_eq!(
+            client.parse_source_response(&value).unwrap_err(),
+            ProviderInvocationError::ResponseTooLarge
+        );
     }
 }
 

@@ -719,6 +719,9 @@ pub(super) fn access_context(
     let locale = header_value(headers, ACCEPT_LANGUAGE.as_str())?
         .map(|value| value.split(',').next().unwrap_or("").trim().to_string())
         .filter(|value| !value.is_empty())
+        // RFC 4647's wildcard is a valid language range, not a one-character
+        // locale. Ordinary fetch clients send it; use our existing default.
+        .filter(|value| value != "*")
         .unwrap_or_else(|| "en-US".to_string());
     let timezone = header_value(headers, "x-elixir-timezone")?.unwrap_or_else(|| "UTC".to_string());
     if !(2..=64).contains(&locale.chars().count())
@@ -1356,6 +1359,51 @@ mod tests {
     };
 
     #[test]
+    fn wildcard_language_uses_default_locale_without_relaxing_bounds_or_authority() {
+        let principal = CurrentPrincipal::fixture_owner(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            Utc::now() + chrono::Duration::hours(1),
+            crate::authz::CapabilitySet::empty(),
+        );
+        for (header, expected) in [
+            (None, "en-US"),
+            (Some("*"), "en-US"),
+            (Some("  *  "), "en-US"),
+            (Some("fr-CA, en-US;q=0.7"), "fr-CA"),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = header {
+                headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_str(value).unwrap());
+            }
+            let context = access_context(&principal, &headers).unwrap();
+            assert_eq!(context.locale, expected);
+            assert_eq!(context.timezone, "UTC");
+            assert_eq!(context.user_id, principal.user_id);
+            assert_eq!(context.home_id, principal.home_id);
+            assert_eq!(context.profile_id, principal.profile_id);
+            assert!(
+                !context.can_browse_live,
+                "language preferences grant no capability"
+            );
+        }
+        for value in ["a".to_string(), "x".repeat(65)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_str(&value).unwrap());
+            assert!(access_context(&principal, &headers).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_bytes(&[255]).unwrap());
+        assert!(access_context(&principal, &headers).is_err());
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("*"));
+        headers.insert("x-elixir-timezone", HeaderValue::from_static(""));
+        assert!(access_context(&principal, &headers).is_err());
+    }
+
+    #[test]
     fn lpi2_account_required_is_distinct_and_provider_scoped() {
         let provider_id = Uuid::new_v4();
         let rejection =
@@ -1404,6 +1452,7 @@ mod tests {
             classifier: ClassifierConfig::default(),
             playback: crate::config::PlaybackConfig::default(),
             media_interactions: MediaInteractionsConfig::default(),
+            marketplace: crate::config::MarketplaceConfig::default(),
             live: LiveConfig {
                 enabled: true,
                 catalog_enabled: true,

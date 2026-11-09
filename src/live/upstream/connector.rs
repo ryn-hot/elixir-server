@@ -12,6 +12,7 @@ use super::{
 pub(crate) struct PreparedRequest {
     pub(crate) method: Method,
     pub(crate) headers: reqwest::header::HeaderMap,
+    pub(crate) body: Option<String>,
 }
 
 #[async_trait]
@@ -28,6 +29,7 @@ pub(crate) trait EgressConnector: Send + Sync {
 #[derive(Clone, Default)]
 pub struct DirectEgressConnector {
     additional_roots: Arc<Vec<Certificate>>,
+    sdk: bool,
 }
 
 impl fmt::Debug for DirectEgressConnector {
@@ -35,6 +37,7 @@ impl fmt::Debug for DirectEgressConnector {
         formatter
             .debug_struct("DirectEgressConnector")
             .field("additional_root_count", &self.additional_roots.len())
+            .field("sdk", &self.sdk)
             .finish()
     }
 }
@@ -44,9 +47,19 @@ impl DirectEgressConnector {
         Self::default()
     }
 
+    /// Fixed local SDK transport only. No custom roots, transparent body
+    /// decompression, redirects, retries or HTTP/2 connection/header state.
+    pub(crate) fn for_sdk() -> Self {
+        Self {
+            sdk: true,
+            ..Self::default()
+        }
+    }
+
     pub fn with_additional_roots(roots: Vec<Certificate>) -> Self {
         Self {
             additional_roots: Arc::new(roots),
+            sdk: false,
         }
     }
 
@@ -58,6 +71,15 @@ impl DirectEgressConnector {
             .pool_max_idle_per_host(0)
             .tcp_nodelay(true)
             .referer(false);
+        if self.sdk {
+            builder = builder
+                .http1_only()
+                .retry(reqwest::retry::never())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd();
+        }
         for root in self.additional_roots.iter() {
             builder = builder.add_root_certificate(root.clone());
         }
@@ -81,10 +103,13 @@ impl EgressConnector for DirectEgressConnector {
         cancellation: &CancellationToken,
     ) -> Result<Response> {
         let client = self.client(target, connect_timeout)?;
-        let future = client
+        let mut outgoing = client
             .request(request.method, target.target.url.clone())
-            .headers(request.headers)
-            .send();
+            .headers(request.headers);
+        if let Some(body) = request.body {
+            outgoing = outgoing.body(body);
+        }
+        let future = outgoing.send();
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(UpstreamErrorCode::Cancelled.into()),
             result = future => result.map_err(|error| {

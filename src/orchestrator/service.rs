@@ -2045,7 +2045,7 @@ impl OrchestratorService {
         self.runtime.clone()
     }
 
-    async fn ensure_runtime_ready(&self) -> Result<()> {
+    pub(crate) async fn ensure_runtime_ready(&self) -> Result<()> {
         match self
             .runtime
             .ensure_daemon_available(&self.docker_startup)

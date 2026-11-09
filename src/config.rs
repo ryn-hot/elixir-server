@@ -44,6 +44,8 @@ pub struct Settings {
     #[serde(default)]
     pub live: LiveConfig,
     #[serde(default)]
+    pub marketplace: MarketplaceConfig,
+    #[serde(default)]
     pub telemetry: TelemetryConfig,
 }
 
@@ -63,8 +65,31 @@ impl Default for Settings {
             playback: PlaybackConfig::default(),
             media_interactions: MediaInteractionsConfig::default(),
             live: LiveConfig::default(),
+            marketplace: MarketplaceConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
+    }
+}
+
+/// Operator-owned startup input only. No HTTP settings mutation can select a
+/// provider, image, credential, bootstrap or native controller directory.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketplaceConfig {
+    pub startup_file: Option<PathBuf>,
+    /// Independent local installed-code restoration; no network participation.
+    pub installed_startup_file: Option<PathBuf>,
+    /// Prelaunch operator selection; never writable through HTTP settings.
+    /// Does not waive current owner, protected connection or source checks.
+    #[serde(default)]
+    pub installation_management: bool,
+}
+
+impl MarketplaceConfig {
+    pub(crate) fn installation_management_configured(&self) -> bool {
+        self.installation_management
+            && self.startup_file.is_some()
+            && self.installed_startup_file.is_some()
     }
 }
 

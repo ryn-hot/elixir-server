@@ -1,5 +1,6 @@
 //! DNS-pinned, credential-scoped Live upstream-fetch boundary.
 
+mod configured_lan;
 mod connector;
 mod credentials;
 mod error;
@@ -7,6 +8,7 @@ mod fetcher;
 mod policy;
 mod resolver;
 
+pub(crate) use configured_lan::{ConfiguredLanEndpoint, LanEndpointAccess};
 pub use connector::DirectEgressConnector;
 pub(crate) use connector::{EgressConnector, PreparedRequest};
 pub use credentials::{CredentialSet, SafeRequestHeaders};
