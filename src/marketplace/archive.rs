@@ -29,9 +29,9 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+use super::quarantine::local_build::LocalBuildRecord;
 use super::{grant_store::GrantCheckedQuarantine, lease::ControllerLease};
 use crate::{db::Database, runtime::RuntimeManager};
-use super::quarantine::local_build::LocalBuildRecord;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_DESCRIPTOR: usize = 64 * 1024;
@@ -399,16 +399,22 @@ pub(in crate::marketplace) async fn persist_compiled(
     path: &Path,
     budget: ArchiveBudget,
 ) -> Result<ArchivedSource> {
-    let checked = source.as_ref().context("compiled archive source owner missing")?;
-    let record = LocalBuildRecord::from_actual_build(checked.source().source(), build, image, secrets)?;
+    let checked = source
+        .as_ref()
+        .context("compiled archive source owner missing")?;
+    let record =
+        LocalBuildRecord::from_actual_build(checked.source().source(), build, image, secrets)?;
     budget.validate()?;
     tokio::runtime::Handle::try_current().context("compiled archive executor unavailable")?;
-    let mut copy = Copy::begin(database.clone(), source.take().expect("borrowed source"), None, path.to_owned(), budget);
-    let (_, mut archive) = copy.finish().await?;
-    record.require_descriptor_data(&SourceMatchDescriptor {
-        schema_version: 1, workspace: archive.descriptor.workspace.clone(), release: archive.descriptor.release.clone(),
-    }, &archive.descriptor.source)?;
-    archive.build = Some(record);
+    let mut copy = Copy::begin_with_build(
+        database.clone(),
+        source.take().expect("borrowed source"),
+        None,
+        path.to_owned(),
+        budget,
+        Some(record),
+    );
+    let (_, archive) = copy.finish().await?;
     Ok(archive)
 }
 

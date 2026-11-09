@@ -26,6 +26,8 @@ use uuid::Uuid;
 
 mod approval;
 mod authorization;
+#[cfg(unix)]
+mod compiled;
 mod upload;
 pub(crate) use upload::UploadClaim;
 #[cfg(unix)]
@@ -99,6 +101,31 @@ struct Entry {
 #[derive(Clone, Default)]
 pub(super) struct Service(Arc<Mutex<Option<Arc<Entry>>>>);
 impl Service {
+    /// The ordinary application install/update path. Only trusted native host
+    /// configuration selects a compiled artifact/compiler/resource profile.
+    #[cfg(unix)]
+    pub(super) fn start_install(
+        &self,
+        selected: Selection,
+        upload: bool,
+        authorization: Option<super::grant_store::source_authorization::SourceAuthorization>,
+        configuration: &super::grant_store::installation::runtime::InstalledRuntime,
+        secrets: crate::secrets::SecretsManager,
+    ) -> Result<Uuid> {
+        let compiled = compiled::Configuration::select(
+            selected.metadata()?.release_payload(),
+            configuration,
+            secrets,
+        )?;
+        let artifact = compiled
+            .as_ref()
+            .map(|configuration| configuration.artifact);
+        let mut work = Live::new_profile(selected, artifact, upload, compiled)?;
+        if let Some(authorization) = authorization {
+            work = work.with_authorization(authorization)?;
+        }
+        self.start_owned(work.with_retention(configuration.retention)?)
+    }
     pub(super) fn start(&self, selected: Selection, artifact: Option<usize>) -> Result<Uuid> {
         let work = Live::new(selected, artifact)?;
         self.start_owned(work)
@@ -491,6 +518,8 @@ enum Workspace {
     Download(Box<Download>),
     Source(Box<Option<QuarantinedSource>>),
     Manifest(Box<Option<SourceMatchedQuarantine>>),
+    #[cfg(unix)]
+    Compiling(Box<compiled::Fresh>),
     Review(Box<Option<ManifestCheckedQuarantine>>),
     Granted(Box<super::grant_store::GrantCheckedQuarantine>),
     #[cfg(unix)]
@@ -501,6 +530,10 @@ enum Workspace {
 }
 impl Workspace {
     fn resource_retryable(&self) -> bool {
+        #[cfg(unix)]
+        if let Self::Compiling(fresh) = self {
+            return fresh.admission_retryable();
+        }
         matches!(
             self,
             Self::Pending | Self::Download(_) | Self::Source(_) | Self::Manifest(_)
@@ -559,12 +592,30 @@ struct Live {
     handoff: Option<handoff::Slot>,
     #[cfg(unix)]
     approved: Option<(Digest, i64)>,
+    #[cfg(unix)]
+    compiled: Option<Box<compiled::Configuration>>,
+    #[cfg(unix)]
+    build_record: Option<Box<super::quarantine::local_build::LocalBuildRecord>>,
 }
 impl Live {
     fn new(selected: Selection, artifact: Option<usize>) -> Result<Self> {
         Self::new_input(selected, artifact, false)
     }
     fn new_input(selected: Selection, artifact: Option<usize>, upload: bool) -> Result<Self> {
+        Self::new_profile(
+            selected,
+            artifact,
+            upload,
+            #[cfg(unix)]
+            None,
+        )
+    }
+    fn new_profile(
+        selected: Selection,
+        artifact: Option<usize>,
+        upload: bool,
+        #[cfg(unix)] compiled: Option<compiled::Configuration>,
+    ) -> Result<Self> {
         let metadata = selected.metadata()?;
         let payload = metadata.release_payload();
         // Trusted foreground profile; not an HTTP/peer-supplied resource claim.
@@ -600,6 +651,11 @@ impl Live {
                 .context("preparation write bounds")?,
             wall_seconds: elixir_marketplace::quarantine::MAX_JOB_SECONDS,
         };
+        #[cfg(unix)]
+        let budget = compiled
+            .as_ref()
+            .map(|configuration| configuration.budget.clone())
+            .unwrap_or(budget);
         let plan = metadata.plan(artifact, &budget)?;
         if !upload
             && !selected.client().provider_discovery_enabled()
@@ -634,6 +690,10 @@ impl Live {
             handoff: None,
             #[cfg(unix)]
             approved: None,
+            #[cfg(unix)]
+            compiled: compiled.map(Box::new),
+            #[cfg(unix)]
+            build_record: None,
         })
     }
     fn with_authorization(
@@ -805,6 +865,14 @@ impl Live {
             let path = source.source().source().archive_directory()?;
             source.refresh_public_source(selected.public_source()?)?;
             let database = selected.client().source_database().clone();
+            if self.compiled.is_some() && self.build_record.is_none() {
+                bail!("compiled archive requires actual fresh reproduction history");
+            }
+            if let Some(record) = self.build_record.as_ref() {
+                let matched = source.source().source();
+                record
+                    .require_descriptor_data(&matched.execution_descriptor(), matched.summary())?;
+            }
             // No await between removing these owners and storing their new
             // task. That task survives a cancelled advance/HTTP waiter.
             let selected = self.selected.take().expect("borrowed archive selection");
@@ -813,13 +881,15 @@ impl Live {
             else {
                 unreachable!("matched granted workspace")
             };
-            self.workspace = Workspace::Archiving(Box::new(super::archive::Copy::begin(
-                database,
-                *source,
-                Some(selected),
-                path,
-                budget,
-            )));
+            self.workspace =
+                Workspace::Archiving(Box::new(super::archive::Copy::begin_with_build(
+                    database,
+                    *source,
+                    Some(selected),
+                    path,
+                    budget,
+                    self.build_record.take().map(|record| *record),
+                )));
             return Ok(Phase::Archiving);
         }
         if matches!(self.workspace, Workspace::Pending) {
@@ -908,12 +978,33 @@ impl Live {
                     self.workspace = Workspace::Manifest(Box::new(Some(matched)));
                     Ok(Phase::CheckingManifest)
                 }
+                #[cfg(unix)]
+                Workspace::Compiling(fresh) => {
+                    if fresh.advance(public_source).await? {
+                        let (source, record) = fresh.take_ready(
+                            self.compiled
+                                .as_deref()
+                                .context("trusted compiled configuration missing")?,
+                        )?;
+                        self.workspace = Workspace::Manifest(Box::new(Some(source)));
+                        self.build_record = Some(Box::new(record));
+                    }
+                    Ok(Phase::CheckingSource)
+                }
                 Workspace::Manifest(source) => {
                     source
                         .as_mut()
                         .as_mut()
                         .context("matched source missing")?
                         .refresh_public_source(public_source)?;
+                    #[cfg(unix)]
+                    if let Some(configuration) = self.compiled.as_deref() {
+                        if self.build_record.is_none() {
+                            let fresh = compiled::Fresh::begin(source, configuration)?;
+                            self.workspace = Workspace::Compiling(Box::new(fresh));
+                            return Ok(Phase::CheckingSource);
+                        }
+                    }
                     let checked = SourceMatchedQuarantine::check_manifest_retained(source)?;
                     self.workspace = Workspace::Review(Box::new(Some(checked)));
                     Ok(Phase::AwaitingApproval)
@@ -1103,6 +1194,8 @@ impl Work for Live {
                     .discard_retained()
                     .await?
             }
+            #[cfg(unix)]
+            Workspace::Compiling(fresh) => fresh.discard().await?,
             Workspace::Review(source) => {
                 source
                     .as_mut()

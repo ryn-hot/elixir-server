@@ -372,6 +372,15 @@ impl Import {
             .as_ref()
             .context("original image source missing")
     }
+    pub(in crate::marketplace) fn refresh_public_source(
+        &mut self,
+        observation: super::super::worker::PublicSourceObservation,
+    ) -> Result<()> {
+        self.source
+            .as_mut()
+            .context("original image source missing")?
+            .refresh_public_source(observation)
+    }
     fn current(&self) -> Result<()> {
         self.export
             .as_ref()

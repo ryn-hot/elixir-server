@@ -106,9 +106,12 @@ pub(super) async fn run(
     if !probe.retired {
         bail!("fresh compiled probe scope was not retired");
     }
-    if value["fixture_variant"].as_str().is_some_and(|v|v.starts_with("container-image-activation")) {
+    if value["fixture_variant"]
+        .as_str()
+        .is_some_and(|v| v.starts_with("container-image-activation"))
+    {
         return Box::pin(crate::marketplace::grant_store::installation::activation::run_compiled_activation_fixture(
-            source,image,build,value,root,&deployment)).await;
+            source,image,build,value,root,&deployment,None)).await;
     }
     let expected_summary = canonical::to_vec(source.summary())?;
     let expected_release = source.workspace().release_id;
@@ -131,9 +134,18 @@ pub(super) async fn run(
         ControllerLease::acquire(&lane)
             .context("original build/archive still pins its retired lane")?,
     );
-    if value["fixture_variant"].as_str()==Some("container-image-installed") {
-        return Box::pin(crate::marketplace::grant_store::installation::runtime::run_compiled_fixture(
-            runtime,root,&lane,&worker,&deployment,value)).await;
+    if value["fixture_variant"].as_str() == Some("container-image-installed") {
+        return Box::pin(
+            crate::marketplace::grant_store::installation::runtime::run_compiled_fixture(
+                runtime,
+                root,
+                &lane,
+                &worker,
+                &deployment,
+                value,
+            ),
+        )
+        .await;
     }
     let record = LocalBuildRecord::parse(&record.to_bytes()?)?;
     let candidate = CandidateDescriptor::parse(&serde_json::to_vec(&serde_json::json!({

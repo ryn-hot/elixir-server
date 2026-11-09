@@ -28,8 +28,23 @@ impl Copy {
         path: PathBuf,
         budget: ArchiveBudget,
     ) -> Self {
+        Self::begin_with_build(database, source, selection, path, budget, None)
+    }
+    // The same task owns the authenticated record AND original source until
+    // copying/disposal join. A cancelled finish waiter cannot lose the record
+    // between a successful copy and the installation-side handoff.
+    pub(in crate::marketplace) fn begin_with_build(
+        database: Database,
+        source: GrantCheckedQuarantine,
+        selection: Option<Selection>,
+        path: PathBuf,
+        budget: ArchiveBudget,
+        build: Option<LocalBuildRecord>,
+    ) -> Self {
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(run(database, source, selection, path, budget, stopped));
+        let task = tokio::spawn(run(
+            database, source, selection, path, budget, build, stopped,
+        ));
         Self {
             stop,
             task: Some(task),
@@ -164,6 +179,7 @@ async fn run(
     mut selection: Option<Selection>,
     path: PathBuf,
     budget: ArchiveBudget,
+    build: Option<LocalBuildRecord>,
     mut stop: watch::Receiver<bool>,
 ) -> Outcome {
     let expires = source.source().source().expires();
@@ -183,7 +199,21 @@ async fn run(
     // source inside Outcome is insufficient: a dropped failed preparation
     // would drop that outcome and its real OS lease too.
     confirm_disposal(&mut source).await;
-    let result = result.and_then(|copied| current(&stop, expires).map(|()| copied.archive));
+    let result = result.and_then(|mut copied| {
+        current(&stop, expires)?;
+        if let Some(record) = build {
+            record.require_descriptor_data(
+                &SourceMatchDescriptor {
+                    schema_version: 1,
+                    workspace: copied.archive.descriptor.workspace.clone(),
+                    release: copied.archive.descriptor.release.clone(),
+                },
+                &copied.archive.descriptor.source,
+            )?;
+            copied.archive.build = Some(record);
+        }
+        Ok(copied.archive)
+    });
     Outcome {
         selection,
         result: Some(result),

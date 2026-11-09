@@ -31,6 +31,7 @@ use futures_util::FutureExt;
 use std::{collections::HashMap, os::unix::fs::PermissionsExt, path::Path};
 use tokio::time::timeout;
 
+mod compiled;
 mod configured;
 
 async fn sdk_fixture(configuring: bool) -> Result<serde_json::Value> {

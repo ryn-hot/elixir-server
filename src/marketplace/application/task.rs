@@ -318,26 +318,13 @@ impl Command {
         if *stop.borrow() {
             return Ok(());
         }
-        self.preparation = Some(
-            if let Some(authorization) = self.source_authorization.as_ref() {
-                self.context.preparation.start_for_owner(
-                    selected,
-                    self.host.runtime.retention,
-                    self.context.upload_source(),
-                    authorization.clone(),
-                )?
-            } else if self.context.upload_source() {
-                self.context
-                    .preparation
-                    .start_retained_upload(selected, self.host.runtime.retention)?
-            } else {
-                self.context.preparation.start_retained(
-                    selected,
-                    None,
-                    self.host.runtime.retention,
-                )?
-            },
-        );
+        self.preparation = Some(self.context.preparation.start_install(
+            selected,
+            self.context.upload_source(),
+            self.source_authorization.clone(),
+            &self.host.runtime,
+            self.host.secrets.clone(),
+        )?);
         self.publish(status, Phase::Preparing);
         Ok(())
     }

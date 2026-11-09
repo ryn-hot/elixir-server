@@ -40,7 +40,8 @@ impl super::super::execution::Broker for ContainerBroker {
         _: usize,
     ) -> Result<elixir_marketplace::source_execution::SourceSdkReply> {
         use elixir_marketplace::source_execution::{RuntimeJson, SourceSdkReply, SourceSdkRequest};
-        let native = self.native
+        let native = self
+            .native
             .as_ref()
             .context("SDK effect preceded actual native binding")?;
         native.require_invoke(&self.source)?;
@@ -160,7 +161,8 @@ async fn actual_owned_compiled_invocation_uses_real_grants_and_stops_on_revocati
 }
 #[tokio::test]
 #[ignore = "explicit actual build/archive/disposal/new-job rematch/reimport/execution; no installed activation or public network"]
-async fn actual_owned_retained_build_record_rechecks_archived_bytes_under_a_new_job() -> Result<()> {
+async fn actual_owned_retained_build_record_rechecks_archived_bytes_under_a_new_job() -> Result<()>
+{
     native_variants_with_runtime(&["container-image-retained"], true, true, true, true, true).await
 }
 #[tokio::test]
@@ -171,7 +173,36 @@ async fn actual_owned_installed_compiled_calls_recheck_crypto_grants_and_cleanup
 #[tokio::test]
 #[ignore = "actual compiled archive/native probe/state copy/candidate SDK/readiness/activation/cold reopen, plus failed-readiness cleanup; source/protection observations synthetic"]
 async fn actual_compiled_activation_uses_the_original_probe_candidate_and_commit() -> Result<()> {
-    native_variants_with_runtime(&["container-image-activation", "container-image-activation-failure"],true,true,true,true,true).await
+    native_variants_with_runtime(
+        &[
+            "container-image-activation",
+            "container-image-activation-failure",
+        ],
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "actual native v1 activation -> v2 nonempty-state/credential update -> failed v3 cleanup and offline v2; source/protection observations synthetic"]
+async fn actual_compiled_updates_copy_nonempty_state_and_preserve_the_active_generation_on_failure()
+-> Result<()> {
+    native_variants_with_runtime(
+        &[
+            "container-image-activation-update-v1",
+            "container-image-activation-update-v2",
+            "container-image-activation-update-v3-failure",
+        ],
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .await
 }
 async fn native_variants_with_runtime(
     variants: &[&str],
@@ -220,11 +251,42 @@ async fn native_variants_with_runtime(
         manager = manager.with_marketplace_container_guardian(profile);
     }
     let runtime = Arc::new(manager);
+    let updating = variants
+        .iter()
+        .any(|v| v.starts_with("container-image-activation-update-"));
+    if updating
+        && variants
+            .iter()
+            .any(|v| !v.starts_with("container-image-activation-update-"))
+    {
+        bail!("compiled update fixture requires one continuous update sequence");
+    }
+    let mut shared_directory = if updating {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let shared_deployment =
+        updating.then(|| format!("compiled-fixture-{}", uuid::Uuid::new_v4().simple()));
+    let mut update_checkpoint: Option<
+        crate::marketplace::grant_store::installation::activation::CompiledUpdateFixtureState,
+    > = None;
     for &variant in variants {
-        let directory = tempfile::tempdir()?;
-        let root = directory.path().canonicalize()?;
+        let directory = if updating {
+            None
+        } else {
+            Some(tempfile::tempdir()?)
+        };
+        let root = directory
+            .as_ref()
+            .or(shared_directory.as_ref())
+            .context("fixture root missing")?
+            .path()
+            .canonicalize()?;
         let lane = root.join("lane");
-        let deployment = format!("compiled-fixture-{}", uuid::Uuid::new_v4().simple());
+        let deployment = shared_deployment
+            .clone()
+            .unwrap_or_else(|| format!("compiled-fixture-{}", uuid::Uuid::new_v4().simple()));
         let volume = format!("elixir-marketplace-source-{deployment}");
         let labels = HashMap::from([
             (ELIXIR_MANAGED_LABEL.into(), "true".into()),
@@ -235,7 +297,7 @@ async fn native_variants_with_runtime(
         // stack. In particular the filesystem-negative path has more wrappers
         // than the direct runtime case; both retain the same cleanup owner.
         let operation=Box::pin(async {
-            if variant=="container-image-installed" || variant.starts_with("container-image-activation") {
+            if (variant=="container-image-installed" || variant.starts_with("container-image-activation")) && (!updating||update_checkpoint.is_none()) {
                 Box::pin(crate::marketplace::grant_store::installation::runtime::initialize_compiled_fixture(
                     runtime.clone(),&root,&lane,&image,&deployment)).await?;
             }
@@ -342,7 +404,12 @@ async fn native_variants_with_runtime(
                                     // remain owned across this distinct root operation.
                                     returned.source.job.measure_host(original_expires).await?.report()?;
                                     if let Some(fixture)=retained_fixture.as_ref() {
-                                        Box::pin(retained::run(returned,&image,&evidence,fixture,&root)).await?;
+                                        if updating {
+                                            Box::pin(crate::marketplace::grant_store::installation::activation::run_compiled_activation_fixture(
+                                                returned,&image,&evidence,fixture,&root,&deployment,Some(&mut update_checkpoint))).await?;
+                                        } else {
+                                            Box::pin(retained::run(returned,&image,&evidence,fixture,&root)).await?;
+                                        }
                                         if variant.starts_with("container-image-activation") {
                                             println!("offline native build {variant}: actual probe/candidate/owner activation or failed-readiness cleanup; source/protection observations synthetic");
                                         } else {
@@ -441,36 +508,56 @@ async fn native_variants_with_runtime(
                 .await
                 .context("original fixture cleanup owner still holds the lane")??;
             }
-            let mut roles=vec![(deployment.clone(),volume.clone(),labels.clone())];
-            if matches!(variant,"container-image-retained"|"container-image-installed") || variant.starts_with("container-image-activation") {
-                let cold=format!("{deployment}-cold");
-                let cold_labels=HashMap::from([
-                    (ELIXIR_MANAGED_LABEL.into(),"true".into()),
-                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(),cold.clone()),
-                    ("elixir.marketplace.volume".into(),"quarantine-v1".into()),
+            let mut roles = vec![(deployment.clone(), volume.clone(), labels.clone())];
+            if matches!(
+                variant,
+                "container-image-retained" | "container-image-installed"
+            ) || variant.starts_with("container-image-activation")
+            {
+                let cold = format!("{deployment}-cold");
+                let cold_labels = HashMap::from([
+                    (ELIXIR_MANAGED_LABEL.into(), "true".into()),
+                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(), cold.clone()),
+                    ("elixir.marketplace.volume".into(), "quarantine-v1".into()),
                 ]);
-                roles.push((cold.clone(),format!("elixir-marketplace-source-{cold}"),cold_labels));
-                let installed=format!("{deployment}-installed");
-                let installed_labels=HashMap::from([
-                    (ELIXIR_MANAGED_LABEL.into(),"true".into()),
-                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(),installed.clone()),
-                    ("elixir.marketplace.volume".into(),"quarantine-v1".into()),
+                roles.push((
+                    cold.clone(),
+                    format!("elixir-marketplace-source-{cold}"),
+                    cold_labels,
+                ));
+                let installed = format!("{deployment}-installed");
+                let installed_labels = HashMap::from([
+                    (ELIXIR_MANAGED_LABEL.into(), "true".into()),
+                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(), installed.clone()),
+                    ("elixir.marketplace.volume".into(), "quarantine-v1".into()),
                 ]);
-                roles.push((installed.clone(),format!("elixir-marketplace-source-{installed}"),installed_labels));
+                roles.push((
+                    installed.clone(),
+                    format!("elixir-marketplace-source-{installed}"),
+                    installed_labels,
+                ));
             }
-            for (deployment,volume,labels) in roles {
+            for (deployment, volume, labels) in roles {
                 SourceQuarantineJob::remove_stopped_writer(runtime.as_ref(), &deployment).await?;
                 if runtime.private_file_volume_owned(&volume, &labels).await? {
                     runtime.remove_private_file_volume(&volume, &labels).await?;
                 }
-                if runtime.get_container_handle(&writer_name(&deployment)).await?.is_some() {
+                if runtime
+                    .get_container_handle(&writer_name(&deployment))
+                    .await?
+                    .is_some()
+                {
                     bail!("fixture writer remains");
                 }
             }
             Ok::<_, anyhow::Error>(())
-        }).await;
+        })
+        .await;
         if let Err(error) = cleanup {
-            let retained = directory.keep();
+            let retained = directory
+                .or_else(|| shared_directory.take())
+                .context("fixture root missing")?
+                .keep();
             bail!(
                 "offline build {variant} cleanup unconfirmed: {error:#}; retained at {}; operation: {}",
                 retained.display(),
@@ -478,7 +565,10 @@ async fn native_variants_with_runtime(
             );
         }
         if let Err(error) = operation {
-            let retained = directory.keep();
+            let retained = directory
+                .or_else(|| shared_directory.take())
+                .context("fixture root missing")?
+                .keep();
             return Err(error).with_context(|| {
                 format!(
                     "offline build {variant} failed; joined cleanup, fixtures retained at {}",
@@ -501,6 +591,12 @@ fn multi_phase_fixture_wrappers_keep_bounded_futures_without_a_larger_thread_sta
     // No future is created/polled and no native work or grant is fabricated.
     let direct = bytes(|| native_variants_with_runtime(&[], true, true, true, true, true));
     let nested = bytes(|| native_variants(&[], true, false));
-    assert!(direct <= 128 * 1024, "direct fixture future too large: {direct}");
-    assert!(nested <= 128 * 1024, "nested fixture future too large: {nested}");
+    assert!(
+        direct <= 128 * 1024,
+        "direct fixture future too large: {direct}"
+    );
+    assert!(
+        nested <= 128 * 1024,
+        "nested fixture future too large: {nested}"
+    );
 }

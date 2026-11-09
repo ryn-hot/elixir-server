@@ -100,6 +100,12 @@ impl SourceMatchedQuarantine {
     }
 }
 impl Export {
+    pub(in crate::marketplace) fn refresh_public_source(
+        &mut self,
+        observation: super::super::worker::PublicSourceObservation,
+    ) -> Result<()> {
+        self.source_mut()?.refresh_public_source(observation)
+    }
     fn source(&self) -> Result<&SourceMatchedQuarantine> {
         self.source
             .as_ref()
