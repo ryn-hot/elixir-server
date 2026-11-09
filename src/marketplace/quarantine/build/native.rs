@@ -205,6 +205,47 @@ async fn actual_compiled_updates_copy_nonempty_state_and_preserve_the_active_gen
     )
     .await
 }
+pub(in crate::marketplace) fn fixture_runtime(
+    import: bool,
+    execute: bool,
+) -> Result<Arc<DockerRuntimeManager>> {
+    let mut manager = DockerRuntimeManager::new(None);
+    if import {
+        let profile = crate::runtime::image_import::Profile::from_operator_configuration(
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_BINARY")
+                    .context("explicit host import companion missing")?,
+            )
+            .canonicalize()?,
+            std::env::var("ELIXIR_TEST_IMAGE_IMPORT_BINARY_SHA256")?.parse()?,
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_SOCKET")
+                    .context("explicit local daemon socket missing")?,
+            )
+            .canonicalize()?,
+        )?;
+        let profile = if std::env::var("ELIXIR_TEST_COMPILED_IMAGE_CACHE").as_deref() == Ok("1") {
+            profile.with_image_cache()
+        } else {
+            profile
+        };
+        manager = manager.with_marketplace_import_profile(profile);
+    }
+    if execute {
+        let profile = crate::runtime::container_guardian::Profile::from_operator_configuration(
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_CONTAINER_GUARDIAN_BINARY")
+                    .context("explicit guardian binary missing")?,
+            )
+            .canonicalize()?,
+            std::env::var("ELIXIR_TEST_CONTAINER_GUARDIAN_SHA256")?.parse()?,
+            elixir_marketplace::reproduction::BuildPlatform::LinuxAmd64,
+        )?;
+        manager = manager.with_marketplace_container_guardian(profile);
+    }
+    Ok(Arc::new(manager))
+}
+
 async fn native_variants_with_runtime(
     variants: &[&str],
     filesystem: bool,
@@ -222,37 +263,7 @@ async fn native_variants_with_runtime(
     {
         bail!("explicit immutable local fixture images required");
     }
-    let mut manager = DockerRuntimeManager::new(None);
-    if import {
-        let profile = crate::runtime::image_import::Profile::from_operator_configuration(
-            std::path::PathBuf::from(
-                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_BINARY")
-                    .context("explicit host import companion missing")?,
-            )
-            .canonicalize()?,
-            std::env::var("ELIXIR_TEST_IMAGE_IMPORT_BINARY_SHA256")?.parse()?,
-            std::path::PathBuf::from(
-                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_SOCKET")
-                    .context("explicit local daemon socket missing")?,
-            )
-            .canonicalize()?,
-        )?;
-        let profile=if std::env::var("ELIXIR_TEST_COMPILED_IMAGE_CACHE").as_deref()==Ok("1") {profile.with_image_cache()} else {profile};
-        manager = manager.with_marketplace_import_profile(profile);
-    }
-    if execute {
-        let profile = crate::runtime::container_guardian::Profile::from_operator_configuration(
-            std::path::PathBuf::from(
-                std::env::var_os("ELIXIR_TEST_CONTAINER_GUARDIAN_BINARY")
-                    .context("explicit guardian binary missing")?,
-            )
-            .canonicalize()?,
-            std::env::var("ELIXIR_TEST_CONTAINER_GUARDIAN_SHA256")?.parse()?,
-            elixir_marketplace::reproduction::BuildPlatform::LinuxAmd64,
-        )?;
-        manager = manager.with_marketplace_container_guardian(profile);
-    }
-    let runtime = Arc::new(manager);
+    let runtime = fixture_runtime(import, execute)?;
     let updating = variants
         .iter()
         .any(|v| v.starts_with("container-image-activation-update-"));

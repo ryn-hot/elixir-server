@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod native;
+#[cfg(test)]
+pub(in crate::marketplace) use native::fixture_runtime;
 
 /// Private in-memory comparison evidence only. Not serializable/cloneable and
 /// not sufficient for activation without the still-missing runtime closure.

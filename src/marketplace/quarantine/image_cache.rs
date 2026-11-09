@@ -422,6 +422,15 @@ impl Pool {
         self.slot.lock().await.clear().await
     }
     #[cfg(test)]
+    pub(in crate::marketplace) async fn idle_deadline(&self) -> Option<Instant> {
+        self.slot
+            .lock()
+            .await
+            .entry
+            .as_ref()
+            .map(|entry| entry.created + IDLE)
+    }
+    #[cfg(test)]
     pub(in crate::marketplace) async fn snapshot(&self) -> Result<Option<(Digest, String, u64)>> {
         let slot = self.slot.lock().await;
         slot.entry

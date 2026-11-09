@@ -247,6 +247,10 @@ impl InstalledController {
         Ok(())
     }
     #[cfg(all(test,unix))]
+    pub(super) async fn image_cache_idle_deadline(&self)->Option<tokio::time::Instant> {
+        match &self.image_cache {Some(cache)=>cache.idle_deadline().await,None=>None}
+    }
+    #[cfg(all(test,unix))]
     pub(super) async fn image_cache_snapshot(&self)->Result<Option<(Digest,String,u64)>> {
         match &self.image_cache {Some(cache)=>cache.snapshot().await,None=>Ok(None)}
     }

@@ -139,6 +139,31 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         println!(
             "compiled image-cache reuse: fresh job/source/artifact/grants; identical passive reference; original foreground lane released"
         );
+        Box::pin(qualify_idle_expiry(
+            &controller,
+            runtime.as_ref(),
+            first_image.as_ref().unwrap(),
+        ))
+        .await?;
+        let binding =
+            InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+        controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+        assert_eq!(controller.finish().await?.as_str(), "true");
+        assert_ne!(controller.image_cache_snapshot().await?, first_image);
+
+        // Retire this parent's owners before starting a separate real process.
+        // The child then fills its own actual cache and exits without Drop.
+        controller.shutdown_cache().await?;
+        drop(controller);
+        controller = Box::pin(qualify_abrupt_restart(
+            &db,
+            &secrets,
+            &config,
+            root,
+            (home, &id, instance),
+            deployment,
+        ))
+        .await?;
         let binding =
             InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
         let capsule = binding.material(&db).await?;
@@ -318,6 +343,223 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         "installed compiled: actual stored-proof authentication/native rematch/reimport/controller/instance SQL-AES SDK, denied network/unapproved secret, original cancellation and live grant revocation passed; ACTIVE enrollment synthetic, no activation qualification"
     );
     Ok(())
+}
+
+async fn qualify_idle_expiry(
+    controller: &InstalledController,
+    runtime: &dyn RuntimeManager,
+    original: &(Digest, String, u64),
+) -> Result<()> {
+    let deadline = controller
+        .image_cache_idle_deadline()
+        .await
+        .context("actual cached image has no idle deadline")?;
+    let started = tokio::time::Instant::now();
+    let before = deadline - Duration::from_secs(5);
+    assert!(
+        before > started,
+        "fixture already missed its pre-expiry observation"
+    );
+    println!("compiled image-cache idle: waiting for the actual five-minute production timer");
+    tokio::time::sleep_until(before).await;
+    assert_eq!(
+        controller.image_cache_snapshot().await?.as_ref(),
+        Some(original),
+        "idle image was evicted before its actual non-renewing deadline"
+    );
+    tokio::time::sleep_until(deadline).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if controller.image_cache_snapshot().await?.is_none() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .context("actual idle timer did not join native image retirement")??;
+    // Pool snapshot clears only after the actual keeper's settled retirement.
+    // This additional daemon observation is not used to manufacture that proof.
+    assert!(
+        runtime
+            .inspect_marketplace_import_image(original.0)
+            .await
+            .is_err()
+    );
+    controller.require_idle()?;
+    println!(
+        "compiled image-cache idle: actual timer joined retirement; waited_ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+const RESTART_CHILD: &str = "marketplace::grant_store::installation::runtime::tests::compiled::actual_compiled_cache_restart_child";
+
+async fn qualify_abrupt_restart(
+    db: &Database,
+    secrets: &SecretsManager,
+    config: &InstalledRuntime,
+    root: &Path,
+    coordinates: (Uuid, &ExtensionId, Uuid),
+    deployment: &str,
+) -> Result<InstalledController> {
+    let (home, id, instance) = coordinates;
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    command
+        .args([RESTART_CHILD, "--exact", "--ignored", "--nocapture"])
+        .env_clear()
+        .kill_on_drop(true);
+    // Explicit fixture inputs only: no dotenv, account credentials or ambient
+    // production configuration is inherited by the subprocess.
+    for key in [
+        "PATH",
+        "TMPDIR",
+        "DOCKER_HOST",
+        "SQLX_OFFLINE",
+        "ELIXIR_MARKETPLACE_WORKER_IMAGE",
+        "ELIXIR_MARKETPLACE_TOOLCHAIN_IMAGE",
+        "ELIXIR_TEST_IMAGE_IMPORT_BINARY",
+        "ELIXIR_TEST_IMAGE_IMPORT_BINARY_SHA256",
+        "ELIXIR_TEST_IMAGE_IMPORT_SOCKET",
+        "ELIXIR_TEST_CONTAINER_GUARDIAN_BINARY",
+        "ELIXIR_TEST_CONTAINER_GUARDIAN_SHA256",
+        "ELIXIR_TEST_COMPILED_IMAGE_CACHE",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("ELIXIR_TEST_CACHE_RESTART_ROOT", root)
+        .env("ELIXIR_TEST_CACHE_RESTART_HOME", home.to_string())
+        .env("ELIXIR_TEST_CACHE_RESTART_EXTENSION", id.as_str())
+        .env("ELIXIR_TEST_CACHE_RESTART_INSTANCE", instance.to_string())
+        .env("ELIXIR_TEST_CACHE_RESTART_DEPLOYMENT", deployment);
+    let mut child = command.spawn()?;
+    let pid = child
+        .id()
+        .context("cache restart child has no process identity")?;
+    let status = match tokio::time::timeout(Duration::from_secs(240), child.wait()).await {
+        Ok(status) => status?,
+        Err(error) => {
+            child.start_kill()?;
+            child.wait().await?;
+            return Err(error).context("cache restart child timed out and was joined");
+        }
+    };
+    assert!(status.success(), "cache restart child failed: {status}");
+    let marker = root.join("cache-restart-child-ready.json");
+    assert!(std::fs::metadata(&marker)?.len() <= 4096);
+    let (previous, actual_pid): ((Digest, String, u64), u32) =
+        serde_json::from_slice(&std::fs::read(&marker)?)?;
+    assert_eq!(actual_pid, pid);
+    config
+        .runtime
+        .inspect_marketplace_import_image(previous.0)
+        .await?;
+    assert!(
+        config
+            .lane
+            .join("compiled-image-cache/image-cache.request")
+            .is_file()
+    );
+    let mut controller =
+        InstalledController::open(db.clone(), secrets.clone(), config.clone()).await?;
+    assert!(
+        controller.image_cache_snapshot().await?.is_none(),
+        "restart restored executable cache authority from disk"
+    );
+    assert!(
+        !config
+            .lane
+            .join("compiled-image-cache/image-cache.request")
+            .exists()
+    );
+    assert!(
+        config
+            .runtime
+            .inspect_marketplace_import_image(previous.0)
+            .await
+            .is_err()
+    );
+    let binding = InstalledBinding::load(db, home, id, instance, standing_tests::limit()).await?;
+    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    assert_eq!(controller.finish().await?.as_str(), "true");
+    let fresh = controller
+        .image_cache_snapshot()
+        .await?
+        .context("post-restart call did not fill a new actual cache")?;
+    assert_eq!(fresh.0, previous.0);
+    assert_ne!(
+        fresh.1, previous.1,
+        "restart reused the dead process's cache owner"
+    );
+    println!(
+        "compiled image-cache abrupt restart: _exit without Drop; original journal retired at reopen; no restored authority; fresh source/native call and new cache owner passed"
+    );
+    Ok(controller)
+}
+
+#[tokio::test]
+#[ignore = "subprocess only: isolated existing compiled fixture; actual native cache then _exit without Rust cleanup"]
+async fn actual_compiled_cache_restart_child() -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    assert_eq!(std::env::var("ELIXIR_TEST_COMPILED_IMAGE_CACHE")?, "1");
+    let root = std::path::PathBuf::from(
+        std::env::var_os("ELIXIR_TEST_CACHE_RESTART_ROOT")
+            .context("explicit isolated restart fixture root required")?,
+    )
+    .canonicalize()?;
+    assert!(root.join("retained-build.sqlite").is_file());
+    let home: Uuid = std::env::var("ELIXIR_TEST_CACHE_RESTART_HOME")?.parse()?;
+    let id: ExtensionId = std::env::var("ELIXIR_TEST_CACHE_RESTART_EXTENSION")?.parse()?;
+    let instance: Uuid = std::env::var("ELIXIR_TEST_CACHE_RESTART_INSTANCE")?.parse()?;
+    let deployment = std::env::var("ELIXIR_TEST_CACHE_RESTART_DEPLOYMENT")?;
+    let worker = std::env::var("ELIXIR_MARKETPLACE_WORKER_IMAGE")?;
+    let runtime = crate::marketplace::quarantine::build::fixture_runtime(true, true)?;
+    let db = grant_tests::connect(&root.join("retained-build.sqlite")).await?;
+    let config = compiled_fixture_configuration(
+        &db,
+        runtime.clone(),
+        &root,
+        &root.join("lane"),
+        &worker,
+        &deployment,
+    )?;
+    let mut controller = InstalledController::open(
+        db.clone(),
+        SecretsManager::from_key_bytes([93; 32], false),
+        config,
+    )
+    .await?;
+    let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+    controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+    assert_eq!(controller.finish().await?.as_str(), "true");
+    controller.require_idle()?;
+    let snapshot = controller
+        .image_cache_snapshot()
+        .await?
+        .context("child has no actual image reference")?;
+    assert!(
+        cached_input_state(runtime.as_ref(), &root.join("lane"))
+            .await?
+            .is_some()
+    );
+    runtime.inspect_marketplace_import_image(snapshot.0).await?;
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join("cache-restart-child-ready.json"))?;
+    marker.write_all(&canonical::to_vec(&(snapshot, std::process::id()))?)?;
+    marker.sync_all()?;
+    std::fs::File::open(&root)?.sync_all()?;
+    println!(
+        "compiled image-cache child: actual SDK call and native retirement completed; exiting without Drop"
+    );
+    std::io::stdout().flush()?;
+    unsafe { libc::_exit(0) }
 }
 
 // Metadata/cleanup observations only, never a source match or runtime ticket.
