@@ -61,6 +61,8 @@ pub(in crate::marketplace) mod image_export;
 pub(in crate::marketplace) mod image_import;
 #[cfg(unix)]
 pub(in crate::marketplace) mod image_reference;
+#[cfg(unix)]
+pub(in crate::marketplace) mod local_build;
 mod cache;
 pub(in crate::marketplace) mod execution;
 mod launch;
@@ -335,6 +337,9 @@ pub struct SourceMatchedQuarantine {
     source: QuarantinedSource,
     summary: SourceMatchSummary,
     public_source: Option<super::worker::PublicSourceObservation>,
+    disposed: bool,
+    #[cfg(unix)]
+    retained_build: Option<Box<local_build::RetainedBuildBinding>>,
 }
 impl SourceMatchedQuarantine {
     /// Attach a current, actual protected public-text observation to this exact
@@ -352,6 +357,10 @@ impl SourceMatchedQuarantine {
         observation: super::worker::PublicSourceObservation,
     ) -> Result<()> {
         self.ensure_job_active()?;
+        #[cfg(unix)]
+        if self.retained_build.is_some() {
+            bail!("retained compiled provenance cannot become foreground availability authority");
+        }
         observation.require_matches_source(&self.source.job.plan.source_match, &self.summary)?;
         self.public_source = Some(observation);
         Ok(())
@@ -362,6 +371,26 @@ impl SourceMatchedQuarantine {
             .as_ref()
             .context("no live public-source binding on this quarantine")?
             .require_matches_source(&self.source.job.plan.source_match, &self.summary)
+    }
+    #[cfg(unix)]
+    fn require_compiled_source(&self) -> Result<()> {
+        self.ensure_job_active()?;
+        match (&self.public_source, &self.retained_build) {
+            (Some(_), None) => self.require_public_source(),
+            (None, Some(binding)) => binding.require_source(self),
+            _ => bail!("compiled code requires actual foreground or authenticated retained provenance"),
+        }
+    }
+    #[cfg(unix)]
+    fn require_compiled_image(
+        &self,
+        image: &elixir_marketplace::container_image::job::ContainerImageSummary,
+    ) -> Result<()> {
+        self.require_compiled_source()?;
+        if let Some(binding) = &self.retained_build {
+            binding.require_image(image)?;
+        }
+        Ok(())
     }
     pub fn summary(&self) -> &SourceMatchSummary {
         &self.summary
@@ -377,13 +406,24 @@ impl SourceMatchedQuarantine {
     }
     pub(super) fn ensure_active(&self) -> Result<()> {
         self.ensure_job_active()?;
+        #[cfg(unix)]
+        if self.retained_build.is_some() {
+            self.require_compiled_source()?;
+        }
         if self.public_source.is_some() {
             self.require_public_source()?;
         }
         Ok(())
     }
+    pub(super) fn require_foreground_manifest(&self) -> Result<()> {
+        #[cfg(unix)]
+        if self.retained_build.is_some() {
+            bail!("retained compiled integrity cannot become foreground approval authority");
+        }
+        self.ensure_active()
+    }
     fn ensure_job_active(&self) -> Result<()> {
-        if Instant::now() >= self.source.job.expires {
+        if self.disposed || Instant::now() >= self.source.job.expires {
             bail!("source quarantine job has expired");
         }
         Ok(())
@@ -451,7 +491,18 @@ impl SourceMatchedQuarantine {
         self.reserve_archive(0, reads, writes)
     }
     pub(super) async fn discard_retained(&mut self) -> Result<()> {
-        self.source.job.discard_retained().await
+        if self.disposed {
+            return Ok(());
+        }
+        // Revoke this wrapper only after the original cleanup actually joins.
+        // Cancellation/failure leaves the same owner available for a retry.
+        self.source.job.discard_retained().await?;
+        self.disposed = true;
+        #[cfg(unix)]
+        {
+            self.retained_build = None;
+        }
+        Ok(())
     }
     /// Integrity-only readback under the same exclusive foreground lease and
     /// cumulative byte/time budget. The destination must be separately reserved.
@@ -585,6 +636,9 @@ impl QuarantinedSource {
             summary,
             source: self,
             public_source: None,
+            disposed: false,
+            #[cfg(unix)]
+            retained_build: None,
         })
     }
     /// Keep the exclusive workspace in the controller's slot across errors or
@@ -599,6 +653,9 @@ impl QuarantinedSource {
             summary,
             source: slot.take().expect("borrowed source owner"),
             public_source: None,
+            disposed: false,
+            #[cfg(unix)]
+            retained_build: None,
         })
     }
     pub(super) async fn discard_retained(&mut self) -> Result<()> {
@@ -2187,6 +2244,9 @@ pub(in crate::marketplace) mod tests {
             },
             summary,
             public_source: None,
+            disposed: false,
+            #[cfg(unix)]
+            retained_build: None,
         })
     }
     #[tokio::test]
@@ -2617,6 +2677,9 @@ pub(in crate::marketplace) mod tests {
             source: QuarantinedSource { job },
             summary,
             public_source: None,
+            disposed: false,
+            #[cfg(unix)]
+            retained_build: None,
         };
         assert!(
             matched.require_public_source().is_err(),

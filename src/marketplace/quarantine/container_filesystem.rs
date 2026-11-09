@@ -23,7 +23,8 @@ impl NativeContainerFilesystemMatch {
     }
     pub(super) fn require_source(&self, source: &SourceMatchedQuarantine) -> Result<()> {
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
+        source.require_compiled_image(&self.summary.image)?;
         self.summary.matches(&descriptor(source)?)?;
         Ok(())
     }
@@ -32,6 +33,18 @@ impl SourceMatchedQuarantine {
     pub(in crate::marketplace) async fn check_container_filesystem(
         &mut self,
         build: &build::NativeBuildMatch,
+    ) -> Result<NativeContainerFilesystemMatch> {
+        Box::pin(self.check_container_filesystem_with(Reproduction::Fresh(build))).await
+    }
+    pub(in crate::marketplace) async fn check_retained_container_filesystem(
+        &mut self,
+        build: &local_build::VerifiedLocalBuild,
+    ) -> Result<NativeContainerFilesystemMatch> {
+        Box::pin(self.check_container_filesystem_with(Reproduction::Retained(build))).await
+    }
+    async fn check_container_filesystem_with(
+        &mut self,
+        build: Reproduction<'_>,
     ) -> Result<NativeContainerFilesystemMatch> {
         build.require_source(self)?;
         let expires = self.expires();
@@ -145,12 +158,34 @@ impl SourceMatchedQuarantine {
             self.source.job.cleanup_activity(runtime.as_ref()).await?;
         }
         let summary = result?;
+        build.require_image(&summary.image)?;
         let observed = NativeContainerFilesystemMatch {
             owner: super::evidence_owner::EvidenceOwner::capture(self)?,
             summary,
         };
         observed.require_source(self)?;
         Ok(observed)
+    }
+}
+enum Reproduction<'a> {
+    Fresh(&'a build::NativeBuildMatch),
+    Retained(&'a local_build::VerifiedLocalBuild),
+}
+impl Reproduction<'_> {
+    fn require_source(&self, source: &SourceMatchedQuarantine) -> Result<()> {
+        match self {
+            Self::Fresh(build) => build.require_source(source),
+            Self::Retained(build) => build.require_source(source),
+        }
+    }
+    fn require_image(
+        &self,
+        image: &elixir_marketplace::container_image::job::ContainerImageSummary,
+    ) -> Result<()> {
+        if let Self::Retained(build) = self {
+            build.require_image(image)?;
+        }
+        Ok(())
     }
 }
 fn limits(job: &SourceQuarantineJob) -> FilesystemLimits {

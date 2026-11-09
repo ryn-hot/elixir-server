@@ -68,7 +68,7 @@ impl ManifestCheckedQuarantine {
 }
 impl SourceMatchedQuarantine {
     pub fn check_manifest(self) -> Result<ManifestCheckedQuarantine> {
-        self.ensure_active()?;
+        self.require_foreground_manifest()?;
         let (manifest, selection, permissions) = check_document(
             self.summary().manifest()?,
             self.release(),

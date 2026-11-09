@@ -264,7 +264,8 @@ impl RuntimeImage {
         source: &SourceMatchedQuarantine,
     ) -> Result<()> {
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
+        source.require_compiled_image(&self.image)?;
         let lease = source.job_lease();
         require_active(&lease, self.record.operation_id, self.record.intent())?;
         private(&self.file)?;

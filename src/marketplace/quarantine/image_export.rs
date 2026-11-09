@@ -34,7 +34,8 @@ impl VerifiedImageExport {
         source: &SourceMatchedQuarantine,
     ) -> Result<()> {
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
+        source.require_compiled_image(&self.summary.filesystem.image)?;
         let d = descriptor(source, &self.summary.filesystem)?;
         self.summary.matches(&d)?;
         self.staging.require_sealed(&self.summary.archive)
@@ -55,6 +56,27 @@ impl SourceMatchedQuarantine {
             .as_ref()
             .context("image export source owner missing")?;
         build.require_source(original)?;
+        Self::begin_image_export_bound(source, filesystem)
+    }
+    pub(in crate::marketplace) fn begin_retained_image_export(
+        source: &mut Option<Self>,
+        build: &local_build::VerifiedLocalBuild,
+        filesystem: &container_filesystem::NativeContainerFilesystemMatch,
+    ) -> Result<Export> {
+        let original = source
+            .as_ref()
+            .context("retained image source owner missing")?;
+        build.require_source(original)?;
+        build.require_image(&filesystem.summary().image)?;
+        Self::begin_image_export_bound(source, filesystem)
+    }
+    fn begin_image_export_bound(
+        source: &mut Option<Self>,
+        filesystem: &container_filesystem::NativeContainerFilesystemMatch,
+    ) -> Result<Export> {
+        let original = source
+            .as_ref()
+            .context("image export source owner missing")?;
         filesystem.require_source(original)?;
         let expected = filesystem.summary().clone();
         let descriptor = descriptor(original, &expected)?;
@@ -91,7 +113,7 @@ impl Export {
     fn current(&self) -> Result<()> {
         let source = self.source()?;
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
         // The exclusively owned byte plan is compared at construction/native
         // launch and again in the final summary. Do not re-serialize the whole
         // source recipe for every 64-KiB chunk; keep live authority checks here.

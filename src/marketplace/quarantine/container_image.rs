@@ -18,7 +18,8 @@ impl NativeContainerImageMatch {
     }
     pub(super) fn require_source(&self, source: &SourceMatchedQuarantine) -> Result<()> {
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
+        source.require_compiled_image(&self.summary)?;
         self.summary.matches(&descriptor(source)?)?;
         Ok(())
     }

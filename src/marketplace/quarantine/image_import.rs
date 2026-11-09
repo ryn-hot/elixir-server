@@ -245,7 +245,7 @@ impl ImportedImage {
         source: &SourceMatchedQuarantine,
     ) -> Result<()> {
         self.owner.require(source)?;
-        source.require_public_source()?;
+        source.require_compiled_source()?;
         if !matches!(source.source.job.activity.as_ref().map(Fence::target),Some(Target::ImageImport{intent}) if intent.request==self.request)
         {
             bail!("imported image lost its original active root owner");
