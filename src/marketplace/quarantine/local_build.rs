@@ -30,12 +30,19 @@ struct Binding {
 impl Binding {
     fn require_source(&self, source: &SourceMatchedQuarantine) -> Result<()> {
         source.ensure_job_active()?;
-        let d = super::super::runtime::build::execution(&source.execution_descriptor(), 1)?;
-        source.summary().matches(&d.inputs.source)?;
+        self.require_descriptor(&source.execution_descriptor(), source.summary())
+    }
+    fn require_descriptor(
+        &self,
+        source: &SourceMatchDescriptor,
+        summary: &SourceMatchSummary,
+    ) -> Result<()> {
+        let d = super::super::runtime::build::execution(source, 1)?;
+        summary.matches(&d.inputs.source)?;
         if self.schema_version != 1
-            || source.release().runtime_profile != RuntimeProfile::Reproducible
-            || self.release != source.workspace().release_id
-            || self.source != Digest::of(canonical::to_vec(source.summary())?)
+            || source.release.runtime_profile != RuntimeProfile::Reproducible
+            || self.release != source.workspace.release_id
+            || self.source != Digest::of(canonical::to_vec(summary)?)
             || self.artifact.sha256 != d.output.artifact.sha256
             || self.artifact.size != d.output.artifact.size
             || self.platform != d.inputs.platform
@@ -112,6 +119,17 @@ impl LocalBuildRecord {
             bail!("invalid canonical local build record");
         }
         Ok(value)
+    }
+    /// Closed DATA binding for installation journals. This does not authenticate
+    /// the seal, prove native bytes or authorize execution; bind_retained must
+    /// still check the machine key and an actual newly rematched native owner.
+    pub(in crate::marketplace) fn require_descriptor_data(
+        &self,
+        source: &SourceMatchDescriptor,
+        summary: &SourceMatchSummary,
+    ) -> Result<()> {
+        self.to_bytes()?;
+        self.binding.require_descriptor(source, summary)
     }
     /// Check every prerequisite before changing the caller's original owner.
     /// This cannot turn an expired foreground fact into offline permission.

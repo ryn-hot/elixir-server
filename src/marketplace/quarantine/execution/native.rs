@@ -232,6 +232,16 @@ impl NativeInvocation {
             fence,
         ))
     }
+    pub(in crate::marketplace) fn require_probe(
+        &self,
+        descriptor: &SourceMatchDescriptor,
+    ) -> Result<()> {
+        self.require_source(descriptor)?;
+        if self.mode != SourceExecutionMode::Probe {
+            bail!("probe requires its actual no-effects executor");
+        }
+        Ok(())
+    }
     pub(in crate::marketplace) fn require_invoke(
         &self,
         descriptor: &SourceMatchDescriptor,

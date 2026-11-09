@@ -463,6 +463,7 @@ async fn stage_borrowed(
             review: intent.review,
             grant_revision: grant.revision,
             instance,
+            build: material.build,
         })),
         cancelled: None,
         activation: None,
@@ -492,3 +493,5 @@ async fn stage_borrowed(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(in crate::marketplace) use tests::compiled::stage_and_reload_compiled;

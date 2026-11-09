@@ -297,6 +297,7 @@ async fn copy(
         archive: ArchivedSource {
             descriptor,
             recovered_incomplete_copy: recovered,
+            build: None,
         },
         _root: root,
     })

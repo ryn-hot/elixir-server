@@ -7,13 +7,22 @@ use crate::marketplace::quarantine::{SourceMatchedQuarantine, image_reference::R
 /// activation fixture is substituted for the original native source/image job.
 pub(in crate::marketplace) async fn archive_compiled(
     source: SourceMatchedQuarantine,
+    build: &crate::marketplace::quarantine::build::NativeBuildMatch,
+    image: &RuntimeImage,
+    value: &serde_json::Value,
     root: &Path,
-    path: &Path,
-    budget: crate::marketplace::archive::ArchiveBudget,
-) -> Result<crate::marketplace::archive::ArchivedSource> {
-    let runtime = source.runtime();
+    secrets: &SecretsManager,
+) -> Result<(
+    crate::marketplace::archive::ArchivedSource,
+    crate::marketplace::quarantine::local_build::LocalBuildRecord,
+)> {
+    let public = source.execution_source()?;
     let db = grants::connect(&root.join("retained-build.sqlite")).await?;
     let actor = grants::owner(&db).await?;
+    let (candidate, policy) = descriptor(value)?;
+    let (metadata, _metadata_owner) =
+        MetadataObservation::fixture_for_verified_descriptor(candidate, &policy)?;
+    security_state::admit(&db, &metadata).await?;
     let preferences = String::from_utf8(canonical::to_vec(
         &crate::marketplace::preferences::Preferences::default(),
     )?)?;
@@ -23,8 +32,26 @@ pub(in crate::marketplace) async fn archive_compiled(
     let manifest = source.check_manifest()?;
     let review = manifest.grant_review()?;
     let grant = approve_for_actor(&db, &actor, &manifest, &grants::selection(&review, 0)?).await?;
-    let checked = grant.check_scope(&db, manifest, Uuid::new_v4()).await?;
-    crate::marketplace::archive::persist(&db, runtime.as_ref(), checked, path, budget).await
+    let mut checked = Some(grant.check_scope(&db, manifest, Uuid::new_v4()).await?);
+    let archive = crate::marketplace::archive::persist_compiled(
+        &db,
+        &mut checked,
+        build,
+        image,
+        secrets,
+        &root.join("retained-archives"),
+        crate::marketplace::archive::ArchiveBudget {
+            bytes: 64 * MIB,
+            releases: 4,
+        },
+    )
+    .await?;
+    assert!(checked.is_none());
+    let record = crate::marketplace::grant_store::installation::stage_and_reload_compiled(
+        &db, &actor, &archive, &metadata, &public, root,
+    )
+    .await?;
+    Ok((archive, record))
 }
 
 pub(in crate::marketplace) async fn run_compiled(

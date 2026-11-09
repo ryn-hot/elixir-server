@@ -14,6 +14,8 @@ use elixir_marketplace::{
 };
 use std::{path::Path, time::Duration};
 
+pub(super) mod compiled;
+
 #[path = "cancellation_tests.rs"]
 mod cancellation_tests;
 

@@ -11,9 +11,11 @@ use crate::{
 use elixir_marketplace::{
     admission::CandidateDescriptor,
     retained_authority::AuthorityRecord,
-    source_execution::{RuntimeJson, SourceExecutionLimits, SourceSdkReply},
+    source_execution::{
+        RuntimeJson, SourceExecutionLimits, SourceExecutionMode, SourceLifecycleContext,
+        SourceSdkReply,
+    },
 };
-use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
 
 // Retains the actual revocable identity but grants NO SDK effects. Ordinary
 // installed execution still needs its own enrollment/session/transaction gates.
@@ -21,7 +23,35 @@ struct NoEffects {
     source: SourceMatchDescriptor,
     native: Option<super::super::super::execution::NativeInvocation>,
     retired: bool,
+    mode: SourceExecutionMode,
+    execution: Option<Digest>,
 }
+impl NoEffects {
+    fn new(
+        source: &SourceMatchedQuarantine,
+        mode: SourceExecutionMode,
+        execution: Option<Digest>,
+    ) -> Self {
+        Self {
+            source: source.execution_descriptor(),
+            native: None,
+            retired: false,
+            mode,
+            execution,
+        }
+    }
+    fn require(&self, native: &super::super::super::execution::NativeInvocation) -> Result<()> {
+        match self.mode {
+            SourceExecutionMode::Invoke => native.require_invoke(&self.source),
+            SourceExecutionMode::Probe => native.require_probe(&self.source),
+            SourceExecutionMode::Lifecycle => native.require_candidate(
+                &self.source,
+                self.execution.context("candidate coordinate missing")?,
+            ),
+        }
+    }
+}
+impl super::super::super::execution::CandidateBroker for NoEffects {}
 #[async_trait::async_trait]
 impl super::super::super::execution::Broker for NoEffects {
     fn native_started(
@@ -31,13 +61,13 @@ impl super::super::super::execution::Broker for NoEffects {
         if self.native.is_some() {
             bail!("retained fixture received duplicate native ownership");
         }
-        invocation.require_invoke(&self.source)?;
+        self.require(&invocation)?;
         self.native = Some(invocation);
         Ok(())
     }
     async fn current(&mut self) -> Result<()> {
         if let Some(native) = &self.native {
-            native.require_invoke(&self.source)?;
+            self.require(native)?;
         }
         Ok(())
     }
@@ -56,7 +86,7 @@ impl super::super::super::execution::Broker for NoEffects {
 }
 
 pub(super) async fn run(
-    source: SourceMatchedQuarantine,
+    mut source: SourceMatchedQuarantine,
     image: &RuntimeImage,
     build: &NativeBuildMatch,
     value: &serde_json::Value,
@@ -69,19 +99,13 @@ pub(super) async fn run(
     let worker = source.source.job.volume.image.clone();
     let old_view = image.runtime_view(&source)?;
     let secrets = SecretsManager::from_key_bytes([93; 32], false);
-    let record = LocalBuildRecord::from_actual_build(&source, build, image, &secrets)?;
-    let record_path = root.join("local-build.json");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&record_path)?;
-    file.write_all(&record.to_bytes()?)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::File::open(root)?.sync_all()?;
-    drop(record);
+    let mut probe = NoEffects::new(&source, SourceExecutionMode::Probe, None);
+    source
+        .probe_container(image, small_limits(), &mut probe)
+        .await?;
+    if !probe.retired {
+        bail!("fresh compiled probe scope was not retired");
+    }
     let expected_summary = canonical::to_vec(source.summary())?;
     let expected_release = source.workspace().release_id;
     let archive_path = root.join("retained-archives");
@@ -89,14 +113,12 @@ pub(super) async fn run(
         bytes: 64 * MIB,
         releases: 4,
     };
-    let archive = crate::marketplace::grant_store::invocation::native_tests::archive_compiled(
-        source,
-        root,
-        &archive_path,
-        retention,
-    )
-    .await
-    .context("actual compiled source archive and original disposal")?;
+    let (archive, record) =
+        crate::marketplace::grant_store::invocation::native_tests::archive_compiled(
+            source, build, image, value, root, &secrets,
+        )
+        .await
+        .context("actual compiled source archive and original disposal")?;
     if archive.release_id() != expected_release || old_view.check().is_ok() {
         bail!("archive failed to retire the original source/image owner");
     }
@@ -105,7 +127,7 @@ pub(super) async fn run(
         ControllerLease::acquire(&lane)
             .context("original build/archive still pins its retired lane")?,
     );
-    let record = LocalBuildRecord::parse(&std::fs::read(&record_path)?)?;
+    let record = LocalBuildRecord::parse(&record.to_bytes()?)?;
     let candidate = CandidateDescriptor::parse(&serde_json::to_vec(&serde_json::json!({
         "schema_version":1,"publisher":value["publisher"],"release":value["release"],
         "head":value["head"],"revocations":[],"gate_evidence":value["evidence"]["pairs"]
@@ -177,7 +199,26 @@ pub(super) async fn run(
             bail!("cold reuse renewed its deadline or reused original foreground evidence");
         }
         let view=image.runtime_view(&returned)?;
-        let mut broker=NoEffects {source:returned.execution_descriptor(),native:None,retired:false};
+        let mut probe=NoEffects::new(&returned,SourceExecutionMode::Probe,None);
+        returned.probe_container(&image,small_limits(),&mut probe).await?;
+        if !probe.retired { bail!("retained probe did not retire its actual scope"); }
+        let execution=Digest::of(uuid::Uuid::new_v4().as_bytes());
+        let context=SourceLifecycleContext::new(None,&returned.release().version)?;
+        let before=(returned.source.job.input_used,returned.source.job.output_used);
+        let mut candidate=NoEffects::new(&returned,SourceExecutionMode::Lifecycle,Some(execution));
+        if returned.lifecycle_container(&image,small_limits(),&SourceLifecycleContext::new(None,"999.0.0")?,execution,&mut candidate).await.is_ok()
+            || before!=(returned.source.job.input_used,returned.source.job.output_used) {
+            bail!("wrong lifecycle target consumed native work or was accepted");
+        }
+        let wrong=returned.lifecycle_container(&image,small_limits(),&context,Digest::of(b"different execution"),&mut candidate).await
+            .err().context("wrong candidate execution was admitted")?;
+        if !format!("{wrong:#}").contains("different candidate execution") {
+            return Err(wrong).context("lifecycle negative did not reach actual native identity check");
+        }
+        let mut candidate=NoEffects::new(&returned,SourceExecutionMode::Lifecycle,Some(execution));
+        returned.lifecycle_container(&image,small_limits(),&context,execution,&mut candidate).await?;
+        if !candidate.retired { bail!("lifecycle scope was not retired"); }
+        let mut broker=NoEffects::new(&returned,SourceExecutionMode::Invoke,None);
         let limits=SourceExecutionLimits {profile:Default::default(),heap_bytes:32*MIB,timeout_millis:10_000,
             max_file_bytes:8*MIB,json_bytes:MIB,pending_jobs:128,sdk:None};
         let invoked=returned.invoke_container(&image,limits,&RuntimeJson::parse(b"null")?,&mut broker).await;
@@ -192,13 +233,25 @@ pub(super) async fn run(
         if result!=serde_json::json!({"fixture":true,"fraction":0.75}) || !broker.retired {
             bail!("retained native invocation failed its no-effects result/revocation check");
         }
-        println!("retained build: actual original mint/archive/disposal, three-slot disk restore/native rematch, wrong-key rejection, native reimport and no-effects execution passed; no compiler rerun, public freshness or installed activation");
+        println!("retained build: actual record/SQL reopen, archive/disposal, disk restore/native rematch, native probe/lifecycle identity/no-effects invocation passed; no compiler rerun, public freshness or installed activation");
         Ok::<_,anyhow::Error>(())
     }).await;
     // Source ownership may have moved into export/import; those owners retain
     // their existing cancellation cleanup. The outer exact-role recovery also
     // covers this cold namespace on any earlier error, never foreign resources.
     operation
+}
+
+fn small_limits() -> SourceExecutionLimits {
+    SourceExecutionLimits {
+        profile: Default::default(),
+        heap_bytes: 32 * MIB,
+        timeout_millis: 10_000,
+        max_file_bytes: 8 * MIB,
+        json_bytes: 1024,
+        pending_jobs: 128,
+        sdk: None,
+    }
 }
 
 #[test]

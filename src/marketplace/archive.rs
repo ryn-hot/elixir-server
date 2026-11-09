@@ -31,6 +31,7 @@ use tokio::{
 
 use super::{grant_store::GrantCheckedQuarantine, lease::ControllerLease};
 use crate::{db::Database, runtime::RuntimeManager};
+use super::quarantine::local_build::LocalBuildRecord;
 
 const MIB: u64 = 1024 * 1024;
 const MAX_DESCRIPTOR: usize = 64 * 1024;
@@ -113,8 +114,15 @@ impl Descriptor {
 pub struct ArchivedSource {
     descriptor: Descriptor,
     recovered_incomplete_copy: bool,
+    // Local verification packet for the subsequent journal commit only. Never
+    // part of the immutable/shareable archive descriptor: randomized encryption
+    // must not change byte identity or break idempotent archive retries.
+    build: Option<LocalBuildRecord>,
 }
 impl ArchivedSource {
+    pub(super) fn build_record(&self) -> Option<&LocalBuildRecord> {
+        self.build.as_ref()
+    }
     pub fn release_id(&self) -> Digest {
         self.descriptor.workspace.release_id
     }
@@ -378,6 +386,32 @@ pub async fn persist(
     Ok(archive)
 }
 
+/// Archive the same actual fresh reproduced/imported owner, retaining its
+/// machine-local proof for the installation journal. Preflight failure leaves
+/// the caller's original source slot intact; the existing Copy owns all later
+/// cancellation/cleanup. No saved receipt can replace either native capability.
+pub(in crate::marketplace) async fn persist_compiled(
+    database: &Database,
+    source: &mut Option<GrantCheckedQuarantine>,
+    build: &super::quarantine::build::NativeBuildMatch,
+    image: &super::quarantine::image_reference::RuntimeImage,
+    secrets: &crate::secrets::SecretsManager,
+    path: &Path,
+    budget: ArchiveBudget,
+) -> Result<ArchivedSource> {
+    let checked = source.as_ref().context("compiled archive source owner missing")?;
+    let record = LocalBuildRecord::from_actual_build(checked.source().source(), build, image, secrets)?;
+    budget.validate()?;
+    tokio::runtime::Handle::try_current().context("compiled archive executor unavailable")?;
+    let mut copy = Copy::begin(database.clone(), source.take().expect("borrowed source"), None, path.to_owned(), budget);
+    let (_, mut archive) = copy.finish().await?;
+    record.require_descriptor_data(&SourceMatchDescriptor {
+        schema_version: 1, workspace: archive.descriptor.workspace.clone(), release: archive.descriptor.release.clone(),
+    }, &archive.descriptor.source)?;
+    archive.build = Some(record);
+    Ok(archive)
+}
+
 // Rehash committed disk bytes, including after an idempotent retry or crash.
 // The returned information still cannot authorize installation or public seeding.
 pub async fn verify_retained(
@@ -425,6 +459,7 @@ pub async fn verify_retained(
             Ok(ArchivedSource {
                 descriptor: found,
                 recovered_incomplete_copy: store.recovered,
+                build: None,
             })
         }),
     )

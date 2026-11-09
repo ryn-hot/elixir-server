@@ -1,4 +1,5 @@
 use super::*;
+use crate::marketplace::quarantine::local_build::LocalBuildRecord;
 use crate::{extensions::manifest::ExtensionManifest, marketplace::archive::RetainedSourceRecord};
 use elixir_marketplace::{
     retained_authority::VerifiedRetainedAuthority, source_job::SourceMatchDescriptor,
@@ -43,6 +44,7 @@ pub(super) struct Material {
     pub source: RetainedSourceRecord,
     pub review: GrantReview,
     pub manifest: ExtensionManifest,
+    pub build: Option<LocalBuildRecord>,
 }
 impl Material {
     pub(super) fn from_archive(
@@ -53,11 +55,14 @@ impl Material {
         let verified = authority.verify()?;
         let source = archive.record_for(verified.release())?;
         let (manifest, review) = source.review(verified.release())?;
+        let build = archive.build_record().cloned();
+        require_build_data(&source, &verified, build.as_ref())?;
         Ok(Self {
             authority,
             source,
             review,
             manifest,
+            build,
         })
     }
     pub(super) fn current(
@@ -66,6 +71,7 @@ impl Material {
         public: &PublicSourceObservation,
     ) -> Result<()> {
         let verified = self.authority.verify()?;
+        require_build_data(&self.source, &verified, self.build.as_ref())?;
         if self.authority.to_bytes()? != metadata.authority_record()?.to_bytes()? {
             bail!("installation selection changed");
         }
@@ -87,6 +93,8 @@ pub(super) struct Capsule {
     pub review: Digest,
     pub grant_revision: i64,
     pub instance: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<LocalBuildRecord>,
 }
 impl Capsule {
     pub(super) fn metadata_id(&self) -> Result<Digest> {
@@ -100,6 +108,7 @@ impl Capsule {
         }
         let authority = self.authority.verify()?;
         let (_, review) = self.source.review(authority.release())?;
+        require_build_data(&self.source, &authority, self.build.as_ref())?;
         if review.review_id()? != self.review {
             bail!("installed source review differs");
         }
@@ -107,6 +116,22 @@ impl Capsule {
     }
     pub(super) fn descriptor(&self) -> Result<SourceMatchDescriptor> {
         Ok(self.source.descriptor(self.authority.verify()?.release()))
+    }
+}
+
+// Signature/source-shape validation only. Runtime activation must authenticate
+// the record using the local key AND check actual native retained bytes/image.
+fn require_build_data(
+    source: &RetainedSourceRecord,
+    authority: &VerifiedRetainedAuthority,
+    build: Option<&LocalBuildRecord>,
+) -> Result<()> {
+    use elixir_marketplace::records::RuntimeProfile;
+    match (authority.release().payload().runtime_profile, build) {
+        (RuntimeProfile::SourceJs, None) => Ok(()),
+        (RuntimeProfile::Reproducible, Some(record)) => record
+            .require_descriptor_data(&source.descriptor(authority.release()), source.summary()),
+        _ => bail!("installed runtime differs from its local reproduction history"),
     }
 }
 

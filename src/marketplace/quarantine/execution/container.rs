@@ -2,9 +2,61 @@
 //! activation is added here; those must retain actual reviewed provenance.
 use super::*;
 use crate::marketplace::runtime::container_execution as profile;
-use elixir_marketplace::container_execution::{ContainerExecutionDescriptor, GUARDIAN_PATH};
+use elixir_marketplace::container_execution::{
+    ContainerExecutionDescriptor, GUARDIAN_PATH, LIFECYCLE_RESULT, PROBE_RESULT,
+};
+
+fn require_acknowledgement(mode: SourceExecutionMode, result: &RuntimeJson) -> Result<()> {
+    let expected = match mode {
+        SourceExecutionMode::Probe => PROBE_RESULT,
+        SourceExecutionMode::Lifecycle => LIFECYCLE_RESULT,
+        SourceExecutionMode::Invoke => bail!("invoke is not a compiled readiness acknowledgement"),
+    };
+    if result.as_str().as_bytes() != expected {
+        bail!("compiled mode lacks its runner-generated ABI acknowledgement");
+    }
+    Ok(())
+}
 
 impl SourceMatchedQuarantine {
+    /// Interface/clean-exit probe only, never installation or readiness authority.
+    pub(in crate::marketplace) async fn probe_container(
+        &mut self,
+        image: &super::super::image_reference::RuntimeImage,
+        limits: SourceExecutionLimits,
+        broker: &mut dyn Broker,
+    ) -> Result<()> {
+        let result = Box::pin(self.evaluate_container(
+            image,
+            SourceExecutionMode::Probe,
+            limits,
+            &RuntimeJson::parse(b"null")?,
+            broker,
+        ))
+        .await?;
+        require_acknowledgement(SourceExecutionMode::Probe, &result)
+    }
+    /// Exact original candidate execution ID, not a random replacement claim.
+    pub(in crate::marketplace) async fn lifecycle_container(
+        &mut self,
+        image: &super::super::image_reference::RuntimeImage,
+        limits: SourceExecutionLimits,
+        context: &SourceLifecycleContext,
+        execution: Digest,
+        broker: &mut dyn CandidateBroker,
+    ) -> Result<()> {
+        context.require_target(&self.release().version)?;
+        let result = Box::pin(self.evaluate_container_as(
+            image,
+            SourceExecutionMode::Lifecycle,
+            limits,
+            &context.arguments()?,
+            broker,
+            execution,
+        ))
+        .await?;
+        require_acknowledgement(SourceExecutionMode::Lifecycle, &result)
+    }
     pub(in crate::marketplace) async fn invoke_container(
         &mut self,
         image: &super::super::image_reference::RuntimeImage,
@@ -21,13 +73,35 @@ impl SourceMatchedQuarantine {
         )
         .await
     }
-    pub(in crate::marketplace) async fn evaluate_container(
+    async fn evaluate_container(
         &mut self,
         image: &super::super::image_reference::RuntimeImage,
         mode: SourceExecutionMode,
         limits: SourceExecutionLimits,
         arguments: &RuntimeJson,
         broker: &mut dyn Broker,
+    ) -> Result<RuntimeJson> {
+        if mode == SourceExecutionMode::Lifecycle {
+            bail!("compiled lifecycle requires its explicit original execution identity");
+        }
+        Box::pin(self.evaluate_container_as(
+            image,
+            mode,
+            limits,
+            arguments,
+            broker,
+            Digest::of(uuid::Uuid::new_v4().as_bytes()),
+        ))
+        .await
+    }
+    async fn evaluate_container_as(
+        &mut self,
+        image: &super::super::image_reference::RuntimeImage,
+        mode: SourceExecutionMode,
+        limits: SourceExecutionLimits,
+        arguments: &RuntimeJson,
+        broker: &mut dyn Broker,
+        execution: Digest,
     ) -> Result<RuntimeJson> {
         image.require_source(self)?;
         let runtime = self.source.job.runtime.clone();
@@ -36,7 +110,7 @@ impl SourceMatchedQuarantine {
             .context("compiled execution guardian is not independently configured")?;
         let descriptor = ContainerExecutionDescriptor {
             schema_version: 1,
-            invocation_id: Digest::of(uuid::Uuid::new_v4().as_bytes()),
+            invocation_id: execution,
             source: self.execution_descriptor(),
             image: image.image().clone(),
             limits,
@@ -149,6 +223,44 @@ impl SourceMatchedQuarantine {
 mod tests {
     use super::*;
     type Image = super::super::super::image_reference::RuntimeImage;
+    #[test]
+    fn compiled_acknowledgements_require_the_abi_not_source_js_exports_or_publisher_null()
+    -> Result<()> {
+        require_acknowledgement(
+            SourceExecutionMode::Probe,
+            &RuntimeJson::parse(PROBE_RESULT)?,
+        )?;
+        require_acknowledgement(
+            SourceExecutionMode::Lifecycle,
+            &RuntimeJson::parse(LIFECYCLE_RESULT)?,
+        )?;
+        assert!(
+            require_acknowledgement(
+                SourceExecutionMode::Probe,
+                &RuntimeJson::parse(SOURCE_PROBE_RESULT)?
+            )
+            .is_err()
+        );
+        assert!(
+            require_acknowledgement(
+                SourceExecutionMode::Lifecycle,
+                &RuntimeJson::parse(SOURCE_LIFECYCLE_RESULT)?
+            )
+            .is_err()
+        );
+        assert!(
+            require_acknowledgement(SourceExecutionMode::Probe, &RuntimeJson::parse(b"null")?)
+                .is_err()
+        );
+        assert!(
+            require_acknowledgement(
+                SourceExecutionMode::Lifecycle,
+                &RuntimeJson::parse(PROBE_RESULT)?
+            )
+            .is_err()
+        );
+        Ok(())
+    }
     #[test]
     fn compiled_invocation_keeps_a_bounded_caller_future() {
         fn bytes<F: std::future::Future>(
