@@ -5,6 +5,8 @@ use super::*;
 use crate::runtime::docker::DockerRuntimeManager;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+mod retained;
+
 // Synthetic SDK replies only. The actual NativeInvocation/image owner and
 // revocation are mandatory; this does not stand in for installed DB grants.
 struct ContainerBroker {
@@ -156,6 +158,11 @@ async fn actual_owned_rebuilt_imported_container_invocation_sdk_and_cleanup() ->
 async fn actual_owned_compiled_invocation_uses_real_grants_and_stops_on_revocation() -> Result<()> {
     native_variants_with_runtime(&["container-image-grants"], true, true, true, true, true).await
 }
+#[tokio::test]
+#[ignore = "explicit actual build/archive/disposal/new-job rematch/reimport/execution; no installed activation or public network"]
+async fn actual_owned_retained_build_record_rechecks_archived_bytes_under_a_new_job() -> Result<()> {
+    native_variants_with_runtime(&["container-image-retained"], true, true, true, true, true).await
+}
 async fn native_variants_with_runtime(
     variants: &[&str],
     filesystem: bool,
@@ -224,6 +231,7 @@ async fn native_variants_with_runtime(
             if !fixture.status.success() || fixture.stdout.len()>2*1024*1024 {bail!("offline compiled fixture failed");}
             let value:serde_json::Value=canonical::parse(&fixture.stdout,2*1024*1024)?;
             let grant_fixture=(variant=="container-image-grants").then(||value.clone());
+            let retained_fixture=(variant=="container-image-retained").then(||value.clone());
             let artifact=STANDARD.decode(value["artifact_base64"].as_str().context("candidate fixture missing")?)?;
             let (release,package,proof)=crate::marketplace::quarantine::tests::decode_fixture(value)?;
             let plan=SourceQuarantinePlan::for_release(&release,Some(0),&SourceJobBudget{memory_bytes:256*MIB,cpu_millicores:200,
@@ -261,7 +269,7 @@ async fn native_variants_with_runtime(
                 let (mut source,evidence)=build.finish()?;
                 let mut adopted_image=None;
                 let mut runtime_view=None;
-                if build.package.is_some() || build.proof.is_some() {
+                if build.package.is_some() || build.proof.is_some() || build.staging.is_some() {
                     bail!("build retained source file descriptors after retiring staging allocation");
                 }
                 if source.expires()!=original_expires || evidence.release!=release.release_id()
@@ -319,7 +327,11 @@ async fn native_variants_with_runtime(
                                     // NOT publisher execution. The passive image must
                                     // remain owned across this distinct root operation.
                                     returned.source.job.measure_host(original_expires).await?.report()?;
-                                    if let Some(fixture)=grant_fixture.as_ref() {
+                                    if let Some(fixture)=retained_fixture.as_ref() {
+                                        Box::pin(retained::run(returned,&image,&evidence,fixture,&root)).await?;
+                                        println!("offline native build {variant}: actual archive/new-job rematch/reimport/execution; no installed activation claim");
+                                        return Ok(());
+                                    } else if let Some(fixture)=grant_fixture.as_ref() {
                                         returned=crate::marketplace::grant_store::invocation::native_tests::run_compiled(
                                             returned,&image,fixture,&root,&package,&proof,&deployment).await?;
                                     } else if execute {
@@ -411,16 +423,24 @@ async fn native_variants_with_runtime(
                 .await
                 .context("original fixture cleanup owner still holds the lane")??;
             }
-            SourceQuarantineJob::remove_stopped_writer(runtime.as_ref(), &deployment).await?;
-            if runtime.private_file_volume_owned(&volume, &labels).await? {
-                runtime.remove_private_file_volume(&volume, &labels).await?;
+            let mut roles=vec![(deployment.clone(),volume.clone(),labels.clone())];
+            if variant=="container-image-retained" {
+                let cold=format!("{deployment}-cold");
+                let cold_labels=HashMap::from([
+                    (ELIXIR_MANAGED_LABEL.into(),"true".into()),
+                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(),cold.clone()),
+                    ("elixir.marketplace.volume".into(),"quarantine-v1".into()),
+                ]);
+                roles.push((cold.clone(),format!("elixir-marketplace-source-{cold}"),cold_labels));
             }
-            if runtime
-                .get_container_handle(&writer_name(&deployment))
-                .await?
-                .is_some()
-            {
-                bail!("fixture writer remains");
+            for (deployment,volume,labels) in roles {
+                SourceQuarantineJob::remove_stopped_writer(runtime.as_ref(), &deployment).await?;
+                if runtime.private_file_volume_owned(&volume, &labels).await? {
+                    runtime.remove_private_file_volume(&volume, &labels).await?;
+                }
+                if runtime.get_container_handle(&writer_name(&deployment)).await?.is_some() {
+                    bail!("fixture writer remains");
+                }
             }
             Ok::<_, anyhow::Error>(())
         }).await;

@@ -3,6 +3,30 @@
 use super::*;
 use crate::marketplace::quarantine::{SourceMatchedQuarantine, image_reference::RuntimeImage};
 
+/// Actual committed owner grant and owned archive copy. No peer or installed
+/// activation fixture is substituted for the original native source/image job.
+pub(in crate::marketplace) async fn archive_compiled(
+    source: SourceMatchedQuarantine,
+    root: &Path,
+    path: &Path,
+    budget: crate::marketplace::archive::ArchiveBudget,
+) -> Result<crate::marketplace::archive::ArchivedSource> {
+    let runtime = source.runtime();
+    let db = grants::connect(&root.join("retained-build.sqlite")).await?;
+    let actor = grants::owner(&db).await?;
+    let preferences = String::from_utf8(canonical::to_vec(
+        &crate::marketplace::preferences::Preferences::default(),
+    )?)?;
+    sqlx::query("UPDATE marketplace_preferences SET revision=1,home_id=$1,preferences_json=$2,mutation_id=$3,approved_by_user_id=$4 WHERE singleton=1")
+        .bind(actor.home.to_string()).bind(preferences).bind(Uuid::new_v4().to_string())
+        .bind(actor.user.to_string()).execute(&db.pool).await?;
+    let manifest = source.check_manifest()?;
+    let review = manifest.grant_review()?;
+    let grant = approve_for_actor(&db, &actor, &manifest, &grants::selection(&review, 0)?).await?;
+    let checked = grant.check_scope(&db, manifest, Uuid::new_v4()).await?;
+    crate::marketplace::archive::persist(&db, runtime.as_ref(), checked, path, budget).await
+}
+
 pub(in crate::marketplace) async fn run_compiled(
     source: SourceMatchedQuarantine,
     image: &RuntimeImage,

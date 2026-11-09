@@ -373,7 +373,7 @@ impl SourceMatchedQuarantine {
             .require_matches_source(&self.source.job.plan.source_match, &self.summary)
     }
     #[cfg(unix)]
-    fn require_compiled_source(&self) -> Result<()> {
+    pub(super) fn require_compiled_source(&self) -> Result<()> {
         self.ensure_job_active()?;
         match (&self.public_source, &self.retained_build) {
             (Some(_), None) => self.require_public_source(),

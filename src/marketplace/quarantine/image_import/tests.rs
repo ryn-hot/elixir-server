@@ -158,6 +158,53 @@ fn changed_request_and_active_keeper_preserve_control_and_root_fence() -> Result
     assert!(lease.directory().join("native-job.pending").exists());
     Ok(())
 }
+#[test]
+fn completed_keeper_releases_its_lock_before_an_unrelated_fork_child_exits() -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (_root, lease) = lane()?;
+    let held = keeper_lock(&lease)?;
+    let mut pipe = [-1; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // Owned parent endpoints guarantee EOF if this fixture unwinds/exits.
+    let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if pid == 0 {
+        // Fork may originate in a multithreaded test process. Use ONLY
+        // async-signal-safe syscalls in this child; no Rust runtime/destructors.
+        unsafe {
+            libc::close(pipe[1]);
+            let mut byte = 0_u8;
+            libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    drop(read_end);
+    drop(held);
+    // The child is still blocked holding the inherited file description. This
+    // fails with a bare File's close-only Drop, despite O_CLOEXEC being set.
+    let acquired = keeper_lock(&lease);
+    drop(write_end);
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    acquired.context("completed keeper retained ownership through a fork child")?;
+    assert_eq!(status, 0, "original fork fixture did not exit cleanly");
+    Ok(())
+}
 fn write_request_unchecked(lease: &ControllerLease, request: &ImportRequest) -> Result<()> {
     put(lease, "image-import.request", &canonical::to_vec(request)?)
 }

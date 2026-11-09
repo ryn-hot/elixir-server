@@ -25,7 +25,7 @@ pub(in crate::marketplace) struct ImageExportStaging {
 }
 impl ImageExportStaging {
     pub(in crate::marketplace) fn new(source: &SourceMatchedQuarantine) -> Result<Self> {
-        source.require_public_source()?;
+        source.require_compiled_source()?;
         let artifact = source
             .selected_artifact()
             .context("image export requires a selected artifact")?;

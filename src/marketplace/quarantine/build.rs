@@ -218,6 +218,9 @@ impl Build {
         if let Some(staging) = self.staging.as_mut() {
             staging.retire().await?;
         }
+        // Retired staging owns a strong reference to the original lane. Once
+        // its actual I/O joins, a completed Build must not pin later jobs.
+        self.staging = None;
         self.source()?.require_public_source()?;
         runtime
             .remove_marketplace_build_output_volume(&slot)
@@ -424,6 +427,7 @@ impl Build {
         if let Some(staging) = self.staging.as_mut() {
             staging.retire().await?;
         }
+        self.staging = None;
         runtime
             .remove_marketplace_build_output_volume(&slot)
             .await?;

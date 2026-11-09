@@ -31,7 +31,7 @@ use std::{
 const MIB: u64 = 1024 * 1024;
 
 mod compiled;
-pub(in crate::marketplace) use compiled::run_compiled;
+pub(in crate::marketplace) use compiled::{archive_compiled, run_compiled};
 
 struct ReadOnlyFixtures(PathBuf);
 impl Drop for ReadOnlyFixtures {

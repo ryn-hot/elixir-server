@@ -87,7 +87,16 @@ pub(in crate::marketplace) fn require_control_absent(lease: &ControllerLease) ->
     }
     Ok(())
 }
-pub(super) fn keeper_lock(lease: &ControllerLease) -> Result<File> {
+pub(super) struct KeeperLock(File);
+impl Drop for KeeperLock {
+    fn drop(&mut self) {
+        // Like ControllerLease: another thread's fork can temporarily inherit
+        // even a CLOEXEC descriptor. Close alone may keep our completed local
+        // critical section locked until that unrelated child reaches exec.
+        let _ = self.0.unlock();
+    }
+}
+pub(super) fn keeper_lock(lease: &ControllerLease) -> Result<KeeperLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -99,7 +108,7 @@ pub(super) fn keeper_lock(lease: &ControllerLease) -> Result<File> {
     private_file(&file, 0)?;
     file.try_lock()
         .context("original image importer still owns its actual OS lock")?;
-    Ok(file)
+    Ok(KeeperLock(file))
 }
 fn clear_retired(lease: &ControllerLease, fence: &Fence) -> Result<()> {
     let Target::ImageImportRetired { intent } = fence.target() else {

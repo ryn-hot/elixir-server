@@ -74,6 +74,7 @@ async fn authenticated_retained_binding_rejects_tampering_wrong_key_unapproved_c
             .is_err()
     );
     assert!(source.retained_build.is_none());
+    assert!(crate::marketplace::archive::ImageExportStaging::new(&source).is_err());
     let mut tampered = value.clone();
     tampered.binding.config = Digest::of(b"different image");
     assert!(
@@ -97,6 +98,10 @@ async fn authenticated_retained_binding_rejects_tampering_wrong_key_unapproved_c
     let original_expires = source.expires();
     let live = value.bind_retained(&mut source, &authority, &approved, &secrets)?;
     live.require_source(&source)?;
+    // Constructor only: no file allocation/native export is qualified here.
+    drop(crate::marketplace::archive::ImageExportStaging::new(
+        &source,
+    )?);
     assert_eq!(source.expires(), original_expires);
     assert!(source.require_public_source().is_err());
     assert!(source.require_foreground_manifest().is_err());
