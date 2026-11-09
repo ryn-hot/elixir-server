@@ -4,6 +4,8 @@
 use super::*;
 use record::{ActivationFence, ActivationPhase, OperationalMetadata};
 use std::sync::Arc;
+#[cfg(test)]
+pub(in crate::marketplace) use tests::compiled_native::run_compiled_activation_fixture;
 
 pub(in crate::marketplace) mod candidate;
 pub(in crate::marketplace) mod commit;

@@ -80,12 +80,11 @@ impl CandidateClaim {
     /// in its caller-owned slot; it cannot consume or recreate that claim.
     pub(in crate::marketplace::grant_store::installation) fn require_configuration(
         &self,
-        image: &str,
-        budget: &crate::marketplace::quarantine::SourceJobBudget,
+        configuration: &super::super::runtime::InstalledRuntime,
+        secrets: &SecretsManager,
     ) -> Result<()> {
         let facts = self.capsule.facts()?;
-        let plan =
-            SourceActivationPlan::new(facts.release(), self.binding.review(), image, budget)?;
+        let plan = SourceActivationPlan::for_capsule(&self.capsule, configuration, secrets)?;
         if plan.id() != self.binding.reference.plan {
             bail!("candidate configuration differs from its original claimed plan");
         }

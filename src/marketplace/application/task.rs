@@ -406,7 +406,7 @@ impl Command {
         self.stage
             .as_ref()
             .unwrap()
-            .plan(&self.host.runtime.image, &self.host.runtime.source_budget)?;
+            .plan(&self.host.runtime, &self.host.secrets)?;
         self.publish(status, Phase::Staging);
         let stage = self
             .stage
@@ -591,7 +591,7 @@ impl Command {
             .stage
             .as_ref()
             .context("original staged request missing")?;
-        let plan = stage.plan(&self.host.runtime.image, &self.host.runtime.source_budget)?;
+        let plan = stage.plan(&self.host.runtime, &self.host.secrets)?;
         let request = ActivationRequest::from_stage(
             self.stage.as_mut().unwrap(),
             &mut self.encrypted,

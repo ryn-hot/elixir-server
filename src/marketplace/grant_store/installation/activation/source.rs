@@ -5,7 +5,7 @@
 use super::*;
 use crate::marketplace::{
     archive::ArchiveBudget,
-    quarantine::execution::Broker,
+    quarantine::execution::{Broker, CompiledPreparation, RetainedCode},
     quarantine::{QuarantinedSource, Restoration, SourceMatchedQuarantine, SourceQuarantineJob},
     worker::{ParticipationClient, SourceResourceWait},
 };
@@ -24,6 +24,24 @@ pub(in crate::marketplace) use prepared::PreparedSource;
 
 const RETRY: Duration = Duration::from_secs(10);
 const STOP_GRACE: Duration = Duration::from_secs(45);
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    #[test]
+    fn probe_continuation_keeps_bounded_stack_ownership() {
+        fn size<F: std::future::Future>(
+            _: impl FnOnce(&'static mut ActivationSource) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Type-only bound, no fabricated source, native probe or readiness.
+        let bytes = size(|source| source.check_probe());
+        assert!(
+            bytes <= 128 * 1024,
+            "activation probe future too large: {bytes}"
+        );
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::marketplace) enum SourcePhase {
     Opening,
@@ -296,13 +314,16 @@ impl ActivationSource {
         })
     }
     async fn check_probe(&mut self) -> Result<()> {
-        async {
-            self.current().await?;
+        Box::pin(async {
+            Box::pin(self.current()).await?;
             let limits = self.plan.probe_limits()?;
-            let Stage::Matched(source) = &mut self.owner.stage else {
-                bail!("source probe has no matched owner");
-            };
-            source.refresh_public_source(self.selected.public_source()?)?;
+            if let Stage::Matched(source) = &mut self.owner.stage {
+                source
+                    .as_mut()
+                    .as_mut()
+                    .context("source probe owner missing")?
+                    .refresh_public_source(self.selected.public_source()?)?;
+            }
             {
                 let mut broker = ProbeBroker {
                     authority: Authority {
@@ -318,7 +339,23 @@ impl ActivationSource {
                 loop {
                     broker.checked = None;
                     broker.current().await?;
-                    match source.probe_source(limits.clone(), &mut broker).await {
+                    let result = match &mut self.owner.stage {
+                        Stage::Matched(source) => {
+                            Box::pin(
+                                source
+                                    .as_mut()
+                                    .as_mut()
+                                    .context("source probe owner missing")?
+                                    .probe_source(limits.clone(), &mut broker),
+                            )
+                            .await
+                        }
+                        Stage::Code(code) => {
+                            Box::pin(code.probe(limits.clone(), &mut broker)).await
+                        }
+                        _ => bail!("source probe has no prepared native owner"),
+                    };
+                    match result {
                         Ok(()) => break,
                         Err(error) if ParticipationClient::source_resources_deferred(&error) => {
                             // Native admission happens BEFORE reservation charging;
@@ -342,21 +379,32 @@ impl ActivationSource {
                 broker.checked = None;
                 broker.current().await?;
             }
-            source.refresh_public_source(self.selected.public_source()?)?;
+            if let Stage::Matched(source) = &mut self.owner.stage {
+                source
+                    .as_mut()
+                    .as_mut()
+                    .context("source probe owner missing")?
+                    .refresh_public_source(self.selected.public_source()?)?;
+            }
             active(self.expires)
-        }
+        })
         .await
     }
     pub(in crate::marketplace) fn summary(
         &self,
     ) -> Result<&elixir_marketplace::source_job::SourceMatchSummary> {
         match &self.owner.stage {
-            Stage::Matched(source) => Ok(source.summary()),
+            Stage::Matched(source) => Ok(source
+                .as_ref()
+                .as_ref()
+                .context("matched source missing")?
+                .summary()),
+            Stage::Code(code) => code.summary(),
             _ => bail!("activation source is unavailable"),
         }
     }
     pub(in crate::marketplace) async fn current(&mut self) -> Result<()> {
-        if !matches!(self.owner.stage, Stage::Matched(_)) {
+        if !matches!(self.owner.stage, Stage::Matched(_) | Stage::Code(_)) {
             bail!("activation source is unavailable");
         }
         active(self.expires)?;
@@ -529,7 +577,9 @@ enum Stage {
     Opening(Box<Option<SourceQuarantineJob>>),
     Restoring(Box<Restoration>),
     Source(Box<Option<QuarantinedSource>>),
-    Matched(Box<SourceMatchedQuarantine>),
+    Matched(Box<Option<SourceMatchedQuarantine>>),
+    Compiling(Box<CompiledPreparation>),
+    Code(Box<RetainedCode>),
 }
 #[derive(Default)]
 struct Owner {
@@ -582,7 +632,13 @@ async fn discard(stage: &mut Stage) -> Result<()> {
                 source.discard_retained().await?;
             }
         }
-        Stage::Matched(source) => source.discard_retained().await?,
+        Stage::Matched(source) => {
+            if let Some(source) = source.as_mut().as_mut() {
+                source.discard_retained().await?;
+            }
+        }
+        Stage::Compiling(source) => source.discard().await?,
+        Stage::Code(code) => code.discard().await?,
     }
     *stage = Stage::Empty;
     Ok(())
@@ -828,18 +884,68 @@ async fn run(
                     }
                 }
             };
-            owner.stage = Stage::Matched(Box::new(matched));
+            owner.stage = Stage::Matched(Box::new(Some(matched)));
             authority.current(&mut selected).await?;
             let Stage::Matched(matched) = &mut owner.stage else {
                 bail!("matched source owner missing");
             };
             let retained = Material::from_archive(&archive, selected.metadata()?)?;
-            if canonical::to_vec(matched.summary())?
-                != canonical::to_vec(retained.source.summary())?
+            if canonical::to_vec(
+                matched
+                    .as_ref()
+                    .as_ref()
+                    .context("matched source missing")?
+                    .summary(),
+            )? != canonical::to_vec(retained.source.summary())?
             {
                 bail!("native source summary differs from the retained installation source");
             }
-            matched.refresh_public_source(selected.public_source()?)?;
+            if plan.is_compiled() {
+                let preparation = plan.begin_compiled(matched)?;
+                owner.stage = Stage::Compiling(Box::new(preparation));
+                loop {
+                    authority.current(&mut selected).await?;
+                    let Stage::Compiling(preparation) = &mut owner.stage else {
+                        unreachable!()
+                    };
+                    let retryable = preparation.admission_retryable();
+                    match authority
+                        .guarded(
+                            &mut selected,
+                            &mut stop,
+                            expires,
+                            Box::pin(preparation.advance()),
+                        )
+                        .await
+                    {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(error) if retryable => {
+                            authority
+                                .wait_for_resources(
+                                    &mut selected,
+                                    &mut stop,
+                                    expires,
+                                    &status,
+                                    error,
+                                )
+                                .await?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let Stage::Compiling(preparation) = &mut owner.stage else {
+                    unreachable!()
+                };
+                let code = preparation.take_ready()?;
+                owner.stage = Stage::Code(Box::new(code));
+            } else {
+                matched
+                    .as_mut()
+                    .as_mut()
+                    .context("matched source missing")?
+                    .refresh_public_source(selected.public_source()?)?;
+            }
             active(expires)?;
             if *stop.borrow() {
                 bail!("activation source cancelled");

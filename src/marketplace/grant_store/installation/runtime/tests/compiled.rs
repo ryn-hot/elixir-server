@@ -20,7 +20,7 @@ pub(in crate::marketplace) async fn initialize_compiled_fixture(
     let controller = InstalledController::open(
         db.clone(),
         SecretsManager::from_key_bytes([93; 32], false),
-        configuration(&db, runtime, root, lane, worker, deployment)?,
+        compiled_fixture_configuration(&db, runtime, root, lane, worker, deployment)?,
     )
     .await?;
     controller.require_idle()?;
@@ -54,7 +54,8 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         &secrets,
     )
     .await?;
-    let config = configuration(&db, runtime.clone(), root, lane, worker, deployment)?;
+    let config =
+        compiled_fixture_configuration(&db, runtime.clone(), root, lane, worker, deployment)?;
     // Fail before source admission; stored metadata/history cannot approve a
     // compiler, enable a missing runtime policy or substitute another key.
     for wrong_key in [false, true] {
@@ -158,7 +159,7 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     Ok(())
 }
 
-fn configuration(
+pub(in crate::marketplace) fn compiled_fixture_configuration(
     db: &Database,
     runtime: Arc<dyn RuntimeManager>,
     root: &Path,

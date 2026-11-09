@@ -10,7 +10,7 @@ use crate::{
         quarantine::{
             QuarantinedSource, Restoration, SourceJobBudget, SourceMatchedQuarantine,
             SourceQuarantineJob, SourceQuarantinePlan,
-            execution::{Broker, NativeInvocation, RetainedCode},
+            execution::{Broker, CompiledPreparation, NativeInvocation, RetainedCode},
         },
         worker::{
             IndependentAdmission, ParticipationClient, SdkHttpAuthority, SdkHttpCall, SdkHttpClient,
@@ -253,8 +253,7 @@ enum Stage {
     Restoring(Box<Restoration>),
     Source(Box<Option<QuarantinedSource>>),
     Matched(Box<Option<SourceMatchedQuarantine>>),
-    Exporting(Box<crate::marketplace::quarantine::image_export::Export>),
-    Importing(Box<crate::marketplace::quarantine::image_import::Import>),
+    Compiling(Box<CompiledPreparation>),
     Executing(Box<RetainedCode>),
 }
 #[derive(Default)]
@@ -288,8 +287,7 @@ impl Owner {
                 }
             }
             Stage::Executing(source) => source.discard().await?,
-            Stage::Exporting(source) => source.discard_source().await?,
-            Stage::Importing(source) => source.discard_source().await?,
+            Stage::Compiling(source) => source.discard().await?,
         }
         self.0 = Stage::Empty;
         Ok(())
@@ -890,4 +888,4 @@ async fn load_retained(
 #[cfg(test)]
 pub(in crate::marketplace::grant_store::installation) mod tests;
 #[cfg(test)]
-pub(in crate::marketplace) use tests::compiled::{initialize_compiled_fixture, run_compiled_fixture};
+pub(in crate::marketplace) use tests::compiled::{compiled_fixture_configuration, initialize_compiled_fixture, run_compiled_fixture};

@@ -106,6 +106,10 @@ pub(super) async fn run(
     if !probe.retired {
         bail!("fresh compiled probe scope was not retired");
     }
+    if value["fixture_variant"].as_str().is_some_and(|v|v.starts_with("container-image-activation")) {
+        return Box::pin(crate::marketplace::grant_store::installation::activation::run_compiled_activation_fixture(
+            source,image,build,value,root,&deployment)).await;
+    }
     let expected_summary = canonical::to_vec(source.summary())?;
     let expected_release = source.workspace().release_id;
     let archive_path = root.join("retained-archives");

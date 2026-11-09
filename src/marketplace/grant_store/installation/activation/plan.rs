@@ -1,15 +1,29 @@
+use super::super::runtime::InstalledRuntime;
 use super::*;
-use crate::marketplace::quarantine::{SourceJobBudget, SourceQuarantinePlan};
+use crate::marketplace::quarantine::{
+    SourceJobBudget, SourceMatchedQuarantine, SourceQuarantinePlan, execution::CompiledPreparation,
+    local_build::LocalBuildRecord,
+};
+use crate::marketplace::runtime::build::ApprovedToolchains;
 use elixir_marketplace::{records::RuntimeProfile, security::AuthorizedRelease};
 
-/// Trusted source-JS launch recipe DATA. A pinned image name and requested
+/// Trusted launch recipe/policy DATA. A pinned image name and requested
 /// limits are not proof of image presence, physical admission or readiness.
-/// Other runtime profiles need their own verified executable-closure path.
+/// Compiled profiles additionally require authenticated reproduction history.
 pub(in crate::marketplace) struct SourceActivationPlan {
     image: String,
     source: SourceQuarantinePlan,
     review: Digest,
     id: Digest,
+    compiled: Option<Box<CompiledPolicy>>,
+}
+struct CompiledPolicy {
+    authority: AuthorityRecord,
+    record: LocalBuildRecord,
+    toolchains: Arc<ApprovedToolchains>,
+    secrets: SecretsManager,
+    runtime: Arc<dyn crate::runtime::RuntimeManager>,
+    summary: elixir_marketplace::source_job::SourceMatchSummary,
 }
 impl SourceActivationPlan {
     pub(in crate::marketplace) fn new(
@@ -18,14 +32,25 @@ impl SourceActivationPlan {
         image: &str,
         budget: &SourceJobBudget,
     ) -> Result<Self> {
-        if release.payload().runtime_profile != RuntimeProfile::SourceJs
-            || release.release_id() != review.release_id()
+        if release.payload().runtime_profile != RuntimeProfile::SourceJs {
+            bail!("source-only activation requires the SourceJs profile");
+        }
+        Self::build(release, review, image, budget, None)
+    }
+    fn build(
+        release: &AuthorizedRelease,
+        review: &GrantReview,
+        image: &str,
+        budget: &SourceJobBudget,
+        artifact: Option<usize>,
+    ) -> Result<Self> {
+        if release.release_id() != review.release_id()
             || &release.payload().extension_id != review.scope().extension_id()
             || !crate::marketplace::runtime::image_is_pinned(image)
         {
             bail!("invalid source activation release/review/image");
         }
-        let source = SourceQuarantinePlan::for_release(release, None, budget)?;
+        let source = SourceQuarantinePlan::for_release(release, artifact, budget)?;
         source.require_execution_resources(
             review
                 .scope()
@@ -44,7 +69,122 @@ impl SourceActivationPlan {
             source,
             review,
             id,
+            compiled: None,
         })
+    }
+    pub(in crate::marketplace::grant_store::installation) fn for_material(
+        material: &Material,
+        configuration: &InstalledRuntime,
+        secrets: &SecretsManager,
+    ) -> Result<Self> {
+        let facts = material.authority.verify()?;
+        if facts.release().payload().runtime_profile == RuntimeProfile::SourceJs {
+            return Self::new(
+                facts.release(),
+                &material.review,
+                &configuration.image,
+                &configuration.source_budget,
+            );
+        }
+        if facts.release().payload().runtime_profile != RuntimeProfile::Reproducible {
+            bail!("unsupported activation runtime profile");
+        }
+        let toolchains = configuration
+            .compiled_toolchains
+            .as_ref()
+            .context("compiled activation is not configured")?;
+        configuration
+            .runtime
+            .marketplace_container_guardian()
+            .context("compiled activation guardian is not configured")?;
+        configuration
+            .runtime
+            .marketplace_import_profile()
+            .context("compiled activation import is not configured")?;
+        let record = material
+            .build
+            .as_ref()
+            .context("compiled activation history missing")?;
+        let descriptor = material.source.descriptor(facts.release());
+        record.authenticate_data(&descriptor, material.source.summary(), toolchains, secrets)?;
+        let blob = descriptor
+            .workspace
+            .artifact
+            .as_ref()
+            .context("compiled activation artifact missing")?;
+        let artifact = facts
+            .release()
+            .payload()
+            .artifacts
+            .iter()
+            .position(|a| a.blob.sha256 == blob.sha256 && a.blob.size == blob.size)
+            .context("compiled activation artifact is not signed")?;
+        let mut plan = Self::build(
+            facts.release(),
+            &material.review,
+            &configuration.image,
+            &configuration.source_budget,
+            Some(artifact),
+        )?;
+        plan.compiled = Some(Box::new(CompiledPolicy {
+            authority: material.authority.clone(),
+            record: record.clone(),
+            toolchains: toolchains.clone(),
+            secrets: secrets.clone(),
+            runtime: configuration.runtime.clone(),
+            summary: material.source.summary().clone(),
+        }));
+        plan.require_material(material)?;
+        Ok(plan)
+    }
+    pub(in crate::marketplace::grant_store::installation) fn for_capsule(
+        capsule: &Capsule,
+        configuration: &InstalledRuntime,
+        secrets: &SecretsManager,
+    ) -> Result<Self> {
+        let facts = capsule.facts()?;
+        let (manifest, review) = capsule.source.review(facts.release())?;
+        Self::for_material(
+            &Material {
+                authority: capsule.authority.clone(),
+                source: capsule.source.clone(),
+                review,
+                manifest,
+                build: capsule.build.clone(),
+            },
+            configuration,
+            secrets,
+        )
+    }
+    pub(super) fn is_compiled(&self) -> bool {
+        self.compiled.is_some()
+    }
+    pub(super) fn begin_compiled(
+        &self,
+        source: &mut Option<SourceMatchedQuarantine>,
+    ) -> Result<CompiledPreparation> {
+        let policy = self
+            .compiled
+            .as_ref()
+            .context("compiled activation policy missing")?;
+        if !Arc::ptr_eq(
+            &source
+                .as_ref()
+                .context("compiled source missing")?
+                .runtime(),
+            &policy.runtime,
+        ) {
+            bail!("compiled activation source differs from its configured native owner");
+        }
+        CompiledPreparation::begin(
+            source,
+            &policy.record,
+            policy.authority.verify()?,
+            self.source.source_descriptor().clone(),
+            policy.summary.clone(),
+            &policy.toolchains,
+            &policy.secrets,
+        )
     }
     pub(in crate::marketplace) fn id(&self) -> Digest {
         self.id
@@ -89,6 +229,24 @@ impl SourceActivationPlan {
             || self.source.workspace().release_id != material.review.release_id()
         {
             bail!("activation plan differs from the verified material");
+        }
+        if let Some(policy) = &self.compiled {
+            let facts = material.authority.verify()?;
+            policy.record.authenticate_data(
+                &material.source.descriptor(facts.release()),
+                material.source.summary(),
+                &policy.toolchains,
+                &policy.secrets,
+            )?;
+            // The archive's storage horizon is not a new execution deadline.
+            // Reuse the exact signed-slot comparison used by installed calls.
+            crate::marketplace::quarantine::execution::require_retained_byte_plan(
+                &facts,
+                &material.source.descriptor(facts.release()),
+                material.source.summary(),
+                self.source.source_descriptor(),
+                RuntimeProfile::Reproducible,
+            )?;
         }
         Ok(())
     }

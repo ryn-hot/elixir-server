@@ -16,7 +16,8 @@ mod retained;
 #[cfg(unix)]
 pub(in crate::marketplace) use native::GatewayLaunch;
 pub(in crate::marketplace) use native::{HttpLaunch, NativeInvocation};
-pub(in crate::marketplace) use retained::RetainedCode;
+pub(in crate::marketplace) use retained::require_byte_plan_for as require_retained_byte_plan;
+pub(in crate::marketplace) use retained::{CompiledPreparation, RetainedCode};
 
 // Configuration check only, NOT evidence of a running executor or permission
 // to execute. Called before native creation against the pinned image's labels.

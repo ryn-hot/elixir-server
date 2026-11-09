@@ -94,20 +94,15 @@ impl StageRequest {
     }
     pub(in crate::marketplace) fn plan(
         &self,
-        image: &str,
-        budget: &crate::marketplace::quarantine::SourceJobBudget,
+        configuration: &runtime::InstalledRuntime,
+        secrets: &SecretsManager,
     ) -> Result<activation::SourceActivationPlan> {
         let (selected, archive) = self
             .owners
             .as_ref()
             .context("original staged source already handed off")?;
         let material = Material::from_archive(archive, selected.metadata()?)?;
-        activation::SourceActivationPlan::new(
-            material.authority.verify()?.release(),
-            &self.review,
-            image,
-            budget,
-        )
+        activation::SourceActivationPlan::for_material(&material, configuration, secrets)
     }
     /// An explicit renewed session can authenticate the SAME user's original
     /// action, never replace its home/release/mutation/expected choice versions.

@@ -247,11 +247,13 @@ async fn candidate_preflight_keeps_the_original_claim_and_never_uses_a_different
     invalid.sdk.as_mut().unwrap().calls = 513;
     assert!(owner.begin_candidate(&mut claim, invalid).is_err());
     assert!(claim.is_some());
+    let mut other = config.clone();
+    other.image = format!("sha256:{}", "2".repeat(64));
     assert!(
         claim
             .as_ref()
             .unwrap()
-            .require_configuration(&format!("sha256:{}", "2".repeat(64)), &config.source_budget)
+            .require_configuration(&other, &manager())
             .is_err()
     );
     assert_eq!(head(&f, staged.instance()).await?, initial);

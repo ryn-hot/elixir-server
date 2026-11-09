@@ -8,6 +8,7 @@ use crate::{
 };
 mod atomic_cancel;
 mod choices;
+pub(super) mod compiled_native;
 mod configured_runtime;
 mod credentials;
 mod pre_candidate;
@@ -40,6 +41,29 @@ fn plan(f: &Fixture) -> Result<SourceActivationPlan> {
         IMAGE,
         &source_budget(),
     )
+}
+#[tokio::test]
+async fn configured_source_js_plans_preserve_their_existing_identity_without_compiled_policy()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    let configuration =
+        super::super::runtime::tests::configuration(&f, IMAGE, "source-plan-compatibility")?;
+    let material = f.material()?;
+    let original = SourceActivationPlan::new(
+        material.authority.verify()?.release(),
+        &material.review,
+        &configuration.image,
+        &configuration.source_budget,
+    )?;
+    let configured = SourceActivationPlan::for_material(
+        &material,
+        &configuration,
+        &SecretsManager::from_key_bytes([57; 32], false),
+    )?;
+    assert_eq!(original.id(), configured.id());
+    assert!(!configured.is_compiled());
+    assert!(configured.source().workspace().artifact.is_none());
+    Ok(())
 }
 fn intent(
     f: &Fixture,

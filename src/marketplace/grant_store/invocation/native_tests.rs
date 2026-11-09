@@ -69,7 +69,7 @@ process.stdout.write(JSON.stringify(f));"#;
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }
-fn descriptor(value: &serde_json::Value) -> Result<(CandidateDescriptor, IssuerPolicy)> {
+pub(in crate::marketplace) fn descriptor(value: &serde_json::Value) -> Result<(CandidateDescriptor, IssuerPolicy)> {
     let mut candidate = CandidateDescriptor::parse(&serde_json::to_vec(&json!({
         "schema_version":1,"publisher":value["publisher"],"release":value["release"],"head":value["head"],"revocations":[],"gate_evidence":value["evidence"]["pairs"]
     }))?)?;

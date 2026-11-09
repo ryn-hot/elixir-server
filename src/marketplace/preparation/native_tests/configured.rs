@@ -58,6 +58,30 @@ pub(super) async fn fresh_postgres(url: &str) -> Result<Database> {
     Ok(database)
 }
 
+#[test]
+fn configured_fixture_phase_future_keeps_bounded_ownership() {
+    fn bytes<F: std::future::Future>(
+        _: impl FnOnce(
+            &'static mut Configured,
+            &'static mut SourceLaunch,
+            &'static StagedInstallation,
+            &'static str,
+            &'static mut Option<PeerPipeFixture>,
+        ) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+    // Type-only size bound; the actual normal-stack native run is still
+    // required, because this does not measure a compiler's polling frame.
+    let size = bytes(|configured, launch, staged, case, peer| {
+        configured.finish(launch, staged, case, peer)
+    });
+    assert!(
+        size <= 128 * 1024,
+        "configured fixture phase future too large: {size}"
+    );
+}
+
 pub(super) struct Configured {
     database: Database,
     principal: CurrentPrincipal,
@@ -158,6 +182,9 @@ impl Configured {
         let source = launch.finish().await?;
         let probed = Box::pin(source.probe()).await?;
         let mut prepared = Box::pin(probed.retain()).await?;
+        // These scenarios must not reserve every later SQL/cancellation
+        // continuation on the stack while the actual source probe is polling.
+        Box::pin(async {
         assert_eq!(prepared.reference().revision(), 4);
         let before: String =
             sqlx::query_scalar("SELECT record_json FROM marketplace_installations")
@@ -208,6 +235,7 @@ impl Configured {
             );
         }
         if lost_authority || case == "retain_configured_cancel" {
+            return Box::pin(async {
             if lost_authority {
                 assert!(
                     prepared
@@ -287,7 +315,8 @@ impl Configured {
             eprintln!(
                 "configured probed source: independently authenticated offline cancellation preserved stable configuration and acknowledged exact retry at reserved capacity"
             );
-            return Ok(());
+            Ok(())
+            }).await;
         }
         let limits = SourceExecutionLimits {
             profile: Default::default(),
@@ -306,6 +335,7 @@ impl Configured {
             case,
             "retain_configured_owned" | "retain_configured_owned_cancel"
         ) {
+            return Box::pin(async {
             use crate::marketplace::grant_store::installation::operation::{OwnedCandidate, Phase};
             let mut owners = Some((
                 prepared,
@@ -340,6 +370,7 @@ impl Configured {
             );
             let mutation = Uuid::new_v4();
             if case == "retain_configured_owned_cancel" {
+                Box::pin(async {
                 let owner = staged.configured_instance().context("configured owner")?;
                 let before_revision: i64 = sqlx::query_scalar(
                     "SELECT revision FROM marketplace_installations WHERE instance_id=$1",
@@ -424,10 +455,12 @@ impl Configured {
                     "exact retry must not spend another final revision"
                 );
                 self.controller = Some(operation.take_controller()?);
-                self.operation = None;
                 eprintln!(
                     "owned configured operation: real native migration/retirement, fresh-owner offline atomic cancellation at reserved final capacity, stable settings and exact retry passed after lost waiter"
                 );
+                Ok::<_, anyhow::Error>(())
+                }).await?;
+                self.operation = None;
                 return Ok(());
             }
             let activated = operation.activate(&self.principal, mutation).await?;
@@ -477,8 +510,10 @@ impl Configured {
             eprintln!(
                 "owned configured operation: real native migration/retirement, explicit activation and installed invocation passed after lost waiter"
             );
-            return Ok(());
+            Ok(())
+            }).await;
         }
+        Box::pin(async {
         let claim = match prepared
             .claim_candidate(
                 self.controller
@@ -572,6 +607,8 @@ impl Configured {
             "configured probed source: real restore/probe/disposal continued through credential copy, native readiness, commit and installed invocation"
         );
         Ok(())
+        }).await
+        }).await
     }
     pub(super) async fn finish_owned_activation(
         &mut self,

@@ -168,6 +168,11 @@ async fn actual_owned_retained_build_record_rechecks_archived_bytes_under_a_new_
 async fn actual_owned_installed_compiled_calls_recheck_crypto_grants_and_cleanup() -> Result<()> {
     native_variants_with_runtime(&["container-image-installed"], true, true, true, true, true).await
 }
+#[tokio::test]
+#[ignore = "actual compiled archive/native probe/state copy/candidate SDK/readiness/activation/cold reopen, plus failed-readiness cleanup; source/protection observations synthetic"]
+async fn actual_compiled_activation_uses_the_original_probe_candidate_and_commit() -> Result<()> {
+    native_variants_with_runtime(&["container-image-activation", "container-image-activation-failure"],true,true,true,true,true).await
+}
 async fn native_variants_with_runtime(
     variants: &[&str],
     filesystem: bool,
@@ -230,7 +235,7 @@ async fn native_variants_with_runtime(
         // stack. In particular the filesystem-negative path has more wrappers
         // than the direct runtime case; both retain the same cleanup owner.
         let operation=Box::pin(async {
-            if variant=="container-image-installed" {
+            if variant=="container-image-installed" || variant.starts_with("container-image-activation") {
                 Box::pin(crate::marketplace::grant_store::installation::runtime::initialize_compiled_fixture(
                     runtime.clone(),&root,&lane,&image,&deployment)).await?;
             }
@@ -240,7 +245,7 @@ async fn native_variants_with_runtime(
             if !fixture.status.success() || fixture.stdout.len()>2*1024*1024 {bail!("offline compiled fixture failed");}
             let value:serde_json::Value=canonical::parse(&fixture.stdout,2*1024*1024)?;
             let grant_fixture=(variant=="container-image-grants").then(||value.clone());
-            let retained_fixture=matches!(variant,"container-image-retained"|"container-image-installed").then(||value.clone());
+            let retained_fixture=(matches!(variant,"container-image-retained"|"container-image-installed")||variant.starts_with("container-image-activation")).then(||value.clone());
             let artifact=STANDARD.decode(value["artifact_base64"].as_str().context("candidate fixture missing")?)?;
             let (release,package,proof)=crate::marketplace::quarantine::tests::decode_fixture(value)?;
             let plan=SourceQuarantinePlan::for_release(&release,Some(0),&SourceJobBudget{memory_bytes:256*MIB,cpu_millicores:200,
@@ -338,7 +343,11 @@ async fn native_variants_with_runtime(
                                     returned.source.job.measure_host(original_expires).await?.report()?;
                                     if let Some(fixture)=retained_fixture.as_ref() {
                                         Box::pin(retained::run(returned,&image,&evidence,fixture,&root)).await?;
-                                        println!("offline native build {variant}: actual archive/new-job rematch/reimport/execution; no installed activation claim");
+                                        if variant.starts_with("container-image-activation") {
+                                            println!("offline native build {variant}: actual probe/candidate/owner activation or failed-readiness cleanup; source/protection observations synthetic");
+                                        } else {
+                                            println!("offline native build {variant}: actual archive/new-job rematch/reimport/execution; no installed activation claim");
+                                        }
                                         return Ok(());
                                     } else if let Some(fixture)=grant_fixture.as_ref() {
                                         returned=crate::marketplace::grant_store::invocation::native_tests::run_compiled(
@@ -433,7 +442,7 @@ async fn native_variants_with_runtime(
                 .context("original fixture cleanup owner still holds the lane")??;
             }
             let mut roles=vec![(deployment.clone(),volume.clone(),labels.clone())];
-            if matches!(variant,"container-image-retained"|"container-image-installed") {
+            if matches!(variant,"container-image-retained"|"container-image-installed") || variant.starts_with("container-image-activation") {
                 let cold=format!("{deployment}-cold");
                 let cold_labels=HashMap::from([
                     (ELIXIR_MANAGED_LABEL.into(),"true".into()),

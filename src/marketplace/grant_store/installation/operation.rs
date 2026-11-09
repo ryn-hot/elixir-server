@@ -113,6 +113,15 @@ pub(in crate::marketplace) struct OwnedCandidate {
     task: OwnedTask<Completion>,
 }
 impl OwnedCandidate {
+    /// Joined fixture diagnostics only, never an execution/cleanup capability
+    /// or a public error channel carrying publisher/private SDK data.
+    #[cfg(test)]
+    pub(in crate::marketplace) fn fixture_failure(&self) -> Option<&anyhow::Error> {
+        self.task
+            .result
+            .as_ref()
+            .and_then(|result| result.failure.as_ref())
+    }
     /// Retain the exact staged source, encrypted intent and controller BEFORE
     /// any prepare/claim SQL await. No native or SQL start is inferred on retry.
     pub(in crate::marketplace) fn begin_activation(

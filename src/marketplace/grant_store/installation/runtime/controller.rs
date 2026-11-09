@@ -261,8 +261,7 @@ impl InstalledController {
     ) -> Result<()> {
         self.preflight_candidate(&limits)?;
         let original = claim.as_ref().context("original candidate claim missing")?;
-        original
-            .require_configuration(&self.configuration.image, &self.configuration.source_budget)?;
+        original.require_configuration(&self.configuration, &self.secrets)?;
         let executor =
             tokio::runtime::Handle::try_current().context("candidate executor unavailable")?;
         let owner = self.retained_owner()?;

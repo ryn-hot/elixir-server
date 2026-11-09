@@ -3,6 +3,8 @@
 //! they are not promoted into a SourceMatchedQuarantine from stored summaries.
 use super::*;
 use elixir_marketplace::{records::RuntimeProfile, retained_authority::VerifiedRetainedAuthority};
+mod compiled;
+pub(in crate::marketplace) use compiled::CompiledPreparation;
 
 pub(in crate::marketplace) struct RetainedCode {
     source: Provenance,
@@ -110,6 +112,30 @@ impl RetainedCode {
     pub(in crate::marketplace) fn descriptor(&self) -> SourceMatchDescriptor {
         self.job().plan.source_match.clone()
     }
+    pub(in crate::marketplace) fn summary(&self) -> Result<&SourceMatchSummary> {
+        match &self.source {
+            Provenance::Matched(source) => Ok(source.summary()),
+            Provenance::Compiled { source, .. } => Ok(source.summary()),
+            Provenance::Pending { .. } => bail!("pending bytes are not a native source match"),
+        }
+    }
+    /// No-effects interface probe under this actual source/image owner. The
+    /// caller retains separate current public-source and activation checks.
+    pub(in crate::marketplace) async fn probe(
+        &mut self,
+        limits: SourceExecutionLimits,
+        broker: &mut dyn Broker,
+    ) -> Result<()> {
+        match &mut self.source {
+            Provenance::Matched(source) => source.probe_source(limits, broker).await,
+            Provenance::Compiled { source, image } => {
+                source.probe_container(image, limits, broker).await
+            }
+            Provenance::Pending { .. } => {
+                bail!("pending bytes cannot become a probed activation source")
+            }
+        }
+    }
     pub(in crate::marketplace) fn require_execution_resources(
         &self,
         resources: &super::super::super::grants::RuntimeResources,
@@ -212,7 +238,7 @@ fn require_byte_plan(
 ) -> Result<()> {
     require_byte_plan_for(authority, expected, saved, actual, RuntimeProfile::SourceJs)
 }
-fn require_byte_plan_for(
+pub(in crate::marketplace) fn require_byte_plan_for(
     authority: &VerifiedRetainedAuthority,
     expected: &SourceMatchDescriptor,
     saved: &SourceMatchSummary,
@@ -276,6 +302,18 @@ mod tests {
         let mut actual = expected.clone();
         actual.workspace.timeout_seconds += 1;
         require_match(&authority, &expected, &summary, &actual, &summary)?;
+        // Archives normalize storage time independently from the next finite
+        // admitted operation. Compare signed bytes, never inherit that time.
+        let mut archived = expected.clone();
+        archived.workspace.timeout_seconds = elixir_marketplace::quarantine::MAX_JOB_SECONDS;
+        actual.workspace.timeout_seconds = 120;
+        require_byte_plan_for(
+            &authority,
+            &archived,
+            &summary,
+            &actual,
+            RuntimeProfile::SourceJs,
+        )?;
         let mut wrong_summary = summary.clone();
         wrong_summary
             .entrypoint

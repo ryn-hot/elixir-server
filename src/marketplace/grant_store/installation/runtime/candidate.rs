@@ -240,7 +240,7 @@ async fn run_candidate(
         };
         restrictions(&stop, expires)?;
         access.current(&database).await?;
-        claim.require_configuration(&configuration.image, &configuration.source_budget)?;
+        claim.require_configuration(&configuration, &secrets)?;
         load_retained(
             &mut workspace,
             &database,
