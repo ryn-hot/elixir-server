@@ -56,6 +56,9 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     .await?;
     let config =
         compiled_fixture_configuration(&db, runtime.clone(), root, lane, worker, deployment)?;
+    let image_cache = runtime
+        .marketplace_import_profile()
+        .is_some_and(|profile| profile.image_cache_enabled());
     // Fail before source admission; stored metadata/history cannot approve a
     // compiler, enable a missing runtime policy or substitute another key.
     for wrong_key in [false, true] {
@@ -108,6 +111,14 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     let cached = cached_input_state(runtime.as_ref(), lane)
         .await?
         .context("compiled input bytes were not retained")?;
+    let first_image = controller.image_cache_snapshot().await?;
+    if image_cache {
+        let (config, _, bytes) = first_image
+            .as_ref()
+            .context("cold call did not retain an actual image")?;
+        assert!(*bytes > 0 && *bytes <= 512 * MIB);
+        runtime.inspect_marketplace_import_image(*config).await?;
+    }
 
     let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
     let warm_started = std::time::Instant::now();
@@ -115,10 +126,66 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     assert_eq!(controller.finish().await?.as_str(), "true");
     let warm_elapsed = warm_started.elapsed();
     println!(
-        "compiled input-byte timing: cold_ms={} cached_ms={}; native rematch/filesystem/export/import retained",
+        "compiled input-byte timing: cold_ms={} cached_ms={}; fresh source/filesystem; optional image cache={image_cache}",
         cold_elapsed.as_millis(),
         warm_elapsed.as_millis()
     );
+    if image_cache {
+        assert_eq!(
+            controller.image_cache_snapshot().await?,
+            first_image,
+            "warm call must use the SAME image-reference owner, not recreate it"
+        );
+        println!(
+            "compiled image-cache reuse: fresh job/source/artifact/grants; identical passive reference; original foreground lane released"
+        );
+        let binding =
+            InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+        let capsule = binding.material(&db).await?;
+        let facts = capsule.facts()?;
+        assert_eq!(facts.release().payload().artifacts.len(), 1);
+        let plan =
+            SourceQuarantinePlan::for_release(facts.release(), Some(0), &config.source_budget)?;
+        let lease = ControllerLease::acquire(lane)?;
+        let admission = IndependentAdmission::new(config.playback.clone(), config.archive.clone())?;
+        let mut other = None;
+        let opened = SourceQuarantineJob::open_leased_retained(
+            &mut other,
+            runtime.clone(),
+            "compiled-cache-foreground-switch",
+            worker,
+            &plan,
+            lease,
+            admission,
+        )
+        .await;
+        let retired = if let Some(job) = other.as_mut() {
+            job.discard_retained().await
+        } else {
+            Ok(())
+        };
+        opened?;
+        retired?;
+        drop(other);
+        assert!(
+            controller.image_cache_snapshot().await?.is_none(),
+            "other foreground source work must evict the cache BEFORE allocation"
+        );
+        assert!(
+            runtime
+                .inspect_marketplace_import_image(first_image.as_ref().unwrap().0)
+                .await
+                .is_err()
+        );
+        let binding =
+            InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
+        controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
+        assert_eq!(controller.finish().await?.as_str(), "true");
+        assert!(controller.image_cache_snapshot().await?.is_some());
+        println!(
+            "compiled image-cache competing source job: original lane acquired, cached image retired before other provisioning, explicit call restored"
+        );
+    }
     // The actual C fixture writes fixture=true on every normal call. The SDK
     // intentionally returns a no-op acknowledgement for an unchanged value.
     assert_eq!(
@@ -160,6 +227,12 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         "corrupt cache produced SDK effects"
     );
     assert!(cached_input_state(runtime.as_ref(), lane).await?.is_none());
+    if image_cache {
+        assert!(
+            controller.image_cache_snapshot().await?.is_none(),
+            "artifact rejection must retire the cached reference"
+        );
+    }
     let binding = InstalledBinding::load(&db, home, &id, instance, standing_tests::limit()).await?;
     controller.begin(binding, limits(), RuntimeJson::parse(b"null")?)?;
     assert_eq!(controller.finish().await?.as_str(), "true");
@@ -180,6 +253,12 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
     wait_key(&db, instance, "cancel_started").await?;
     controller.cancel().await?;
     controller.require_idle()?;
+    if image_cache {
+        assert!(
+            controller.image_cache_snapshot().await?.is_none(),
+            "cancelled code retained its cached image"
+        );
+    }
     assert!(
         cached_input_state(runtime.as_ref(), lane).await?.is_none(),
         "cancelled call cannot park its workspace"
@@ -217,6 +296,12 @@ pub(in crate::marketplace) async fn run_compiled_fixture(
         cached_input_state(runtime.as_ref(), lane).await?.is_none(),
         "revoked call cannot park its workspace"
     );
+    if image_cache {
+        assert!(
+            controller.image_cache_snapshot().await?.is_none(),
+            "revocation retained a cached image"
+        );
+    }
     controller.shutdown_cache().await?;
     drop(controller);
     drop(ControllerLease::acquire(lane)?);

@@ -237,6 +237,7 @@ async fn native_variants_with_runtime(
             )
             .canonicalize()?,
         )?;
+        let profile=if std::env::var("ELIXIR_TEST_COMPILED_IMAGE_CACHE").as_deref()==Ok("1") {profile.with_image_cache()} else {profile};
         manager = manager.with_marketplace_import_profile(profile);
     }
     if execute {

@@ -42,6 +42,7 @@ impl CandidateCall {
         let control = RunControl {
             stop: stopped,
             owner: Some(owner.lease()),
+            #[cfg(unix)] image_cache:None,
         };
         let task = executor.spawn(run_candidate(
             database,

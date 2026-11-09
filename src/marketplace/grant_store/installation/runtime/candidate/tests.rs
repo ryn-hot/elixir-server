@@ -296,6 +296,7 @@ async fn candidate_cancelled_waiter_keeps_the_original_handle_and_joined_result_
                 RunControl {
                     stop: stopped,
                     owner: Some(runtime_owner.lease()),
+                    #[cfg(unix)] image_cache:None,
                 },
                 runtime_owner,
             )

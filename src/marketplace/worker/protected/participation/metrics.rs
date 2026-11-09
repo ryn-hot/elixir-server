@@ -449,7 +449,7 @@ fn check_source_headroom(
         .and_then(|bytes| bytes.checked_add(plan.memory_reservation_bytes()))
         .context("foreground source memory bounds")?;
     let pending_disk = match stage {
-        SourceStage::BeforeProvision => plan.disk_reservation_bytes(),
+        SourceStage::BeforeProvision => plan.disk_allocation_bytes(),
         SourceStage::AfterProvision => plan.remaining_disk_reservation_bytes(),
     };
     let disk_needed = ordinary

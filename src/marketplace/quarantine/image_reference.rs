@@ -227,11 +227,54 @@ pub(in crate::marketplace) async fn recover(
 /// inode. No Clone/Deserialize; reopening the cleanup JSON cannot construct it.
 pub(in crate::marketplace) struct RuntimeImage {
     owner: evidence_owner::EvidenceOwner,
-    file: File,
-    record: Record,
+    reference: Reference,
     image: ContainerImageSummary,
 }
+enum Reference {
+    Imported { file: File, record: Record },
+    Cached(Arc<super::image_cache::Anchor>),
+}
+impl Reference {
+    fn check(&self, lease: &ControllerLease) -> Result<()> {
+        match self {
+            Self::Imported { file, record } => {
+                require_active(lease, record.operation_id, record.intent())?;
+                private(file)?;
+                let (named, actual) = read(lease, FILE)?;
+                let held = file.metadata()?;
+                let current = named.metadata()?;
+                if held.dev() != current.dev() || held.ino() != current.ino() || actual != *record {
+                    bail!("imported-image reference inode/identity changed");
+                }
+                Ok(())
+            }
+            Self::Cached(anchor) => anchor.check(),
+        }
+    }
+    fn view(&self) -> Result<Self> {
+        Ok(match self {
+            Self::Imported { file, record } => Self::Imported {
+                file: file.try_clone()?,
+                record: record.clone(),
+            },
+            Self::Cached(anchor) => Self::Cached(anchor.clone()),
+        })
+    }
+}
 impl RuntimeImage {
+    pub(super) fn capture_cached(
+        source: &SourceMatchedQuarantine,
+        anchor: Arc<super::image_cache::Anchor>,
+        proof: &super::local_build::VerifiedLocalBuild,
+        filesystem: &super::container_filesystem::NativeContainerFilesystemMatch,
+    ) -> Result<Self> {
+        anchor.require_source(source, proof, filesystem)?;
+        Ok(Self {
+            owner: evidence_owner::EvidenceOwner::capture(source)?,
+            image: anchor.image().clone(),
+            reference: Reference::Cached(anchor),
+        })
+    }
     pub(super) fn capture(
         source: &SourceMatchedQuarantine,
         imported: &super::image_import::ImportedImage,
@@ -254,8 +297,7 @@ impl RuntimeImage {
         }
         Ok(Self {
             owner: evidence_owner::EvidenceOwner::capture(source)?,
-            file,
-            record,
+            reference: Reference::Imported { file, record },
             image: request.filesystem.image.clone(),
         })
     }
@@ -266,16 +308,7 @@ impl RuntimeImage {
         self.owner.require(source)?;
         source.require_compiled_source()?;
         source.require_compiled_image(&self.image)?;
-        let lease = source.job_lease();
-        require_active(&lease, self.record.operation_id, self.record.intent())?;
-        private(&self.file)?;
-        let (actual, record) = read(&lease, FILE)?;
-        let held = self.file.metadata()?;
-        let named = actual.metadata()?;
-        if held.dev() != named.dev() || held.ino() != named.ino() || record != self.record {
-            bail!("runtime image reference inode/identity changed");
-        }
-        Ok(())
+        self.reference.check(&source.job_lease())
     }
     pub(in crate::marketplace) fn image(&self) -> &ContainerImageSummary {
         &self.image
@@ -287,8 +320,7 @@ impl RuntimeImage {
         self.require_source(source)?;
         Ok(RuntimeImageView {
             owner: evidence_owner::EvidenceOwner::capture(source)?,
-            file: self.file.try_clone()?,
-            record: self.record.clone(),
+            reference: self.reference.view()?,
             image: self.image.clone(),
             source: Digest::of(canonical::to_vec(&source.execution_descriptor())?),
         })
@@ -299,23 +331,14 @@ impl RuntimeImage {
 /// Deserialize or constructor from disk/summary; it cannot keep a job alive.
 pub(in crate::marketplace) struct RuntimeImageView {
     owner: evidence_owner::EvidenceOwner,
-    file: File,
-    record: Record,
+    reference: Reference,
     image: ContainerImageSummary,
     source: Digest,
 }
 impl RuntimeImageView {
     pub(in crate::marketplace) fn check(&self) -> Result<()> {
         let lease = self.owner.current()?;
-        require_active(&lease, self.record.operation_id, self.record.intent())?;
-        private(&self.file)?;
-        let (named, record) = read(&lease, FILE)?;
-        let held = self.file.metadata()?;
-        let actual = named.metadata()?;
-        if held.dev() != actual.dev() || held.ino() != actual.ino() || record != self.record {
-            bail!("compiled invocation lost its actual imported-image reference");
-        }
-        Ok(())
+        self.reference.check(&lease)
     }
     pub(in crate::marketplace) fn require_descriptor(
         &self,

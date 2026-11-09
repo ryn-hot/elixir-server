@@ -9,11 +9,19 @@ use std::{
     process::Stdio,
 };
 
+#[async_trait::async_trait]
+pub(crate) trait CacheControl: Send + Sync {
+    fn directory(&self) -> &Path;
+    async fn evict(&self) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub struct Profile {
     executable: PathBuf,
     digest: Digest,
     socket: SocketBinding,
+    cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<dyn CacheControl>>>>,
+    cache_enabled: bool,
 }
 impl Profile {
     pub fn from_operator_configuration(
@@ -40,12 +48,51 @@ impl Profile {
                 device: m.dev(),
                 inode: m.ino(),
             },
+            cache: Default::default(),
+            cache_enabled: false,
         };
         profile.require()?;
         Ok(profile)
     }
     pub(crate) fn socket(&self) -> SocketBinding {
         self.socket.clone()
+    }
+    /// Trusted prelaunch opt-in only; the independently approved companion
+    /// must implement the passive-reference keeper. Never a peer/HTTP option.
+    pub(crate) fn with_image_cache(mut self) -> Self {
+        self.cache_enabled = true;
+        self
+    }
+    pub(crate) fn image_cache_enabled(&self) -> bool {
+        self.cache_enabled
+    }
+    pub(crate) fn register_cache(&self, cache: std::sync::Arc<dyn CacheControl>) -> Result<()> {
+        let mut slot = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image cache hook poisoned"))?;
+        if slot.as_ref().and_then(std::sync::Weak::upgrade).is_some() {
+            bail!("image cache already has an actual owner");
+        }
+        *slot = Some(std::sync::Arc::downgrade(&cache));
+        Ok(())
+    }
+    pub(crate) fn cache(
+        &self,
+        directory: &Path,
+    ) -> Result<Option<std::sync::Arc<dyn CacheControl>>> {
+        let slot = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image cache hook poisoned"))?;
+        let value = slot.as_ref().and_then(std::sync::Weak::upgrade);
+        if value
+            .as_ref()
+            .is_some_and(|cache| cache.directory() != directory)
+        {
+            bail!("image cache belongs to another foreground lane");
+        }
+        Ok(value)
     }
     fn require(&self) -> Result<()> {
         let mut file = OpenOptions::new()
@@ -87,6 +134,16 @@ impl Profile {
     }
     pub(crate) fn spawn_reference_cleanup(&self, lane: &Path) -> Result<tokio::process::Child> {
         self.spawn_role(lane, Some("--cleanup-reference"))
+    }
+    pub(crate) fn spawn_cache(&self, lane: &Path, cleanup: bool) -> Result<tokio::process::Child> {
+        self.spawn_role(
+            lane,
+            Some(if cleanup {
+                "--cleanup-image-cache"
+            } else {
+                "--retain-image-cache"
+            }),
+        )
     }
     fn spawn_role(&self, lane: &Path, mode: Option<&'static str>) -> Result<tokio::process::Child> {
         self.require()?;

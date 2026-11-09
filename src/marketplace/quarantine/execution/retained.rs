@@ -172,9 +172,9 @@ impl RetainedCode {
         }
     }
     pub(in crate::marketplace) async fn park_bytes(&mut self) -> Result<bool> {
-        // Retiring this job removes its imported-image reference BEFORE raw
-        // bytes can remain in the shared one-slot cache. A subsequent compiled
-        // call must authenticate history and rematch/reimport independently.
+        // Retire this job's own imported-image reference before retaining raw
+        // bytes. Any passive image-cache reference has a separate owner and
+        // reservation; the next call must rematch source/artifact independently.
         super::super::cache::park(self.job_mut()).await
     }
     /// Optional migration + local readiness, NEVER ordinary invoke. A parsed

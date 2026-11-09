@@ -59,6 +59,7 @@ pub(in crate::marketplace) struct InstalledController {
     database: Database,
     secrets: SecretsManager,
     configuration: InstalledRuntime,
+    #[cfg(unix)] image_cache:Option<Arc<crate::marketplace::quarantine::image_cache::Pool>>,
 }
 impl InstalledController {
     pub(in crate::marketplace) async fn open(
@@ -76,6 +77,12 @@ impl InstalledController {
         // write-ahead invariant covers every native create, including crashes
         // before an InstalledCall's acknowledgement reaches this controller.
         let (lease, binding) = binding::open(&database, &configuration).await?;
+        #[cfg(unix)]
+        let image_cache=if configuration.compiled_toolchains.is_some()
+            && let Some(profile)=configuration.runtime.marketplace_import_profile()
+            && profile.image_cache_enabled() {
+                Some(crate::marketplace::quarantine::image_cache::Pool::open(configuration.runtime.clone(),profile,&configuration.lane).await?)
+            } else {None};
         if let Some(connection) = configuration.application_http.as_mut() {
             if let Some((network, _)) = connection.network() {
                 let pool = crate::marketplace::application_egress::WarmPool::new(
@@ -99,6 +106,7 @@ impl InstalledController {
             database,
             secrets,
             configuration,
+            #[cfg(unix)] image_cache,
         })
     }
     fn require_owner(&self) -> Result<()> {
@@ -207,6 +215,7 @@ impl InstalledController {
             arguments,
             self.lease.clone(),
             http,
+            #[cfg(unix)] self.image_cache.clone(),
         )?;
         // No await between starting the task and retaining its ONLY owner.
         self.active = Some(RegisteredCall { generation, call });
@@ -236,6 +245,10 @@ impl InstalledController {
             bail!("original installed controller still owns native work");
         }
         Ok(())
+    }
+    #[cfg(all(test,unix))]
+    pub(super) async fn image_cache_snapshot(&self)->Result<Option<(Digest,String,u64)>> {
+        match &self.image_cache {Some(cache)=>cache.snapshot().await,None=>Ok(None)}
     }
     pub(in crate::marketplace) async fn begin_provider(
         &mut self,
@@ -358,6 +371,8 @@ impl InstalledController {
             // Cancelling must not throw away the only failure-cleanup proof.
             candidate.cancel().await?;
         }
+        #[cfg(unix)]
+        if let Some(cache)=&self.image_cache {cache.evict().await?;}
         Ok(())
     }
     pub(in crate::marketplace) async fn shutdown_cache(&mut self) -> Result<()> {
@@ -410,6 +425,8 @@ impl InstalledController {
         }
         self.require_owner()?;
         scope.current(&self.database).await?;
+        #[cfg(unix)]
+        if let Some(cache)=&self.image_cache {cache.evict().await?;}
         if let Some(connection) = &self.configuration.application_http {
             connection.shutdown().await?;
         }

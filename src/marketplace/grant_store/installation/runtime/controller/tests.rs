@@ -330,6 +330,7 @@ async fn replaced_owner_inode_denies_new_starts_without_disabling_owned_cleanup(
     let control = RunControl {
         stop: stopped,
         owner: Some(owner.lease.clone()),
+        #[cfg(unix)] image_cache:None,
     };
     restrictions(&control, Deadline::now() + Duration::from_secs(10))?;
     let path = config(&f)?
@@ -550,6 +551,7 @@ async fn queued_pre_native_call_keeps_the_registry_lock_until_its_original_task_
     let mut control = RunControl {
         stop: receiver,
         owner: Some(owner.lease.clone()),
+        #[cfg(unix)] image_cache:None,
     };
     let (release, wait) = tokio::sync::oneshot::channel();
     let (done, joined) = tokio::sync::oneshot::channel();

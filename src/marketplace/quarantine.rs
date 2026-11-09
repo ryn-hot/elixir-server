@@ -62,6 +62,8 @@ pub(in crate::marketplace) mod image_import;
 #[cfg(unix)]
 pub(in crate::marketplace) mod image_reference;
 #[cfg(unix)]
+pub(in crate::marketplace) mod image_cache;
+#[cfg(unix)]
 pub(in crate::marketplace) mod local_build;
 mod cache;
 pub(in crate::marketplace) mod execution;
@@ -94,6 +96,7 @@ pub struct SourceQuarantinePlan {
     limits: SourceJobLimits,
     disk_reservation: u64,
     preallocated_bytes: u64,
+    retained_disk_bytes: u64,
     disk_limit: u64,
     input_limit: u64,
     output_limit: u64,
@@ -108,6 +111,8 @@ pub struct SourceQuarantinePlan {
 /// extend its original lifetime or skip the actual admission checks.
 #[async_trait::async_trait]
 pub(super) trait ResourceAdmission: Send + Sync {
+    #[cfg(unix)]
+    fn cached_image(&self) -> Option<Arc<image_cache::Borrow>> {None}
     fn needs_measurement(&self) -> bool {
         false
     }
@@ -122,6 +127,19 @@ pub(super) trait ResourceAdmission: Send + Sync {
     ) -> Result<()>;
 }
 impl SourceQuarantinePlan {
+    #[cfg(unix)]
+    fn fits_cached_image(&self, bytes:u64) -> bool {
+        self.workspace.volume_reservation_bytes().ok()
+            .and_then(|archive| self.disk_reservation.checked_add(archive)?.checked_add(2*MIB)?.checked_add(bytes))
+            .is_some_and(|total| total<=self.disk_limit)
+    }
+    #[cfg(unix)]
+    fn reserve_cached_image(&mut self, bytes:u64) -> Result<()> {
+        if !self.fits_cached_image(bytes) {bail!("cached image and foreground job exceed their shared disk ceiling");}
+        self.disk_reservation=self.disk_reservation.checked_add(bytes).context("image reservation overflow")?;
+        self.retained_disk_bytes=self.retained_disk_bytes.checked_add(bytes).context("retained image reservation overflow")?;
+        Ok(())
+    }
     /// Authority, current head/revocation, public-source preflight, owner
     /// approval and aggregate job admission are distinct controller checks.
     /// `artifact` selects a signed blob only; it never supplies a URL/path.
@@ -269,6 +287,7 @@ impl SourceQuarantinePlan {
             limits,
             disk_reservation,
             preallocated_bytes: input,
+            retained_disk_bytes:0,
             disk_limit: budget.disk_bytes,
             input_limit: budget.input_bytes,
             output_limit: budget.output_bytes,
@@ -286,6 +305,7 @@ impl SourceQuarantinePlan {
     pub fn disk_reservation_bytes(&self) -> u64 {
         self.disk_reservation
     }
+    pub(super) fn disk_allocation_bytes(&self)->u64 {self.disk_reservation-self.retained_disk_bytes}
     pub(super) fn memory_reservation_bytes(&self) -> u64 {
         self.limits.memory_bytes
     }
@@ -293,7 +313,7 @@ impl SourceQuarantinePlan {
         // The trusted native provisioner proves every signed slot is physically
         // allocated before returning. Keep all allocation slack, metadata and
         // temporary/control reservations, but do not reserve those bytes twice.
-        self.disk_reservation - self.preallocated_bytes
+        self.disk_reservation - self.preallocated_bytes - self.retained_disk_bytes
     }
 }
 
@@ -1530,6 +1550,12 @@ impl SourceQuarantineJob {
         }
         let lease = Arc::new(lease);
         #[cfg(unix)]
+        if let Some(borrow)=admission.as_ref().and_then(|a|a.cached_image()) {
+            borrow.require_plan(plan,lease.directory())?;
+        } else {
+            image_cache::before_source(runtime.clone(),&lease).await?;
+        }
+        #[cfg(unix)]
         image_reference::require_absent(&lease)?;
         #[cfg(unix)]
         super::archive::ImageExportStaging::cleanup_idle(lease.clone()).await?;
@@ -1937,6 +1963,10 @@ impl SourceQuarantineJob {
             self.cleanup_activity(runtime).await?;
             self.recover_writer(runtime).await?;
             Self::remove_stopped_writer(runtime, &self.deployment).await?;
+            #[cfg(unix)]
+            if let Some(borrow)=self.admission.as_ref().and_then(|a|a.cached_image()) {
+                borrow.retire(remove_volume).await?;
+            }
             #[cfg(unix)]
             image_reference::recover(runtime,&self._lease).await?;
             runtime

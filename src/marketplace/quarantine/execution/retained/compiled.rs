@@ -15,6 +15,7 @@ pub(in crate::marketplace) struct CompiledPreparation {
     expected: Box<SourceMatchDescriptor>,
     summary: Box<SourceMatchSummary>,
     proof: VerifiedLocalBuild,
+    filesystem: Option<super::super::super::container_filesystem::NativeContainerFilesystemMatch>,
 }
 enum Stage {
     Empty,
@@ -53,6 +54,7 @@ impl CompiledPreparation {
             expected: Box::new(expected),
             summary: Box::new(summary),
             proof,
+            filesystem: None,
         })
     }
     /// Only the first filesystem-admission phase may return a retryable
@@ -69,11 +71,42 @@ impl CompiledPreparation {
                     .context("compiled source missing")?
                     .check_retained_container_filesystem(&self.proof)
                     .await?;
+                let original = source
+                    .as_ref()
+                    .as_ref()
+                    .context("compiled source missing")?;
+                if let Some(borrow) = original
+                    .source
+                    .job
+                    .admission
+                    .as_ref()
+                    .and_then(|a| a.cached_image())
+                    && let Some(anchor) = borrow.get(original, &self.proof, &filesystem).await?
+                {
+                    let mut image = Some(
+                        super::super::super::image_reference::RuntimeImage::capture_cached(
+                            original,
+                            anchor,
+                            &self.proof,
+                            &filesystem,
+                        )?,
+                    );
+                    let code = RetainedCode::take_compiled(
+                        source,
+                        &mut image,
+                        &self.authority,
+                        &self.expected,
+                        &self.summary,
+                    )?;
+                    self.stage = Stage::Ready(Box::new(code));
+                    return Ok(true);
+                }
                 let exporting = SourceMatchedQuarantine::begin_retained_image_export(
                     source,
                     &self.proof,
                     &filesystem,
                 )?;
+                self.filesystem = Some(filesystem);
                 self.stage = Stage::Exporting(Box::new(exporting));
                 Ok(false)
             }
@@ -99,6 +132,24 @@ impl CompiledPreparation {
                 let Stage::Matched(source) = &mut self.stage else {
                     unreachable!()
                 };
+                let original = source.as_ref().as_ref().context("cache source missing")?;
+                if let Some(borrow) = original
+                    .source
+                    .job
+                    .admission
+                    .as_ref()
+                    .and_then(|a| a.cached_image())
+                {
+                    borrow
+                        .put(
+                            original,
+                            image.as_ref().context("cache image missing")?,
+                            self.filesystem
+                                .as_ref()
+                                .context("cache filesystem missing")?,
+                        )
+                        .await?;
+                }
                 let code = RetainedCode::take_compiled(
                     source,
                     &mut image,

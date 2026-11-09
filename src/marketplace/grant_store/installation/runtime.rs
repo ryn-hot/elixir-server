@@ -1,7 +1,7 @@
-//! One cold installed call: exact ACTIVE binding -> retained archive
-//! rehash -> actual native rematch -> independently scoped SDK -> confirmed
-//! disposal. No discovery/issuer/browser dependency or public entry point.
-//! This is NOT the final warm-runtime/cache or production activation policy.
+//! Owned installed calls: exact ACTIVE binding, actual native byte checks,
+//! independently scoped SDK and confirmed process disposal. Optional compiled
+//! image reuse has a separate owner/budget; it never retains SDK authority.
+//! No discovery/issuer/browser dependency or public entry point.
 use super::*;
 use crate::{
     marketplace::{
@@ -81,6 +81,7 @@ impl InstalledCall {
         arguments: RuntimeJson,
         owner: Arc<ControllerLease>,
         http: Option<SdkHttpClient>,
+        #[cfg(unix)] image_cache:Option<Arc<crate::marketplace::quarantine::image_cache::Pool>>,
     ) -> Result<Self> {
         Self::start(
             database,
@@ -93,6 +94,7 @@ impl InstalledCall {
             |stop| RunControl {
                 stop,
                 owner: Some(owner),
+                #[cfg(unix)] image_cache,
             },
         )
     }
@@ -330,11 +332,12 @@ struct RunControl {
     // A queued call retains the registry owner BEFORE it takes the native lane.
     // None is constructed only by explicit raw-call component fixtures.
     owner: Option<Arc<ControllerLease>>,
+    #[cfg(unix)] image_cache:Option<Arc<crate::marketplace::quarantine::image_cache::Pool>>,
 }
 impl RunControl {
     #[cfg(test)]
     fn fixture(stop: watch::Receiver<bool>) -> Self {
-        Self { stop, owner: None }
+        Self { stop, owner: None,#[cfg(unix)] image_cache:None }
     }
 }
 fn restrictions(stop: &RunControl, expires: Deadline) -> Result<()> {
@@ -685,7 +688,7 @@ async fn load_retained(
     } else {
         bail!("unsupported installed runtime profile");
     };
-    let plan =
+    let mut plan =
         SourceQuarantinePlan::for_release(facts.release(), selected, &configuration.source_budget)?;
     let resources = binding
         .review()
@@ -693,8 +696,7 @@ async fn load_retained(
         .runtime()
         .context("installed source has no reviewed runtime resources")?;
     plan.require_execution_resources(resources)?;
-    let lease = ControllerLease::acquire(&configuration.lane)?;
-    let admission = if configuration
+    let admission:Arc<dyn crate::marketplace::quarantine::ResourceAdmission> = if configuration
         .application_http
         .as_ref()
         .is_some_and(|http| http.has_network())
@@ -709,6 +711,12 @@ async fn load_retained(
             configuration.archive.clone(),
         )?
     };
+    #[cfg(unix)]
+    let admission=if compiled && stop.owner.is_some() && let Some(cache)=stop.image_cache.clone() {
+        let borrow=guarded(database,binding,stop,expires,Box::pin(cache.claim(&mut plan))).await?;
+        crate::marketplace::quarantine::image_cache::admission(admission,borrow)
+    } else {admission};
+    let lease = ControllerLease::acquire(&configuration.lane)?;
     owner.0 = Stage::Opening(Box::new(None));
     let Stage::Opening(slot) = &mut owner.0 else {
         unreachable!()
@@ -716,9 +724,9 @@ async fn load_retained(
     // All partial native work is retained in slot before the first native
     // side effect. A cancelled outer future cannot detach its cleanup.
     // The single cache holds signed INPUT BYTES only, including a compiled
-    // artifact. Compiler trust/history authentication above, native source
-    // matching and filesystem/export/import below remain fresh for every call.
-    // No image, job deadline, resource sample or SDK scope survives reuse.
+    // artifact. Compiler trust/history, source matching and filesystem checks
+    // stay fresh. The optional separately owned image cache skips export/import
+    // only; job deadlines, admission and SDK scopes are never carried forward.
     let reuse_allowed = stop.owner.is_some();
     let mut opened = guarded(database, binding, stop, expires, async {
         if reuse_allowed {
