@@ -29,6 +29,8 @@ mod application_http;
 mod build_output;
 mod image_labels;
 mod image_import;
+#[cfg(unix)]
+mod local_observation;
 mod measurement;
 #[cfg(unix)]
 mod provider;
@@ -47,6 +49,10 @@ pub struct DockerRuntimeManager {
     docker_bin: String,
     #[cfg(unix)]
     import_profile:Option<std::sync::Arc<crate::runtime::image_import::Profile>>,
+    #[cfg(unix)]
+    local_observer: tokio::sync::OnceCell<local_observation::Observer>,
+    #[cfg(unix)]
+    local_cli_binding: tokio::sync::OnceCell<()>,
     #[cfg(unix)]
     container_guardian: Option<std::sync::Arc<crate::runtime::container_guardian::Profile>>,
     immutable_image_labels: tokio::sync::Mutex<image_labels::Cache>,
@@ -215,7 +221,7 @@ impl DockerRuntimeManager {
             }
             Ok(bytes)
         }
-        let mut child = Command::new(&self.docker_bin)
+        let mut child = self.docker_command().await?
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -239,6 +245,10 @@ impl DockerRuntimeManager {
             #[cfg(unix)]
             import_profile:None,
             #[cfg(unix)]
+            local_observer: Default::default(),
+            #[cfg(unix)]
+            local_cli_binding: Default::default(),
+            #[cfg(unix)]
             container_guardian: None,
             immutable_image_labels: Default::default(),
         }
@@ -248,12 +258,21 @@ impl DockerRuntimeManager {
         self.run_capture_with_timeout(args, None).await
     }
 
+    async fn docker_command(&self) -> Result<Command> {
+        #[cfg(unix)]
+        if self.import_profile.is_some() {
+            // Keep lazy endpoint validation off every caller's native stack.
+            return Box::pin(self.local_docker_command()).await;
+        }
+        Ok(Command::new(&self.docker_bin))
+    }
+
     async fn run_capture_with_timeout(
         &self,
         args: &[String],
         timeout_duration: Option<TokioDuration>,
     ) -> Result<CommandOutput> {
-        let mut command = Command::new(&self.docker_bin);
+        let mut command = self.docker_command().await?;
         command.args(args).kill_on_drop(true);
         let command_label = format!("docker {}", args.join(" "));
         let output_future = command.output();
@@ -297,7 +316,7 @@ impl DockerRuntimeManager {
     }
 
     async fn inspect_named_volume(&self, name: &str) -> Result<Option<Value>> {
-        let output = Command::new(&self.docker_bin)
+        let output = self.docker_command().await?
             .args(["volume", "inspect", name])
             .kill_on_drop(true)
             .output()
@@ -776,6 +795,14 @@ impl DockerRuntimeManager {
     }
 
     async fn inspect_image_value(&self, image: &str) -> Result<Value> {
+        #[cfg(unix)]
+        if self.import_profile.is_some() && image_labels::immutable_reference(image) {
+            let bytes = self.image_import_inspect(image.parse()?).await?;
+            return Ok(elixir_marketplace::canonical::parse(
+                &bytes,
+                elixir_marketplace::container_image::import::MAX_INSPECTION_BYTES,
+            )?);
+        }
         let stdout = self
             .run_stdout(&[
                 "image".to_string(),
@@ -969,6 +996,13 @@ impl DockerRuntimeManager {
     }
 
     async fn find_container_id(&self, name: &str) -> Result<Option<String>> {
+        #[cfg(unix)]
+        if self.use_local_observation(name) {
+            return Ok(self
+                .observe_local_container(name)
+                .await?
+                .and_then(|value| value["Id"].as_str().map(str::to_owned)));
+        }
         let args = vec![
             "ps".to_string(),
             "-a".to_string(),
@@ -1063,6 +1097,13 @@ impl DockerRuntimeManager {
     }
 
     async fn inspect_container(&self, name: &str) -> Result<Value> {
+        #[cfg(unix)]
+        if self.use_local_observation(name) {
+            return self
+                .observe_local_container(name)
+                .await?
+                .context("exact local container is absent");
+        }
         let args = vec![
             "inspect".to_string(),
             "--format".to_string(),
@@ -2822,7 +2863,7 @@ impl DockerRuntimeManager {
         if !purpose.supports_feature(actual, version) {
             bail!("marketplace image lacks the independent fetch feature");
         }
-        let mut command = Command::new(&self.docker_bin);
+        let mut command = self.docker_command().await?;
         command.args([
             "exec",
             "-i",
@@ -3886,7 +3927,7 @@ impl RuntimeManager for DockerRuntimeManager {
         {
             bail!("private process ownership or stream configuration differs");
         }
-        let mut child = Command::new(&self.docker_bin)
+        let mut child = self.docker_command().await?
             .args(["attach", "--sig-proxy=false", &handle.id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

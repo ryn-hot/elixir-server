@@ -148,7 +148,7 @@ impl DockerRuntimeManager {
             "guard START requires exact never-started object"
         );
         self.provider_guard_parent(profile).await?;
-        let mut child = Command::new(&self.docker_bin)
+        let mut child = self.docker_command().await?
             .args(["start", "--attach", "--interactive", &handle.id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

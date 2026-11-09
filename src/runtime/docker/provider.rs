@@ -99,7 +99,7 @@ impl DockerRuntimeManager {
             state.status == "created" && Self::application_gateway_stopped(&value),
             "provider start requires its exact never-started actor"
         );
-        let mut child = Command::new(&self.docker_bin)
+        let mut child = self.docker_command().await?
             .args(["start", "--attach", "--interactive", &handle.id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
