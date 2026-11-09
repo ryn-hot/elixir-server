@@ -250,6 +250,7 @@ async fn run_candidate(
             &mut stop,
             expires,
             elixir_marketplace::source_execution::SourceExecutionMode::Lifecycle,
+            &secrets,
         )
         .await?;
         let Stage::Executing(code) = &mut workspace.0 else {

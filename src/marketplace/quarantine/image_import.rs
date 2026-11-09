@@ -516,6 +516,15 @@ impl Import {
         self.cancelled = true;
         Ok(())
     }
+    pub(in crate::marketplace) async fn discard_source(&mut self) -> Result<()> {
+        self.cancel().await?;
+        if let Some(source) = self.source.as_mut() {
+            source.discard_retained().await?;
+        }
+        self.export = None;
+        self.source = None;
+        Ok(())
+    }
     pub(in crate::marketplace) fn take_cancelled_source(
         &mut self,
     ) -> Result<SourceMatchedQuarantine> {

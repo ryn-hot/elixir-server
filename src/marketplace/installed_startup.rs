@@ -101,6 +101,7 @@ fn configuration(state: &AppState, profile: &Profile) -> Result<InstalledRuntime
         playback: state.transcodes.clone(),
         local_http: state.marketplace.local_http_client(),
         application_http: None,
+        compiled_toolchains: None,
         lane: directory.join("foreground-source"),
         archive: directory.join("source-archives"),
         deployment: format!("installed-{}", uuid::Uuid::new_v4().simple()),

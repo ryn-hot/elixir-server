@@ -23,6 +23,7 @@ async fn host() -> Result<(tempfile::TempDir, Host)> {
         playback: Arc::new(PlaybackJobManager::new(database.pool.clone(), None)),
         local_http: None,
         application_http: None,
+        compiled_toolchains: None,
         lane: directory.join("foreground"),
         archive: directory.join("archive"),
         deployment: "restoration-unit".into(),
@@ -106,6 +107,36 @@ async fn retained_controller_requires_the_same_local_http_owner_not_omission_or_
     );
     // Rejection cannot detach/replace the original owner or make its
     // unchanged, idle configuration unusable.
+    controller.require_configuration(&saved.runtime, &saved.secrets)?;
+    controller.require_idle()?;
+    Ok(())
+}
+#[tokio::test]
+async fn retained_controller_requires_the_original_compiled_toolchain_policy() -> Result<()> {
+    use crate::marketplace::runtime::build::ApprovedToolchains;
+    let (_root, mut host) = host().await?;
+    host.runtime.compiled_toolchains = Some(Arc::new(ApprovedToolchains::default()));
+    let saved = again(&host)?;
+    let controller = InstalledController::open(
+        host.database.clone(),
+        host.secrets.clone(),
+        host.runtime.clone(),
+    )
+    .await?;
+    controller.require_configuration(&saved.runtime, &saved.secrets)?;
+    let mut changed = saved.runtime.clone();
+    changed.compiled_toolchains = None;
+    assert!(
+        controller
+            .require_configuration(&changed, &saved.secrets)
+            .is_err()
+    );
+    changed.compiled_toolchains = Some(Arc::new(ApprovedToolchains::default()));
+    assert!(
+        controller
+            .require_configuration(&changed, &saved.secrets)
+            .is_err()
+    );
     controller.require_configuration(&saved.runtime, &saved.secrets)?;
     controller.require_idle()?;
     Ok(())

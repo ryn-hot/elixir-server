@@ -82,6 +82,7 @@ impl Configured {
             playback: Arc::new(PlaybackJobManager::new(database.pool.clone(), None)),
             local_http: None,
             application_http: None,
+            compiled_toolchains: None,
             lane: lane.into(),
             archive: archive.into(),
             deployment: format!("configured-probed-{}", Uuid::new_v4().simple()),

@@ -5,6 +5,7 @@ use super::*;
 use crate::marketplace::grant_store::tests as grant_tests;
 use serde_json::json;
 mod application_http;
+pub(super) mod compiled;
 mod local_http;
 
 fn secrets() -> SecretsManager {
@@ -233,6 +234,7 @@ pub(in crate::marketplace::grant_store::installation) fn configuration(
         playback: Arc::new(PlaybackJobManager::new(f.db.pool.clone(), None)),
         local_http: None,
         application_http: None,
+        compiled_toolchains: None,
         lane: f.root.path().canonicalize()?.join("expensive"),
         archive: f.root.path().canonicalize()?.join("archive"),
         deployment: deployment.into(),

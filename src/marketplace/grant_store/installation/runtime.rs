@@ -1,4 +1,4 @@
-//! One cold installed SourceJs call: exact ACTIVE binding -> retained archive
+//! One cold installed call: exact ACTIVE binding -> retained archive
 //! rehash -> actual native rematch -> independently scoped SDK -> confirmed
 //! disposal. No discovery/issuer/browser dependency or public entry point.
 //! This is NOT the final warm-runtime/cache or production activation policy.
@@ -46,6 +46,8 @@ pub(in crate::marketplace) struct InstalledRuntime {
     pub playback: Arc<PlaybackJobManager>,
     pub local_http: Option<Arc<crate::marketplace::local_http::Client>>,
     pub application_http: Option<crate::marketplace::application_egress::Configuration>,
+    // Trusted operator policy only. None keeps compiled execution disabled.
+    pub compiled_toolchains: Option<Arc<crate::marketplace::runtime::build::ApprovedToolchains>>,
     pub lane: PathBuf,
     pub archive: PathBuf,
     pub deployment: String,
@@ -240,6 +242,7 @@ pub(in crate::marketplace) use controller::{
     InstalledController, QuiescentRuntime, UnstartedCandidate,
 };
 mod candidate;
+mod compiled;
 pub(in crate::marketplace) use candidate::RetiredCandidate;
 
 #[derive(Default)]
@@ -250,6 +253,8 @@ enum Stage {
     Restoring(Box<Restoration>),
     Source(Box<Option<QuarantinedSource>>),
     Matched(Box<Option<SourceMatchedQuarantine>>),
+    Exporting(Box<crate::marketplace::quarantine::image_export::Export>),
+    Importing(Box<crate::marketplace::quarantine::image_import::Import>),
     Executing(Box<RetainedCode>),
 }
 #[derive(Default)]
@@ -283,6 +288,8 @@ impl Owner {
                 }
             }
             Stage::Executing(source) => source.discard().await?,
+            Stage::Exporting(source) => source.discard_source().await?,
+            Stage::Importing(source) => source.discard_source().await?,
         }
         self.0 = Stage::Empty;
         Ok(())
@@ -535,6 +542,7 @@ async fn run(
             &mut stop,
             expires,
             elixir_marketplace::source_execution::SourceExecutionMode::Invoke,
+            &secrets,
         )
         .await;
         tracing::debug!(target: "elixir_server::marketplace::installed_call_timing",
@@ -637,13 +645,50 @@ async fn load_retained(
     stop: &mut RunControl,
     expires: Deadline,
     mode: elixir_marketplace::source_execution::SourceExecutionMode,
+    secrets: &SecretsManager,
 ) -> Result<()> {
     let facts = capsule.facts()?;
-    if facts.release().payload().runtime_profile != RuntimeProfile::SourceJs {
-        bail!("installed cold execution supports SourceJs only");
-    }
+    let compiled = facts.release().payload().runtime_profile == RuntimeProfile::Reproducible;
+    let selected = if compiled {
+        let trusted = configuration
+            .compiled_toolchains
+            .as_deref()
+            .context("compiled installed execution is not configured")?;
+        configuration
+            .runtime
+            .marketplace_container_guardian()
+            .context("compiled guardian is not configured")?;
+        configuration
+            .runtime
+            .marketplace_import_profile()
+            .context("compiled image import is not configured")?;
+        let record = capsule
+            .build
+            .as_ref()
+            .context("compiled installed history missing")?;
+        let expected = capsule.descriptor()?;
+        record.authenticate_data(&expected, capsule.source.summary(), trusted, secrets)?;
+        let artifact = expected
+            .workspace
+            .artifact
+            .as_ref()
+            .context("compiled retained artifact missing")?;
+        Some(
+            facts
+                .release()
+                .payload()
+                .artifacts
+                .iter()
+                .position(|a| a.blob.sha256 == artifact.sha256 && a.blob.size == artifact.size)
+                .context("compiled retained artifact is not signed")?,
+        )
+    } else if facts.release().payload().runtime_profile == RuntimeProfile::SourceJs {
+        None
+    } else {
+        bail!("unsupported installed runtime profile");
+    };
     let plan =
-        SourceQuarantinePlan::for_release(facts.release(), None, &configuration.source_budget)?;
+        SourceQuarantinePlan::for_release(facts.release(), selected, &configuration.source_budget)?;
     let resources = binding
         .review()
         .scope()
@@ -672,7 +717,7 @@ async fn load_retained(
     };
     // All partial native work is retained in slot before the first native
     // side effect. A cancelled outer future cannot detach its cleanup.
-    let reuse_allowed = stop.owner.is_some();
+    let reuse_allowed = !compiled && stop.owner.is_some();
     let mut opened = guarded(database, binding, stop, expires, async {
         if reuse_allowed {
             SourceQuarantineJob::open_installed_retained(
@@ -730,8 +775,9 @@ async fn load_retained(
     };
     tracing::debug!(target: "elixir_server::marketplace::installed_call_timing",
         cache_hit = reuse, "installed byte workspace preparation");
-    let source = if reuse {
-        SourceQuarantineJob::take_cached_candidate(slot)?
+    if reuse {
+        let source = SourceQuarantineJob::take_cached_candidate(slot)?;
+        owner.0 = Stage::Source(Box::new(Some(source)));
     } else {
         let job = slot
             .take()
@@ -741,25 +787,38 @@ async fn load_retained(
             configuration.archive.clone(),
             configuration.retention,
         )));
-        let Stage::Restoring(restoration) = &mut owner.0 else {
-            unreachable!()
-        };
-        loop {
-            match guarded(database, binding, stop, expires, restoration.advance()).await {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => resource_pause(database, binding, stop, expires, error).await?,
+        {
+            let Stage::Restoring(restoration) = &mut owner.0 else {
+                unreachable!()
+            };
+            loop {
+                match guarded(database, binding, stop, expires, restoration.advance()).await {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => resource_pause(database, binding, stop, expires, error).await?,
+                }
             }
         }
         loop {
-            match guarded(database, binding, stop, expires, restoration.finish()).await {
-                Ok(source) => break source,
+            match guarded(database, binding, stop, expires, async {
+                let source = {
+                    let Stage::Restoring(restoration) = &mut owner.0 else {
+                        unreachable!()
+                    };
+                    restoration.finish().await?
+                };
+                owner.0 = Stage::Source(Box::new(Some(source)));
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => break,
                 Err(error) => resource_pause(database, binding, stop, expires, error).await?,
             }
         }
-    };
-    owner.0 = Stage::Source(Box::new(Some(source)));
-    let inline = mode == elixir_marketplace::source_execution::SourceExecutionMode::Invoke
+    }
+    let inline = !compiled
+        && mode == elixir_marketplace::source_execution::SourceExecutionMode::Invoke
         && configuration
             .runtime
             .image_labels(&configuration.image)
@@ -778,33 +837,46 @@ async fn load_retained(
             capsule.source.summary(),
         )?));
     } else {
-        let Stage::Source(slot) = &mut owner.0 else {
-            unreachable!()
-        };
-        let matched = loop {
-            match guarded(
-                database,
-                binding,
-                stop,
-                expires,
-                QuarantinedSource::match_retained(slot),
-            )
+        loop {
+            match guarded(database, binding, stop, expires, async {
+                let matched = {
+                    let Stage::Source(slot) = &mut owner.0 else {
+                        unreachable!()
+                    };
+                    QuarantinedSource::match_retained(slot).await?
+                };
+                owner.0 = Stage::Matched(Box::new(Some(matched)));
+                Ok(())
+            })
             .await
             {
-                Ok(matched) => break matched,
+                Ok(()) => break,
                 Err(error) => resource_pause(database, binding, stop, expires, error).await?,
             }
-        };
-        owner.0 = Stage::Matched(Box::new(Some(matched)));
-        let Stage::Matched(slot) = &mut owner.0 else {
-            unreachable!()
-        };
-        owner.0 = Stage::Executing(Box::new(RetainedCode::take(
-            slot,
-            &facts,
-            &capsule.descriptor()?,
-            capsule.source.summary(),
-        )?));
+        }
+        if compiled {
+            Box::pin(compiled::load(
+                owner,
+                database,
+                binding,
+                configuration,
+                capsule,
+                secrets,
+                stop,
+                expires,
+            ))
+            .await?;
+        } else {
+            let Stage::Matched(slot) = &mut owner.0 else {
+                unreachable!()
+            };
+            owner.0 = Stage::Executing(Box::new(RetainedCode::take(
+                slot,
+                &facts,
+                &capsule.descriptor()?,
+                capsule.source.summary(),
+            )?));
+        }
     }
     restrictions(stop, expires)?;
     binding.current(database).await?;
@@ -817,3 +889,5 @@ async fn load_retained(
 
 #[cfg(test)]
 pub(in crate::marketplace::grant_store::installation) mod tests;
+#[cfg(test)]
+pub(in crate::marketplace) use tests::compiled::{initialize_compiled_fixture, run_compiled_fixture};

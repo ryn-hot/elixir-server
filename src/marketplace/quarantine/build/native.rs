@@ -163,6 +163,11 @@ async fn actual_owned_compiled_invocation_uses_real_grants_and_stops_on_revocati
 async fn actual_owned_retained_build_record_rechecks_archived_bytes_under_a_new_job() -> Result<()> {
     native_variants_with_runtime(&["container-image-retained"], true, true, true, true, true).await
 }
+#[tokio::test]
+#[ignore = "actual reproduced/imported code plus installed controller, crypto, SQL/AES SDK, cancellation and revocation; ACTIVE enrollment synthetic"]
+async fn actual_owned_installed_compiled_calls_recheck_crypto_grants_and_cleanup() -> Result<()> {
+    native_variants_with_runtime(&["container-image-installed"], true, true, true, true, true).await
+}
 async fn native_variants_with_runtime(
     variants: &[&str],
     filesystem: bool,
@@ -225,13 +230,17 @@ async fn native_variants_with_runtime(
         // stack. In particular the filesystem-negative path has more wrappers
         // than the direct runtime case; both retain the same cleanup owner.
         let operation=Box::pin(async {
+            if variant=="container-image-installed" {
+                Box::pin(crate::marketplace::grant_store::installation::runtime::initialize_compiled_fixture(
+                    runtime.clone(),&root,&lane,&image,&deployment)).await?;
+            }
             let script=Path::new(env!("CARGO_MANIFEST_DIR")).join("../extensions/sdk/marketplace/test/compiled-build-fixture.mjs");
             let fixture=timeout(Duration::from_secs(30),tokio::process::Command::new("node").arg(script)
                 .args([toolchain.as_str(),if variant=="drop-before-build"{"match"}else{variant}]).kill_on_drop(true).output()).await??;
             if !fixture.status.success() || fixture.stdout.len()>2*1024*1024 {bail!("offline compiled fixture failed");}
             let value:serde_json::Value=canonical::parse(&fixture.stdout,2*1024*1024)?;
             let grant_fixture=(variant=="container-image-grants").then(||value.clone());
-            let retained_fixture=(variant=="container-image-retained").then(||value.clone());
+            let retained_fixture=matches!(variant,"container-image-retained"|"container-image-installed").then(||value.clone());
             let artifact=STANDARD.decode(value["artifact_base64"].as_str().context("candidate fixture missing")?)?;
             let (release,package,proof)=crate::marketplace::quarantine::tests::decode_fixture(value)?;
             let plan=SourceQuarantinePlan::for_release(&release,Some(0),&SourceJobBudget{memory_bytes:256*MIB,cpu_millicores:200,
@@ -424,7 +433,7 @@ async fn native_variants_with_runtime(
                 .context("original fixture cleanup owner still holds the lane")??;
             }
             let mut roles=vec![(deployment.clone(),volume.clone(),labels.clone())];
-            if variant=="container-image-retained" {
+            if matches!(variant,"container-image-retained"|"container-image-installed") {
                 let cold=format!("{deployment}-cold");
                 let cold_labels=HashMap::from([
                     (ELIXIR_MANAGED_LABEL.into(),"true".into()),
@@ -432,6 +441,13 @@ async fn native_variants_with_runtime(
                     ("elixir.marketplace.volume".into(),"quarantine-v1".into()),
                 ]);
                 roles.push((cold.clone(),format!("elixir-marketplace-source-{cold}"),cold_labels));
+                let installed=format!("{deployment}-installed");
+                let installed_labels=HashMap::from([
+                    (ELIXIR_MANAGED_LABEL.into(),"true".into()),
+                    (ELIXIR_DEPLOYMENT_ID_LABEL.into(),installed.clone()),
+                    ("elixir.marketplace.volume".into(),"quarantine-v1".into()),
+                ]);
+                roles.push((installed.clone(),format!("elixir-marketplace-source-{installed}"),installed_labels));
             }
             for (deployment,volume,labels) in roles {
                 SourceQuarantineJob::remove_stopped_writer(runtime.as_ref(), &deployment).await?;

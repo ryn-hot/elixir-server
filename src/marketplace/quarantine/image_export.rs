@@ -302,6 +302,17 @@ impl Export {
         self.terminal = true;
         Ok(())
     }
+    /// Keep this same owner through both staging and whole-source disposal.
+    /// A cancelled await cannot move the cleanup source out of its parent slot.
+    pub(in crate::marketplace) async fn discard_source(&mut self) -> Result<()> {
+        self.cancel().await?;
+        if let Some(source) = self.source.as_mut() {
+            source.discard_retained().await?;
+        }
+        self.staging = None;
+        self.source = None;
+        Ok(())
+    }
     pub(in crate::marketplace) fn finish(
         &mut self,
     ) -> Result<(SourceMatchedQuarantine, VerifiedImageExport)> {

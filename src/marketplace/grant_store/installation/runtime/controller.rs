@@ -138,9 +138,16 @@ impl InstalledController {
             (None, None) => true,
             _ => false,
         };
+        let same_compiled_toolchains =
+            match (&a.compiled_toolchains, &configuration.compiled_toolchains) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
         if !Arc::ptr_eq(&a.runtime, &configuration.runtime)
             || !Arc::ptr_eq(&a.playback, &configuration.playback)
             || !same_local_http
+            || !same_compiled_toolchains
             || a.lane != configuration.lane
             || a.archive != configuration.archive
             || a.image != configuration.image

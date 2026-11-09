@@ -13,6 +13,10 @@ enum Provenance {
         source: QuarantinedSource,
         expected: SourceMatchSummary,
     },
+    Compiled {
+        source: Box<SourceMatchedQuarantine>,
+        image: Box<super::super::image_reference::RuntimeImage>,
+    },
 }
 impl RetainedCode {
     /// Check while BORROWING the controller's real cleanup slot. A mismatch
@@ -58,16 +62,49 @@ impl RetainedCode {
             },
         })
     }
+    pub(in crate::marketplace) fn take_compiled(
+        slot: &mut Option<SourceMatchedQuarantine>,
+        image: &mut Option<super::super::image_reference::RuntimeImage>,
+        authority: &VerifiedRetainedAuthority,
+        expected: &SourceMatchDescriptor,
+        summary: &SourceMatchSummary,
+    ) -> Result<Self> {
+        let source = slot.as_ref().context("compiled retained source missing")?;
+        let actual_image = image.as_ref().context("compiled retained image missing")?;
+        if source.public_source.is_some() || source.retained_build.is_none() {
+            bail!("compiled installed code requires authenticated retained provenance");
+        }
+        require_byte_plan_for(
+            authority,
+            expected,
+            summary,
+            &source.execution_descriptor(),
+            RuntimeProfile::Reproducible,
+        )?;
+        source.summary().matches(&source.execution_descriptor())?;
+        if canonical::to_vec(source.summary())? != canonical::to_vec(summary)? {
+            bail!("compiled native source differs from its enrolled summary");
+        }
+        actual_image.require_source(source)?;
+        Ok(Self {
+            source: Provenance::Compiled {
+                source: Box::new(slot.take().expect("borrowed compiled source")),
+                image: Box::new(image.take().expect("borrowed compiled image")),
+            },
+        })
+    }
     fn job(&self) -> &SourceQuarantineJob {
         match &self.source {
             Provenance::Matched(source) => &source.source.job,
             Provenance::Pending { source, .. } => &source.job,
+            Provenance::Compiled { source, .. } => &source.source.job,
         }
     }
     fn job_mut(&mut self) -> &mut SourceQuarantineJob {
         match &mut self.source {
             Provenance::Matched(source) => &mut source.source.job,
             Provenance::Pending { source, .. } => &mut source.job,
+            Provenance::Compiled { source, .. } => &mut source.source.job,
         }
     }
     pub(in crate::marketplace) fn descriptor(&self) -> SourceMatchDescriptor {
@@ -94,12 +131,26 @@ impl RetainedCode {
             Provenance::Pending { source, expected } => {
                 super::evaluate_verified(source, expected, limits, arguments, broker).await
             }
+            Provenance::Compiled { source, image } => {
+                source
+                    .invoke_container(image, limits, arguments, broker)
+                    .await
+            }
         }
     }
     pub(in crate::marketplace) async fn discard(&mut self) -> Result<()> {
-        self.job_mut().discard_retained().await
+        match &mut self.source {
+            Provenance::Matched(source) => source.discard_retained().await,
+            Provenance::Compiled { source, .. } => source.discard_retained().await,
+            Provenance::Pending { source, .. } => source.discard_retained().await,
+        }
     }
     pub(in crate::marketplace) async fn park_bytes(&mut self) -> Result<bool> {
+        if matches!(self.source, Provenance::Compiled { .. }) {
+            // Do not put imported-image ownership into the SourceJs byte cache.
+            // Compiled warm reuse needs its own bounded, measured lifetime.
+            return Ok(false);
+        }
         super::super::cache::park(self.job_mut()).await
     }
     /// Optional migration + local readiness, NEVER ordinary invoke. A parsed
@@ -113,6 +164,11 @@ impl RetainedCode {
         broker: &mut dyn CandidateBroker,
     ) -> Result<()> {
         context.require_target(&self.descriptor().release.version)?;
+        if let Provenance::Compiled { source, image } = &mut self.source {
+            return source
+                .lifecycle_container(image, limits, context, execution, broker)
+                .await;
+        }
         let Provenance::Matched(source) = &mut self.source else {
             bail!("pending invocation bytes cannot become a lifecycle candidate");
         };
@@ -154,6 +210,15 @@ fn require_byte_plan(
     saved: &SourceMatchSummary,
     actual: &SourceMatchDescriptor,
 ) -> Result<()> {
+    require_byte_plan_for(authority, expected, saved, actual, RuntimeProfile::SourceJs)
+}
+fn require_byte_plan_for(
+    authority: &VerifiedRetainedAuthority,
+    expected: &SourceMatchDescriptor,
+    saved: &SourceMatchSummary,
+    actual: &SourceMatchDescriptor,
+    profile: RuntimeProfile,
+) -> Result<()> {
     expected.validate()?;
     actual.validate()?;
     saved.matches(expected)?;
@@ -167,9 +232,10 @@ fn require_byte_plan(
                 && a.blob.sha256 == b.blob.sha256
                 && a.blob.size == b.blob.size
         });
-    if authority.release().payload().runtime_profile != RuntimeProfile::SourceJs
-        || actual.workspace.artifact.is_some()
-        || expected.workspace.artifact.is_some()
+    let compiled = profile == RuntimeProfile::Reproducible;
+    if authority.release().payload().runtime_profile != profile
+        || actual.workspace.artifact.is_some() != compiled
+        || expected.workspace.artifact.is_some() != compiled
         || canonical::to_vec(authority.release().payload())?
             != canonical::to_vec(&expected.release)?
         || canonical::to_vec(&actual.release)? != canonical::to_vec(&expected.release)?

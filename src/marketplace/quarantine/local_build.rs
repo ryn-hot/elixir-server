@@ -131,6 +131,23 @@ impl LocalBuildRecord {
         self.to_bytes()?;
         self.binding.require_descriptor(source, summary)
     }
+    /// Fail-fast admission check only. Authentication of stored data cannot
+    /// mint native byte/image authority; bind_retained still requires an actual
+    /// newly rematched owner before any compiled export/import/execution.
+    pub(in crate::marketplace) fn authenticate_data(
+        &self,
+        source: &SourceMatchDescriptor,
+        summary: &SourceMatchSummary,
+        approved: &ApprovedToolchains,
+        secrets: &SecretsManager,
+    ) -> Result<()> {
+        self.require_descriptor_data(source, summary)?;
+        approved.require(self.binding.compiler)?;
+        if secrets.decrypt_bound(&self.seal, &self.binding.associated()?)? != MARKER {
+            bail!("local build record authentication failed");
+        }
+        Ok(())
+    }
     /// Check every prerequisite before changing the caller's original owner.
     /// This cannot turn an expired foreground fact into offline permission.
     pub(in crate::marketplace) fn bind_retained(
@@ -148,12 +165,12 @@ impl LocalBuildRecord {
         {
             bail!("retained build publication differs from signed installed authority");
         }
-        self.to_bytes()?;
-        self.binding.require_source(source)?;
-        approved.require(self.binding.compiler)?;
-        if secrets.decrypt_bound(&self.seal, &self.binding.associated()?)? != MARKER {
-            bail!("local build record authentication failed");
-        }
+        self.authenticate_data(
+            &source.execution_descriptor(),
+            source.summary(),
+            approved,
+            secrets,
+        )?;
         let owner = evidence_owner::EvidenceOwner::capture(source)?;
         source.retained_build = Some(Box::new(RetainedBuildBinding(self.binding.clone())));
         Ok(VerifiedLocalBuild {

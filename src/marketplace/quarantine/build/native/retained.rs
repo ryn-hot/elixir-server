@@ -127,6 +127,10 @@ pub(super) async fn run(
         ControllerLease::acquire(&lane)
             .context("original build/archive still pins its retired lane")?,
     );
+    if value["fixture_variant"].as_str()==Some("container-image-installed") {
+        return Box::pin(crate::marketplace::grant_store::installation::runtime::run_compiled_fixture(
+            runtime,root,&lane,&worker,&deployment,value)).await;
+    }
     let record = LocalBuildRecord::parse(&record.to_bytes()?)?;
     let candidate = CandidateDescriptor::parse(&serde_json::to_vec(&serde_json::json!({
         "schema_version":1,"publisher":value["publisher"],"release":value["release"],

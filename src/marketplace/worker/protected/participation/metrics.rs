@@ -137,6 +137,7 @@ impl Source {
                 playback: self.playback.clone(),
                 local_http: None,
                 application_http: None,
+                compiled_toolchains: None,
                 lane: self.source_job_directory.clone(),
                 archive: self
                     .source_job_directory
