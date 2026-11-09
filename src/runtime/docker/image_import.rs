@@ -5,6 +5,11 @@ use elixir_marketplace::{
 };
 impl DockerRuntimeManager {
     #[cfg(unix)]
+    pub fn with_marketplace_container_guardian(mut self, profile: crate::runtime::container_guardian::Profile) -> Self {
+        self.container_guardian = Some(std::sync::Arc::new(profile));
+        self
+    }
+    #[cfg(unix)]
     pub fn with_marketplace_import_profile(
         mut self,
         profile: crate::runtime::image_import::Profile,

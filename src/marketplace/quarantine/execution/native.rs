@@ -25,6 +25,8 @@ pub(in crate::marketplace) struct NativeInvocation {
     lease: Arc<ControllerLease>,
     expires: Instant,
     active: Arc<AtomicBool>,
+    #[cfg(unix)]
+    image: Option<super::super::image_reference::RuntimeImageView>,
 }
 impl NativeScope {
     /// The caller has already inspected the actual source executor's kernel
@@ -37,17 +39,66 @@ impl NativeScope {
         expires: Instant,
     ) -> Result<(Self, NativeInvocation)> {
         descriptor.validate()?;
+        Self::open_bound(
+            runtime,
+            handle,
+            (
+                Digest::of(canonical::to_vec(&descriptor.source)?),
+                descriptor.job_id()?,
+                descriptor.invocation_id,
+                descriptor.mode,
+            ),
+            lease,
+            expires,
+            #[cfg(unix)]
+            None,
+        )
+    }
+    #[cfg(unix)]
+    pub(super) fn open_container(
+        runtime: Arc<dyn RuntimeManager>,
+        handle: ContainerHandle,
+        descriptor: &elixir_marketplace::container_execution::ContainerExecutionDescriptor,
+        lease: Arc<ControllerLease>,
+        expires: Instant,
+        image: super::super::image_reference::RuntimeImageView,
+    ) -> Result<(Self, NativeInvocation)> {
+        image.require_descriptor(descriptor)?;
+        Self::open_bound(
+            runtime,
+            handle,
+            (
+                Digest::of(canonical::to_vec(&descriptor.source)?),
+                descriptor.job_id()?,
+                descriptor.invocation_id,
+                descriptor.mode,
+            ),
+            lease,
+            expires,
+            Some(image),
+        )
+    }
+    fn open_bound(
+        runtime: Arc<dyn RuntimeManager>,
+        handle: ContainerHandle,
+        coordinates: (Digest, Digest, Digest, SourceExecutionMode),
+        lease: Arc<ControllerLease>,
+        expires: Instant,
+        #[cfg(unix)] image: Option<super::super::image_reference::RuntimeImageView>,
+    ) -> Result<(Self, NativeInvocation)> {
         let active = Arc::new(AtomicBool::new(true));
         let invocation = NativeInvocation {
-            source: Digest::of(canonical::to_vec(&descriptor.source)?),
-            _execution: descriptor.job_id()?,
-            invocation: descriptor.invocation_id,
-            mode: descriptor.mode,
+            source: coordinates.0,
+            _execution: coordinates.1,
+            invocation: coordinates.2,
+            mode: coordinates.3,
             handle,
             runtime,
             lease,
             expires,
             active: active.clone(),
+            #[cfg(unix)]
+            image,
         };
         invocation.check()?;
         Ok((Self(active), invocation))
@@ -222,9 +273,14 @@ impl NativeInvocation {
         }
         Ok(())
     }
-    /// Synchronous same-transaction restriction. No disk/network operation and
-    /// no interpretation of the scope bit as successful native cleanup.
+    /// Synchronous same-transaction restriction. Compiled calls also recheck
+    /// their bounded private reference file; no network/daemon call occurs.
+    /// The scope bit never substitutes for successful native cleanup.
     pub(in crate::marketplace) fn check(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(image) = &self.image {
+            image.check()?;
+        }
         if !self.active.load(Ordering::SeqCst)
             || Instant::now() >= self.expires
             || !self.lease.matches_directory(self.lease.directory())

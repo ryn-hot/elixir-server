@@ -13,6 +13,8 @@ use elixir_marketplace::policy::OrdinaryLimits;
 
 pub mod application_http;
 pub(crate) mod build;
+#[cfg(unix)]
+pub(crate) mod container_execution;
 pub mod source_writer;
 
 pub const WORKER_UID: u32 = 10004;
@@ -201,6 +203,8 @@ fn verify_inspect(
     if build {
         build::validate_spec(spec)?;
     }
+    #[cfg(unix)]
+    if container_execution::is_command(&spec.command) { container_execution::validate_spec(spec)?; }
     let security = &state.security;
     if state.name != spec.name
         || state.network_mode != spec.network_mode
@@ -226,7 +230,11 @@ fn verify_inspect(
                         && mount.destination == expected.container_path
                         && mount.read_only == expected.read_only
                 });
-            !tmpfs && !volume
+            #[cfg(unix)]
+            let guardian = container_execution::bind_matches(spec, mount);
+            #[cfg(not(unix))]
+            let guardian = false;
+            !tmpfs && !volume && !guardian
         })
         || security.user != spec.security.user
         || security.image_reference.as_deref() != Some(spec.image.as_str())

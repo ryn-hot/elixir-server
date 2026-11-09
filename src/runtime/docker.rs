@@ -47,6 +47,8 @@ pub struct DockerRuntimeManager {
     docker_bin: String,
     #[cfg(unix)]
     import_profile:Option<std::sync::Arc<crate::runtime::image_import::Profile>>,
+    #[cfg(unix)]
+    container_guardian: Option<std::sync::Arc<crate::runtime::container_guardian::Profile>>,
     immutable_image_labels: tokio::sync::Mutex<image_labels::Cache>,
 }
 
@@ -236,6 +238,8 @@ impl DockerRuntimeManager {
             docker_bin: docker_bin.unwrap_or_else(|| "docker".to_string()),
             #[cfg(unix)]
             import_profile:None,
+            #[cfg(unix)]
+            container_guardian: None,
             immutable_image_labels: Default::default(),
         }
     }
@@ -1195,6 +1199,12 @@ impl DockerRuntimeManager {
     }
 
     fn require_source_writer_spec(spec: &ContainerSpec) -> Result<()> {
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            crate::marketplace::runtime::container_execution::validate_spec(spec)?;
+            container_resource_args(&spec.security)?;
+            return Ok(());
+        }
         if crate::marketplace::runtime::build::is_command(&spec.command) {
             crate::marketplace::runtime::build::validate_spec(spec)?;
             crate::marketplace::runtime::source_writer::SourceWriterIntent::capture(spec)?;
@@ -1258,6 +1268,10 @@ impl DockerRuntimeManager {
         }
         Self::verify_source_start_intent(value, spec)?;
         let actual = Self::extract_runtime_state(value);
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            return crate::marketplace::runtime::container_execution::verify_configuration(spec, &actual, limits);
+        }
         if crate::marketplace::runtime::build::is_command(&spec.command) {
             return crate::marketplace::runtime::build::verify_configuration(spec, &actual, limits);
         }
@@ -1275,6 +1289,10 @@ impl DockerRuntimeManager {
     }
 
     fn verify_source_start_intent(value: &Value, spec: &ContainerSpec) -> Result<()> {
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            return Self::verify_private_start_intent(value, spec, elixir_marketplace::container_execution::GUARDIAN_PATH);
+        }
         Self::verify_private_start_intent(
             value,
             spec,
@@ -1312,7 +1330,18 @@ impl DockerRuntimeManager {
             .and_then(Value::as_array)
             .context("source environment is unavailable")?;
         let mut keys = HashSet::new();
-        for item in env {
+        #[cfg(unix)]
+        let compiled = crate::marketplace::runtime::container_execution::is_command(&spec.command);
+        #[cfg(not(unix))]
+        let compiled = false;
+        #[cfg(unix)]
+        if compiled {
+            if entrypoint != elixir_marketplace::container_execution::GUARDIAN_PATH {
+                bail!("compiled command requires its independent guardian entrypoint");
+            }
+            crate::marketplace::runtime::container_execution::verify_environment(spec, value.pointer("/Config/Env").context("compiled environment absent")?)?;
+        }
+        for item in env.iter().filter(|_| !compiled) {
             let (key, _) = item
                 .as_str()
                 .and_then(|v| v.split_once('='))
@@ -2829,6 +2858,10 @@ impl DockerRuntimeManager {
 #[async_trait::async_trait]
 impl RuntimeManager for DockerRuntimeManager {
     #[cfg(unix)]
+    fn marketplace_container_guardian(&self) -> Option<std::sync::Arc<crate::runtime::container_guardian::Profile>> {
+        self.container_guardian.clone()
+    }
+    #[cfg(unix)]
     fn marketplace_import_profile(&self)->Option<std::sync::Arc<crate::runtime::image_import::Profile>> {self.import_profile.clone()}
     async fn marketplace_daemon_id(&self)->Result<String> {self.image_import_daemon_id().await}
     async fn inspect_marketplace_import_image(&self,image:elixir_marketplace::identity::Digest)->Result<Vec<u8>> {self.image_import_inspect(image).await}
@@ -3290,6 +3323,11 @@ impl RuntimeManager for DockerRuntimeManager {
         spec: &ContainerSpec,
     ) -> Result<ContainerHandle> {
         Self::require_source_writer_spec(spec)?;
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            crate::marketplace::runtime::container_execution::require_guardian(spec,
+                self.container_guardian.as_deref().context("compiled guardian is not independently configured")?)?;
+        }
         // No general conflict cleanup, implicit restart, image pull or network
         // creation. Reuse this attempt's name only after positive stopped and
         // managed-role inspection of the previous immutable writer.
@@ -3311,6 +3349,10 @@ impl RuntimeManager for DockerRuntimeManager {
             self.remove_container(&identity).await?;
         }
         // Return the CID immediately, before further inspection can fail.
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            return self.create_container_entrypoint(spec, false, Some(elixir_marketplace::container_execution::GUARDIAN_PATH)).await;
+        }
         self.create_container_mode(spec, false).await
     }
 
@@ -3321,6 +3363,11 @@ impl RuntimeManager for DockerRuntimeManager {
         limits: &crate::marketplace::runtime::SourceJobLimits,
     ) -> Result<()> {
         Self::require_source_writer_spec(spec)?;
+        #[cfg(unix)]
+        if crate::marketplace::runtime::container_execution::is_command(&spec.command) {
+            crate::marketplace::runtime::container_execution::require_guardian(spec,
+                self.container_guardian.as_deref().context("compiled guardian is not independently configured")?)?;
+        }
         limits.validate()?;
         let value = self.inspect_container(&handle.id).await?;
         Self::verify_unstarted_source_writer(&value, handle, spec, limits)?;

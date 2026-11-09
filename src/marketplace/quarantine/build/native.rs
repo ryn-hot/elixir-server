@@ -5,6 +5,78 @@ use super::*;
 use crate::runtime::docker::DockerRuntimeManager;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+// Synthetic SDK replies only. The actual NativeInvocation/image owner and
+// revocation are mandatory; this does not stand in for installed DB grants.
+struct ContainerBroker {
+    source: SourceMatchDescriptor,
+    native: Option<Arc<super::super::execution::NativeInvocation>>,
+    calls: u32,
+    retired: bool,
+}
+#[async_trait::async_trait]
+impl super::super::execution::Broker for ContainerBroker {
+    fn native_started(
+        &mut self,
+        invocation: super::super::execution::NativeInvocation,
+    ) -> Result<()> {
+        if self.native.is_some() {
+            bail!("compiled fixture received a second native owner");
+        }
+        invocation.require_invoke(&self.source)?;
+        self.native = Some(Arc::new(invocation));
+        Ok(())
+    }
+    async fn current(&mut self) -> Result<()> {
+        if let Some(native) = &self.native {
+            native.require_invoke(&self.source)?;
+        }
+        Ok(())
+    }
+    async fn request(
+        &mut self,
+        raw: &elixir_marketplace::source_execution::RuntimeJson,
+        _: usize,
+    ) -> Result<elixir_marketplace::source_execution::SourceSdkReply> {
+        use elixir_marketplace::source_execution::{RuntimeJson, SourceSdkReply, SourceSdkRequest};
+        let native = self.native
+            .as_ref()
+            .context("SDK effect preceded actual native binding")?;
+        native.require_invoke(&self.source)?;
+        // Like the actual installed broker: require the immutable process to
+        // be running immediately before an effect, not after RESULT_ACK has
+        // deliberately let the guardian exit. Scope/image/lease checks remain
+        // live throughout transport and the actual exit is joined separately.
+        native.current().await?;
+        self.calls += 1;
+        let request = SourceSdkRequest::parse(raw)?;
+        let value = match (self.calls, request) {
+            (1, SourceSdkRequest::StateSet { key, value })
+                if key == "fixture" && value == serde_json::json!(true) =>
+            {
+                serde_json::json!(true)
+            }
+            (2, SourceSdkRequest::StateGet { key }) if key == "fixture" => serde_json::json!(true),
+            (3, SourceSdkRequest::Secret { key }) if key == "token" => {
+                serde_json::json!("synthetic-sdk-value")
+            }
+            (4, SourceSdkRequest::Fetch { url, .. }) if url == "https://fixture.invalid/" => {
+                serde_json::json!({"body":"synthetic body","headers":[],"status":200})
+            }
+            _ => bail!("compiled fixture requested an unexpected synthetic SDK effect"),
+        };
+        Ok(SourceSdkReply::Value(RuntimeJson::from_value(value)?))
+    }
+    async fn retire_effects(&mut self) -> Result<()> {
+        if let Some(native) = self.native.take() {
+            if native.check().is_ok() {
+                bail!("compiled native scope was not revoked before retiring effects");
+            }
+            self.retired = true;
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 #[ignore = "explicit private native compiled-build ownership test; no public network"]
 async fn actual_owned_source_staging_build_comparison_and_deadline_cleanup() -> Result<()> {
@@ -45,22 +117,48 @@ async fn actual_owned_reproduction_filesystem_and_native_export_seal_and_cleanup
 }
 
 async fn native_variants(variants: &[&str], filesystem: bool, export: bool) -> Result<()> {
-    native_variants_with_import(variants,filesystem,export,false).await
+    native_variants_with_import(variants, filesystem, export, false).await
 }
 #[tokio::test]
 #[ignore = "explicit offline original-source-owner image import/retirement; no publisher execution"]
-async fn actual_owned_reproduction_export_daemon_import_inspection_and_retirement()->Result<()> {
-    native_variants_with_import(&["container-image"],true,true,true).await
+async fn actual_owned_reproduction_export_daemon_import_inspection_and_retirement() -> Result<()> {
+    native_variants_with_import(&["container-image"], true, true, true).await
 }
-async fn native_variants_with_import(variants: &[&str], filesystem: bool, export: bool, import:bool) -> Result<()> {
-    native_variants_with_handoff(variants,filesystem,export,import,false).await
+async fn native_variants_with_import(
+    variants: &[&str],
+    filesystem: bool,
+    export: bool,
+    import: bool,
+) -> Result<()> {
+    native_variants_with_handoff(variants, filesystem, export, import, false).await
 }
 #[tokio::test]
-#[ignore="explicit original-source image reference handoff across another native phase; no publisher execution"]
-async fn actual_owned_import_reference_handoff_native_phase_and_disposal()->Result<()> {
-    native_variants_with_handoff(&["container-image"],true,true,true,true).await
+#[ignore = "explicit original-source image reference handoff across another native phase; no publisher execution"]
+async fn actual_owned_import_reference_handoff_native_phase_and_disposal() -> Result<()> {
+    native_variants_with_handoff(&["container-image"], true, true, true, true).await
 }
-async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bool,import:bool,adopt:bool)->Result<()> {
+async fn native_variants_with_handoff(
+    variants: &[&str],
+    filesystem: bool,
+    export: bool,
+    import: bool,
+    adopt: bool,
+) -> Result<()> {
+    native_variants_with_runtime(variants, filesystem, export, import, adopt, false).await
+}
+#[tokio::test]
+#[ignore = "explicit original-source rebuilt/imported image plus independent guardian and SDK execution; no activation or public network"]
+async fn actual_owned_rebuilt_imported_container_invocation_sdk_and_cleanup() -> Result<()> {
+    native_variants_with_runtime(&["container-image-runtime"], true, true, true, true, true).await
+}
+async fn native_variants_with_runtime(
+    variants: &[&str],
+    filesystem: bool,
+    export: bool,
+    import: bool,
+    adopt: bool,
+    execute: bool,
+) -> Result<()> {
     let image = std::env::var("ELIXIR_MARKETPLACE_WORKER_IMAGE")?;
     let toolchain = std::env::var("ELIXIR_MARKETPLACE_TOOLCHAIN_IMAGE")?;
     if !image.starts_with("sha256:")
@@ -70,13 +168,34 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
     {
         bail!("explicit immutable local fixture images required");
     }
-    let mut manager=DockerRuntimeManager::new(None);
+    let mut manager = DockerRuntimeManager::new(None);
     if import {
-        let profile=crate::runtime::image_import::Profile::from_operator_configuration(
-            std::path::PathBuf::from(std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_BINARY").context("explicit host import companion missing")?).canonicalize()?,
+        let profile = crate::runtime::image_import::Profile::from_operator_configuration(
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_BINARY")
+                    .context("explicit host import companion missing")?,
+            )
+            .canonicalize()?,
             std::env::var("ELIXIR_TEST_IMAGE_IMPORT_BINARY_SHA256")?.parse()?,
-            std::path::PathBuf::from(std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_SOCKET").context("explicit local daemon socket missing")?).canonicalize()?)?;
-        manager=manager.with_marketplace_import_profile(profile);
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_IMAGE_IMPORT_SOCKET")
+                    .context("explicit local daemon socket missing")?,
+            )
+            .canonicalize()?,
+        )?;
+        manager = manager.with_marketplace_import_profile(profile);
+    }
+    if execute {
+        let profile = crate::runtime::container_guardian::Profile::from_operator_configuration(
+            std::path::PathBuf::from(
+                std::env::var_os("ELIXIR_TEST_CONTAINER_GUARDIAN_BINARY")
+                    .context("explicit guardian binary missing")?,
+            )
+            .canonicalize()?,
+            std::env::var("ELIXIR_TEST_CONTAINER_GUARDIAN_SHA256")?.parse()?,
+            elixir_marketplace::reproduction::BuildPlatform::LinuxAmd64,
+        )?;
+        manager = manager.with_marketplace_container_guardian(profile);
     }
     let runtime = Arc::new(manager);
     for &variant in variants {
@@ -90,7 +209,10 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
             (ELIXIR_DEPLOYMENT_ID_LABEL.into(), deployment.clone()),
             ("elixir.marketplace.volume".into(), "quarantine-v1".into()),
         ]);
-        let operation=async {
+        // Do not duplicate the whole multi-phase state on each async wrapper's
+        // stack. In particular the filesystem-negative path has more wrappers
+        // than the direct runtime case; both retain the same cleanup owner.
+        let operation=Box::pin(async {
             let script=Path::new(env!("CARGO_MANIFEST_DIR")).join("../extensions/sdk/marketplace/test/compiled-build-fixture.mjs");
             let fixture=timeout(Duration::from_secs(30),tokio::process::Command::new("node").arg(script)
                 .args([toolchain.as_str(),if variant=="drop-before-build"{"match"}else{variant}]).kill_on_drop(true).output()).await??;
@@ -132,6 +254,7 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                 built?;
                 let (mut source,evidence)=build.finish()?;
                 let mut adopted_image=None;
+                let mut runtime_view=None;
                 if build.package.is_some() || build.proof.is_some() {
                     bail!("build retained source file descriptors after retiring staging allocation");
                 }
@@ -142,7 +265,10 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                 if filesystem {
                     // Both fixtures have a valid exact image graph; the
                     // negative must fail native layer semantics, not parsing.
-                    super::super::container_image::descriptor(&source)?.verify(std::io::Cursor::new(&artifact))?;
+                    let expected_image=super::super::container_image::descriptor(&source)?.verify(std::io::Cursor::new(&artifact))?;
+                    if variant=="container-image" && expected_image.config.to_string()!="sha256:452c1ee955f698cad26d3427503f00371c288cf0db5d42fe6c433aad59c94ad8" {
+                        bail!("original image fixture changed unexpectedly");
+                    }
                     let observed=source.check_container_filesystem(&evidence).await;
                     if variant=="container-image-filesystem-invalid" {
                         let error=observed.err().context("reproduced missing-working-directory image was admitted")?;
@@ -153,7 +279,8 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                         let observed=observed?;
                         observed.require_source(&source)?;
                         let summary=observed.summary();
-                        if summary.image.artifact.sha256!=release.payload().artifacts[0].blob.sha256
+                        if canonical::to_vec(&summary.image)?!=canonical::to_vec(&expected_image)?
+                            || summary.image.artifact.sha256!=release.payload().artifacts[0].blob.sha256
                             || summary.entrypoint!="/app/provider" || summary.working_directory!="/app"
                             || summary.final_entries!=3 || summary.reserved_unpacked_bytes>512*MIB {
                             bail!("native image filesystem differs from reproduced artifact");
@@ -165,8 +292,8 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                             exporting.run().await?;
                             let (returned,mut sealed)=exporting.finish()?;
                             sealed.require_source(&returned)?;
-                            if returned.expires()!=original_expires || sealed.summary().archive.size!=688_128
-                                || sealed.summary().filesystem.image.config.to_string()!="sha256:452c1ee955f698cad26d3427503f00371c288cf0db5d42fe6c433aad59c94ad8" {
+                            if returned.expires()!=original_expires || (!execute && sealed.summary().archive.size!=688_128)
+                                || sealed.summary().filesystem.image.config!=expected_image.config {
                                 bail!("native staged image export differs from original authored fixture/deadline");
                             }
                             if import {
@@ -175,17 +302,36 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                                 if original.is_some() || export.is_some(){bail!("image importer did not take its actual original source/export");}
                                 importing.run().await?;
                                 importing.verified()?.require_source(importing.source()?)?;
-                                if importing.source()?.expires()!=original_expires || importing.verified()?.config().to_string()!="sha256:452c1ee955f698cad26d3427503f00371c288cf0db5d42fe6c433aad59c94ad8" {
+                                if importing.source()?.expires()!=original_expires || importing.verified()?.config()!=expected_image.config {
                                     bail!("native import changed its original source/image/deadline");
                                 }
                                 if adopt {
                                     let (mut returned,image)=importing.adopt().await?;
                                     image.require_source(&returned)?;
-                                    if Fence::load(&returned.job_lease())?.is_some() || image.image().config.to_string()!="sha256:452c1ee955f698cad26d3427503f00371c288cf0db5d42fe6c433aad59c94ad8" {bail!("image handoff did not release only its old actor fence");}
+                                    if Fence::load(&returned.job_lease())?.is_some() || (!execute && image.image().config.to_string()!="sha256:452c1ee955f698cad26d3427503f00371c288cf0db5d42fe6c433aad59c94ad8") {bail!("image handoff did not release only its old actor fence");}
                                     // Actual independently inspected native measurement,
                                     // NOT publisher execution. The passive image must
                                     // remain owned across this distinct root operation.
                                     returned.source.job.measure_host(original_expires).await?.report()?;
+                                    if execute {
+                                        let view=image.runtime_view(&returned)?;
+                                        view.check()?;
+                                        let mut broker=ContainerBroker { source: returned.execution_descriptor(), native: None, calls: 0, retired: false };
+                                        let limits=elixir_marketplace::source_execution::SourceExecutionLimits {
+                                            profile: Default::default(), heap_bytes:32*MIB, timeout_millis:10_000,
+                                            max_file_bytes:8*MIB,json_bytes:MIB,pending_jobs:128,
+                                            sdk:Some(elixir_marketplace::source_execution::SourceSdkLimits {calls:8,request_bytes:MIB,response_bytes:MIB}),
+                                        };
+                                        let started=Instant::now();
+                                        let invoked=returned.invoke_container(&image, limits,
+                                            &elixir_marketplace::source_execution::RuntimeJson::parse(b"null")?,&mut broker).await;
+                                        println!("compiled fixture invocation: elapsed_ms={} sdk_calls={} scope_retired={}",started.elapsed().as_millis(),broker.calls,broker.retired);
+                                        let result=invoked.context("original-source compiled fixture invocation")?;
+                                        if result.as_str()!="true" || broker.calls!=4 || !broker.retired {bail!("original-source compiled SDK invocation did not complete and revoke its scope");}
+                                        image.require_source(&returned)?;
+                                        view.check()?;
+                                        runtime_view=Some(view);
+                                    }
                                     image.require_source(&returned)?;adopted_image=Some(image);source=returned;
                                 } else {
                                     importing.cancel().await?;
@@ -216,6 +362,9 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                     if source.expires()!=original_expires {bail!("container graph check renewed its original deadline");}
                 }
                 source.discard_retained().await?;
+                if let Some(view)=runtime_view {
+                    if view.check().is_ok(){bail!("disposed source/image left a usable compiled SDK image view");}
+                }
                 if let Some(image)=adopted_image {
                     if image.require_source(&source).is_ok(){bail!("disposed image reference retained usable runtime evidence");}
                     super::super::image_reference::require_absent(&source.job_lease())?;
@@ -230,10 +379,10 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
             if fs_exists(&lane.join("build-inputs/releases/.pending")) {bail!("build staging retained payload files after joined cleanup");}
             println!("offline native build {variant}: exact original source owner, package/proof-only staging, no activation claim");
             Ok::<_,anyhow::Error>(())
-        }.await;
+        }).await;
         // Exact source-role recovery only. Keep any uncertain fence for audit;
         // never force-reset it or infer process retirement from a missing name.
-        let cleanup = async {
+        let cleanup = Box::pin(async {
             if lane.exists() {
                 // An operation error can drop its build owner and start that
                 // SAME retained cleanup task. Wait for its actual OS lock;
@@ -265,8 +414,7 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
                 bail!("fixture writer remains");
             }
             Ok::<_, anyhow::Error>(())
-        }
-        .await;
+        }).await;
         if let Err(error) = cleanup {
             let retained = directory.keep();
             bail!(
@@ -289,4 +437,16 @@ async fn native_variants_with_handoff(variants:&[&str],filesystem:bool,export:bo
 }
 fn fs_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+#[test]
+fn multi_phase_fixture_wrappers_keep_bounded_futures_without_a_larger_thread_stack() {
+    fn bytes<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    // No future is created/polled and no native work or grant is fabricated.
+    let direct = bytes(|| native_variants_with_runtime(&[], true, true, true, true, true));
+    let nested = bytes(|| native_variants(&[], true, false));
+    assert!(direct <= 128 * 1024, "direct fixture future too large: {direct}");
+    assert!(nested <= 128 * 1024, "nested fixture future too large: {nested}");
 }

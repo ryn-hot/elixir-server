@@ -279,6 +279,56 @@ impl RuntimeImage {
     pub(in crate::marketplace) fn image(&self) -> &ContainerImageSummary {
         &self.image
     }
+    pub(in crate::marketplace) fn runtime_view(
+        &self,
+        source: &SourceMatchedQuarantine,
+    ) -> Result<RuntimeImageView> {
+        self.require_source(source)?;
+        Ok(RuntimeImageView {
+            owner: evidence_owner::EvidenceOwner::capture(source)?,
+            file: self.file.try_clone()?,
+            record: self.record.clone(),
+            image: self.image.clone(),
+            source: Digest::of(canonical::to_vec(&source.execution_descriptor())?),
+        })
+    }
+}
+
+/// A live private view for the SAME invocation's SDK checks. No Clone,
+/// Deserialize or constructor from disk/summary; it cannot keep a job alive.
+pub(in crate::marketplace) struct RuntimeImageView {
+    owner: evidence_owner::EvidenceOwner,
+    file: File,
+    record: Record,
+    image: ContainerImageSummary,
+    source: Digest,
+}
+impl RuntimeImageView {
+    pub(in crate::marketplace) fn check(&self) -> Result<()> {
+        let lease = self.owner.current()?;
+        require_active(&lease, self.record.operation_id, self.record.intent())?;
+        private(&self.file)?;
+        let (named, record) = read(&lease, FILE)?;
+        let held = self.file.metadata()?;
+        let actual = named.metadata()?;
+        if held.dev() != actual.dev() || held.ino() != actual.ino() || record != self.record {
+            bail!("compiled invocation lost its actual imported-image reference");
+        }
+        Ok(())
+    }
+    pub(in crate::marketplace) fn require_descriptor(
+        &self,
+        descriptor: &elixir_marketplace::container_execution::ContainerExecutionDescriptor,
+    ) -> Result<()> {
+        self.check()?;
+        descriptor.validate()?;
+        if self.source != Digest::of(canonical::to_vec(&descriptor.source)?)
+            || canonical::to_vec(&self.image)? != canonical::to_vec(&descriptor.image)?
+        {
+            bail!("compiled invocation differs from its private source/image provenance");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

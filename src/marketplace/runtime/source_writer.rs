@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) fn supported_command(command: &[String]) -> bool {
     matches!(command, [mode, _] if matches!(mode.as_str(),
         "--quarantine" | "--export-blob" | "--source-match" | "--build-inputs-check" | "--container-image-check" | "--container-filesystem-check" | "--container-image-export" | "--source-eval" | "--source-eval-verified"
-        | "--build-output-init" | "--build-run" | "--build-output-check"))
+        | "--build-output-init" | "--build-run" | "--build-output-check" | "--container-eval"))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -105,6 +105,7 @@ mod tests {
             "--build-output-check",
             "--source-eval",
             "--source-eval-verified",
+            "--container-eval",
         ] {
             assert!(supported_command(&[mode.into(), "{}".into()]));
         }

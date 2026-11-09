@@ -10,6 +10,16 @@ pub(super) struct EvidenceOwner {
     release: Digest,
 }
 impl EvidenceOwner {
+    pub(super) fn current(&self) -> Result<Arc<ControllerLease>> {
+        let lease = self
+            .lease
+            .upgrade()
+            .context("native evidence source owner was disposed")?;
+        if Instant::now() >= self.expires || !lease.matches_directory(lease.directory()) {
+            bail!("native evidence source owner is no longer current");
+        }
+        Ok(lease)
+    }
     pub(super) fn capture(source: &SourceMatchedQuarantine) -> Result<Self> {
         source.ensure_job_active()?;
         let lease = &source.source.job._lease;

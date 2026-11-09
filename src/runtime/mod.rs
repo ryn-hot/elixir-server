@@ -14,6 +14,8 @@ use crate::runtime::model::{
 
 pub mod docker;
 #[cfg(unix)]
+pub mod container_guardian;
+#[cfg(unix)]
 pub mod gateway_creation;
 pub mod health;
 pub mod http_creation;
@@ -89,6 +91,8 @@ pub fn deployment_id_for_storage_root(storage_root: &str) -> String {
 
 #[async_trait]
 pub trait RuntimeManager: Send + Sync {
+    #[cfg(unix)]
+    fn marketplace_container_guardian(&self) -> Option<std::sync::Arc<container_guardian::Profile>> { None }
     #[cfg(unix)]
     fn marketplace_import_profile(&self)->Option<std::sync::Arc<image_import::Profile>> {None}
     async fn marketplace_daemon_id(&self)->anyhow::Result<String> {anyhow::bail!("runtime lacks local image-import daemon identity")}

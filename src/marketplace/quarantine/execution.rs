@@ -9,6 +9,8 @@ use elixir_marketplace::source_execution::{
     SourceSdkRequest,
 };
 
+#[cfg(unix)]
+mod container;
 mod native;
 mod retained;
 #[cfg(unix)]
@@ -163,7 +165,24 @@ async fn exchange(
     arguments: &RuntimeJson,
     broker: &mut dyn Broker,
 ) -> Result<RuntimeJson> {
-    let job = descriptor.job_id()?;
+    exchange_bound(
+        channel,
+        descriptor.job_id()?,
+        &descriptor.limits,
+        arguments,
+        broker,
+    )
+    .await
+}
+// Wire/session limits only, not a constructor for native/grant authority.
+// Each caller must first establish its distinct actual native provenance.
+async fn exchange_bound(
+    channel: &mut SourceChannel,
+    job: Digest,
+    limits: &SourceExecutionLimits,
+    arguments: &RuntimeJson,
+    broker: &mut dyn Broker,
+) -> Result<RuntimeJson> {
     broker.current().await?;
     channel
         .execution_send(job, PayloadKind::Arguments, arguments, broker)
@@ -178,16 +197,12 @@ async fn exchange(
         // bound the entire exchange; frames/SDK calls never extend them.
         let event = guarded(
             broker,
-            channel.execution_event(
-                job,
-                Duration::from_millis(u64::from(descriptor.limits.timeout_millis)),
-            ),
+            channel.execution_event(job, Duration::from_millis(u64::from(limits.timeout_millis))),
         )
         .await?;
         match event {
             Event::SdkCall { call_id, .. } => {
-                let allowance = descriptor
-                    .limits
+                let allowance = limits
                     .sdk
                     .as_ref()
                     .context("source SDK transport is disabled")?;
@@ -223,7 +238,7 @@ async fn exchange(
                 let maximum = allowance
                     .response_bytes
                     .saturating_sub(responses)
-                    .min(descriptor.limits.json_bytes);
+                    .min(limits.json_bytes);
                 if maximum == 0 {
                     bail!("source SDK reply allowance exhausted");
                 }
@@ -267,7 +282,7 @@ async fn exchange(
                         first,
                         job,
                         PayloadKind::Result,
-                        descriptor.limits.json_bytes as usize,
+                        limits.json_bytes as usize,
                         broker,
                     )
                     .await?;
