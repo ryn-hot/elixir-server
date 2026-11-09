@@ -39,6 +39,8 @@ mod provider_state;
 pub mod quarantine;
 pub mod runtime;
 pub mod search;
+#[cfg(test)]
+mod search_timing;
 pub mod security_state;
 mod selected_source;
 pub mod service;

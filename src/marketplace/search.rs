@@ -814,6 +814,8 @@ impl SearchService {
         }
     }
     pub(super) async fn view(&self, id: Uuid) -> Result<SearchView> {
+        #[cfg(test)]
+        let (timing, began) = (super::search_timing::view(id), std::time::Instant::now());
         let _permit = self.views.try_acquire().context("search view is busy")?;
         let (
             request,
@@ -859,9 +861,16 @@ impl SearchService {
             }
             live.push(value.clone());
         }
-        let summaries = backend
-            .supports(&live)
-            .await
+        #[cfg(test)]
+        let supports_began = std::time::Instant::now();
+        let pending_summaries = backend.supports(&live);
+        #[cfg(test)]
+        let summaries = super::search_timing::scope(timing, pending_summaries).await;
+        #[cfg(not(test))]
+        let summaries = pending_summaries.await;
+        #[cfg(test)]
+        let supports_us = super::search_timing::micros(supports_began);
+        let summaries = summaries
             .ok()
             .filter(|rows| rows.len() == live.len())
             .unwrap_or_else(|| vec![None; live.len()]);
@@ -935,7 +944,7 @@ impl SearchService {
                 preparation = query.preparation.clone();
             }
         }
-        Ok(SearchView {
+        let view = SearchView {
             schema_version: SCHEMA_VERSION,
             query_id: id,
             query: request.query,
@@ -959,7 +968,18 @@ impl SearchService {
             metadata_only: true,
             valid_for_seconds: valid_for.as_secs().saturating_sub(1),
             preparation,
-        })
+        };
+        #[cfg(test)]
+        if let Some(context) = timing {
+            super::search_timing::emit(super::search_timing::Event::SearchViewTiming {
+                context,
+                supports_us,
+                total_us: super::search_timing::micros(began),
+                cards: view.results.len(),
+                phase: view.phase,
+            });
+        }
+        Ok(view)
     }
 }
 async fn run(inner: Arc<Inner>) {
@@ -1193,13 +1213,15 @@ async fn process(
     // One bounded aggregate per successful query in explicit test binaries.
     // No query text, identities, key material or production logging changes.
     #[cfg(test)]
-    eprintln!(
-        "{}",
-        serde_json::json!({"stage":"search_query_timing","candidates":attempts,
-            "initial_page_ms":initial_page_ms,"admission_ms":admission_time.as_millis(),
-            "continuation_ms":continuation_time.as_millis(),"first_admitted_ms":first_admitted_ms,
-            "total_ms":began.elapsed().as_millis()})
-    );
+    super::search_timing::emit(super::search_timing::Event::SearchQueryTiming {
+        query_id: interest.id,
+        candidates: attempts,
+        initial_page_ms,
+        admission_ms: admission_time.as_millis(),
+        continuation_ms: continuation_time.as_millis(),
+        first_admitted_ms,
+        total_ms: began.elapsed().as_millis(),
+    });
     Ok(())
 }
 // Best-effort enrichment of an already admitted page. Errors cannot turn

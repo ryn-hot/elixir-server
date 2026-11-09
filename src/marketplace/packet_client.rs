@@ -27,7 +27,7 @@ use tokio::{
 };
 
 pub(super) struct PacketClient {
-    process: PrivateProcessStdio,
+    process: Option<PrivateProcessStdio>,
     diagnostics: tokio::task::JoinHandle<()>,
     failure_stage: Arc<AtomicU16>,
     generation_mismatch: Arc<AtomicU64>,
@@ -189,7 +189,7 @@ impl PacketClient {
             let _ = sender.send(()).await;
         });
         Ok(Self {
-            process,
+            process: Some(process),
             diagnostics,
             failure_stage,
             generation_mismatch,
@@ -257,34 +257,35 @@ impl PacketClient {
         }
         // Keep poisoned across cancellation/unknown apply. Never retry a debit.
         self.poisoned = true;
+        let process = self
+            .process
+            .as_mut()
+            .context("packet attachment is closed")?;
         let mut cancellation = Cancel {
-            child: &mut self.process.child,
+            child: &mut process.child,
             armed: true,
         };
         let deadline = command_deadline(self.deadline, &request.command);
         let operation = async {
-            self.process
+            process
                 .input
                 .write_all(&(bytes.len() as u32).to_be_bytes())
                 .await?;
-            self.process.input.write_all(&bytes).await?;
+            process.input.write_all(&bytes).await?;
             if let Some(secrets) = secrets {
-                self.process
+                process
                     .input
                     .write_all(&(SECRET_FRAME_BYTES as u32).to_be_bytes())
                     .await?;
-                self.process
-                    .input
-                    .write_all(secrets.private_frame())
-                    .await?;
+                process.input.write_all(secrets.private_frame()).await?;
             }
-            self.process.input.flush().await?;
-            let length = self.process.output.read_u32().await? as usize;
+            process.input.flush().await?;
+            let length = process.output.read_u32().await? as usize;
             if length == 0 || length > MAX_GUARD_REPLY_BYTES {
                 bail!("invalid packet actor response length");
             }
             let mut bytes = vec![0; length];
-            self.process.output.read_exact(&mut bytes).await?;
+            process.output.read_exact(&mut bytes).await?;
             let reply: GuardReply = canonical::decode(&bytes, MAX_GUARD_REPLY_BYTES)?;
             if reply.schema_version != 1
                 || reply.sequence != self.sequence
@@ -434,23 +435,43 @@ impl PacketClient {
         result
     }
     pub(super) async fn close(mut self) {
-        let _ = self.process.input.shutdown().await;
-        if timeout(Duration::from_secs(2), self.process.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.process.child.start_kill();
-            let _ = timeout(Duration::from_secs(2), self.process.child.wait()).await;
-        }
+        let _ = self.close_attachment().await;
         self.diagnostics.abort();
+    }
+    async fn close_attachment(&mut self) -> Result<std::process::ExitStatus> {
+        self.poisoned = true;
+        let mut process = self.process.take().context("packet attachment is closed")?;
+        // ChildStdin::shutdown does not close the Unix pipe. Deliver EOF to
+        // this original actor before waiting, retaining bounded forced cleanup.
+        drop(process.input);
+        let mut cancellation = Cancel {
+            child: &mut process.child,
+            armed: true,
+        };
+        let status = match timeout(Duration::from_secs(2), cancellation.child.wait()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = cancellation.child.start_kill();
+                timeout(Duration::from_secs(2), cancellation.child.wait()).await??
+            }
+        };
+        cancellation.armed = false;
+        self.diagnostics.abort();
+        Ok(status)
     }
     /// Native parent retirement requires the original attachment's actual join.
     pub(super) async fn close_joined(mut self) -> Result<()> {
         self.poisoned = true;
-        let _ = self.process.child.start_kill();
-        timeout(Duration::from_secs(10), self.process.child.wait())
+        let mut process = self.process.take().context("packet attachment is closed")?;
+        let mut cancellation = Cancel {
+            child: &mut process.child,
+            armed: true,
+        };
+        let _ = cancellation.child.start_kill();
+        timeout(Duration::from_secs(10), cancellation.child.wait())
             .await
             .context("original packet attachment termination unconfirmed")??;
+        cancellation.armed = false;
         Ok(())
     }
 }
@@ -490,7 +511,9 @@ impl Drop for Cancel<'_> {
 impl Drop for PacketClient {
     fn drop(&mut self) {
         self.diagnostics.abort();
-        let _ = self.process.child.start_kill();
+        if let Some(process) = &mut self.process {
+            let _ = process.child.start_kill();
+        }
     }
 }
 
@@ -720,6 +743,50 @@ for(let i=0;i<frame.length;i+=3)process.stdout.write(frame.subarray(i,i+3));
         client.deadline = deadline;
         Ok(client)
     }
+    #[tokio::test]
+    async fn closing_packet_attachment_delivers_eof_before_wait_without_granting_health()
+    -> Result<()> {
+        let mut child = tokio::process::Command::new("node")
+            .args(["-e", "const timer=setInterval(()=>{},1000);process.stdin.resume();process.stdin.once('end',()=>clearInterval(timer));process.stdout.write('READY');"])
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+        let mut client = PacketClient::new(
+            PrivateProcessStdio {
+                input: child.stdin.take().context("stdin")?,
+                output: child.stdout.take().context("stdout")?,
+                diagnostics: child.stderr.take(),
+                child,
+            },
+            Digest::of(b"EOF test only"),
+            128 * 1024 * 1024,
+            100,
+            16,
+        )?;
+        let mut ready = [0; 5];
+        timeout(
+            Duration::from_secs(3),
+            client
+                .process
+                .as_mut()
+                .context("attachment")?
+                .output
+                .read_exact(&mut ready),
+        )
+        .await??;
+        assert_eq!(&ready, b"READY");
+        assert!(client.close_attachment().await?.success());
+        assert!(client.process.is_none() && client.poisoned);
+        assert!(client.namespace.is_none() && client.credit.is_none());
+        assert!(client.close_attachment().await.is_err());
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_packet_retirement_still_joins_the_original_attachment() -> Result<()> {
+        fake("stall", Duration::from_secs(3))?.close_joined().await
+    }
+
     #[tokio::test]
     async fn private_client_correlates_operations_credit_and_kernel_identity() -> Result<()> {
         let mut client = fake("good", Duration::from_secs(2))?;

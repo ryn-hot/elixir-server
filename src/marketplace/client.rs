@@ -37,7 +37,7 @@ fn control_deadline(base: Duration, operation: &WorkerControlOperation) -> Durat
 }
 
 pub struct PrivateWorkerClient {
-    process: PrivateProcessStdio,
+    process: Option<PrivateProcessStdio>,
     diagnostics: tokio::task::JoinHandle<()>,
     diagnostic_overflow: mpsc::Receiver<()>,
     prefix: u64,
@@ -76,7 +76,7 @@ impl PrivateWorkerClient {
             u64::from(u32::from_be_bytes(random.as_bytes()[..4].try_into().unwrap()) & 0x7fff_ffff)
                 << 20;
         Ok(Self {
-            process,
+            process: Some(process),
             diagnostics,
             diagnostic_overflow: receiver,
             prefix,
@@ -105,16 +105,33 @@ impl PrivateWorkerClient {
         };
         request.validate()?;
         let encoded = canonical::to_vec(&request)?;
-        self.exchange(&encoded, MAX_CONTROL_FRAME_BYTES, self.deadline, |bytes| {
-            let response = PeerResponse::parse(bytes)?;
-            if response.request_id != Some(id) {
-                bail!("private response correlation mismatch");
-            }
-            if !peer_kind_matches(&request.request, &response.response) {
-                bail!("private response operation differs from request");
-            }
-            Ok(response)
-        })
+        #[cfg(test)]
+        let timing = matches!(&request.request, PeerOperation::Search { .. })
+            .then(|| {
+                super::search_timing::Rpc::begin(
+                    id,
+                    super::search_timing::RpcKind::LocalSearch,
+                    encoded.len(),
+                )
+            })
+            .flatten();
+        self.exchange(
+            &encoded,
+            MAX_CONTROL_FRAME_BYTES,
+            self.deadline,
+            #[cfg(test)]
+            timing,
+            |bytes| {
+                let response = PeerResponse::parse(bytes)?;
+                if response.request_id != Some(id) {
+                    bail!("private response correlation mismatch");
+                }
+                if !peer_kind_matches(&request.request, &response.response) {
+                    bail!("private response operation differs from request");
+                }
+                Ok(response)
+            },
+        )
         .await
     }
 
@@ -149,15 +166,35 @@ impl PrivateWorkerClient {
         let encoded = canonical::to_vec(&request)?;
         let reply_limit = request.control.reply_limit();
         let deadline = control_deadline(self.deadline, &request.control);
-        self.exchange(&encoded, reply_limit, deadline, |bytes| {
-            let response = WorkerControlResponse::parse(bytes)?;
-            if response.request_id != id
-                || !control_kind_matches(&request.control, &response.control_response)
-            {
-                bail!("private receipt correlation, operation or work differs");
-            }
-            Ok(response)
+        #[cfg(test)]
+        let timing = matches!(
+            &request.control,
+            WorkerControlOperation::CatalogHeads { .. }
+        )
+        .then(|| {
+            super::search_timing::Rpc::begin(
+                id,
+                super::search_timing::RpcKind::CatalogHeads,
+                encoded.len(),
+            )
         })
+        .flatten();
+        self.exchange(
+            &encoded,
+            reply_limit,
+            deadline,
+            #[cfg(test)]
+            timing,
+            |bytes| {
+                let response = WorkerControlResponse::parse(bytes)?;
+                if response.request_id != id
+                    || !control_kind_matches(&request.control, &response.control_response)
+                {
+                    bail!("private receipt correlation, operation or work differs");
+                }
+                Ok(response)
+            },
+        )
         .await
     }
 
@@ -166,6 +203,7 @@ impl PrivateWorkerClient {
         encoded: &[u8],
         reply_limit: usize,
         deadline: Duration,
+        #[cfg(test)] mut timing: Option<super::search_timing::Rpc>,
         decode: impl FnOnce(&[u8]) -> Result<T>,
     ) -> Result<T> {
         if self.poisoned {
@@ -177,31 +215,56 @@ impl PrivateWorkerClient {
         // Cancellation after any I/O leaves an ambiguous stream. Keep it
         // poisoned and kill the attachment unless a full correlated reply wins.
         self.poisoned = true;
+        let process = self
+            .process
+            .as_mut()
+            .context("private worker attachment is closed")?;
         let mut cancellation = KillOnCancellation {
-            child: &mut self.process.child,
+            child: &mut process.child,
             armed: true,
         };
         let operation = async {
-            self.process
+            process
                 .input
                 .write_all(&(encoded.len() as u32).to_be_bytes())
                 .await?;
-            self.process.input.write_all(encoded).await?;
-            self.process.input.flush().await?;
-            let length = self.process.output.read_u32().await? as usize;
+            process.input.write_all(encoded).await?;
+            process.input.flush().await?;
+            #[cfg(test)]
+            if let Some(timing) = &mut timing {
+                timing.written();
+            }
+            let length = process.output.read_u32().await? as usize;
+            #[cfg(test)]
+            if let Some(timing) = &mut timing {
+                timing.header(length);
+            }
             if length == 0 || length > reply_limit {
                 bail!("invalid private response length");
             }
             let mut bytes = vec![0; length];
-            self.process.output.read_exact(&mut bytes).await?;
+            process.output.read_exact(&mut bytes).await?;
+            #[cfg(test)]
+            if let Some(timing) = &mut timing {
+                timing.body();
+            }
             // Decode and correlate before unpoisoning. A syntactically valid
             // reply of the wrong private/public kind is still terminal.
-            decode(&bytes)
+            let result = decode(&bytes);
+            #[cfg(test)]
+            if let Some(timing) = &mut timing {
+                timing.decoded();
+            }
+            result
         };
         let outcome = tokio::select! {
             result=timeout(deadline,operation)=>result.context("private worker deadline exceeded").and_then(|result|result),
             Some(())=self.diagnostic_overflow.recv()=>Err(anyhow::anyhow!("private worker diagnostic limit exceeded")),
         };
+        #[cfg(test)]
+        if let Some(timing) = &mut timing {
+            timing.finished(outcome.is_ok());
+        }
         if outcome.is_ok() {
             self.poisoned = false;
             cancellation.armed = false;
@@ -212,15 +275,34 @@ impl PrivateWorkerClient {
     /// The supervisor stops its validated container separately. Closing this
     /// handle does not delete persisted catalog or installed security state.
     pub async fn close(mut self) {
-        let _ = self.process.input.shutdown().await;
-        if timeout(Duration::from_secs(2), self.process.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.process.child.start_kill();
-            let _ = timeout(Duration::from_secs(2), self.process.child.wait()).await;
-        }
+        let _ = self.close_attachment().await;
         self.diagnostics.abort();
+    }
+
+    async fn close_attachment(&mut self) -> Result<std::process::ExitStatus> {
+        self.poisoned = true;
+        let mut process = self
+            .process
+            .take()
+            .context("private worker attachment is closed")?;
+        // Tokio's Unix ChildStdin::shutdown is a no-op: holding that writer
+        // while waiting prevents the worker from ever observing EOF. Drop the
+        // ORIGINAL descriptor first; never create a replacement pipe/child.
+        drop(process.input);
+        let mut cancellation = KillOnCancellation {
+            child: &mut process.child,
+            armed: true,
+        };
+        let status = match timeout(Duration::from_secs(2), cancellation.child.wait()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = cancellation.child.start_kill();
+                timeout(Duration::from_secs(2), cancellation.child.wait()).await??
+            }
+        };
+        cancellation.armed = false;
+        self.diagnostics.abort();
+        Ok(status)
     }
 }
 
@@ -455,9 +537,15 @@ impl Drop for KillOnCancellation<'_> {
 impl Drop for PrivateWorkerClient {
     fn drop(&mut self) {
         self.diagnostics.abort();
-        let _ = self.process.child.start_kill();
+        if let Some(process) = &mut self.process {
+            let _ = process.child.start_kill();
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "client/native_timing.rs"]
+mod native_timing;
 
 #[cfg(test)]
 mod tests {
@@ -907,6 +995,60 @@ mod tests {
             assert!(client.request(query()).await.is_err());
             client.close().await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closing_drops_original_stdin_before_wait_and_cannot_reopen_the_stream() -> Result<()> {
+        let mut child = tokio::process::Command::new("node")
+            .args(["-e", "const timer=setInterval(()=>{},1000);process.stdin.resume();process.stdin.once('end',()=>clearInterval(timer));process.stdout.write('READY');"])
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+        let mut client = PrivateWorkerClient::new(PrivateProcessStdio {
+            input: child.stdin.take().context("stdin")?,
+            output: child.stdout.take().context("stdout")?,
+            diagnostics: child.stderr.take(),
+            child,
+        })?;
+        let mut ready = [0; 5];
+        timeout(
+            Duration::from_secs(3),
+            client
+                .process
+                .as_mut()
+                .context("attachment")?
+                .output
+                .read_exact(&mut ready),
+        )
+        .await??;
+        assert_eq!(&ready, b"READY");
+        assert!(
+            client.close_attachment().await?.success(),
+            "EOF must permit natural exit, not timeout/kill"
+        );
+        assert!(client.process.is_none());
+        assert!(client.poisoned);
+        assert!(client.request(query()).await.is_err());
+        assert!(
+            client.close_attachment().await.is_err(),
+            "the consumed attachment cannot be replaced"
+        );
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn noncooperative_close_keeps_bounded_kill_and_original_wait() -> Result<()> {
+        let mut client = fake("stall", Duration::from_secs(3))?;
+        let status = client.close_attachment().await?;
+        assert!(
+            !status.success(),
+            "a forced exit is not a graceful-close receipt"
+        );
+        assert!(client.process.is_none());
+        assert!(client.poisoned);
+        assert!(client.request(query()).await.is_err());
+        client.close().await;
         Ok(())
     }
 

@@ -71,6 +71,8 @@ impl ParticipationClient {
         let head_began = Instant::now();
         #[cfg(test)]
         let mut requests = 0usize;
+        #[cfg(test)]
+        let mut rpc_ids = Vec::new();
         let mut offset = 0;
         while offset < indices.len() {
             let ids = indices[offset..]
@@ -85,12 +87,22 @@ impl ParticipationClient {
                 })
                 .collect::<Vec<_>>();
             let (send, reply) = oneshot::channel();
+            #[cfg(test)]
+            let waiting = std::time::Instant::now();
             let response = self
                 .enqueue_after_capacity(Request::Heads(ids.clone(), send), reply)
                 .await?;
             #[cfg(test)]
             {
                 requests += 1;
+                rpc_ids.push(response.request_id);
+                crate::marketplace::search_timing::emit(
+                    crate::marketplace::search_timing::Event::SearchHeadWaitTiming {
+                        context: crate::marketplace::search_timing::context(),
+                        request_id: response.request_id,
+                        total_us: crate::marketplace::search_timing::micros(waiting),
+                    },
+                );
             }
             let WorkerControlOutcome::CatalogHeads { rows } = response.control_response else {
                 bail!("local head batch unavailable");
@@ -133,10 +145,17 @@ impl ParticipationClient {
             }
         }
         #[cfg(test)]
-        eprintln!(
-            "{}",
-            serde_json::json!({"stage":"search_current_batch_timing","rows":metadata.len(),"requests":requests,
-            "metadata_rank_ms":metadata_rank_ms,"heads_ms":heads_ms,"after_ms":after_began.elapsed().as_millis(),"total_ms":began.elapsed().as_millis()})
+        crate::marketplace::search_timing::emit(
+            crate::marketplace::search_timing::Event::SearchCurrentBatchTiming {
+                context: crate::marketplace::search_timing::context(),
+                rows: metadata.len(),
+                requests,
+                rpc_ids,
+                metadata_rank_ms,
+                heads_ms,
+                after_ms: after_began.elapsed().as_millis(),
+                total_ms: began.elapsed().as_millis(),
+            },
         );
         Ok(summaries)
     }
