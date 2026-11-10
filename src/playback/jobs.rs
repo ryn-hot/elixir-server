@@ -38,6 +38,8 @@ use super::{
     TranscodeHandle, TranscodeParams, detect_text_subtitles, spawn_ffmpeg,
 };
 
+mod fragment;
+
 pub type HardwareFailureCallback = Arc<dyn Fn() + Send + Sync>;
 
 const DEFAULT_REMUX_JOBS: usize = 8;
@@ -2042,7 +2044,21 @@ async fn has_first_media_segment(temp_dir: &Path) -> bool {
         if (name.starts_with("seg_0_") || name.starts_with("segment_"))
             && (name.ends_with(".ts") || name.ends_with(".m4s"))
         {
-            return true;
+            let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if name.ends_with(".m4s") {
+                if fragment::ready(&entry.path()).await.unwrap_or(false) {
+                    return true;
+                }
+            } else if metadata.len() >= 188 {
+                // One complete TS packet is the minimum; an empty/truncated
+                // filename alone must never satisfy first-media readiness.
+                return true;
+            }
         }
     }
     false

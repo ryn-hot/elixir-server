@@ -438,6 +438,7 @@ pub(crate) fn build_direct_stream_ffmpeg_args(
     } else {
         args.push("-an".to_string());
     }
+    push_copied_aac_fmp4_filter(&mut args, playback_plan, params.delivery);
 
     if let Some(bitstream_filter) =
         direct_stream_video_bitstream_filter(playback_plan, params.delivery)
@@ -596,6 +597,7 @@ pub(crate) fn build_transcode_ffmpeg_args(
             }
         }
     }
+    push_copied_aac_fmp4_filter(&mut args, playback_plan, params.delivery);
 
     args.extend(
         [
@@ -1532,6 +1534,27 @@ fn hls_segment_type(delivery: Delivery) -> &'static str {
     }
 }
 
+fn push_copied_aac_fmp4_filter(
+    args: &mut Vec<String>,
+    playback_plan: Option<&PlaybackPlan>,
+    delivery: Delivery,
+) {
+    // MPEGTS/HLS carries AAC as ADTS. The HLS fMP4 muxer does not reliably
+    // insert this conversion automatically, unlike the standalone MP4 muxer.
+    // Keep the audio copied; do not apply an AAC-only filter to other codecs,
+    // transcoded audio, MPEGTS output or a missing/unverified codec report.
+    if matches!(delivery, Delivery::HlsFmp4 | Delivery::HlsAdaptiveFmp4)
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "-c:a" && pair[1] == "copy")
+        && playback_plan
+            .and_then(|plan| plan.compatibility_report.source_audio_codec.as_deref())
+            .is_some_and(|codec| codec.eq_ignore_ascii_case("aac"))
+    {
+        args.extend(["-bsf:a", "aac_adtstoasc"].into_iter().map(String::from));
+    }
+}
+
 fn direct_stream_video_bitstream_filter(
     playback_plan: Option<&PlaybackPlan>,
     delivery: Delivery,
@@ -1812,7 +1835,7 @@ mod tests {
     use anyhow::{Context, Result};
     use serde_json::Value;
     use tempfile::tempdir;
-    use tokio::process::Command;
+    use tokio::{fs, process::Command};
 
     use super::*;
     use crate::playback::plan::{
@@ -2123,6 +2146,7 @@ mod tests {
         assert_arg_pair(&args, "-map", "0:1");
         assert_arg_pair(&args, "-c:v", "copy");
         assert_arg_pair(&args, "-c:a", "copy");
+        assert_arg_pair(&args, "-bsf:a", "aac_adtstoasc");
         assert_arg_pair(&args, "-hls_segment_type", "fmp4");
         assert_arg_pair(
             &args,
@@ -2133,6 +2157,64 @@ mod tests {
         assert!(args.iter().any(|arg| arg.ends_with("segment_%05d.m4s")));
         assert!(args.iter().any(|arg| arg.ends_with("media.m3u8")));
         assert!(!args.iter().any(|arg| arg == "libx264" || arg == "-b:a"));
+    }
+
+    #[test]
+    fn copied_aac_filter_is_scoped_to_aac_copy_and_fmp4() {
+        let temp = tempdir().unwrap();
+        for delivery in [Delivery::HlsFmp4, Delivery::HlsMpegts] {
+            for codec in ["aac", "ac3"] {
+                let layout =
+                    HlsOutputLayout::for_job(temp.path(), PlaybackMode::DirectStream, delivery);
+                let params = TranscodeParams {
+                    seek_seconds: 0.0,
+                    mode: PlaybackMode::DirectStream,
+                    delivery,
+                };
+                let mut plan = direct_stream_plan(delivery, "hls", "h264", Some(codec));
+                let args = build_direct_stream_ffmpeg_args(
+                    "/fixture/source.m3u8",
+                    &params,
+                    Some(&plan),
+                    &layout,
+                );
+                assert_eq!(
+                    args.iter().any(|arg| arg == "aac_adtstoasc"),
+                    delivery == Delivery::HlsFmp4 && codec == "aac"
+                );
+                plan.audio_action = StreamAction::Disabled;
+                let muted = build_direct_stream_ffmpeg_args(
+                    "/fixture/source.m3u8",
+                    &params,
+                    Some(&plan),
+                    &layout,
+                );
+                assert!(!muted.iter().any(|arg| arg == "aac_adtstoasc"));
+            }
+        }
+        let plan = direct_stream_plan(Delivery::HlsFmp4, "hls", "h264", Some("aac"));
+        let mut encoded_audio = vec!["-c:a".into(), "aac".into()];
+        push_copied_aac_fmp4_filter(&mut encoded_audio, Some(&plan), Delivery::HlsFmp4);
+        assert!(!encoded_audio.iter().any(|arg| arg == "aac_adtstoasc"));
+        let mut unknown = vec!["-c:a".into(), "copy".into()];
+        push_copied_aac_fmp4_filter(&mut unknown, None, Delivery::HlsFmp4);
+        assert!(!unknown.iter().any(|arg| arg == "aac_adtstoasc"));
+        let params = TranscodeParams {
+            seek_seconds: 0.0,
+            mode: PlaybackMode::SubtitleTranscode,
+            delivery: Delivery::HlsFmp4,
+        };
+        let layout = HlsOutputLayout::for_job(temp.path(), params.mode, params.delivery);
+        let subtitle = build_transcode_ffmpeg_args(
+            "/fixture/source.m3u8",
+            &params,
+            Some(&plan),
+            &layout,
+            temp.path(),
+            &[],
+            24.0,
+        );
+        assert_arg_pair(&subtitle, "-bsf:a", "aac_adtstoasc");
     }
 
     #[test]
@@ -3348,6 +3430,68 @@ mod tests {
         );
         assert_eq!(stream_string(source_audio, "codec_name"), Some("aac"));
         assert_eq!(stream_string(output_audio, "codec_name"), Some("aac"));
+
+        // Exercise the formerly failing ADTS-AAC path too. MP4-only input
+        // cannot expose the HLS fMP4 muxer's missing AAC conversion.
+        let hls_source = temp.path().join("source.m3u8");
+        let transport = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i"])
+            .arg(&source)
+            .args([
+                "-c",
+                "copy",
+                "-f",
+                "hls",
+                "-hls_time",
+                "4",
+                "-hls_list_size",
+                "0",
+                "-hls_segment_filename",
+            ])
+            .arg(temp.path().join("source_%05d.ts"))
+            .arg(&hls_source)
+            .output()
+            .await?;
+        assert!(
+            transport.status.success(),
+            "actual TS/HLS source generation failed: {}",
+            String::from_utf8_lossy(&transport.stderr)
+        );
+        let hls_directory = temp.path().join("hls-remux");
+        fs::create_dir(&hls_directory).await?;
+        let hls_layout = HlsOutputLayout::for_job(
+            &hls_directory,
+            PlaybackMode::DirectStream,
+            Delivery::HlsFmp4,
+        );
+        let hls_plan = direct_stream_plan(Delivery::HlsFmp4, "hls", "h264", Some("aac"));
+        let hls_args = build_direct_stream_ffmpeg_args(
+            hls_source.to_str().context("HLS source path")?,
+            &params,
+            Some(&hls_plan),
+            &hls_layout,
+        );
+        let hls_remux = Command::new("ffmpeg").args(&hls_args).output().await?;
+        assert!(
+            hls_remux.status.success(),
+            "ADTS AAC to HLS fMP4 remux failed: {}",
+            String::from_utf8_lossy(&hls_remux.stderr)
+        );
+        let remux_probe = probe_media(&hls_layout.media_playlist_path).await?;
+        assert_eq!(
+            stream_string(first_stream(&remux_probe, "video")?, "codec_name"),
+            Some("h264")
+        );
+        assert_eq!(
+            stream_string(first_stream(&remux_probe, "audio")?, "codec_name"),
+            Some("aac")
+        );
+        let fragment = fs::read(hls_directory.join("segment_00000.m4s")).await?;
+        assert!(
+            fragment.windows(4).any(|bytes| bytes == b"moof")
+                && fragment.windows(4).any(|bytes| bytes == b"mdat"),
+            "remux advertised a header-only fragment"
+        );
         Ok(())
     }
 
