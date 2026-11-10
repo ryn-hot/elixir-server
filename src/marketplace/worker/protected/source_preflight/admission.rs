@@ -73,18 +73,19 @@ impl Work {
     }
 
     /// Reserving the existing slot is not permission to start a helper or send
-    /// input. Foreground work may retain that slot across routine Checking;
-    /// background work continues to defer immediately.
+    /// input. Foreground and local restriction work may wait across routine
+    /// Checking; optional network/source background work defers immediately.
     pub(super) fn admit_start(self, owner: &Owner) -> Result<()> {
-        self.admit(owner, self.background()).map_err(|error| {
-            if self.background() && error.is::<Checking>() {
-                error.context(PrelaunchDeferred(
-                    "background source preflight is not admitted",
-                ))
-            } else {
-                error
-            }
-        })
+        self.admit(owner, matches!(self, Self::Background))
+            .map_err(|error| {
+                if matches!(self, Self::Background) && error.is::<Checking>() {
+                    error.context(PrelaunchDeferred(
+                        "background source preflight is not admitted",
+                    ))
+                } else {
+                    error
+                }
+            })
     }
 
     /// Before launch, allow the SAME protection owner's bounded health cycle
@@ -95,8 +96,15 @@ impl Work {
         owner: &Owner,
         completion: &mut oneshot::Sender<Result<T>>,
     ) -> Result<()> {
-        self.wait_ready(owner, completion, super::super::CHECKING_DEADLINE, true)
-            .await
+        // Restrictions must not repeatedly miss the short Ready window after
+        // the asynchronous headroom read. They retain background priority and
+        // only the existing 12-second wait, not the foreground's 72 seconds.
+        let maximum = if matches!(self, Self::Restrictions) {
+            super::super::RENEW_DEADLINE
+        } else {
+            super::super::CHECKING_DEADLINE
+        };
+        self.wait_ready(owner, completion, maximum, true).await
     }
 
     /// A launched helper remains under its shorter retirement budget. Never
@@ -138,13 +146,15 @@ impl Work {
             } else {
                 // A helper already exists: never label its interruption as
                 // positively unsent or permit a replacement before retirement.
-                self.admit(owner, self.background())?;
+                self.admit(owner, matches!(self, Self::Background))?;
             }
             if self.admit(owner, true).is_ok() {
                 return Ok(());
             }
-            // Only foreground Checking reaches this wait. Revalidate all
-            // other gates rather than waiting out revoked consent or pressure.
+            // Only foreground/local-restriction Checking reaches this wait.
+            // Revalidate the purpose's gates, including background resource
+            // and playback priority for restrictions. Ready is still required
+            // before native launch/input; a timer is never positive authority.
             self.admit(owner, false)?;
             tokio::select! {biased;
                 _ = completion.closed() => bail!("marketplace helper cancelled before protected readiness"),

@@ -120,8 +120,8 @@ async fn local_restrictions_need_no_network_disclosure_or_metering_but_keep_back
     Work::Restrictions.admit_start(&f.owner)?;
     assert!(Work::Background.admit_start(&f.owner).is_err());
     checking(&f.protection, 60);
-    let error = Work::Restrictions.admit_start(&f.owner).unwrap_err();
-    assert!(verification_deferred(&error));
+    Work::Restrictions.admit_start(&f.owner)?;
+    assert!(Work::Restrictions.admit(&f.owner, true).is_err());
     assert_eq!(f.owner.slots.available_permits(), 1);
     for change in 0..9 {
         let f = fixture()?;
@@ -158,6 +158,137 @@ async fn local_restrictions_need_no_network_disclosure_or_metering_but_keep_back
             "change {change}"
         );
         assert_eq!(f.owner.slots.available_permits(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_restrictions_wait_for_the_same_ready_event_before_launch_or_input() -> Result<()> {
+    for before_launch in [false, true] {
+        let f = fixture()?;
+        f.settings.send_modify(|s| {
+            s.accepted_disclosure_version = None;
+            s.metering = Metering::Unknown;
+        });
+        checking(&f.protection, 60);
+        Work::Restrictions.admit_start(&f.owner)?;
+        assert!(Work::Restrictions.admit(&f.owner, true).is_err());
+        let permit = try_slot(&f.owner, Work::Restrictions, "restriction slot busy")?;
+        let (mut completion, _response) = oneshot::channel::<Result<()>>();
+        let mut wait = Box::pin(ready_for_phase(
+            Work::Restrictions,
+            &f.owner,
+            &mut completion,
+            before_launch,
+        ));
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        assert_eq!(f.owner.slots.available_permits(), 0);
+        f.protection.send_replace(Snapshot {
+            state: ProtectionState::Ready,
+            until: Some(Instant::now() + Duration::from_secs(15)),
+        });
+        wait.await?;
+        Work::Restrictions.admit(&f.owner, true)?;
+        assert!(!f.owner.failed.load(Ordering::SeqCst));
+        drop(permit);
+        assert_eq!(f.owner.slots.available_permits(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_restriction_waits_cannot_renew_the_existing_twelve_second_bound() -> Result<()> {
+    for before_launch in [false, true] {
+        let f = fixture()?;
+        checking(&f.protection, 60);
+        let (mut completion, _response) = oneshot::channel::<Result<()>>();
+        let mut wait = Box::pin(ready_for_phase(
+            Work::Restrictions,
+            &f.owner,
+            &mut completion,
+            before_launch,
+        ));
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            checking(&f.protection, 60);
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(
+            wait.await
+                .unwrap_err()
+                .to_string()
+                .contains("readiness deadline")
+        );
+        assert!(Work::Restrictions.admit(&f.owner, true).is_err());
+        assert!(!f.owner.failed.load(Ordering::SeqCst));
+        assert_eq!(f.owner.slots.available_permits(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_restriction_waits_keep_cancellation_background_pressure_and_owner_fences()
+-> Result<()> {
+    for before_launch in [false, true] {
+        for change in 0..14 {
+            let f = fixture()?;
+            checking(&f.protection, 60);
+            let (mut completion, response) = oneshot::channel::<Result<()>>();
+            let mut wait = Box::pin(ready_for_phase(
+                Work::Restrictions,
+                &f.owner,
+                &mut completion,
+                before_launch,
+            ));
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+            match change {
+                0 => drop(response),
+                1 => f
+                    .protection
+                    .send_modify(|s| s.state = ProtectionState::Failed),
+                2 => f
+                    .protection
+                    .send_modify(|s| s.state = ProtectionState::Stopped),
+                3 => f
+                    .protection
+                    .send_modify(|s| s.state = ProtectionState::Expired),
+                4 => f
+                    .facts
+                    .send_modify(|v| v.as_mut().unwrap().resource_pressure = true),
+                5 => f
+                    .facts
+                    .send_modify(|v| v.as_mut().unwrap().playback_pressure = true),
+                6 => f
+                    .facts
+                    .send_modify(|v| v.as_mut().unwrap().background_allowance = false),
+                7 => f
+                    .facts
+                    .send_modify(|v| v.as_mut().unwrap().available_memory = None),
+                8 => f
+                    .facts
+                    .send_modify(|v| v.as_mut().unwrap().disk_headroom = false),
+                9 => drop(f.facts),
+                10 => drop(f.settings),
+                11 => drop(f.protection),
+                12 => {
+                    f.facts.send_replace(None);
+                }
+                13 => f.facts.send_modify(|v| {
+                    v.as_mut().unwrap().observed = Instant::now() - Duration::from_secs(31)
+                }),
+                _ => unreachable!(),
+            }
+            assert!(
+                wait.await.is_err(),
+                "before_launch={before_launch} change={change}"
+            );
+            assert!(!f.owner.failed.load(Ordering::SeqCst));
+            assert_eq!(f.owner.slots.available_permits(), 1);
+        }
     }
     Ok(())
 }
@@ -211,16 +342,15 @@ async fn prelaunch_health_observations_cannot_renew_the_original_72_second_budge
 }
 
 async fn ready_for_phase<T>(
+    work: Work,
     owner: &Owner,
     completion: &mut oneshot::Sender<Result<T>>,
     before_launch: bool,
 ) -> Result<()> {
     if before_launch {
-        Work::Foreground
-            .ready_before_launch(owner, completion)
-            .await
+        work.ready_before_launch(owner, completion).await
     } else {
-        Work::Foreground.ready(owner, completion).await
+        work.ready(owner, completion).await
     }
 }
 
@@ -281,7 +411,12 @@ async fn earlier_protection_expiry_ends_the_wait_without_granting_readiness() ->
         let f = fixture()?;
         checking(&f.protection, 1);
         let (mut completion, _response) = oneshot::channel::<Result<()>>();
-        let mut wait = Box::pin(ready_for_phase(&f.owner, &mut completion, before_launch));
+        let mut wait = Box::pin(ready_for_phase(
+            Work::Foreground,
+            &f.owner,
+            &mut completion,
+            before_launch,
+        ));
         assert!(futures_util::poll!(wait.as_mut()).is_pending());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(wait.await.is_err());
@@ -298,7 +433,12 @@ async fn checking_wait_rechecks_cancellation_consent_resources_and_owner_loss() 
             let f = fixture()?;
             checking(&f.protection, 60);
             let (mut completion, response) = oneshot::channel::<Result<()>>();
-            let mut wait = Box::pin(ready_for_phase(&f.owner, &mut completion, before_launch));
+            let mut wait = Box::pin(ready_for_phase(
+                Work::Foreground,
+                &f.owner,
+                &mut completion,
+                before_launch,
+            ));
             assert!(futures_util::poll!(wait.as_mut()).is_pending());
             match change {
                 0 => drop(response),
