@@ -20,7 +20,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("source allocation unavailable"))?
-            .clone();
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone());
         let Some(allocation) = allocation else {
             return Ok(vec![]);
         };
@@ -56,7 +57,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("source allocation unavailable"))?
-            .clone();
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone());
         let Some(allocation) = allocation else {
             return Ok(None);
         };
@@ -92,7 +94,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("source allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("source execution not configured by trusted startup")?;
         self.installation.begin_provider_call(
             descriptor,

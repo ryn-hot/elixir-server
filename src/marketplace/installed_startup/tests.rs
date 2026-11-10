@@ -18,6 +18,8 @@ fn installed_profile_is_closed_pinned_and_independent_of_network_configuration()
     Profile::parse(&serde_json::to_vec(&profile())?)?;
     let original = Profile::parse(&serde_json::to_vec(&profile())?)?;
     assert!(original.application_http.is_none());
+    assert!(original.compiled.is_none());
+    assert!(compiled::select(None)?.is_none());
     for family in ["ipv4", "ipv6"] {
         let mut configured = profile();
         configured["application_http"] = json!({"family":family});
@@ -70,5 +72,93 @@ fn installed_profile_is_closed_pinned_and_independent_of_network_configuration()
         assert!(Profile::parse(&serde_json::to_vec(&changed)?).is_err());
     }
     assert!(Profile::parse(b"{\"schema_version\":1,\"schema_version\":1}").is_err());
+    Ok(())
+}
+
+fn compiled_profile() -> Value {
+    json!({
+        "guardian":{"executable":"/approved/guardian","sha256":elixir_marketplace::identity::Digest::of(b"guardian"),"platform":"linux/amd64"},
+        "importer":{"executable":"/approved/importer","sha256":elixir_marketplace::identity::Digest::of(b"importer"),"local_socket":"/approved/docker.sock"},
+        "toolchains":[elixir_marketplace::identity::Digest::of(b"reviewed-compiler")]
+    })
+}
+
+#[test]
+fn compiled_startup_is_an_explicit_closed_local_operator_selection() -> Result<()> {
+    for platform in ["linux/amd64", "linux/arm64"] {
+        for cached in [false, true] {
+            let mut data = profile();
+            data["compiled"] = compiled_profile();
+            data["compiled"]["guardian"]["platform"] = json!(platform);
+            if cached {
+                data["compiled"]["retain_image_cache"] = json!(true);
+            }
+            let parsed = Profile::parse(&serde_json::to_vec(&data)?);
+            assert_eq!(parsed.is_ok(), cfg!(unix));
+            #[cfg(unix)]
+            assert!(parsed?.compiled.is_some());
+        }
+    }
+    for (pointer, value) in [
+        ("/guardian/executable", json!("relative/guardian")),
+        ("/guardian/platform", json!("windows/amd64")),
+        ("/guardian/sha256", json!("mutable:latest")),
+        ("/importer/executable", json!("https://host/importer")),
+        ("/importer/local_socket", json!("tcp://127.0.0.1:2375")),
+        ("/importer/local_socket", json!("/approved/socket\nother")),
+        (
+            "/importer/local_socket",
+            json!(format!("/{}", "x".repeat(4096))),
+        ),
+        ("/toolchains", json!([])),
+        ("/toolchains", json!(["mutable:latest"])),
+        (
+            "/toolchains",
+            json!([
+                elixir_marketplace::identity::Digest::of(b"same"),
+                elixir_marketplace::identity::Digest::of(b"same")
+            ]),
+        ),
+        (
+            "/toolchains",
+            json!(
+                (0u8..9)
+                    .map(|n| elixir_marketplace::identity::Digest::of([n]))
+                    .collect::<Vec<_>>()
+            ),
+        ),
+    ] {
+        let mut data = profile();
+        data["compiled"] = compiled_profile();
+        *data["compiled"].pointer_mut(pointer).unwrap() = value;
+        assert!(
+            Profile::parse(&serde_json::to_vec(&data)?).is_err(),
+            "{pointer}"
+        );
+    }
+    for parent in ["", "/guardian", "/importer"] {
+        let mut data = profile();
+        data["compiled"] = compiled_profile();
+        data["compiled"].pointer_mut(parent).unwrap()["untrusted_override"] = json!(true);
+        assert!(
+            Profile::parse(&serde_json::to_vec(&data)?).is_err(),
+            "{parent}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn compiled_profile_parsing_cannot_approve_missing_native_helpers() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut data = profile();
+    data["compiled"] = compiled_profile();
+    data["compiled"]["guardian"]["executable"] = json!(root.path().join("missing-guardian"));
+    data["compiled"]["importer"]["executable"] = json!(root.path().join("missing-importer"));
+    data["compiled"]["importer"]["local_socket"] = json!(root.path().join("missing-socket"));
+    let parsed = Profile::parse(&serde_json::to_vec(&data)?)?;
+    assert!(compiled::select(parsed.compiled.as_ref()).is_err());
+    assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
     Ok(())
 }

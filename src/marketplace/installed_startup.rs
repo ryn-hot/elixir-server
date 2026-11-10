@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 mod application_http;
+mod compiled;
 pub(super) mod storage;
 
 #[derive(Deserialize)]
@@ -28,6 +29,9 @@ struct Profile {
     execution: SourceExecutionLimits,
     // Explicit trusted-operator opt-in only; no peer/admin request can set it.
     application_http: Option<application_http::Profile>,
+    // Optional independently reviewed local Docker toolchains/helpers only.
+    // This is read from the same protected operator file, never HTTP/peers.
+    compiled: Option<compiled::Profile>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +68,9 @@ impl Profile {
             bail!("invalid closed installed startup profile");
         }
         profile.allocation().validate()?;
+        if let Some(compiled) = &profile.compiled {
+            compiled.validate()?;
+        }
         Ok(profile)
     }
     fn allocation(&self) -> Allocation {
@@ -89,19 +96,27 @@ impl Profile {
     }
 }
 
-fn configuration(state: &AppState, profile: &Profile) -> Result<InstalledRuntime> {
+fn configuration(
+    state: &AppState,
+    profile: &Profile,
+    compiled: Option<&compiled::Selection>,
+) -> Result<InstalledRuntime> {
     let paths = RuntimePaths::from_roots(
         &state.settings.extensions.storage_root,
         &state.settings.library.local_root,
     );
     let directory = storage::prepare(Path::new(&paths.data_root))?;
     let allocation = profile.allocation();
+    let (runtime, compiled_toolchains) = match compiled {
+        Some(selected) => (selected.runtime.clone(), Some(selected.toolchains.clone())),
+        None => (state.orchestrator.runtime_manager(), None),
+    };
     Ok(InstalledRuntime {
-        runtime: state.orchestrator.runtime_manager(),
+        runtime,
         playback: state.transcodes.clone(),
         local_http: state.marketplace.local_http_client(),
         application_http: None,
-        compiled_toolchains: None,
+        compiled_toolchains,
         lane: directory.join("foreground-source"),
         archive: directory.join("source-archives"),
         deployment: format!("installed-{}", uuid::Uuid::new_v4().simple()),
@@ -118,15 +133,19 @@ async fn activate(
     stage: &mut &'static str,
 ) -> Result<()> {
     let path = path.to_owned();
-    let profile = tokio::task::spawn_blocking(move || {
-        Profile::parse(&super::startup::read_private_profile_bytes(&path)?)
+    let (profile, compiled) = tokio::task::spawn_blocking(move || {
+        let profile = Profile::parse(&super::startup::read_private_profile_bytes(&path)?)?;
+        // Hashing bounded local helper files must not block playback's async
+        // executor. No process, network role or native work is launched here.
+        let compiled = compiled::select(profile.compiled.as_ref())?;
+        Ok::<_, anyhow::Error>((profile, compiled))
     })
     .await??;
     if shutdown.is_cancelled() {
         return Ok(());
     }
     *stage = "private_storage";
-    let mut configuration = configuration(state, &profile)?;
+    let mut configuration = configuration(state, &profile, compiled.as_ref())?;
     // Validate all allocations before permitting even lineage initialization.
     *stage = "allocation_validation";
     super::application::Host::from_runtime(
@@ -174,7 +193,7 @@ async fn activate(
     *stage = "installation_allocation";
     state
         .marketplace
-        .configure_installation(profile.allocation())?;
+        .configure_installation_runtime(profile.allocation(), Some(configuration.clone()))?;
     *stage = "restoration_start";
     state.marketplace.begin_installed_restoration(
         Database {

@@ -77,7 +77,7 @@ pub struct MarketplaceService {
     #[cfg(unix)]
     sharing: super::sharing::Service,
     #[cfg(unix)]
-    installation_allocation: Arc<Mutex<Option<super::application::Allocation>>>,
+    installation_allocation: Arc<Mutex<Option<InstallationConfiguration>>>,
     #[cfg(unix)]
     target_reads: Arc<tokio::sync::Semaphore>,
     #[cfg(unix)]
@@ -88,6 +88,14 @@ pub struct MarketplaceService {
     local_http: Option<Arc<super::local_http::Client>>,
     #[cfg(all(test, unix))]
     installation_context: Arc<Mutex<Option<InstallContext>>>,
+}
+/// One immutable startup selection shared by fresh/manual installs and retained
+/// restoration. The optional native adapter never comes from management input.
+#[cfg(unix)]
+#[derive(Clone)]
+struct InstallationConfiguration {
+    allocation: super::application::Allocation,
+    runtime: Option<super::grant_store::installation::runtime::InstalledRuntime>,
 }
 impl Default for MarketplaceService {
     fn default() -> Self {
@@ -165,6 +173,36 @@ impl MarketplaceService {
     ) -> Option<Arc<super::local_http::Client>> {
         self.local_http.clone()
     }
+    #[cfg(unix)]
+    fn installation_host(
+        &self,
+        client: &ParticipationClient,
+        secrets: crate::secrets::SecretsManager,
+        allocation: super::application::Allocation,
+    ) -> Result<super::application::Host> {
+        // Fresh installs must reuse the SAME trusted startup configuration as
+        // restoration: runtime, playback, paths, HTTP underlay and compiler
+        // policy. A network client still owns fresh protected source admission;
+        // its observations cannot replace that immutable operator selection.
+        let configured = self
+            .installation_allocation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installation configuration unavailable"))?
+            .as_ref()
+            .and_then(|configuration| configuration.runtime.clone());
+        let runtime = match configured {
+            Some(runtime) => runtime,
+            None => client.installed_configuration(allocation.source, allocation.retention)?,
+        };
+        Ok(super::application::Host::from_runtime(
+            client.source_database().clone(),
+            secrets,
+            runtime,
+            allocation.installations,
+            allocation.execution,
+        )?
+        .with_local_http(self.local_http_client()))
+    }
     /// Operator startup only. No network/discovery/provider receipt or status
     /// can open this slot. The task retains its actual native reconciliation.
     #[cfg(unix)]
@@ -178,7 +216,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installed allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("installed restoration not configured by trusted startup")?;
         if configuration.source_budget != allocation.source
             || (
@@ -214,7 +253,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installed allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("automatic updates require configured installed startup")?;
         if configuration.source_budget != allocation.source
             || (
@@ -245,7 +285,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installed allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("sharing requires configured installed startup")?;
         if configuration.source_budget != allocation.source
             || (
@@ -307,7 +348,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installed allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("installed execution not configured by trusted startup")?;
         let turn = self.source_calls.try_acquire()?;
         self.installation.begin_installed_http_call(
@@ -346,8 +388,7 @@ impl MarketplaceService {
             #[cfg(test)]
             fixture: None,
         };
-        let host = super::application::Host::new(&context.client, secrets, allocation)?
-            .with_local_http(self.local_http_client());
+        let host = self.installation_host(&context.client, secrets, allocation)?;
         let id = self
             .installation
             .start(context, host, principal.clone(), query, action)?;

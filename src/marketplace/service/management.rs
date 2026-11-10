@@ -423,6 +423,7 @@ impl MarketplaceService {
             .map_err(|_| anyhow::anyhow!("installation allocation unavailable"))?
             .as_ref()
             .context("publisher seeding not admitted by trusted startup")?
+            .allocation
             .installations;
         let observation = if let Some(publication) = request.publication() {
             if self.stop_requested() {
@@ -473,7 +474,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installation allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("installation management not admitted by trusted local startup")?;
         let context = InstallContext {
             inner: self.inner.clone(),
@@ -490,8 +492,7 @@ impl MarketplaceService {
         } else {
             context
         };
-        let host = application::Host::new(&context.client, secrets, allocation)?
-            .with_local_http(self.local_http_client());
+        let host = self.installation_host(&context.client, secrets, allocation)?;
         let operation_id = self.installation.start_direct(
             context,
             host,
@@ -515,7 +516,23 @@ impl MarketplaceService {
         &self,
         allocation: application::Allocation,
     ) -> Result<()> {
+        self.configure_installation_runtime(allocation, None)
+    }
+    pub(in crate::marketplace) fn configure_installation_runtime(
+        &self,
+        allocation: application::Allocation,
+        runtime: Option<installation::runtime::InstalledRuntime>,
+    ) -> Result<()> {
         allocation.validate()?;
+        if let Some(runtime) = &runtime {
+            if runtime.source_budget != allocation.source
+                || (runtime.retention.bytes, runtime.retention.releases)
+                    != (allocation.retention.bytes, allocation.retention.releases)
+                || !crate::marketplace::runtime::image_is_pinned(&runtime.image)
+            {
+                bail!("installation runtime differs from its trusted allocation");
+            }
+        }
         let mut slot = self
             .installation_allocation
             .lock()
@@ -523,7 +540,10 @@ impl MarketplaceService {
         if slot.is_some() {
             bail!("installation allocation already configured");
         }
-        *slot = Some(allocation);
+        *slot = Some(super::InstallationConfiguration {
+            allocation,
+            runtime,
+        });
         Ok(())
     }
     pub(crate) fn installation_review_available(&self) -> bool {
@@ -569,7 +589,8 @@ impl MarketplaceService {
             .installation_allocation
             .lock()
             .map_err(|_| anyhow::anyhow!("installation allocation unavailable"))?
-            .clone()
+            .as_ref()
+            .map(|configuration| configuration.allocation.clone())
             .context("installation management not admitted by trusted local startup")?;
         #[cfg(test)]
         if let Some(context) = self
@@ -578,8 +599,7 @@ impl MarketplaceService {
             .map_err(|_| anyhow::anyhow!("native fixture context unavailable"))?
             .take()
         {
-            let host = application::Host::new(&context.client, secrets, allocation)?
-                .with_local_http(self.local_http_client());
+            let host = self.installation_host(&context.client, secrets, allocation)?;
             return self
                 .installation
                 .start(context, host, principal.clone(), query, action)
@@ -673,7 +693,7 @@ impl MarketplaceService {
     #[cfg(test)]
     pub(in crate::marketplace) fn fixture_install_context(
         &self,
-        context: InstallContext,
+        mut context: InstallContext,
     ) -> Result<()> {
         let mut slot = self
             .installation_context
@@ -682,6 +702,9 @@ impl MarketplaceService {
         if slot.is_some() {
             bail!("original fixture context already retained");
         }
+        // The real upload handler addresses this service's preparation owner;
+        // a synthetic selection must not create a second inaccessible owner.
+        context.preparation = self.preparation.clone();
         *slot = Some(context);
         Ok(())
     }

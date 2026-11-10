@@ -10,6 +10,7 @@ use axum::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 mod cache_tamper;
+mod compiled;
 pub(in crate::marketplace) use cache_tamper::mutate as mutate_cached_fixture_bytes;
 mod restart;
 mod source_live;

@@ -242,3 +242,74 @@ async fn an_unadmitted_service_never_bootstraps_or_allocates_from_a_management_r
     service.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn installed_startup_configuration_is_immutable_and_cannot_expand_its_allocation()
+-> Result<()> {
+    use crate::marketplace::grant_store::installation::runtime::InstalledRuntime;
+    let db = Database::connect(&crate::config::DatabaseConfig {
+        url: "sqlite::memory:".into(),
+        max_connections: 1,
+        connect_timeout_seconds: 5,
+    })
+    .await?;
+    let a = application::fixture_allocation();
+    let runtime = InstalledRuntime {
+        runtime: Arc::new(crate::runtime::docker::DockerRuntimeManager::new(None)),
+        playback: Arc::new(crate::playback::PlaybackJobManager::new(
+            db.pool.clone(),
+            None,
+        )),
+        local_http: None,
+        application_http: None,
+        compiled_toolchains: None,
+        lane: "/not-opened/foreground-source".into(),
+        archive: "/not-opened/source-archives".into(),
+        deployment: "configuration-data-only".into(),
+        image: format!("sha256:{}", "1".repeat(64)),
+        source_budget: a.source.clone(),
+        retention: a.retention,
+    };
+    let service = MarketplaceService::default();
+    for changed in 0..3 {
+        let mut invalid = runtime.clone();
+        match changed {
+            0 => invalid.source_budget.cpu_millicores += 1,
+            1 => invalid.retention.bytes += 1,
+            _ => invalid.image = "mutable:latest".into(),
+        }
+        assert!(
+            service
+                .configure_installation_runtime(a.clone(), Some(invalid))
+                .is_err()
+        );
+        assert!(
+            service.installation_allocation.lock().unwrap().is_none(),
+            "rejection cannot partially configure startup"
+        );
+    }
+    service.configure_installation_runtime(a.clone(), Some(runtime.clone()))?;
+    let shared = service.clone();
+    let chosen = shared
+        .installation_allocation
+        .lock()
+        .unwrap()
+        .clone()
+        .context("configured selection")?;
+    let chosen = chosen.runtime.context("configured runtime")?;
+    assert!(Arc::ptr_eq(&chosen.runtime, &runtime.runtime));
+    assert!(Arc::ptr_eq(&chosen.playback, &runtime.playback));
+    assert_eq!(chosen.lane, runtime.lane);
+    assert_eq!(chosen.archive, runtime.archive);
+    assert!(
+        shared.configure_installation_runtime(a, None).is_err(),
+        "requests/retries cannot erase the original native policy"
+    );
+    assert_eq!(service.snapshot().phase, RuntimePhase::NotConnected);
+    assert!(
+        !service.installation_review_available(),
+        "trusted runtime configuration is not network admission"
+    );
+    db.pool.close().await;
+    Ok(())
+}
