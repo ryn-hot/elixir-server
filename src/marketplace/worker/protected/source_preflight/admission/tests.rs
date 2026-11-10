@@ -9,6 +9,33 @@ fn checking(sender: &watch::Sender<Snapshot>, seconds: u64) {
     });
 }
 
+#[tokio::test]
+async fn actual_foreground_playback_reason_is_typed_without_granting_retry_authority() -> Result<()>
+{
+    let f = fixture()?;
+    Work::Foreground.admit_start(&f.owner)?;
+    f.owner.playback.set_test_startup_queue_len(1);
+    let error = Work::Foreground.admit_start(&f.owner).unwrap_err();
+    assert!(playback_startup_deferred(&error));
+    assert!(playback_startup_deferred(
+        &error.context("source preflight")
+    ));
+    assert_eq!(f.owner.slots.available_permits(), 1);
+    assert!(!f.owner.failed.load(Ordering::SeqCst));
+    let error = Work::Foreground.admit_start(&f.owner).unwrap_err();
+    assert!(!verification_deferred(&error));
+    assert!(!playback_startup_deferred(&anyhow::anyhow!(
+        "foreground helper playback startup or seek is active"
+    )));
+    f.owner.playback.set_test_startup_queue_len(0);
+    Work::Foreground.admit_start(&f.owner)?;
+    f.owner.failed.store(true, Ordering::SeqCst);
+    let error = Work::Foreground.admit_start(&f.owner).unwrap_err();
+    assert!(!playback_startup_deferred(&error));
+    assert!(!verification_deferred(&error));
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn healthy_checking_defers_only_before_native_launch() -> Result<()> {
     let f = fixture()?;

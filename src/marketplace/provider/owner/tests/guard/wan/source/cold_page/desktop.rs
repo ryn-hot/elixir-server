@@ -512,10 +512,11 @@ async fn actual_desktop(with_playback: bool) -> Result<()> {
                                 if manager.startup_queue_len() > 0 {
                                     match source_client.preflight_fresh_metadata(&metadata, 0).await {
                                         Err(error) => {
-                                            use crate::marketplace::worker::SourceResourceWait;
-                                            let yielded = matches!(error.downcast_ref::<SourceResourceWait>(),
-                                                Some(SourceResourceWait::Measured { playback: true, .. })
-                                                | Some(SourceResourceWait::Bootstrap { playback: true, .. }));
+                                            // Public-source preflight and installed-source
+                                            // quarantine have different admission errors.
+                                            // Accept only the actual preflight's closed
+                                            // playback reason, never an arbitrary Err.
+                                            let yielded = ParticipationClient::source_verification_waiting_for_playback(&error);
                                             deferral.store(if yielded { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
                                         }
                                         Ok(_) if manager.startup_queue_len() > 0 => {

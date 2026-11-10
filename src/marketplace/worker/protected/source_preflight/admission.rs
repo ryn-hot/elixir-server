@@ -13,6 +13,17 @@ impl std::fmt::Display for Checking {
 }
 impl std::error::Error for Checking {}
 
+// A closed local scheduling reason, not permission to launch, retry a native
+// job or treat unrelated protection/resource errors as playback deferrals.
+#[derive(Debug, thiserror::Error)]
+#[error("foreground helper playback startup or seek is active")]
+struct PlaybackStartupDeferred;
+
+#[cfg(test)]
+pub(super) fn playback_startup_deferred(error: &anyhow::Error) -> bool {
+    error.is::<PlaybackStartupDeferred>()
+}
+
 #[derive(Debug)]
 struct PrelaunchDeferred(&'static str);
 impl std::fmt::Display for PrelaunchDeferred {
@@ -186,7 +197,7 @@ impl Owner {
         // Current server state, not the slower background sample. Stable
         // playback alone is not a veto; startup/seek/fallback still wins.
         if self.playback.startup_queue_len() > 0 {
-            bail!("foreground helper playback startup or seek is active");
+            return Err(PlaybackStartupDeferred.into());
         }
         let settings = self.settings.borrow();
         let explicitly_off = settings.mode == elixir_marketplace::policy::ContributionMode::Off

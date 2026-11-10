@@ -69,6 +69,10 @@ pub(super) fn verification_deferred(error: &anyhow::Error) -> bool {
     admission::verification_deferred(error)
 }
 #[cfg(test)]
+pub(super) fn playback_startup_deferred(error: &anyhow::Error) -> bool {
+    admission::playback_startup_deferred(error)
+}
+#[cfg(test)]
 pub(super) fn fixture_sharing_deferral() -> anyhow::Error {
     admission::fixture_deferral()
 }

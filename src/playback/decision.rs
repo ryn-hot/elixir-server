@@ -3877,7 +3877,10 @@ mod tests {
         assert_eq!(plan.mode, PlaybackMode::DirectPlay);
         assert_eq!(
             plan.reasons,
-            vec!["direct_play_all_capabilities_satisfied".to_string()]
+            vec![
+                "direct_play_all_capabilities_satisfied".to_string(),
+                "server_transcode_not_required".to_string(),
+            ]
         );
 
         let mut browser_policy = EffectivePlaybackPolicy {
@@ -5264,7 +5267,10 @@ mod tests {
         assert_eq!(native_plan.mode, PlaybackMode::DirectPlay);
         assert_eq!(
             native_plan.reasons,
-            vec!["direct_play_all_capabilities_satisfied".to_string()]
+            vec![
+                "direct_play_all_capabilities_satisfied".to_string(),
+                "server_transcode_not_required".to_string(),
+            ]
         );
         assert_eq!(
             native_plan.expected_outputs[0],
@@ -5290,7 +5296,10 @@ mod tests {
         assert_eq!(browser_plan.mode, PlaybackMode::DirectStream);
         assert_eq!(
             browser_plan.reasons,
-            vec!["direct_stream_codecs_copyable_container_changed".to_string()]
+            vec![
+                "direct_stream_codecs_copyable_container_changed".to_string(),
+                "server_transcode_not_required".to_string(),
+            ]
         );
         assert!(browser_plan.expected_outputs.iter().any(|output| {
             output.name == "master.m3u8" && output.kind == "hls_master_playlist"
@@ -5986,6 +5995,31 @@ mod tests {
         };
         policy.max_bitrate_bps = Some(3_000_000);
 
+        let unqualified = plan_playback(
+            "low-width-hardware-file",
+            &media,
+            PlaybackSelection::default(),
+            &ClientPlaybackProfile::browser_like(),
+            &policy,
+        );
+
+        // Selecting the software fallback does not prove it can run in real
+        // time. Preserve the current deny policy until this exact software
+        // workload has a qualifying envelope; do not relax production policy
+        // merely to recover the older width-floor fixture's playable flag.
+        assert_eq!(unqualified.mode, PlaybackMode::VideoTranscode);
+        assert!(!unqualified.playable);
+        assert!(!unqualified.hardware_acceleration.enabled);
+        assert_eq!(
+            unqualified.feasibility.as_ref().unwrap().reason,
+            "transcode_performance_unknown_policy_denied"
+        );
+        policy.performance_envelopes = vec![envelope_for_plan(
+            &unqualified,
+            PlaybackSupportDecision::SoftwareOnly,
+            PlaybackPerformanceDecision::RealtimeSafe,
+            PlaybackPerformanceConfidence::Certified,
+        )];
         let plan = plan_playback(
             "low-width-hardware-file",
             &media,
@@ -5996,6 +6030,19 @@ mod tests {
 
         assert_eq!(plan.mode, PlaybackMode::VideoTranscode);
         assert!(plan.playable);
+        let feasibility = plan.feasibility.as_ref().unwrap();
+        assert_eq!(
+            feasibility.action,
+            PlaybackFeasibilityAction::AllowTranscode
+        );
+        assert_eq!(
+            feasibility.support_decision,
+            PlaybackSupportDecision::SoftwareOnly
+        );
+        assert_eq!(
+            feasibility.selected_envelope_id.as_deref(),
+            Some("phase20-envelope")
+        );
         assert!(!plan.hardware_acceleration.enabled);
         assert_eq!(
             plan.video_output

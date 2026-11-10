@@ -415,6 +415,14 @@ impl ParticipationClient {
     ) -> Option<SourceResourceWait> {
         error.downcast_ref::<SourceResourceWait>().copied()
     }
+    /// Exact source-verification scheduling reason for qualification, not the
+    /// separate installed-source quarantine's measured resource-wait type.
+    #[cfg(test)]
+    pub(in crate::marketplace) fn source_verification_waiting_for_playback(
+        error: &anyhow::Error,
+    ) -> bool {
+        super::source_preflight::playback_startup_deferred(error)
+    }
     /// Only the same actual protected owner can open this source lane. The plan
     /// is derived from a sealed observation, and host resource admission runs
     /// before any volume/writer creation. This does not grant peer transfer,
