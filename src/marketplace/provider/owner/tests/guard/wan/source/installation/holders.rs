@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 mod catalog;
 mod handoff;
+mod resource_faults;
 mod startup_interruptions;
 
 struct Participant {
