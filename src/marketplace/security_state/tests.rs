@@ -12,6 +12,7 @@ use elixir_marketplace::{
 use std::sync::Arc;
 
 mod catalog_export;
+mod current_batch;
 mod direct_import;
 mod preview;
 mod retained;
@@ -331,6 +332,7 @@ async fn postgres_security_state_serializes_replays_reopens_and_retains_withdraw
         MetadataObservation::fixture_for_verified_descriptor(d.clone(), &policy)?;
     admit(&db, &receipt).await?;
     assert!(require_publication_current(&db, &direct).await?);
+    assert_eq!(require_current_batch(&db, &[&receipt]).await?, vec![true]);
     let baseline = catalog_baseline(&db).await?;
     assert_eq!(baseline.revision(), 1);
     baseline.require_current(&db).await?;
@@ -347,6 +349,7 @@ async fn postgres_security_state_serializes_replays_reopens_and_retains_withdraw
     a?;
     b?;
     assert!(require_current(&db, &receipt).await.is_err());
+    assert_eq!(require_current_batch(&db, &[&receipt]).await?, vec![false]);
     let (next_receipt, _next_owner) =
         MetadataObservation::fixture_for_verified_descriptor(next.clone(), &policy)?;
     let (next_direct, _next_direct_owner) = direct_import::receipt(&next)?;
@@ -392,5 +395,15 @@ async fn postgres_security_state_serializes_replays_reopens_and_retains_withdraw
         .context("missing PostgreSQL exported extension")?;
     assert!(extension.revoked_keys.contains(&d.release.signer_key));
     baseline.require_current(&reopened).await?;
+    let (page, _page_owners) = current_batch::full_page(&reopened).await?;
+    let references = page.iter().rev().collect::<Vec<_>>();
+    assert_eq!(
+        require_current_batch(&reopened, &references).await?,
+        vec![true; 20]
+    );
+    for value in references {
+        require_current(&reopened, value).await?;
+    }
+    reopened.pool.close().await;
     Ok(())
 }

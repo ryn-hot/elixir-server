@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Acquire, Row};
 use std::collections::BTreeSet;
 
+mod current_batch;
 mod export;
 mod preview;
 pub(in crate::marketplace) mod retained;
 mod unchanged;
+pub(in crate::marketplace) use current_batch::require_current_batch;
 pub(in crate::marketplace) use export::catalog_baseline;
 pub(in crate::marketplace) use preview::observation_needed;
 
@@ -405,6 +407,12 @@ pub async fn require_current(database: &Database, value: &MetadataObservation) -
         JOIN marketplace_security_budget b ON b.singleton=1 WHERE e.extension_id=$1 AND e.root_key=$2")
         .bind(id.as_str()).bind(root.to_string()).fetch_optional(&database.pool).await?
         .context("marketplace security authority is missing")?;
+    check_current_row(&row, value)
+}
+
+fn check_current_row(row: &sqlx::any::AnyRow, value: &MetadataObservation) -> Result<()> {
+    let id = &value.descriptor().release.payload.extension_id;
+    let root = value.descriptor().publisher.payload.root_key;
     if row.try_get::<i64, _>("blocked")? != 0 {
         bail!("marketplace security storage is blocked");
     }

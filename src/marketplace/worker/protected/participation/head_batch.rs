@@ -7,6 +7,20 @@ use elixir_marketplace::{
 };
 
 impl ParticipationClient {
+    async fn metadata_page_current(
+        &self,
+        metadata: &[&super::super::MetadataObservation],
+    ) -> Result<Vec<bool>> {
+        if self.snapshot().phase != ParticipationPhase::Running {
+            bail!("marketplace participation is unavailable");
+        }
+        self.security_result(
+            crate::marketplace::security_state::require_current_batch(&self.database, metadata),
+            false,
+        )
+        .await
+    }
+
     pub(in crate::marketplace) async fn ranking_summaries_current(
         &self,
         metadata: &[&super::super::MetadataObservation],
@@ -46,8 +60,9 @@ impl ParticipationClient {
         #[cfg(test)]
         let began = Instant::now();
         let mut summaries = Vec::with_capacity(metadata.len());
-        for value in metadata {
-            let summary = if self.check_metadata_current(value).await.is_ok() {
+        let current = self.metadata_page_current(metadata).await?;
+        for (value, allowed) in metadata.iter().zip(current) {
+            let summary = if allowed {
                 // Immutable native evidence only. This synchronous read grants
                 // no I/O or execution, and durable checks bracket the readback.
                 self.source_preflight
@@ -139,8 +154,13 @@ impl ParticipationClient {
         let heads_ms = head_began.elapsed().as_millis();
         #[cfg(test)]
         let after_began = Instant::now();
-        for (index, value) in metadata.iter().enumerate() {
-            if summaries[index].is_some() && self.check_metadata_current(value).await.is_err() {
+        for (index, allowed) in self
+            .metadata_page_current(metadata)
+            .await?
+            .into_iter()
+            .enumerate()
+        {
+            if !allowed {
                 summaries[index] = None;
             }
         }
