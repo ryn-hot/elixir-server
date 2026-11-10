@@ -61,11 +61,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 md4 = "0.11"
 sha2 = "0.10"
 tar = "0.4"
-zip = "2.2"
+# Keep the existing supported formats; do not add 9.x's PPMd default.
+zip = { version = "=9.3.0", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "time", "zstd", "xz"] }
 quick-xml = "0.41"
 quick-m3u8 = { version = "=0.8.0", default-features = false }
 semver = "1.0"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
 elixir_classifier = { path = "../crates/elixir_classifier" }
 elixir_marketplace = { path = "../crates/elixir_marketplace" }
 

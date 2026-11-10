@@ -182,13 +182,13 @@ fn unpack_zip(package_path: &Path, dest_dir: &Path) -> Result<()> {
             .with_context(|| format!("reading zip entry {i}"))?;
         if is_zip_symlink(&entry) {
             bail!(
-                "zip entry {} is a symlink, which is not allowed",
-                entry.name()
+                "zip entry {:?} is a symlink, which is not allowed",
+                entry.name_raw()
             );
         }
         let rel_path = entry
             .enclosed_name()
-            .ok_or_else(|| anyhow::anyhow!("zip entry has invalid path {}", entry.name()))?;
+            .ok_or_else(|| anyhow::anyhow!("zip entry has invalid path {:?}", entry.name_raw()))?;
         let out_path = dest_dir.join(rel_path);
 
         if entry.is_dir() {
@@ -281,12 +281,15 @@ fn sanitize_entry_path(path: &Path) -> Result<PathBuf> {
     Ok(clean)
 }
 
-fn is_zip_symlink(entry: &zip::read::ZipFile<'_>) -> bool {
+fn is_zip_symlink<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     entry
         .unix_mode()
         .map(|mode| (mode & 0o170000) == 0o120000)
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod zip_tests;
 
 fn parse_public_key(key_id: &str) -> Result<VerifyingKey> {
     let trimmed = key_id.trim();
