@@ -83,3 +83,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["test-util"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

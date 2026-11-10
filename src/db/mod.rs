@@ -389,3 +389,6 @@ fn sqlite_file_path(url: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tls_security;
