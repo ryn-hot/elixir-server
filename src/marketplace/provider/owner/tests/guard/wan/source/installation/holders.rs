@@ -18,6 +18,9 @@ struct Participant {
     state: Option<AppState>,
     app: Option<Router>,
     token: Option<String>,
+    // Read-only test observation after normal logout. Never submit this retained
+    // principal to bypass HTTP/session authorization or create an update.
+    principal: Option<crate::http::auth::CurrentPrincipal>,
     shutdown: CancellationToken,
     startup: Option<JoinHandle<Result<()>>>,
     installed_startup: Option<JoinHandle<Result<()>>>,
@@ -29,6 +32,7 @@ impl Participant {
             state: None,
             app: None,
             token: None,
+            principal: None,
             shutdown: CancellationToken::new(),
             startup: None,
             installed_startup: None,
@@ -57,7 +61,7 @@ impl Participant {
     ) -> Result<()> {
         let root = self.rig.root.path().canonicalize()?;
         let url = format!("sqlite://{}", root.join("wan.sqlite").display());
-        let (mut state, _, _, token) =
+        let (mut state, _, principal, token) =
             crate::http::handlers::marketplace::installation_http_fixture(
                 self.rig.database.clone(),
                 &root,
@@ -80,6 +84,7 @@ impl Participant {
         self.rig.secrets = state.secrets.clone();
         self.app = Some(crate::http::router(state.clone()));
         self.token = Some(token);
+        self.principal = Some(principal);
         self.state = Some(state);
         // Parse the closed trusted profile before a settings mutation or any
         // enrollment. Invalid static roles must not become an HTTP readback
@@ -221,6 +226,7 @@ impl Participant {
         self.app = None;
         self.state = None;
         self.token = None;
+        self.principal = None;
         if stopped.is_err() || retired.is_err() {
             self.rig.root.preserve();
         }

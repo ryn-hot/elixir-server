@@ -8,6 +8,7 @@ use elixir_marketplace::{
     records::{SignatureCache, SignedRecord},
 };
 mod freshness;
+mod lifecycle;
 
 fn descriptor(source: &SourceFixture, weight: u8) -> Result<CandidateDescriptor> {
     // Reuse only the five public TEST credential shapes. Author signatures and
@@ -193,6 +194,16 @@ async fn install_card(
     query: Uuid,
     existing: Option<Uuid>,
 ) -> Result<Uuid> {
+    install_card_with_policy(actor, source, query, existing, false).await
+}
+
+async fn install_card_with_policy(
+    actor: &Participant,
+    source: &SourceFixture,
+    query: Uuid,
+    existing: Option<Uuid>,
+    automatic_updates: bool,
+) -> Result<Uuid> {
     let extension = &source.publication.release.payload.extension_id;
     let targets = target_choices(
         actor.app()?,
@@ -248,7 +259,7 @@ async fn install_card(
         id,
         json!({"action":"approve",
         "review_id":review["review_id"],"expected_revision":review["approval_revision"],
-        "mutation_id":Uuid::new_v4(),"automatic_updates":false}),
+        "mutation_id":Uuid::new_v4(),"automatic_updates":automatic_updates}),
     )
     .await?;
     phase(actor.app()?, actor.token()?, id, "awaiting_setup", None).await?;
@@ -285,7 +296,8 @@ async fn install_card(
         "{}",
         json!({"stage":"cross_peer_selected_card_activated",
         "version":source.publication.release.payload.version,"source_uploads":0,
-        "manual_acceptance":true,"simulated_support_only":true})
+        "manual_acceptance":true,"automatic_updates_opted_in":automatic_updates,
+        "simulated_support_only":true})
     );
     Ok(instance)
 }
@@ -357,6 +369,16 @@ fn approved_versioned_sources_and_test_support_match_before_enrollment() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "two explicitly approved remaining identities; real protected peer catalog/source/install/update; TEST support only"]
 async fn independent_catalog_selected_card_install_and_manual_update() -> Result<()> {
+    catalog_workflow(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "standing-approved two free identities, synthetic sources; normal automatic scheduler/logout, owner opt-out and actual guard failure"]
+async fn independent_catalog_automatic_update_opt_out_and_protection_loss() -> Result<()> {
+    catalog_workflow(true).await
+}
+
+async fn catalog_workflow(lifecycle: bool) -> Result<()> {
     consent()?; // No input access or enrollment before explicit consent.
     ensure!(
         std::env::var("ELIXIR_MARKETPLACE_REMAINING_TWO_IDENTITY_LIVE_TEST").as_deref() == Ok("1"),
@@ -438,7 +460,7 @@ async fn independent_catalog_selected_card_install_and_manual_update() -> Result
         discover_pair(&actors).await?;
         private_parent_diagnostics()?;
         let query = card(&actors[CONSUMER], &sources[0], 10, None).await?;
-        let installed = install_card(&actors[CONSUMER], &sources[0], query, None).await?;
+        let installed = install_card_with_policy(&actors[CONSUMER], &sources[0], query, None, lifecycle).await?;
         // Publisher updates are the exact SECOND already-public approved source.
         // No new repository content or production extension is published.
         for n in 0..1 {
@@ -455,20 +477,29 @@ async fn independent_catalog_selected_card_install_and_manual_update() -> Result
             actors[n].seeding(holders[n], &sources[1], true).await?;
             offer(&actors[n], &descriptors[1]).await?;
         }
-        let query = card(
-            &actors[CONSUMER],
-            &sources[1],
-            20,
-            Some((sources[0].matched.release_id, 10)),
-        )
-        .await?;
-        install_card(&actors[CONSUMER], &sources[1], query, Some(installed)).await?;
-        actors[CONSUMER].roles(false, 3).await?;
+        if lifecycle {
+            // No consumer search, install request, selection, new login or timer
+            // override after offering the new head: the real startup scheduler
+            // must discover and authorize the update using its standing grant.
+            lifecycle::unattended(&actors[CONSUMER], &sources[1], installed).await?;
+            lifecycle::transitions(&actors, &sources[1], &guard).await?;
+        } else {
+            let query = card(
+                &actors[CONSUMER],
+                &sources[1],
+                20,
+                Some((sources[0].matched.release_id, 10)),
+            )
+            .await?;
+            install_card(&actors[CONSUMER], &sources[1], query, Some(installed)).await?;
+            actors[CONSUMER].roles(false, 3).await?;
+        }
         eprintln!(
             "{}",
             json!({"stage":"cross_peer_catalog_workflow_verified",
             "independent_vpn_namespaces":2,"approved_source_versions":2,"holders":1,
-            "selected_card_install_and_update":true,"consumer_source_uploads":0,
+            "selected_card_install_and_update":true,"automatic_update":lifecycle,
+            "owner_opt_out_and_protection_loss":lifecycle,"consumer_source_uploads":0,
             "test_supporters_per_release":5,"real_paid_credentials":0,
             "consumer_only":true,"unmetered_refresh":true,"production_enabled":false})
         );
