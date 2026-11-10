@@ -11,6 +11,7 @@ use elixir_marketplace::{
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+mod catalog;
 
 struct Participant {
     rig: Rig,
@@ -137,7 +138,10 @@ impl Participant {
     }
     async fn roles(&self, seed: bool, revision: i64) -> Result<()> {
         let client = self.client()?;
-        let until = tokio::time::Instant::now() + Duration::from_secs(180);
+        // A recovered contribution owner earns ten healthy minutes. Consumers
+        // need not wait for this; do not weaken the real policy for a WAN test.
+        let until = tokio::time::Instant::now() + Duration::from_secs(if seed { 900 } else { 180 });
+        let mut report = tokio::time::Instant::now();
         loop {
             let state = client.snapshot();
             if state.phase == ParticipationPhase::Running
@@ -152,6 +156,15 @@ impl Participant {
                 tokio::time::Instant::now() < until,
                 "actual contribution roles did not apply: {state:?}"
             );
+            if tokio::time::Instant::now() >= report {
+                eprintln!(
+                    "{}",
+                    json!({"stage":"holder_contribution_wait","seeder":seed,
+                    "phase":state.phase,"blockers":state.blockers,
+                    "recovery_seconds":state.recovery_seconds})
+                );
+                report = tokio::time::Instant::now() + Duration::from_secs(15);
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
