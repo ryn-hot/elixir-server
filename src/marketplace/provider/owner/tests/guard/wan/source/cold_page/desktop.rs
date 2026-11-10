@@ -140,6 +140,9 @@ async fn run_desktop(
         .env("QT_QPA_PLATFORM", "offscreen")
         .env("QT_QUICK_BACKEND", "software")
         .env("QT_FATAL_WARNINGS", "1")
+        // The combined playback + full discovery case can legitimately exceed
+        // Qt's default five minutes; stay below our unchanged 480s child bound.
+        .envs(with_playback.then_some(("QTEST_FUNCTION_TIMEOUT", "450000")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -4,9 +4,11 @@ use super::{Preferences, SELECT, Stored};
 use crate::db::{Database, DatabaseDriver};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
-use sqlx::{Acquire, ConnectOptions, any::AnyPoolOptions, sqlite::SqliteConnectOptions};
-use std::{str::FromStr, time::Duration};
+use sqlx::{Acquire, any::AnyPoolOptions};
+use std::time::Duration;
 use uuid::Uuid;
+
+mod sqlite_url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BindingReceipt {
@@ -22,23 +24,7 @@ pub async fn connect_existing(url: &str) -> Result<Database> {
         .map_err(|_| anyhow::anyhow!("unsupported setup database driver"))?;
     let normalized;
     let url = if driver == DatabaseDriver::Sqlite {
-        let options = SqliteConnectOptions::from_str(url)
-            .map_err(|_| anyhow::anyhow!("invalid setup SQLite URL"))?
-            .create_if_missing(false);
-        normalized = options.to_url_lossy();
-        ensure!(
-            !normalized
-                .query_pairs()
-                .any(|(key, value)| key == "mode" && value == "memory"),
-            "setup requires an existing persistent database"
-        );
-        let metadata = tokio::fs::metadata(options.get_filename())
-            .await
-            .map_err(|_| anyhow::anyhow!("setup SQLite database must already exist"))?;
-        ensure!(
-            metadata.is_file(),
-            "setup SQLite database must be a regular file"
-        );
+        normalized = sqlite_url::existing_url(url).await?;
         normalized.as_str()
     } else {
         url
