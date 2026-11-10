@@ -84,11 +84,11 @@ async fn checking_cannot_disguise_revocation_pressure_staleness_or_owner_failure
 async fn only_background_slot_contention_is_a_prelaunch_deferral() -> Result<()> {
     let f = fixture()?;
     let permit = f.owner.slots.clone().try_acquire_owned()?;
-    for work in [Work::Background, Work::Foreground] {
+    for work in [Work::Background, Work::Foreground, Work::Restrictions] {
         let error = try_slot(&f.owner, work, "source/verification slot is busy").unwrap_err();
         assert_eq!(
             verification_deferred(&error),
-            matches!(work, Work::Background)
+            matches!(work, Work::Background | Work::Restrictions)
         );
         assert_eq!(error.to_string(), "source/verification slot is busy");
     }
@@ -106,6 +106,59 @@ async fn only_background_slot_contention_is_a_prelaunch_deferral() -> Result<()>
         "background source preflight is not admitted"
     )));
     assert!(!f.owner.failed.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_restrictions_need_no_network_disclosure_or_metering_but_keep_background_priority()
+-> Result<()> {
+    let f = fixture()?;
+    f.settings.send_modify(|s| {
+        s.accepted_disclosure_version = None;
+        s.metering = Metering::Unknown;
+    });
+    Work::Restrictions.admit_start(&f.owner)?;
+    assert!(Work::Background.admit_start(&f.owner).is_err());
+    checking(&f.protection, 60);
+    let error = Work::Restrictions.admit_start(&f.owner).unwrap_err();
+    assert!(verification_deferred(&error));
+    assert_eq!(f.owner.slots.available_permits(), 1);
+    for change in 0..9 {
+        let f = fixture()?;
+        match change {
+            0 => f.owner.failed.store(true, Ordering::SeqCst),
+            1 => f
+                .facts
+                .send_modify(|v| v.as_mut().unwrap().resource_pressure = true),
+            2 => f
+                .facts
+                .send_modify(|v| v.as_mut().unwrap().playback_pressure = true),
+            3 => f
+                .facts
+                .send_modify(|v| v.as_mut().unwrap().background_allowance = false),
+            4 => f
+                .facts
+                .send_modify(|v| v.as_mut().unwrap().available_memory = None),
+            5 => f
+                .facts
+                .send_modify(|v| v.as_mut().unwrap().disk_headroom = false),
+            6 => {
+                f.facts.send_replace(None);
+            }
+            7 => {
+                tokio::time::advance(Duration::from_secs(31)).await;
+            }
+            8 => {
+                drop(f.protection);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            Work::Restrictions.admit_start(&f.owner).is_err(),
+            "change {change}"
+        );
+        assert_eq!(f.owner.slots.available_permits(), 1);
+    }
     Ok(())
 }
 

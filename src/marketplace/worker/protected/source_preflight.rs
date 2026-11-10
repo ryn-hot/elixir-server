@@ -540,15 +540,18 @@ impl Client {
 fn background_admitted(settings: &ParticipationSettings, facts: Option<&Facts>) -> bool {
     settings.accepted_disclosure_version == Some(PARTICIPATION_DISCLOSURE_VERSION)
         && settings.metering == Metering::Unmetered
-        && facts.is_some_and(|f| {
-            f.observed.elapsed() <= Duration::from_secs(30)
-                && f.available_memory
-                    .is_some_and(|n| n >= HOST_HELPER_HEADROOM)
-                && f.disk_headroom
-                && !f.resource_pressure
-                && !f.playback_pressure
-                && f.background_allowance
-        })
+        && background_resources_admitted(facts)
+}
+fn background_resources_admitted(facts: Option<&Facts>) -> bool {
+    facts.is_some_and(|f| {
+        f.observed.elapsed() <= Duration::from_secs(30)
+            && f.available_memory
+                .is_some_and(|n| n >= HOST_HELPER_HEADROOM)
+            && f.disk_headroom
+            && !f.resource_pressure
+            && !f.playback_pressure
+            && f.background_allowance
+    })
 }
 impl Owner {
     fn cache_admit(&self) -> Result<()> {
@@ -565,18 +568,32 @@ impl Owner {
         Ok(())
     }
     fn admit(&self, ready: bool) -> Result<()> {
+        self.admit_background(ready, false)
+    }
+    // Restriction verification is local-only: it cannot fetch sources, discover
+    // peers or install code. Turning off contribution/automatic updates must
+    // not opt an installed source out of already-received security notices.
+    fn admit_local_restrictions(&self, ready: bool) -> Result<()> {
+        self.admit_background(ready, true)
+    }
+    fn admit_background(&self, ready: bool, local_restrictions: bool) -> Result<()> {
         let phase = observed_state(&self.protection);
         let blocked = self.failed.load(Ordering::SeqCst)
             || !matches!(phase, ProtectionState::Ready | ProtectionState::Checking)
             || self.settings.has_changed().is_err()
             || self.facts.has_changed().is_err()
-            || !background_admitted(&self.settings.borrow(), self.facts.borrow().as_ref());
+            || if local_restrictions {
+                !background_resources_admitted(self.facts.borrow().as_ref())
+            } else {
+                !background_admitted(&self.settings.borrow(), self.facts.borrow().as_ref())
+            };
         let checking = ready && phase == ProtectionState::Checking;
         if blocked || checking {
             let settings = self.settings.borrow();
             let facts = self.facts.borrow();
             tracing::debug!(target: "elixir_marketplace::sharing_diagnostics",
                 stage = "background_admission",
+                local_restrictions,
                 protection = ?phase,
                 owner_failed = self.failed.load(Ordering::SeqCst),
                 settings_live = self.settings.has_changed().is_ok(),

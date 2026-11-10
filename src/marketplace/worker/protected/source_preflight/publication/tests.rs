@@ -478,3 +478,14 @@ async fn direct_preview_reuses_exact_source_cache_but_installation_requires_a_fr
     assert!(client.request_fresh_publication(&receipt, 0).await.is_err());
     Ok(())
 }
+#[tokio::test]
+async fn local_restriction_purpose_cannot_reserve_publication_work() -> Result<()> {
+    let f = super::super::tests::fixture()?;
+    assert!(
+        publication_slot(&f.owner, Work::Restrictions)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.owner.slots.available_permits(), 1);
+    Ok(())
+}

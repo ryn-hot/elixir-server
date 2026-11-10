@@ -146,7 +146,7 @@ impl Client {
         &self,
         records: &SecurityRecords,
     ) -> Result<SecurityObservation> {
-        self.verify_security_mode(records, Work::Background).await
+        self.verify_security_mode(records, Work::Restrictions).await
     }
     pub(in crate::marketplace::worker::protected) async fn verify_owner_security(
         &self,
@@ -163,12 +163,7 @@ impl Client {
         if !self.0.binding.security_verifier {
             bail!("independent security verification is unavailable");
         }
-        let permit = self
-            .0
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .context("metadata/source/security slot is busy")?;
+        let permit = admission::try_slot(&self.0, work, "metadata/source/security slot is busy")?;
         records.validate_shape()?;
         let records = records.clone();
         let random = u64::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into()?);

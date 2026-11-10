@@ -276,6 +276,7 @@ impl Client {
 
 async fn publication_slot(owner: &Owner, work: Work) -> Result<tokio::sync::OwnedSemaphorePermit> {
     let permit = match work {
+        Work::Restrictions => bail!("local restriction work cannot verify a publication"),
         Work::Background => admission::try_slot(owner, work, "source/verification slot is busy")?,
         // The service already admits only one preview and one installation.
         // Wait fairly for that existing slot, not an unbounded job queue.

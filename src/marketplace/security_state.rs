@@ -14,9 +14,11 @@ use sqlx::{Acquire, Row};
 use std::collections::BTreeSet;
 
 mod export;
+mod preview;
 pub(in crate::marketplace) mod retained;
 mod unchanged;
 pub(in crate::marketplace) use export::catalog_baseline;
+pub(in crate::marketplace) use preview::observation_needed;
 
 const MAX_ROWS: i64 = 10_000;
 const MAX_BYTES: i64 = 8 * 1024 * 1024;

@@ -7,6 +7,7 @@ use elixir_marketplace::{
     evidence::IssuerPolicy,
     records::{SignatureCache, SignedRecord},
 };
+mod freshness;
 
 fn descriptor(source: &SourceFixture, weight: u8) -> Result<CandidateDescriptor> {
     // Reuse only the five public TEST credential shapes. Author signatures and

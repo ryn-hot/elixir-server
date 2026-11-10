@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod catalog_export;
 mod direct_import;
+mod preview;
 mod retained;
 mod unchanged;
 

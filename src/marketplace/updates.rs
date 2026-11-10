@@ -25,6 +25,8 @@ use uuid::Uuid;
 const CYCLE: u64 = 6 * 60 * 60;
 const MAX_TARGETS: i64 = 4096;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+const RESTRICTION_TICK: Duration = Duration::from_secs(5);
+mod restrictions;
 
 #[derive(Default, Clone)]
 pub(super) struct Service(Arc<Mutex<Option<Arc<Entry>>>>);
@@ -41,6 +43,8 @@ struct Diagnostics {
     last_outcome: Option<&'static str>,
     operation: Option<Uuid>,
     failure: Option<Arc<anyhow::Error>>,
+    restriction_checks: u64,
+    restriction_failure: Option<Arc<anyhow::Error>>,
 }
 enum Outcome {
     Complete(Option<Uuid>),
@@ -180,7 +184,9 @@ impl Service {
         Ok(
             serde_json::json!({"checks":d.checks,"deferrals":d.deferrals,
             "last_outcome":d.last_outcome,"operation":d.operation,
-            "original_failure_retained":d.failure.is_some()}),
+            "original_failure_retained":d.failure.is_some(),
+            "restriction_checks":d.restriction_checks,
+            "restriction_failure_retained":d.restriction_failure.is_some()}),
         )
     }
     #[cfg(test)]
@@ -192,13 +198,14 @@ impl Service {
         let Some(entry) = slot.as_ref() else {
             return Ok(None);
         };
-        let failure = entry
+        let diagnostics = entry
             .diagnostics
             .lock()
-            .map_err(|_| anyhow::anyhow!("update diagnostics unavailable"))?
+            .map_err(|_| anyhow::anyhow!("update diagnostics unavailable"))?;
+        Ok(diagnostics
             .failure
-            .clone();
-        Ok(failure)
+            .clone()
+            .or_else(|| diagnostics.restriction_failure.clone()))
     }
     pub(super) async fn shutdown(&self) -> Result<()> {
         self.request_stop();
@@ -374,17 +381,49 @@ async fn run(
     let mut retry = Retry::default();
     // Stagger restarts; no enrollment, provider consent or network readiness is
     // inferred from a timer. A missing protected client simply defers this job.
-    let mut delay = Duration::from_secs(15 + (Uuid::new_v4().as_u128() % 60) as u64);
-    while wait(&mut stopped, delay).await {
+    let initial_delay = Duration::from_secs(15 + (Uuid::new_v4().as_u128() % 60) as u64);
+    let mut next_update = Instant::now() + initial_delay;
+    let mut restriction_scan = restrictions::Scan::default();
+    while wait(&mut stopped, RESTRICTION_TICK).await {
         if marketplace.stop_requested() {
             break;
         }
+        // A manual-update choice cannot disable restriction propagation. This
+        // reuses this task and the existing LOCAL index/native security lane;
+        // no discovery or source lookup is started. Offline startup stays local.
+        if runtime.playback.startup_queue_len() == 0
+            && let Ok(client) = marketplace.client()
+            && client.snapshot().phase == super::worker::ParticipationPhase::Running
+            && client.snapshot().host_sample_current
+        {
+            let result = restriction_scan.check(client, &database).await;
+            let mut d = diagnostics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("update diagnostics unavailable"))?;
+            d.restriction_checks = d.restriction_checks.saturating_add(1);
+            if let Err(error) = result {
+                if d.restriction_failure.is_none() {
+                    d.restriction_failure = Some(Arc::new(error));
+                }
+                tracing::debug!(
+                    "local installed security refresh deferred; retained fences unchanged"
+                );
+            } else {
+                d.restriction_failure = None;
+            }
+        }
+        if *stopped.borrow() || marketplace.stop_requested() {
+            break;
+        }
+        if Instant::now() < next_update {
+            continue;
+        }
         if !marketplace.automatic_update_idle()? || runtime.playback.startup_queue_len() > 0 {
-            delay = Duration::from_secs(30);
+            next_update = Instant::now() + Duration::from_secs(30);
             continue;
         }
         let (target, next_delay) = next_target(&database, cursor.as_ref()).await?;
-        delay = next_delay;
+        next_update = Instant::now() + next_delay;
         let target = match target {
             Some(target) => target,
             None => {
@@ -417,7 +456,7 @@ async fn run(
         }
         let complete = matches!(outcome, Ok(Outcome::Complete(_)));
         let (advance, next) = retry.after(complete, next_delay);
-        delay = next;
+        next_update = Instant::now() + next;
         if advance {
             cursor = Some((target.extension.to_string(), target.instance.to_string()));
         }
@@ -428,7 +467,7 @@ async fn run(
         if !complete {
             tracing::debug!(
                 reason = d.last_outcome,
-                retry_seconds = delay.as_secs(),
+                retry_seconds = next.as_secs(),
                 "automatic-update check deferred; current installed source unchanged"
             );
         }
@@ -502,6 +541,7 @@ mod tests {
             last_outcome: Some("check_failed"),
             operation: None,
             failure: Some(failure.clone()),
+            ..Default::default()
         }));
         *service.0.lock().unwrap() = Some(Arc::new(Entry {
             stop,

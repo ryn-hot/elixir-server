@@ -43,7 +43,7 @@ pub(super) fn try_slot(
     owner.slots.clone().try_acquire_owned().map_err(|error| {
         let busy = matches!(&error, tokio::sync::TryAcquireError::NoPermits);
         let error = anyhow::Error::new(error).context(message);
-        if busy && matches!(work, Work::Background) {
+        if busy && work.background() {
             error.context(PrelaunchDeferred(message))
         } else {
             error
@@ -55,12 +55,20 @@ pub(super) fn try_slot(
 pub(super) enum Work {
     Background,
     Foreground,
+    // Only the source-free native security verifier may use this purpose.
+    // It retains background resource/playback priority, without network consent
+    // or metering gates for reading already-received signed restrictions.
+    Restrictions,
 }
 impl Work {
+    fn background(self) -> bool {
+        !matches!(self, Self::Foreground)
+    }
     pub(super) fn admit(self, owner: &Owner, ready: bool) -> Result<()> {
         match self {
             Self::Background => owner.admit(ready),
             Self::Foreground => owner.admit_foreground(ready),
+            Self::Restrictions => owner.admit_local_restrictions(ready),
         }
     }
 
@@ -68,16 +76,15 @@ impl Work {
     /// input. Foreground work may retain that slot across routine Checking;
     /// background work continues to defer immediately.
     pub(super) fn admit_start(self, owner: &Owner) -> Result<()> {
-        self.admit(owner, matches!(self, Self::Background))
-            .map_err(|error| {
-                if matches!(self, Self::Background) && error.is::<Checking>() {
-                    error.context(PrelaunchDeferred(
-                        "background source preflight is not admitted",
-                    ))
-                } else {
-                    error
-                }
-            })
+        self.admit(owner, self.background()).map_err(|error| {
+            if self.background() && error.is::<Checking>() {
+                error.context(PrelaunchDeferred(
+                    "background source preflight is not admitted",
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     /// Before launch, allow the SAME protection owner's bounded health cycle
@@ -131,7 +138,7 @@ impl Work {
             } else {
                 // A helper already exists: never label its interruption as
                 // positively unsent or permit a replacement before retirement.
-                self.admit(owner, matches!(self, Self::Background))?;
+                self.admit(owner, self.background())?;
             }
             if self.admit(owner, true).is_ok() {
                 return Ok(());
