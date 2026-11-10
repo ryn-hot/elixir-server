@@ -20,6 +20,7 @@ use tokio::time::Instant;
 const COMMIT: &str = "09d9c040aaf015b37b6bf13037ce18f0fb6abbba";
 const WARM_SAMPLES: usize = 32;
 mod desktop;
+mod playback;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -461,6 +461,12 @@ async fn catalog_workflow(lifecycle: bool) -> Result<()> {
         private_parent_diagnostics()?;
         let query = card(&actors[CONSUMER], &sources[0], 10, None).await?;
         let installed = install_card_with_policy(&actors[CONSUMER], &sources[0], query, None, lifecycle).await?;
+        if lifecycle && std::env::var("ELIXIR_MARKETPLACE_FULL_LIFECYCLE_CAPTURE").as_deref() == Ok("1") {
+            // Observation window BEFORE publishing the already-approved next
+            // version to this private cohort. No scheduler/health/role override.
+            eprintln!("{}", json!({"stage":"cross_peer_automatic_capture_begin"}));
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
         // Publisher updates are the exact SECOND already-public approved source.
         // No new repository content or production extension is published.
         for n in 0..1 {

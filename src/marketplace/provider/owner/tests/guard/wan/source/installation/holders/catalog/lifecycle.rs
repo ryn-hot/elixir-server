@@ -269,6 +269,17 @@ pub(super) async fn transitions(
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
+    let full_capture =
+        std::env::var("ELIXIR_MARKETPLACE_FULL_LIFECYCLE_CAPTURE").as_deref() == Ok("1");
+    if full_capture {
+        // The observer must bind the NEW namespace/transport tuple. This does
+        // not claim coverage of the preceding startup/handoff packets.
+        eprintln!(
+            "{}",
+            json!({"stage":"cross_peer_recovered_transport_capture_begin"})
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
     source_ready(&recovered).await?;
     let fresh = recovered.verify_publication(&source.publication).await?;
     ensure!(
@@ -290,5 +301,10 @@ pub(super) async fn transitions(
         "normal_startup_recovered":true,"fresh_source_after_recovery":true,
         "excludes":"physical sleep, outer IPv6, off-site operators and full platform matrix"})
     );
+    if full_capture {
+        // Let the external observer join its exact capture before the normal
+        // parent retirement; do not keep the namespace alive via instrumentation.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
     Ok(())
 }
