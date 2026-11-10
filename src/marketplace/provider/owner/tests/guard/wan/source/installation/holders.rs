@@ -12,6 +12,7 @@ use elixir_marketplace::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 mod catalog;
+mod handoff;
 
 struct Participant {
     rig: Rig,

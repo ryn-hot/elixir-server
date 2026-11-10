@@ -25,6 +25,11 @@ use elixir_marketplace::{
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+// Qualification instrumentation only: no socket, wait or environment switch is
+// present in a production executable.
+#[cfg(all(test, unix))]
+pub(in crate::marketplace) mod test_capture;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Intent {
@@ -216,6 +221,8 @@ impl Owner {
             );
             let credit = debit.into_packet_credit()?;
             let transport = owner.transport().await?;
+            #[cfg(all(test, unix))]
+            test_capture::begin(&owner, &transport).await?;
             let namespace = transport.namespace_inode;
             // A caller/SDK cannot select provider exceptions or reuse example
             // endpoints. Freeze only the ORIGINAL service's current UDP tuple.
