@@ -6393,6 +6393,22 @@ pub async fn stream_subtitle(
     Ok((direct_response.status, direct_response.headers, body).into_response())
 }
 
+// Playlist delivery is activity, not a new playback-position report. The
+// original job start is stale after a seek or progress update. A late response
+// must also never revive a session that ended while FFmpeg was starting.
+async fn touch_delivered_hls_playlist(
+    pool: &sqlx::AnyPool,
+    session_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query::<sqlx::Any>(
+        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND state = 'active'",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 pub async fn master_playlist(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -6550,13 +6566,7 @@ pub async fn master_playlist(
         params.ts.as_deref(),
     );
 
-    let _ = sqlx::query::<sqlx::Any>(
-        "UPDATE playback_sessions SET updated_at = CURRENT_TIMESTAMP, state = 'active', logical_position_seconds = $1 WHERE id = $2",
-    )
-    .bind(seek_seconds)
-    .bind(&id)
-    .execute(&state.db_pool)
-    .await;
+    let _ = touch_delivered_hls_playlist(&state.db_pool, &id).await;
     TRANSCODE_DURATION
         .with_label_values(&["ok"])
         .observe(start_time.elapsed().as_secs_f64());
@@ -8500,6 +8510,44 @@ mod tests {
         PlaybackPerformanceDecision, PlaybackSupportDecision, SeekBehavior, StreamAction,
         VideoFrameRateMode, VideoFrameRatePlan, VideoOutputPlan,
     };
+
+    #[tokio::test]
+    async fn hls_playlist_delivery_preserves_seek_progress_and_ended_state()
+    -> Result<(), sqlx::Error> {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        sqlx::query("CREATE TABLE playback_sessions (id TEXT PRIMARY KEY, state TEXT NOT NULL, logical_position_seconds REAL NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool).await?;
+        sqlx::query(
+            "INSERT INTO playback_sessions VALUES ('fixture', 'active', 0.0, '2000-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        for position in [60.0_f64, 75.0, 120.0] {
+            sqlx::query("UPDATE playback_sessions SET logical_position_seconds = $1, updated_at = '2000-01-01' WHERE id = 'fixture'")
+                .bind(position).execute(&pool).await?;
+            touch_delivered_hls_playlist(&pool, "fixture").await?;
+            touch_delivered_hls_playlist(&pool, "fixture").await?;
+            let row = sqlx::query("SELECT state, logical_position_seconds, updated_at FROM playback_sessions WHERE id = 'fixture'")
+                .fetch_one(&pool).await?;
+            assert_eq!(row.try_get::<String, _>("state")?, "active");
+            assert_eq!(row.try_get::<f64, _>("logical_position_seconds")?, position);
+            assert_ne!(row.try_get::<String, _>("updated_at")?, "2000-01-01");
+        }
+        sqlx::query("UPDATE playback_sessions SET state = 'ended', updated_at = '2000-01-01' WHERE id = 'fixture'")
+            .execute(&pool).await?;
+        touch_delivered_hls_playlist(&pool, "fixture").await?;
+        let row = sqlx::query("SELECT state, logical_position_seconds, updated_at FROM playback_sessions WHERE id = 'fixture'")
+            .fetch_one(&pool).await?;
+        assert_eq!(row.try_get::<String, _>("state")?, "ended");
+        assert_eq!(row.try_get::<f64, _>("logical_position_seconds")?, 120.0);
+        assert_eq!(row.try_get::<String, _>("updated_at")?, "2000-01-01");
+        pool.close().await;
+        Ok(())
+    }
 
     fn phase13_test_plan(mode: PlaybackMode) -> PlaybackPlan {
         let delivery = match mode {

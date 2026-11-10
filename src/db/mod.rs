@@ -395,3 +395,6 @@ mod tls_security;
 
 #[cfg(test)]
 mod sqlite_security;
+
+#[cfg(test)]
+mod protocol_security;

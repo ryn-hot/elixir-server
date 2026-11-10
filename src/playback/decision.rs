@@ -5531,6 +5531,17 @@ mod tests {
         automatic.quality_mode = QualityMode::Automatic;
         let mut adaptive_policy = policy.clone();
         adaptive_policy.allow_adaptive_transcode = true;
+        let without_abr = plan_playback(
+            "adaptive-file-without-abr",
+            &hevc_hdr_pgs,
+            PlaybackSelection::default(),
+            &automatic,
+            &adaptive_policy,
+        );
+        assert_eq!(without_abr.mode, PlaybackMode::VideoTranscode);
+        assert!(!without_abr.adaptive);
+        automatic.abr_support_type = AbrSupportType::HlsJs;
+        adaptive_policy.abr_support_type = AbrSupportType::HlsJs;
         let adaptive_plan = plan_playback(
             "adaptive-file",
             &hevc_hdr_pgs,

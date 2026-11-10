@@ -19,7 +19,7 @@ serde_ignored = "=0.1.14"
 serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 tempfile = "3.10"
-sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "any", "macros", "uuid", "chrono", "migrate", "json"] }
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "any", "macros", "uuid", "chrono", "migrate", "json"] }
 thiserror = "1.0"
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "signal", "process"] }
 tower = { version = "0.4", features = ["util"] }

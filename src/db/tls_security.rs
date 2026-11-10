@@ -213,6 +213,13 @@ async fn actual_postgres_tls_modes_and_all_supported_client_key_encodings() -> R
     fixture
         .good(fixture.url("localhost", "verify-full", &ca, client)?, true)
         .await?;
+    super::protocol_security::postgres_target_inference_and_parameter_limit(fixture.url(
+        "localhost",
+        "verify-full",
+        &ca,
+        client,
+    )?)
+    .await?;
     fixture
         .bad_certificate(fixture.url("127.0.0.1", "verify-full", &ca, client)?, true)
         .await?;

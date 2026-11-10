@@ -37,6 +37,7 @@ pub(super) fn migrator() -> Result<Migrator> {
         migrations: Cow::Owned(migrations),
         ignore_missing: MIGRATOR.ignore_missing,
         locking: MIGRATOR.locking,
+        no_tx: MIGRATOR.no_tx,
     })
 }
 
@@ -99,6 +100,7 @@ fn adapt(migration: &Migration) -> Result<(Migration, bool)> {
             migration.description.clone(),
             migration.migration_type,
             Cow::Owned(sql),
+            migration.no_tx,
         ),
         adapted,
     ))
@@ -130,6 +132,9 @@ mod tests {
     fn adapter_preserves_order_metadata_and_explicit_change_set() -> Result<()> {
         let postgres = migrator()?;
         assert_eq!(postgres.iter().len(), MIGRATOR.iter().len());
+        assert_eq!(postgres.ignore_missing, MIGRATOR.ignore_missing);
+        assert_eq!(postgres.locking, MIGRATOR.locking);
+        assert_eq!(postgres.no_tx, MIGRATOR.no_tx);
 
         let changed: Vec<i64> = MIGRATOR
             .iter()
@@ -138,6 +143,7 @@ mod tests {
                 assert_eq!(sqlite.version, postgres.version);
                 assert_eq!(sqlite.description, postgres.description);
                 assert_eq!(sqlite.migration_type, postgres.migration_type);
+                assert_eq!(sqlite.no_tx, postgres.no_tx);
                 (sqlite.sql != postgres.sql).then_some(sqlite.version)
             })
             .collect();
@@ -147,6 +153,19 @@ mod tests {
                 && !migration.sql.contains(SQLITE_BOOLEAN_DEFAULT_TRUE)
                 && !migration.sql.contains("INSERT OR IGNORE")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_preserves_explicit_transaction_mode_for_every_migration() -> Result<()> {
+        for no_tx in [false, true] {
+            for original in MIGRATOR.iter() {
+                let mut source = original.clone();
+                source.no_tx = no_tx;
+                let (postgres, _) = adapt(&source)?;
+                assert_eq!(postgres.no_tx, no_tx, "migration {}", source.version);
+            }
+        }
         Ok(())
     }
 }

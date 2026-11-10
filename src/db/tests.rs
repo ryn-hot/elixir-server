@@ -124,6 +124,7 @@ fn migrator_through(version: i64) -> sqlx::migrate::Migrator {
         ),
         ignore_missing: false,
         locking: true,
+        no_tx: super::MIGRATOR.no_tx,
     }
 }
 
@@ -139,6 +140,7 @@ fn postgres_migrator_through(version: i64) -> Result<sqlx::migrate::Migrator> {
         ),
         ignore_missing: migrator.ignore_missing,
         locking: migrator.locking,
+        no_tx: migrator.no_tx,
     })
 }
 
