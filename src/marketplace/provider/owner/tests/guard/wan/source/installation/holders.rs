@@ -20,6 +20,7 @@ struct Participant {
     token: Option<String>,
     shutdown: CancellationToken,
     startup: Option<JoinHandle<Result<()>>>,
+    installed_startup: Option<JoinHandle<Result<()>>>,
 }
 impl Participant {
     async fn new(runtime: Arc<dyn RuntimeManager>, image: &str) -> Result<Self> {
@@ -30,6 +31,7 @@ impl Participant {
             token: None,
             shutdown: CancellationToken::new(),
             startup: None,
+            installed_startup: None,
         })
     }
     fn state(&self) -> Result<&AppState> {
@@ -76,9 +78,6 @@ impl Participant {
         settings.marketplace.installation_management = true;
         state.settings = Arc::new(settings);
         self.rig.secrets = state.secrets.clone();
-        state
-            .marketplace
-            .configure_installation(allocation.clone())?;
         self.app = Some(crate::http::router(state.clone()));
         self.token = Some(token);
         self.state = Some(state);
@@ -113,6 +112,20 @@ impl Participant {
             crate::marketplace::startup::spawn_configured(self.state()?, self.shutdown.clone())
                 .context("original configured startup missing")?,
         );
+        // Match main: networking does not start retained-extension restoration,
+        // installed sharing or automatic updates. The separate startup owns
+        // those services. Join its original task before racing an installation
+        // against the empty-database restoration barrier.
+        self.installed_startup = Some(
+            crate::marketplace::installed_startup::spawn_configured(
+                self.state()?,
+                self.shutdown.clone(),
+            )
+            .context("original installed startup missing")?,
+        );
+        let installed = self.installed_startup.as_mut().unwrap().await;
+        self.installed_startup = None;
+        installed.context("original installed startup join")??;
         let until = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if self.state()?.marketplace.installation_review_available() {
@@ -177,6 +190,13 @@ impl Participant {
                 .and_then(|r| r),
             None => Ok(()),
         };
+        let installed = match self.installed_startup.take() {
+            Some(task) => task
+                .await
+                .context("original installed startup join")
+                .and_then(|result| result),
+            None => Ok(()),
+        };
         let application = match &self.state {
             Some(state) => state.marketplace.shutdown().await,
             None => Ok(()),
@@ -184,7 +204,10 @@ impl Participant {
         if let Err(error) = &startup {
             eprintln!("Original holder startup retirement failed: {error:#}");
         }
-        application.and(startup)
+        if let Err(error) = &installed {
+            eprintln!("Original holder installed startup retirement failed: {error:#}");
+        }
+        application.and(startup).and(installed)
     }
     async fn close(&mut self) -> Result<()> {
         let stopped = self.stop().await;
@@ -232,6 +255,20 @@ impl Participant {
             saved["enabled"] == enable,
             "exact publisher-seeding choice did not apply"
         );
+        if enable {
+            // A saved consent row is not a running contributor. Wait for the
+            // actual protected owner's nonempty installed-sharing lease before
+            // publishing a test offer; the download still proves exact bytes.
+            let until = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !self.client()?.snapshot().package_sharing_active {
+                ensure!(
+                    tokio::time::Instant::now() < until,
+                    "original installed archive never acquired its sharing lease"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            eprintln!("{}", json!({"stage":"holder_installed_sharing_ready"}));
+        }
         Ok(())
     }
 }
