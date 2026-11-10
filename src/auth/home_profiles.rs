@@ -425,16 +425,6 @@ pub(crate) async fn ensure_owner_home_in_transaction(
     .await?;
 
     sqlx::query(
-        "INSERT INTO profile_authorization_revisions (profile_id, home_id, revision)
-         VALUES ($1, $2, 1)
-         ON CONFLICT(profile_id) DO NOTHING",
-    )
-    .bind(profile_id.to_string())
-    .bind(home.id.to_string())
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
         "UPDATE server_instances
          SET home_id = $1
          WHERE user_id = $2 AND home_id IS NULL",
@@ -483,6 +473,18 @@ pub(crate) async fn ensure_owner_home_in_transaction(
     let profile = Profile::try_from(profile_row)?;
 
     require_owner_bootstrap(&home, &membership, &profile, user_id)?;
+    // A legacy account profile can retain a different persisted ID. The
+    // candidate ID above is only for insertion, never the resolved identity.
+    sqlx::query(
+        "INSERT INTO profile_authorization_revisions (profile_id, home_id, revision)
+         VALUES ($1, $2, 1)
+         ON CONFLICT(profile_id) DO NOTHING",
+    )
+    .bind(profile.id.to_string())
+    .bind(home.id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+
     Ok(OwnerHomeBootstrap {
         home,
         membership,
@@ -712,6 +714,33 @@ mod tests {
                 .await?;
             assert_eq!(count, 1, "bootstrap duplicated the legacy {table} row");
         }
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM profile_authorization_revisions
+             WHERE profile_id = $1 AND home_id = $2",
+        )
+        .bind(bootstrap.profile.id.to_string())
+        .bind(bootstrap.home.id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(revision, 1);
+        sqlx::query(
+            "UPDATE profile_authorization_revisions SET revision = 7 WHERE profile_id = $1",
+        )
+        .bind(bootstrap.profile.id.to_string())
+        .execute(&database.pool)
+        .await?;
+        assert_eq!(repository.ensure_owner_home(user_id).await?, bootstrap);
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM profile_authorization_revisions WHERE profile_id = $1",
+        )
+        .bind(bootstrap.profile.id.to_string())
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(revision, 7, "bootstrap must not reset authorization state");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profile_authorization_revisions")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(count, 1, "only the actual persisted profile is authorized");
         Ok(())
     }
 

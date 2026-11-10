@@ -559,9 +559,49 @@ pub fn init_metrics() {
 }
 
 pub fn gather() -> Vec<u8> {
+    encode(&REGISTRY)
+}
+
+fn encode(registry: &Registry) -> Vec<u8> {
     let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
+    let metric_families = registry.gather();
     let mut buf = Vec::new();
     encoder.encode(&metric_families, &mut buf).ok();
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_metrics_preserve_counters_gauges_and_histograms_without_binary_encoding() {
+        let registry = Registry::new();
+        let requests = IntCounterVec::new(
+            Opts::new("qualification_requests_total", "Text-only request count"),
+            &["operation"],
+        )
+        .unwrap();
+        requests.with_label_values(&["search"]).inc_by(3);
+        registry.register(Box::new(requests)).unwrap();
+        let active = IntGauge::new("qualification_active", "Text-only active count").unwrap();
+        active.set(2);
+        registry.register(Box::new(active)).unwrap();
+        let duration = prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
+            "qualification_duration_seconds",
+            "Text-only duration",
+        ))
+        .unwrap();
+        duration.observe(0.5);
+        registry.register(Box::new(duration)).unwrap();
+
+        let rendered = String::from_utf8(encode(&registry)).unwrap();
+        assert!(rendered.contains("# TYPE qualification_requests_total counter\n"));
+        assert!(rendered.contains("qualification_requests_total{operation=\"search\"} 3\n"));
+        assert!(rendered.contains("# TYPE qualification_active gauge\n"));
+        assert!(rendered.contains("qualification_active 2\n"));
+        assert!(rendered.contains("# TYPE qualification_duration_seconds histogram\n"));
+        assert!(rendered.contains("qualification_duration_seconds_count 1\n"));
+        assert!(rendered.contains("qualification_duration_seconds_sum 0.5\n"));
+    }
 }
