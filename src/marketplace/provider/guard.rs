@@ -280,6 +280,15 @@ impl Owner {
                             "guard joined another kernel namespace"
                         );
                         runtime.inspect_provider_guard(&handle, &profile).await?;
+                        #[cfg(all(test, unix))]
+                        test_capture::guard_ready(
+                            &owner.profile.intent().deployment,
+                            &owner.handle.id,
+                            &handle.id,
+                            namespace,
+                            owner.profile.intent().resume,
+                        )
+                        .await?;
                         Ok::<_, anyhow::Error>(())
                     }
                     .await;

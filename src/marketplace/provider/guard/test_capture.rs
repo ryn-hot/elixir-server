@@ -98,10 +98,70 @@ pub(in crate::marketplace) async fn finish() -> Result<()> {
     exchange(&path, serde_json::json!({"operation":"end"}), b"done\n").await
 }
 
+// Only the separate startup-interruption fixture enables this second barrier.
+// Existing packet-capture runs keep their original two-operation protocol.
+pub(super) async fn guard_ready(
+    deployment: &str,
+    provider_id: &str,
+    guard_id: &str,
+    namespace_inode: u64,
+    resumed: bool,
+) -> Result<()> {
+    if std::env::var("ELIXIR_MARKETPLACE_TEST_STARTUP_BARRIER").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let path = configured()?.context("explicit startup-interruption socket required")?;
+    exchange(
+        &path,
+        guard_ready_frame(deployment, provider_id, guard_id, namespace_inode, resumed),
+        b"ready\n",
+    )
+    .await
+}
+
+fn guard_ready_frame(
+    deployment: &str,
+    provider_id: &str,
+    guard_id: &str,
+    namespace_inode: u64,
+    resumed: bool,
+) -> serde_json::Value {
+    serde_json::json!({"operation":"guard_ready", "deployment":deployment,
+        "provider_id":provider_id,"guard_id":guard_id,"namespace_inode":namespace_inode,"resumed":resumed})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn startup_ready_frame_is_closed_and_contains_no_transport_address() {
+        for resumed in [false, true] {
+            let frame =
+                guard_ready_frame("fixture", &"a".repeat(64), &"b".repeat(64), 12345, resumed);
+            let mut fields: Vec<_> = frame
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort();
+            assert_eq!(
+                fields,
+                [
+                    "deployment",
+                    "guard_id",
+                    "namespace_inode",
+                    "operation",
+                    "provider_id",
+                    "resumed"
+                ]
+            );
+            assert_eq!(frame["resumed"], resumed);
+            assert_eq!(frame["operation"], "guard_ready");
+        }
+    }
 
     async fn roundtrip(ack: &'static [u8], private: bool) -> Result<bool> {
         let root = tempfile::Builder::new()
