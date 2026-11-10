@@ -289,9 +289,63 @@ async fn install_card(
     Ok(instance)
 }
 
+fn private_parent_diagnostics() -> Result<()> {
+    // This ignored test alone owns the executable. Enable only the existing
+    // fixed sharing-stage messages, after cooldown, never arbitrary errors.
+    tracing_subscriber::fmt()
+        .with_env_filter("off,elixir_marketplace::sharing_diagnostics=debug")
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .try_init()
+        .map_err(|_| anyhow::anyhow!("private sharing observer unavailable"))
+}
+
+fn failure_snapshot(
+    participant: usize,
+    state: &crate::marketplace::worker::ParticipationSnapshot,
+) -> Value {
+    // A near-failure diagnostic, NOT a liveness/cleanup/serving receipt. Avoid
+    // the full snapshot: catalog fields may grow independent diagnostic data.
+    json!({"stage":"cross_peer_failure_state","participant":participant,
+        "phase":state.phase,"blockers":state.blockers,"applied_roles":state.applied_roles,
+        "host_sample_current":state.host_sample_current,"preferences_revision":state.preferences_revision,
+        "package_sharing_active":state.package_sharing_active,"recovery_seconds":state.recovery_seconds})
+}
+
+#[test]
+fn private_failure_snapshot_preserves_unknown_roles_and_uses_only_closed_fields() {
+    let state = crate::marketplace::worker::ParticipationSnapshot::default();
+    let value = failure_snapshot(1, &state);
+    let keys = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "stage",
+            "participant",
+            "phase",
+            "blockers",
+            "applied_roles",
+            "host_sample_current",
+            "preferences_revision",
+            "package_sharing_active",
+            "recovery_seconds"
+        ])
+    );
+    assert!(value["applied_roles"].is_null());
+    assert!(value["preferences_revision"].is_null());
+    assert_eq!(value["host_sample_current"], false);
+}
+
 #[test]
 #[ignore = "approved local signed source fixtures only; no provider or network"]
 fn approved_versioned_sources_and_test_support_match_before_enrollment() -> Result<()> {
+    private_parent_diagnostics()?;
     let sources = configured_fixtures()?;
     ensure!(sources.len() == 2, "two approved snapshots required");
     descriptor(&sources[0], 2)?;
@@ -381,6 +435,7 @@ async fn independent_catalog_selected_card_install_and_manual_update() -> Result
         ensure!(saved["settings"]["revision"] == 3, "consumer refresh choice was not saved");
         actors[CONSUMER].roles(false, 3).await?;
         discover_pair(&actors).await?;
+        private_parent_diagnostics()?;
         let query = card(&actors[CONSUMER], &sources[0], 10, None).await?;
         let installed = install_card(&actors[CONSUMER], &sources[0], query, None).await?;
         // Publisher updates are the exact SECOND already-public approved source.
@@ -429,6 +484,9 @@ async fn independent_catalog_selected_card_install_and_manual_update() -> Result
         // error transcript; never require a second live run just to recover
         // the cause. These approved synthetic-only test logs remain private.
         for (index, actor) in actors.iter().enumerate() {
+            if let Ok(client) = actor.client() {
+                eprintln!("{}", failure_snapshot(index + 1, &client.snapshot()));
+            }
             if let Some(state) = &actor.state
                 && let Ok((original, cleanup)) =
                     state.marketplace.fixture_original_installation_failures()
