@@ -423,6 +423,31 @@ async fn independent_catalog_selected_card_install_and_manual_update() -> Result
     if let Ok(Err(error)) = &outcome {
         eprintln!("Original cross-peer catalog operation failed: {error:#}");
     }
+    if !outcome.as_ref().is_ok_and(|value| value.is_ok()) {
+        // Read the SAME retained command before shutdown drops its private
+        // diagnostics. Generic HTTP recovery state is intentionally not an
+        // error transcript; never require a second live run just to recover
+        // the cause. These approved synthetic-only test logs remain private.
+        for (index, actor) in actors.iter().enumerate() {
+            if let Some(state) = &actor.state
+                && let Ok((original, cleanup)) =
+                    state.marketplace.fixture_original_installation_failures()
+            {
+                for (kind, failure) in [("original", original), ("cleanup", cleanup)] {
+                    if let Some(failure) = failure {
+                        let report = format!("{failure:#}")
+                            .chars()
+                            .take(4096)
+                            .collect::<String>();
+                        eprintln!(
+                            "Private cross-peer participant {} installation {kind}: {report}",
+                            index + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut cleanup = Vec::new();
     for (index, actor) in actors.iter_mut().enumerate() {
         match actor.close().await {
