@@ -16,6 +16,9 @@ pub(in crate::marketplace) struct SourceActivationPlan {
     review: Digest,
     id: Digest,
     compiled: Option<Box<CompiledPolicy>>,
+    // Trusted local transport selection, never serialized or part of source/
+    // grant authority. SourceJs keeps its existing plan identity.
+    runtime: Option<Arc<dyn crate::runtime::RuntimeManager>>,
 }
 struct CompiledPolicy {
     authority: AuthorityRecord,
@@ -70,6 +73,7 @@ impl SourceActivationPlan {
             review,
             id,
             compiled: None,
+            runtime: None,
         })
     }
     pub(in crate::marketplace::grant_store::installation) fn for_material(
@@ -79,12 +83,14 @@ impl SourceActivationPlan {
     ) -> Result<Self> {
         let facts = material.authority.verify()?;
         if facts.release().payload().runtime_profile == RuntimeProfile::SourceJs {
-            return Self::new(
+            let mut plan = Self::new(
                 facts.release(),
                 &material.review,
                 &configuration.image,
                 &configuration.source_budget,
-            );
+            )?;
+            plan.runtime = Some(configuration.runtime.clone());
+            return Ok(plan);
         }
         if facts.release().payload().runtime_profile != RuntimeProfile::Reproducible {
             bail!("unsupported activation runtime profile");
@@ -134,6 +140,7 @@ impl SourceActivationPlan {
             runtime: configuration.runtime.clone(),
             summary: material.source.summary().clone(),
         }));
+        plan.runtime = Some(configuration.runtime.clone());
         plan.require_material(material)?;
         Ok(plan)
     }
@@ -194,6 +201,11 @@ impl SourceActivationPlan {
     }
     pub(in crate::marketplace) fn source(&self) -> &SourceQuarantinePlan {
         &self.source
+    }
+    pub(in crate::marketplace) fn native_runtime(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::RuntimeManager>> {
+        self.runtime.clone()
     }
     pub(super) fn probe_limits(
         &self,

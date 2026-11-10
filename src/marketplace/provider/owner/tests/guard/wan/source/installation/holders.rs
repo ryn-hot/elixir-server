@@ -496,7 +496,7 @@ async fn two_installed_holders_deliver_to_a_fresh_consumer_and_recover_after_hol
         let metadata = consumer.verify_metadata(&received).await?;
         let admitted_source = consumer.preflight_fresh_metadata(&metadata, 0).await?;
         ensure!(admitted_source.release_id() == source.matched.release_id, "initial public source differs");
-        consumer.open_source_quarantine_retained(&mut job, &metadata, None, &allocation.source).await?;
+        consumer.open_source_quarantine_retained(&mut job, &metadata, None, &allocation.source, None).await?;
         let original_volume = job.as_ref().context("original quarantine missing")?.plan_workspace().release_id;
         let original_deadline = job.as_ref().unwrap().expires();
         // A pristine third root plus ordinary network-only receiver prevents

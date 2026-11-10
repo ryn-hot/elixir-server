@@ -189,12 +189,19 @@ impl Selection {
         slot: &mut Option<crate::marketplace::quarantine::SourceQuarantineJob>,
         artifact: Option<usize>,
         budget: &crate::marketplace::quarantine::SourceJobBudget,
+        runtime: Option<Arc<dyn crate::runtime::RuntimeManager>>,
     ) -> Result<()> {
         self.require_local()?;
         self.invalidated = true;
         let result = self
             .client
-            .open_source_quarantine_retained(slot, self.source_unchecked(), artifact, budget)
+            .open_source_quarantine_retained(
+                slot,
+                self.source_unchecked(),
+                artifact,
+                budget,
+                runtime,
+            )
             .await;
         let retryable = result
             .as_ref()
@@ -651,6 +658,9 @@ mod tests {
                 &mut slot,
                 None,
                 &crate::marketplace::quarantine::tests::budget(),
+                Some(Arc::new(crate::runtime::docker::DockerRuntimeManager::new(
+                    None,
+                ))),
             )
             .await;
         let error = match result {

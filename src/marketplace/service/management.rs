@@ -477,16 +477,29 @@ impl MarketplaceService {
             .as_ref()
             .map(|configuration| configuration.allocation.clone())
             .context("installation management not admitted by trusted local startup")?;
-        let context = InstallContext {
-            inner: self.inner.clone(),
-            search: self.search.clone(),
-            preparation: self.preparation.clone(),
-            client: self.client()?,
-            direct: None,
-            #[cfg(test)]
-            fixture: None,
-        }
-        .with_direct(principal.clone(), publication, reference, query);
+        let context_for_client = || -> Result<InstallContext> {
+            Ok(InstallContext {
+                inner: self.inner.clone(),
+                search: self.search.clone(),
+                preparation: self.preparation.clone(),
+                client: self.client()?,
+                direct: None,
+                #[cfg(test)]
+                fixture: None,
+            })
+        };
+        #[cfg(test)]
+        let context = self
+            .installation_context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native fixture context unavailable"))?
+            .take()
+            .map_or_else(context_for_client, Ok)?;
+        #[cfg(not(test))]
+        let context = context_for_client()?;
+        // Even synthetic discovery uses the actual parsed direct reference,
+        // acceptance and upload choice; it cannot bypass the SDK contract.
+        let context = context.with_direct(principal.clone(), publication, reference, query);
         let context = if upload {
             context.with_upload()?
         } else {

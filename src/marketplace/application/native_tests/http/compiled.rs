@@ -6,7 +6,12 @@ use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
-fn write_profile(root: &Path, image: &str, toolchain: &str, a: &Allocation) -> Result<()> {
+pub(super) fn write_profile(
+    root: &Path,
+    image: &str,
+    toolchain: &str,
+    a: &Allocation,
+) -> Result<()> {
     let local = |name| -> Result<std::path::PathBuf> {
         Ok(std::path::PathBuf::from(std::env::var(name)?).canonicalize()?)
     };
@@ -96,6 +101,7 @@ async fn review_with_uploads(
     package: &[u8],
     proof: &[u8],
     artifact: &[u8],
+    original: &Service,
 ) -> Result<Value> {
     timeout(Duration::from_secs(240), async {
         let mut supplied = std::collections::BTreeSet::new();
@@ -120,6 +126,9 @@ async fn review_with_uploads(
                 view["phase"].as_str(),
                 Some("stopped" | "recovery_required" | "cancelled")
             ) {
+                if let Some(failure) = original.fixture_current_failures()?.0 {
+                    bail!("compiled HTTP preparation failed: {failure:#}");
+                }
                 bail!("compiled HTTP preparation stopped at {:?}", view["phase"]);
             }
             let input = &view["preparation"]["upload"];
@@ -246,8 +255,7 @@ async fn normal_startup_owns_compiled_http_install_update_and_offline_restore() 
             let query = Uuid::new_v4();
             let publication = elixir_marketplace::publication::PreparedPublication::parse(&serde_json::to_vec(&json!({"schema_version":1,"publisher":value["publisher"],"release":value["release"],"head":value["head"]}))?)?;
             let reference = Digest::of(publication.to_bytes()?);
-            state.marketplace.fixture_install_context(InstallContext::fixture_selected(peer.client.clone(), query, selected, false)
-                .with_direct(principal.clone(), publication, reference, query).with_upload()?)?;
+            state.marketplace.fixture_install_context(InstallContext::fixture_selected(peer.client.clone(), query, selected, false))?;
             let targets = call(&app, &token, "POST", "/api/v1/marketplace/install/targets", Some(json!({"schema_version":1,"extension_id":release.payload().extension_id}))).await?;
             let (target, expected, controls) = if let Some((instance, _)) = &installed {
                 let row = targets["instances"].as_array().context("current instances")?.iter().find(|r| r["instance_id"] == json!(instance)).context("same configured target")?;
@@ -255,9 +263,9 @@ async fn normal_startup_owns_compiled_http_install_update_and_offline_restore() 
             } else {
                 (json!({"kind":"new","name":"Normal startup compiled fixture"}), targets["new_instance"]["expected_revision"].clone(), targets["new_instance"]["controls"].clone())
             };
-            let started = call(&app, &token, "POST", "/api/v1/marketplace/installations", Some(json!({"schema_version":1,"query_id":query,"extension_id":release.payload().extension_id,"release_id":release.release_id(),"target":target,"expected_revision":expected,"mutation_id":Uuid::new_v4(),"controls":controls}))).await?;
+            let started = call(&app, &token, "POST", "/api/v1/marketplace/installations/direct", Some(json!({"schema_version":1,"request_id":query,"publication":publication,"accepted_reference":reference,"accept_unqualified":true,"upload_source":true,"target":target,"expected_revision":expected,"mutation_id":Uuid::new_v4(),"controls":controls}))).await?;
             let id: Uuid = serde_json::from_value(started["operation_id"].clone())?;
-            let review = review_with_uploads(&app, &token, id, &package, &proof, &artifact).await?;
+            let review = review_with_uploads(&app, &token, id, &package, &proof, &artifact, &original).await?;
             action(&app, &token, id, json!({"action":"approve","review_id":review["review_id"],"expected_revision":review["approval_revision"],"mutation_id":Uuid::new_v4(),"automatic_updates":false})).await?;
             observed(&app, &token, id, "awaiting_setup").await?;
             let credentials = if generation == 1 { json!([{"operation":"set","key":"source_api","value":"own-native-instance","rotatable":false}]) } else { json!([]) };

@@ -61,6 +61,13 @@ async fn configured_source_js_plans_preserve_their_existing_identity_without_com
         &SecretsManager::from_key_bytes([57; 32], false),
     )?;
     assert_eq!(original.id(), configured.id());
+    assert!(original.native_runtime().is_none());
+    assert!(Arc::ptr_eq(
+        &configured
+            .native_runtime()
+            .context("configured native adapter")?,
+        &configuration.runtime
+    ));
     assert!(!configured.is_compiled());
     assert!(configured.source().workspace().artifact.is_none());
     Ok(())

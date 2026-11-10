@@ -258,12 +258,17 @@ impl Source {
         self: &Arc<Self>,
         slot: &mut Option<SourceQuarantineJob>,
         plan: &SourceQuarantinePlan,
+        runtime: Option<Arc<dyn RuntimeManager>>,
     ) -> Result<()> {
+        // The caller's trusted installed adapter may carry its live cache
+        // owner. Keep THIS protected source's lane/image/physical admission;
+        // native selection is not a replacement for any of those checks.
+        let runtime = self.local_source_runtime(runtime).await?;
         if let Some(job) = slot {
             let admission: Arc<dyn crate::marketplace::quarantine::ResourceAdmission> =
                 self.clone();
             return job
-                .resume_opening_retained(self.runtime.as_ref(), &admission, plan)
+                .resume_opening_retained(runtime.as_ref(), &admission, plan)
                 .await;
         }
         let lease =
@@ -275,7 +280,7 @@ impl Source {
             .context("foreground source deployment is unavailable")?;
         SourceQuarantineJob::open_leased_retained(
             slot,
-            self.runtime.clone(),
+            runtime,
             deployment,
             &spec.image,
             plan,
@@ -299,6 +304,7 @@ impl Source {
             plan,
             budget,
         } = *request;
+        let runtime = self.local_source_runtime(plan.native_runtime()).await?;
         let lease =
             crate::marketplace::lease::ControllerLease::acquire(&self.source_job_directory)?;
         let spec = self.profile.container_spec();
@@ -319,7 +325,7 @@ impl Source {
         // source preparation, but the claim supplies this attempt's namespace.
         SourceQuarantineJob::open_leased_retained(
             slot,
-            self.runtime.clone(),
+            runtime,
             &start.deployment(),
             plan.image(),
             plan.source(),
@@ -327,6 +333,19 @@ impl Source {
             self.clone(),
         )
         .await
+    }
+    async fn local_source_runtime(
+        &self,
+        configured: Option<Arc<dyn RuntimeManager>>,
+    ) -> Result<Arc<dyn RuntimeManager>> {
+        let runtime = configured.unwrap_or_else(|| self.runtime.clone());
+        if !Arc::ptr_eq(&runtime, &self.runtime) {
+            // Sampling one daemon cannot authorize mutations on another.
+            // The configured adapter must independently see this SAME immutable
+            // protected worker and its exact fixed native profile.
+            inspect_fixed_worker(runtime.as_ref(), &self.handle, &self.profile).await?;
+        }
+        Ok(runtime)
     }
     async fn admit_source_resources(
         &self,

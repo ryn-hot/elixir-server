@@ -35,7 +35,7 @@ async fn call(
     let response = app.clone().oneshot(request.body(body)?).await?;
     anyhow::ensure!(
         response.status().is_success(),
-        "HTTP management request failed: {}",
+        "HTTP management request failed: {method} {path}: {}",
         response.status()
     );
     let bytes = body::to_bytes(response.into_body(), 128 * 1024).await?;
@@ -163,19 +163,24 @@ async fn require_idle_byte_workspace(
 #[ignore = "explicit actual private HTTP auth/DTO/target choices/original native installation/offline cancellation+invocation; synthetic selection/protection"]
 async fn native_http_authenticated_management_owns_install_and_offline_cancellation() -> Result<()>
 {
-    run(None, 100).await
+    run(None, 100, false).await
 }
 #[tokio::test]
 #[ignore = "exclusive actual native foreground CPU comparison, 64 MiB/200m with signed reviewed quota; synthetic initial selection/protection, not production sizing"]
 async fn native_http_foreground_fifth_core_preserves_install_cancel_call_and_restart() -> Result<()>
 {
-    run(None, 200).await
+    run(None, 200, false).await
 }
 #[tokio::test]
 #[ignore = "exclusive actual native foreground CPU comparison, 64 MiB/500m with signed reviewed quota; synthetic initial selection/protection, not production sizing"]
 async fn native_http_foreground_half_core_preserves_install_cancel_call_and_restart() -> Result<()>
 {
-    run(None, 500).await
+    run(None, 500, false).await
+}
+#[tokio::test]
+#[ignore = "exclusive local native SourceJs HTTP/install/cancel/invoke/restart regression with the explicit compiled operator profile; synthetic initial selection/protection"]
+async fn normal_compiled_startup_preserves_source_js_http_workflow() -> Result<()> {
+    run(None, 200, true).await
 }
 #[tokio::test]
 #[ignore = "explicit NEW empty loopback PostgreSQL with actual HTTP auth/original native app commands; not public network qualification"]
@@ -186,6 +191,7 @@ async fn postgres_native_http_authenticated_management_owns_install_and_cancella
             "ELIXIR_TEST_MARKETPLACE_APPLICATION_HTTP_POSTGRES_URL",
         )?),
         100,
+        false,
     )
     .await
 }
@@ -239,7 +245,7 @@ async fn foreground_comparison_requires_declared_quota_and_keeps_entrypoint_byte
     }
     Ok(())
 }
-async fn run(postgres: Option<&str>, cpu_millicores: u32) -> Result<()> {
+async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Result<()> {
     let _ = tracing_subscriber::fmt()
         // Preserve other targets at WARN; only fixed, payload-free phase
         // durations are DEBUG. Never enable blanket private-transport logging.
@@ -265,7 +271,16 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32) -> Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(path)?;
     }
     let lane = controller_root.join("foreground-source");
-    restart::write_profile(&directory, &image, &configured)?;
+    if compiled {
+        compiled::write_profile(
+            &directory,
+            &image,
+            &std::env::var("ELIXIR_MARKETPLACE_TOOLCHAIN_IMAGE")?,
+            &configured,
+        )?;
+    } else {
+        restart::write_profile(&directory, &image, &configured)?;
+    }
     std::fs::create_dir(&files)?;
     let value = sdk_fixture_profile_with_cpu(true, cpu_millicores).await?;
     let (release, package, proof) =
@@ -281,25 +296,38 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32) -> Result<()> {
         "sqlite://{}",
         directory.join("application.sqlite").display()
     );
-    let (state, public, principal, token) =
+    let (mut state, public, principal, token) =
         crate::http::handlers::marketplace::installation_http_fixture(
             db.clone(),
             &directory,
             postgres.unwrap_or(&sqlite_url),
         )
         .await?;
+    if compiled {
+        let mut settings = state.settings.as_ref().clone();
+        settings.marketplace.installed_startup_file =
+            Some(directory.join("installed-startup.json"));
+        state.settings = Arc::new(settings);
+    }
     let app = public
         .merge(crate::http::handlers::marketplace::installation_routes().with_state(state.clone()));
-    state
-        .marketplace
-        .configure_installation(configured.clone())?;
+    if !compiled {
+        state
+            .marketplace
+            .configure_installation(configured.clone())?;
+    }
     let original = state.marketplace.fixture_original_installation();
     let runtime: Arc<dyn RuntimeManager> = Arc::new(DockerRuntimeManager::new(None));
     let name = format!("elixir-marketplace-http-peer-{}", Uuid::new_v4().simple());
     let host_deployment = format!("http-host-{}", Uuid::new_v4().simple());
     let mut peer = None;
     let mut host = None;
+    let startup_shutdown = tokio_util::sync::CancellationToken::new();
     let outcome=std::panic::AssertUnwindSafe(Box::pin(async{
+        if compiled {
+            crate::marketplace::installed_startup::spawn_configured(&state, startup_shutdown.clone())
+                .context("normal compiled startup for mixed SourceJs regression")?.await??;
+        }
         let issuer=value["issuer_key"].as_str().context("fixture issuer")?;
         peer=Some(PeerPipeFixture::start(&image,&files,&name,issuer,"providers").await?);check_profile(&name).await?;
         host=Some(OfflineWorker::start(runtime.as_ref(),&directory.join("admission-host"),&host_deployment,&image,&[issuer.parse()?],
@@ -396,6 +424,7 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32) -> Result<()> {
         println!("actual authenticated HTTP owned install A/cancel B/offline A invocation passed; target data, exact inputs and original native owners retained; synthetic discovery/protection only");
         Ok::<_,anyhow::Error>(())
     })).catch_unwind().await;
+    startup_shutdown.cancel();
     let stopped = state.marketplace.shutdown().await;
     let peer_stopped = match peer.take() {
         Some(peer) => peer.finish().await,

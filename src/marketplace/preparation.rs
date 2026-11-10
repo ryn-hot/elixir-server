@@ -121,6 +121,9 @@ impl Service {
             .as_ref()
             .map(|configuration| configuration.artifact);
         let mut work = Live::new_profile(selected, artifact, upload, compiled)?;
+        // Keep the installed controller's exact local adapter/cache owner for
+        // source opening as well as the subsequent build and activation.
+        work.runtime = Some(configuration.runtime.clone());
         if let Some(authorization) = authorization {
             work = work.with_authorization(authorization)?;
         }
@@ -580,6 +583,7 @@ struct Live {
     workspace: Workspace,
     artifact: Option<usize>,
     budget: SourceJobBudget,
+    runtime: Option<Arc<dyn crate::runtime::RuntimeManager>>,
     release: Digest,
     expires: Instant,
     opening_uncertain: bool,
@@ -678,6 +682,7 @@ impl Live {
             workspace: Workspace::Pending,
             artifact,
             budget,
+            runtime: None,
             release,
             expires,
             opening_uncertain: false,
@@ -740,6 +745,7 @@ impl Live {
                 .context("preparation selection missing")?;
             let artifact = self.artifact;
             let budget = self.budget.clone();
+            let runtime = self.runtime.clone();
             let mut source = self
                 .opening_source
                 .take()
@@ -748,7 +754,7 @@ impl Live {
                 let result = async {
                     selected.maintain().await?;
                     selected
-                        .open_quarantine_retained(&mut source, artifact, &budget)
+                        .open_quarantine_retained(&mut source, artifact, &budget, runtime)
                         .await
                 }
                 .await;

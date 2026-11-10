@@ -425,6 +425,7 @@ impl ParticipationClient {
         metadata: &dyn crate::marketplace::selected_source::SelectedSource,
         artifact: Option<usize>,
         budget: &crate::marketplace::quarantine::SourceJobBudget,
+        runtime: Option<Arc<dyn crate::runtime::RuntimeManager>>,
     ) -> Result<()> {
         self.require_blob_owner()?;
         let source = self
@@ -433,7 +434,9 @@ impl ParticipationClient {
             .context("foreground source jobs are unavailable")?;
         self.check_selected_source(metadata).await?;
         let plan = metadata.plan(artifact, budget)?;
-        source.open_source_job_retained(slot, &plan).await?;
+        source
+            .open_source_job_retained(slot, &plan, runtime)
+            .await?;
         // The caller retains the original slot even if this final check fails.
         // It, not this borrowed await, must join/dispose any actual native work.
         self.require_blob_owner()?;
