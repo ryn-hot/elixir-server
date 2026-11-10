@@ -4,6 +4,23 @@
 mod enrollment;
 mod fence;
 mod guard;
+
+/// Reconcile only the recorded native preparation under the original OS lane.
+/// No registration, replacement process, quota reset or account-state deletion.
+pub(in crate::marketplace) async fn retire_cancelled_preparation(
+    runtime: &dyn crate::runtime::RuntimeManager,
+    lease: &super::lease::ControllerLease,
+) -> anyhow::Result<()> {
+    lease.require_provider_lane()?;
+    fence::Fence::recover(runtime, lease).await?;
+    for name in [FENCE, NEXT] {
+        match std::fs::symlink_metadata(lease.directory().join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            _ => anyhow::bail!("cancelled native preparation remains fenced"),
+        }
+    }
+    Ok(())
+}
 mod owner;
 mod worker;
 use crate::runtime::{

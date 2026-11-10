@@ -388,6 +388,119 @@ async fn cancellation_or_stop_during_consent_preflight_cannot_claim_a_late_owner
 }
 
 #[cfg(unix)]
+fn cancelled_directory(state: &AppState) -> Result<PathBuf> {
+    let paths = RuntimePaths::from_roots(
+        &state.settings.extensions.storage_root,
+        &state.settings.library.local_root,
+    );
+    Ok(PathBuf::from(paths.data_root)
+        .canonicalize()?
+        .join("marketplace"))
+}
+
+#[cfg(unix)]
+fn cancel_empty_generation(state: &AppState) -> Result<()> {
+    drop(state.marketplace.begin_startup()?);
+    state.marketplace.request_stop();
+    assert_eq!(
+        state.marketplace.snapshot().phase,
+        crate::marketplace::service::RuntimePhase::Failed
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+// Real SQLite uses an external worker thread: a paused runtime can expire its
+// connection timer before that thread replies. Keep this real 300-ms lock wait.
+#[tokio::test]
+async fn cancelled_native_retirement_waits_for_original_lease_and_binds_same_service() -> Result<()>
+{
+    use crate::marketplace::service::RuntimePhase;
+    let (_root, _database, state, _) = activation_fixture().await?;
+    cancel_empty_generation(&state)?;
+    let directory = cancelled_directory(&state)?;
+    let held = StartupLeases::acquire_inner(&directory, true)?;
+    let original = state.clone();
+    let retiring = tokio::spawn(async move { native_provider::retire_cancelled(&original).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !retiring.is_finished(),
+        "cannot replace the original controller lease"
+    );
+    assert_eq!(state.marketplace.snapshot().phase, RuntimePhase::Failed);
+    drop(held);
+    let proof = retiring.await??;
+    let foreign = crate::marketplace::service::MarketplaceService::default();
+    drop(foreign.begin_startup()?);
+    foreign.request_stop();
+    assert!(foreign.finish_cancelled_startup(&proof).is_err());
+    assert_eq!(foreign.snapshot().phase, RuntimePhase::Failed);
+    state.marketplace.finish_cancelled_startup(&proof)?;
+    assert_eq!(state.marketplace.snapshot().phase, RuntimePhase::Stopped);
+    assert!(state.marketplace.client().is_err());
+    assert!(
+        !directory.join("worker/provider-state.v1").exists(),
+        "empty retirement must never enroll"
+    );
+    drop(proof);
+    state.marketplace.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_native_preparation_never_produces_a_stopped_acknowledgement() -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let (_root, _database, state, _) = activation_fixture().await?;
+    cancel_empty_generation(&state)?;
+    let directory = cancelled_directory(&state)?;
+    let leases = StartupLeases::acquire_inner(&directory, true)?;
+    let fence = directory.join("worker/provider-native.pending");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&fence)?;
+    file.write_all(b"malformed original intent")?;
+    file.sync_all()?;
+    drop(file);
+    drop(leases);
+    assert!(native_provider::retire_cancelled(&state).await.is_err());
+    assert_eq!(std::fs::read(&fence)?, b"malformed original intent");
+    assert_eq!(
+        state.marketplace.snapshot().phase,
+        crate::marketplace::service::RuntimePhase::Failed
+    );
+    assert!(state.marketplace.client().is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replaced_controller_inode_invalidates_cancelled_retirement_acknowledgement() -> Result<()>
+{
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_root, _database, state, _) = activation_fixture().await?;
+    cancel_empty_generation(&state)?;
+    let proof = native_provider::retire_cancelled(&state).await?;
+    let lock = cancelled_directory(&state)?.join("worker/controller.lock");
+    std::fs::rename(&lock, lock.with_file_name("original-controller.lock"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock)?
+        .sync_all()?;
+    assert!(state.marketplace.finish_cancelled_startup(&proof).is_err());
+    assert_eq!(
+        state.marketplace.snapshot().phase,
+        crate::marketplace::service::RuntimePhase::Failed
+    );
+    assert!(state.marketplace.client().is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn original_local_profile_change_or_loss_invalidates_connection_binding() -> Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};

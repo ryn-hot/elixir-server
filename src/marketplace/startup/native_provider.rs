@@ -4,6 +4,49 @@ use super::*;
 use crate::marketplace::provider::{Owner, Profile as ProviderProfile, TRANSPORT_BOOTSTRAP_BYTES};
 use elixir_marketplace::{packet_guard::PROVIDER_TUN_INTERFACE, warp_provider::Scope};
 
+/// A dropped activation waiter requests cancellation but the original physical
+/// tasks retain their locks/outcomes. Wait for those locks, then reconcile any
+/// remaining exact native fence before acknowledging an empty stopped slot.
+pub(super) async fn retire_cancelled(state: &AppState) -> Result<CancelledStartupRetirement> {
+    ensure!(
+        state.marketplace.stop_requested(),
+        "native retirement requires owner stop"
+    );
+    let paths = RuntimePaths::from_roots(
+        &state.settings.extensions.storage_root,
+        &state.settings.library.local_root,
+    );
+    let directory = PathBuf::from(paths.data_root)
+        .canonicalize()?
+        .join("marketplace");
+    timeout(Duration::from_secs(75), async {
+        let leases = loop {
+            match StartupLeases::acquire_inner(&directory, true) {
+                Ok(leases) => break leases,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::fs::TryLockError>()
+                        .is_some_and(|error| {
+                            matches!(error, std::fs::TryLockError::WouldBlock)
+                        }) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error.context("cancelled native ownership unavailable")),
+            }
+        };
+        let runtime = state.orchestrator.runtime_manager();
+        super::super::provider::retire_cancelled_preparation(runtime.as_ref(), &leases.worker)
+            .await?;
+        Ok(CancelledStartupRetirement {
+            leases,
+            service: state.marketplace.clone(),
+        })
+    })
+    .await
+    .context("cancelled native preparation retirement deadline")?
+}
+
 pub(super) async fn prepare(
     orchestrator: Arc<crate::orchestrator::OrchestratorService>,
     database: Database,

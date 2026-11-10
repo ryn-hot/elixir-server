@@ -35,6 +35,9 @@ trait Starter: Send + 'static {
     fn stop_requested(&self) -> bool;
     fn entropy(&self) -> u64;
     fn start(&mut self) -> impl Future<Output = Result<()>> + Send;
+    fn cancel_preparation(&mut self) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn retire(&mut self) -> impl Future<Output = Result<bool>> + Send;
     fn configuration_current(&self) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
@@ -49,6 +52,7 @@ struct AppStarter {
     state: AppState,
     path: PathBuf,
     binding: Option<super::ConnectionBinding>,
+    preparing_native: bool,
     _progress: super::super::service::StartupOwner,
 }
 impl Starter for AppStarter {
@@ -63,8 +67,35 @@ impl Starter for AppStarter {
     }
     async fn start(&mut self) -> Result<()> {
         self.binding = None;
-        self.binding = Some(activate_once(&self.state, &self.path).await?);
+        self.binding = Some(
+            activate_once_tracking(&self.state, &self.path, &mut self.preparing_native).await?,
+        );
         Ok(())
+    }
+    async fn cancel_preparation(&mut self) -> Result<()> {
+        self.state.marketplace.request_stop();
+        let status = self.status();
+        if status.participation.is_some()
+            || matches!(
+                status.phase,
+                RuntimePhase::NotConnected | RuntimePhase::Stopped
+            )
+        {
+            // Main still joins an attached owner via normal service shutdown.
+            // Preflight-only cancellation created no native generation.
+            return Ok(());
+        }
+        ensure!(
+            self.preparing_native,
+            "cancelled preparation has no native retirement selection"
+        );
+        #[cfg(unix)]
+        {
+            let proof = native_provider::retire_cancelled(&self.state).await?;
+            self.state.marketplace.finish_cancelled_startup(&proof)
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("cancelled native preparation is unsupported on this platform")
     }
     async fn retire(&mut self) -> Result<bool> {
         self.state.marketplace.recover_failed().await
@@ -102,6 +133,7 @@ pub(super) fn spawn(
                 state,
                 path,
                 binding: None,
+                preparing_native: false,
                 _progress: progress,
             },
             shutdown,
@@ -114,6 +146,18 @@ pub(super) fn spawn(
     })
 }
 async fn drive(mut starter: impl Starter, shutdown: CancellationToken) -> Result<()> {
+    let result = drive_loop(&mut starter, &shutdown).await;
+    if shutdown.is_cancelled() || starter.stop_requested() {
+        // Also covers shutdown during failed-attempt backoff: that attempt's
+        // physical task may still be retiring even though its waiter ended.
+        timeout(RETIRE_DEADLINE, starter.cancel_preparation())
+            .await
+            .context("marketplace cancelled preparation cleanup deadline")??;
+    }
+    result
+}
+
+async fn drive_loop(starter: &mut impl Starter, shutdown: &CancellationToken) -> Result<()> {
     let mut backoff = Backoff::default();
     loop {
         if shutdown.is_cancelled()
@@ -133,8 +177,13 @@ async fn drive(mut starter: impl Starter, shutdown: CancellationToken) -> Result
         }
         starter.retry_after(None);
         let activation = tokio::select! { biased;
-            _=shutdown.cancelled()=>return Ok(()),
-            result=timeout(ATTEMPT_DEADLINE,starter.start())=>result.context("marketplace startup deadline").and_then(|result|result),
+            _=shutdown.cancelled()=>None,
+            result=timeout(ATTEMPT_DEADLINE,starter.start())=>Some(result.context("marketplace startup deadline").and_then(|result|result)),
+        };
+        let Some(activation) = activation else {
+            // Drop this activation before drive() acquires reconciliation
+            // leases; never overlap the original retained physical task.
+            return Ok(());
         };
         match activation {
             Ok(()) => {

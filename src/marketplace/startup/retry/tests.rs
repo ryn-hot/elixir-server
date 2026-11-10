@@ -13,6 +13,9 @@ struct Shared {
     stall_start: AtomicBool,
     stop_requested: AtomicBool,
     cancelled_starts: AtomicUsize,
+    cancelled_preparations: AtomicUsize,
+    pause_cancel_preparation: AtomicBool,
+    fail_cancel_preparation: AtomicBool,
     retired: AtomicUsize,
     fail_retire: AtomicBool,
     pause_retire: AtomicBool,
@@ -72,6 +75,7 @@ impl Starter for Fixture {
     async fn start(&mut self) -> Result<()> {
         self.0.starts.lock().unwrap().push(Instant::now());
         self.0.started.notify_one();
+        self.0.set(RuntimePhase::Starting, false);
         let mut cancelled = CancelStart {
             state: self.0.clone(),
             armed: true,
@@ -105,6 +109,29 @@ impl Starter for Fixture {
         }
         self.0.set(RuntimePhase::NotConnected, false);
         Ok(true)
+    }
+    async fn cancel_preparation(&mut self) -> Result<()> {
+        let status = self.status();
+        if status.participation.is_some()
+            || matches!(
+                status.phase,
+                RuntimePhase::NotConnected | RuntimePhase::Stopped
+            )
+        {
+            return Ok(());
+        }
+        self.0.cancelled_preparations.fetch_add(1, Ordering::SeqCst);
+        self.0.set(RuntimePhase::Failed, false);
+        self.0.retiring.notify_one();
+        if self.0.pause_cancel_preparation.load(Ordering::SeqCst) {
+            self.0.resume.notified().await;
+        }
+        ensure!(
+            !self.0.fail_cancel_preparation.load(Ordering::SeqCst),
+            "fixture cancellation cleanup unknown"
+        );
+        self.0.set(RuntimePhase::Stopped, false);
+        Ok(())
     }
     async fn configuration_current(&self) -> Result<()> {
         self.0.configuration_checks.fetch_add(1, Ordering::SeqCst);
@@ -150,6 +177,9 @@ fn fixture(failures: usize) -> (Fixture, Arc<Shared>) {
         stall_start: AtomicBool::new(false),
         stop_requested: AtomicBool::new(false),
         cancelled_starts: AtomicUsize::new(0),
+        cancelled_preparations: AtomicUsize::new(0),
+        pause_cancel_preparation: AtomicBool::new(false),
+        fail_cancel_preparation: AtomicBool::new(false),
         retired: AtomicUsize::new(0),
         fail_retire: AtomicBool::new(false),
         pause_retire: AtomicBool::new(false),
@@ -404,6 +434,76 @@ async fn cancellation_preempts_an_inflight_attempt_and_backoff_without_another_s
             state.cancelled_starts.load(Ordering::SeqCst),
             usize::from(stall)
         );
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_joins_preparation_retirement_before_returning() -> Result<()> {
+    let (starter, state) = fixture(0);
+    state.stall_start.store(true, Ordering::SeqCst);
+    state.pause_cancel_preparation.store(true, Ordering::SeqCst);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(drive(starter, shutdown.clone()));
+    state.started.notified().await;
+    shutdown.cancel();
+    state.retiring.notified().await;
+    assert_eq!(state.cancelled_starts.load(Ordering::SeqCst), 1);
+    assert!(!task.is_finished());
+    step(74).await;
+    assert!(!task.is_finished(), "original cleanup must be joined");
+    state.resume.notify_one();
+    task.await??;
+    assert_eq!(state.cancelled_preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(state.count(), 1);
+    assert_eq!(state.status.lock().unwrap().phase, RuntimePhase::Stopped);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_failed_backoff_also_joins_preparation() -> Result<()> {
+    let (starter, state) = fixture(99);
+    state.pause_cancel_preparation.store(true, Ordering::SeqCst);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(drive(starter, shutdown.clone()));
+    state.started.notified().await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    state.retiring.notified().await;
+    assert!(!task.is_finished());
+    state.resume.notify_one();
+    task.await??;
+    assert_eq!(state.cancelled_preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(state.count(), 1);
+    assert_eq!(state.cancelled_starts.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn unconfirmed_cancelled_preparation_is_terminal_without_stopped_or_retry() -> Result<()> {
+    for stall in [false, true] {
+        let (starter, state) = fixture(0);
+        state.stall_start.store(true, Ordering::SeqCst);
+        state
+            .pause_cancel_preparation
+            .store(stall, Ordering::SeqCst);
+        state
+            .fail_cancel_preparation
+            .store(!stall, Ordering::SeqCst);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(drive(starter, shutdown.clone()));
+        state.started.notified().await;
+        shutdown.cancel();
+        state.retiring.notified().await;
+        if stall {
+            step(75).await;
+        }
+        assert!(task.await?.is_err());
+        assert_eq!(state.count(), 1);
+        assert_eq!(state.status.lock().unwrap().phase, RuntimePhase::Failed);
+        assert_eq!(state.cancelled_preparations.load(Ordering::SeqCst), 1);
     }
     Ok(())
 }

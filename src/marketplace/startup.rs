@@ -114,6 +114,21 @@ impl StartupLeases {
                 .matches_directory(&self.directory.join("worker"))
     }
 }
+
+/// Stop-only acknowledgement produced after native reconciliation under all
+/// original controller leases. Never a health/traffic/startup capability.
+pub(super) struct CancelledStartupRetirement {
+    leases: StartupLeases,
+    service: super::service::MarketplaceService,
+}
+impl CancelledStartupRetirement {
+    pub(super) fn is_current(&self) -> bool {
+        self.leases.is_current()
+    }
+    pub(super) fn service(&self) -> &super::service::MarketplaceService {
+        &self.service
+    }
+}
 struct StartOwner {
     service: super::service::MarketplaceService,
     initial: Option<super::service::StartupAttempt>,
@@ -739,7 +754,18 @@ pub(crate) async fn customer_provider_configuration(state: &AppState) -> Result<
     .context("provider setup configuration read task")?
 }
 
+#[cfg(test)]
 async fn activate_once(state: &AppState, path: &Path) -> Result<ConnectionBinding> {
+    let mut preparing_native = false;
+    activate_once_tracking(state, path, &mut preparing_native).await
+}
+
+async fn activate_once_tracking(
+    state: &AppState,
+    path: &Path,
+    preparing_native: &mut bool,
+) -> Result<ConnectionBinding> {
+    *preparing_native = false;
     let status = state.marketplace.snapshot();
     ensure!(
         status.phase == super::service::RuntimePhase::NotConnected
@@ -793,6 +819,9 @@ async fn activate_once(state: &AppState, path: &Path) -> Result<ConnectionBindin
         service: state.marketplace.clone(),
         initial,
     };
+    // In-memory selection from THIS parsed attempt, not a later config reread
+    // or an assertion that native cleanup has completed.
+    *preparing_native = matches!(&profile.provider, Provider::NativeWarp { .. });
     let saved = prepare_worker(
         state.orchestrator.clone(),
         database,

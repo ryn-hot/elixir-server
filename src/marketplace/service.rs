@@ -419,6 +419,15 @@ impl MarketplaceService {
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.inner.snapshot()
     }
+    pub(in crate::marketplace) fn finish_cancelled_startup(
+        &self,
+        proof: &super::startup::CancelledStartupRetirement,
+    ) -> Result<()> {
+        if !proof.is_current() || !Arc::ptr_eq(&self.inner, &proof.service().inner) {
+            bail!("cancelled startup retirement belongs to another controller");
+        }
+        self.inner.finish_cancelled_startup()
+    }
     pub fn client(&self) -> Result<ParticipationClient> {
         self.inner.client()
     }
@@ -892,6 +901,22 @@ impl<W: Owned> Default for Managed<W> {
     }
 }
 impl<W: Owned> Managed<W> {
+    fn finish_cancelled_startup(&self) -> Result<()> {
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("marketplace ownership state is unavailable"))?;
+        if !slot.stop_requested
+            || slot.owner.is_some()
+            || slot.client.is_some()
+            || slot.closing
+            || !matches!(slot.phase, RuntimePhase::Failed | RuntimePhase::Stopped)
+        {
+            bail!("cancelled startup slot is not exclusively vacant and stopping");
+        }
+        slot.phase = RuntimePhase::Stopped;
+        Ok(())
+    }
     fn begin_startup(self: &Arc<Self>) -> Result<Starting<W>> {
         self.begin_at(RuntimePhase::NotConnected)
     }
