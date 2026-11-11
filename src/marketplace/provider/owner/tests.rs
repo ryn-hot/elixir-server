@@ -11,6 +11,7 @@ use elixir_marketplace::warp_provider::State;
 use serde_json::Value;
 use std::{collections::HashMap, fs::File};
 use tokio::time::{Duration, timeout};
+mod catalog_cleanup;
 mod guard;
 
 /// Preserve recovery evidence on failed/uncertain native tests. Never erase a
@@ -60,9 +61,7 @@ impl PreservedRoot {
         file.sync_all()?;
         Ok(())
     }
-}
-impl Drop for PreservedRoot {
-    fn drop(&mut self) {
+    fn must_preserve(&self) -> bool {
         let directories = ["provider", "marketplace/worker"];
         let identity = !self.1.get()
             && directories.iter().any(|directory| {
@@ -82,11 +81,46 @@ impl Drop for PreservedRoot {
                     }
                 })
         });
-        if self.2.get() || identity || fenced {
+        self.2.get() || identity || fenced
+    }
+    fn close_completed_catalog(&mut self) -> Result<()> {
+        ensure!(
+            self.1.get() && !self.must_preserve(),
+            "catalog fixture still requires recovery"
+        );
+        if let Err(error) = catalog_cleanup::unseal_completed_archives(self.path()) {
+            self.preserve();
+            return Err(error.context("catalog fixture sealed archive cleanup"));
+        }
+        self.0
+            .take()
+            .unwrap()
+            .close()
+            .context("completed catalog fixture directory cleanup")
+    }
+}
+impl Drop for PreservedRoot {
+    fn drop(&mut self) {
+        if self.0.is_some() && self.must_preserve() {
             let path = self.0.take().unwrap().keep();
             eprintln!("provider fixture recovery retained at {}", path.display());
         }
     }
+}
+
+#[test]
+fn catalog_cleanup_requires_completion_and_refuses_recovery_fences() -> Result<()> {
+    let mut root = PreservedRoot::new()?;
+    assert!(root.close_completed_catalog().is_err());
+    let worker = root.path().join("marketplace/worker");
+    std::fs::create_dir_all(&worker)?;
+    let fence = worker.join(FENCE);
+    std::fs::write(&fence, b"synthetic unresolved fixture")?;
+    root.complete();
+    assert!(root.close_completed_catalog().is_err());
+    assert!(fence.is_file());
+    std::fs::remove_file(fence)?;
+    Ok(())
 }
 
 async fn docker(args: &[&str]) -> Result<String> {

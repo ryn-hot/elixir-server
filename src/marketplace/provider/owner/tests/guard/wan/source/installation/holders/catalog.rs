@@ -602,6 +602,15 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
             "same-identity cleanup failures: {cleanup:?}"
         ),
     }
+    // Only after both original identities and their installed application
+    // tasks are confirmed retired. TempDir's implicit drop ignores a failure
+    // to remove files inside an intentionally read-only source capsule.
+    for (index, actor) in actors.iter_mut().enumerate() {
+        if let Err(error) = actor.rig.root.close_completed_catalog() {
+            cleanup.push(format!("participant {}: {error:#}", index + 1));
+        }
+    }
+    ensure!(cleanup.is_empty(), "local catalog fixture cleanup failures: {cleanup:?}");
     eprintln!(
         "{}",
         json!({"stage":"cross_peer_catalog_test_complete","same_identities_revoked":2,
