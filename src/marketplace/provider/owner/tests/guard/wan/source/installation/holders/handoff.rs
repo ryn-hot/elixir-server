@@ -1,10 +1,26 @@
 //! Single consumer, ordinary startup/retry, approved sources and original
 //! identity only. The observer must ACK before either guard handoff begins.
 use super::*;
+mod route_loss;
 
 #[tokio::test]
 #[ignore = "explicit consent, pinned native images, private capture socket and approved public fixtures"]
 async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()> {
+    qualify(false).await
+}
+
+#[tokio::test]
+#[ignore = "standing-approved one free identity; actual route removal only inside the exact isolated provider; bounded packet capture"]
+async fn isolated_route_loss_closes_old_authority_and_recovers_without_direct_egress() -> Result<()>
+{
+    ensure!(
+        std::env::var("ELIXIR_MARKETPLACE_ROUTE_LOSS_CAPTURE").as_deref() == Ok("1"),
+        "explicit isolated route-loss capture required"
+    );
+    qualify(true).await
+}
+
+async fn qualify(route_loss: bool) -> Result<()> {
     for flag in ["WARP_LIFECYCLE", "WAN", "PUBLIC_SOURCE"] {
         ensure!(
             std::env::var(format!("ELIXIR_MARKETPLACE_{flag}_LIVE_TEST")).as_deref() == Ok("1"),
@@ -46,8 +62,16 @@ async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()
                 == sources[0].matched.release_id,
             "initial handoff did not preserve exact protected public source"
         );
-        crate::marketplace::provider::guard::test_capture::finish().await?;
+        if route_loss {
+            crate::marketplace::provider::guard::test_capture::route_loss().await?;
+        } else {
+            crate::marketplace::provider::guard::test_capture::finish().await?;
+        }
         eprintln!("{}", json!({"stage":"handoff_initial_source_verified"}));
+        if route_loss {
+            route_loss::apply(&actor, &image).await?;
+            eprintln!("{}", json!({"stage":"isolated_route_loss_applied","actual_ipv4_default_removed":true,"host_routes_unchanged":true}));
+        } else {
         let label = format!("label=elixir.deployment_id={}", actor.rig.deployment);
         let ids = docker(&[
             "ps",
@@ -77,6 +101,7 @@ async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()
             "original guard image changed"
         );
         docker(&["kill", "--signal=KILL", ids[0]]).await?;
+        }
         let until = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             let state = stale.snapshot();
@@ -107,6 +132,10 @@ async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()
                     .is_err(),
             "old network/source capability survived guard loss"
         );
+        if route_loss {
+            crate::marketplace::provider::guard::test_capture::finish().await?;
+            eprintln!("{}", json!({"stage":"isolated_route_loss_closed","old_capability_closed":true}));
+        }
         let until = tokio::time::Instant::now() + Duration::from_secs(600);
         let recovered = loop {
             if let Ok(client) = actor.client()
@@ -141,7 +170,7 @@ async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()
         eprintln!(
             "{}",
             json!({"stage":"handoff_recovery_verified", "same_original_identity":true,
-            "normal_startup_retry":true,"stale_capability_closed":true,"fresh_public_source":true})
+            "normal_startup_retry":true,"stale_capability_closed":true,"fresh_public_source":true,"isolated_route_loss":route_loss})
         );
         Ok::<_, anyhow::Error>(())
     }))

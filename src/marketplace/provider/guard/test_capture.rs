@@ -98,6 +98,21 @@ pub(in crate::marketplace) async fn finish() -> Result<()> {
     exchange(&path, serde_json::json!({"operation":"end"}), b"done\n").await
 }
 
+/// Bind the exact still-live namespace before an isolated route-loss fault.
+pub(in crate::marketplace) async fn route_loss() -> Result<()> {
+    ensure!(
+        std::env::var("ELIXIR_MARKETPLACE_ROUTE_LOSS_CAPTURE").as_deref() == Ok("1"),
+        "explicit isolated route-loss capture required"
+    );
+    let path = configured()?.context("explicit route-loss socket required")?;
+    exchange(
+        &path,
+        serde_json::json!({"operation":"route_loss"}),
+        b"ready\n",
+    )
+    .await
+}
+
 // Only the separate startup-interruption fixture enables this second barrier.
 // Existing packet-capture runs keep their original two-operation protocol.
 pub(super) async fn guard_ready(
