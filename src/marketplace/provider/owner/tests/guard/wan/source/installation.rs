@@ -548,6 +548,28 @@ async fn install_with_updates(
         upload_source.then_some(fixture),
     )
     .await?;
+    let instance = activate_direct_review(
+        app, state, token, id, &review, existing, automatic_updates,
+    )
+    .await?;
+    eprintln!(
+        "{}",
+        json!({"stage":"actual_public_source_http_activation","version":publication.release.payload.version,
+        "source_uploads":if upload_source {2} else {0},"peer_downloads":!upload_source,
+        "paid_credentials":0,"discovery_qualified":false})
+    );
+    Ok(instance)
+}
+
+async fn activate_direct_review(
+    app: &Router,
+    state: &AppState,
+    token: &str,
+    id: Uuid,
+    review: &Value,
+    existing: Option<Uuid>,
+    automatic_updates: bool,
+) -> Result<Uuid> {
     ensure!(
         review["review_id"].is_string() && review["approval_revision"].is_i64(),
         "native source equality did not produce a real review"
@@ -580,12 +602,6 @@ async fn install_with_updates(
     ensure!(
         existing.is_none_or(|original| instance == original),
         "manual update replaced the configured instance"
-    );
-    eprintln!(
-        "{}",
-        json!({"stage":"actual_public_source_http_activation","version":publication.release.payload.version,
-        "source_uploads":if upload_source {2} else {0},"peer_downloads":!upload_source,
-        "paid_credentials":0,"discovery_qualified":false})
     );
     Ok(instance)
 }

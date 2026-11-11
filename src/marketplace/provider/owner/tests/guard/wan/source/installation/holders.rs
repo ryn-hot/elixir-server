@@ -62,6 +62,23 @@ impl Participant {
         seed: bool,
         allocation: &Allocation,
     ) -> Result<()> {
+        self.start_application(guard, worker, topic, seed, allocation).await?;
+        self.roles(seed, 2).await?;
+        eprintln!(
+            "{}",
+            json!({"stage":"holder_participant_ready","seeder":seed})
+        );
+        Ok(())
+    }
+
+    async fn start_application(
+        &mut self,
+        guard: &str,
+        worker: &str,
+        topic: Digest,
+        seed: bool,
+        allocation: &Allocation,
+    ) -> Result<()> {
         let root = self.rig.root.path().canonicalize()?;
         let url = format!("sqlite://{}", root.join("wan.sqlite").display());
         let (mut state, _, principal, token) =
@@ -150,39 +167,40 @@ impl Participant {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         source_ready(&self.client()?).await?;
-        self.roles(seed, 2).await?;
-        eprintln!(
-            "{}",
-            json!({"stage":"holder_participant_ready","seeder":seed})
-        );
         Ok(())
     }
     async fn roles(&self, seed: bool, revision: i64) -> Result<()> {
-        let client = self.client()?;
-        // A recovered contribution owner earns ten healthy minutes. Consumers
-        // need not wait for this; do not weaken the real policy for a WAN test.
-        let until = tokio::time::Instant::now() + Duration::from_secs(if seed { 900 } else { 180 });
+        use crate::marketplace::service::RuntimePhase;
+        let marketplace = &self.state()?.marketplace;
+        // A recovered contributor earns ten healthy minutes. Allow one full
+        // replacement window in the test, without shortening product policy
+        // or resetting the deadline on each recovery. Consumers do not wait.
+        let until = tokio::time::Instant::now() + Duration::from_secs(if seed { 1200 } else { 180 });
         let mut report = tokio::time::Instant::now();
         loop {
-            let state = client.snapshot();
-            if state.phase == ParticipationPhase::Running
-                && state.preferences_revision == Some(revision)
-                && state
-                    .applied_roles
-                    .is_some_and(|r| r.consumer && r.catalog == seed && !r.routing)
+            // Read the current owner, not a clone of the first generation.
+            // The original VPN identity and the saved role/revision remain fixed.
+            let runtime = marketplace.snapshot();
+            let state = runtime.participation.as_ref();
+            if runtime.phase == RuntimePhase::Running
+                && state.is_some_and(|state| {
+                    state.phase == ParticipationPhase::Running
+                        && state.preferences_revision == Some(revision)
+                        && state.applied_roles.is_some_and(|r| r.consumer && r.catalog == seed && !r.routing)
+                })
             {
                 return Ok(());
             }
             ensure!(
                 tokio::time::Instant::now() < until,
-                "actual contribution roles did not apply: {state:?}"
+                "actual contribution roles did not apply: {runtime:?}"
             );
             if tokio::time::Instant::now() >= report {
                 eprintln!(
                     "{}",
                     json!({"stage":"holder_contribution_wait","seeder":seed,
-                    "phase":state.phase,"blockers":state.blockers,
-                    "recovery_seconds":state.recovery_seconds})
+                    "phase":runtime.phase,"blockers":state.map(|state| &state.blockers),
+                    "recovery_seconds":state.map(|state| state.recovery_seconds)})
                 );
                 report = tokio::time::Instant::now() + Duration::from_secs(15);
             }
@@ -265,19 +283,32 @@ impl Participant {
             "exact publisher-seeding choice did not apply"
         );
         if enable {
-            // A saved consent row is not a running contributor. Wait for the
-            // actual protected owner's nonempty installed-sharing lease before
-            // publishing a test offer; the download still proves exact bytes.
-            let until = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !self.client()?.snapshot().package_sharing_active {
-                ensure!(
-                    tokio::time::Instant::now() < until,
-                    "original installed archive never acquired its sharing lease"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            eprintln!("{}", json!({"stage":"holder_installed_sharing_ready"}));
+            self.wait_for_sharing().await?;
         }
+        Ok(())
+    }
+
+    async fn wait_for_sharing(&self) -> Result<()> {
+        // A saved consent row is not a running contributor. The test offer
+        // follows the original protected owner's installed-sharing lease.
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        let marketplace = &self.state()?.marketplace;
+        loop {
+            let runtime = marketplace.snapshot();
+            if runtime.phase == crate::marketplace::service::RuntimePhase::Running
+                && runtime.participation.is_some_and(|state|
+                    state.phase == ParticipationPhase::Running && state.package_sharing_active
+                )
+            {
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < until,
+                "original installed archive never acquired its sharing lease"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        eprintln!("{}", json!({"stage":"holder_installed_sharing_ready"}));
         Ok(())
     }
 }

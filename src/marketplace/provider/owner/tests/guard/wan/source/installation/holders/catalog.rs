@@ -9,6 +9,7 @@ use elixir_marketplace::{
 };
 mod freshness;
 mod lifecycle;
+mod sdk;
 
 fn descriptor(source: &SourceFixture, weight: u8) -> Result<CandidateDescriptor> {
     // Reuse only the five public TEST credential shapes. Author signatures and
@@ -369,16 +370,38 @@ fn approved_versioned_sources_and_test_support_match_before_enrollment() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "two explicitly approved remaining identities; real protected peer catalog/source/install/update; TEST support only"]
 async fn independent_catalog_selected_card_install_and_manual_update() -> Result<()> {
-    catalog_workflow(false).await
+    catalog_workflow(false, false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "standing-approved two free identities, synthetic sources; normal automatic scheduler/logout, owner opt-out and actual guard failure"]
 async fn independent_catalog_automatic_update_opt_out_and_protection_loss() -> Result<()> {
-    catalog_workflow(true).await
+    catalog_workflow(true, false).await
 }
 
-async fn catalog_workflow(lifecycle: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "two standing-approved free identities; real publisher SDK and independently protected consumer; already-approved synthetic sources only"]
+async fn independent_catalog_sdk_publish_install_and_update() -> Result<()> {
+    catalog_workflow(false, true).await
+}
+
+async fn publish_and_seed(
+    actor: &Participant,
+    source: &SourceFixture,
+    existing: Option<Uuid>,
+    sdk: Option<&sdk::PublisherSdk>,
+) -> Result<Uuid> {
+    if let Some(sdk) = sdk {
+        return sdk.install_and_seed(actor, source, existing).await;
+    }
+    let instance = install_with_updates(
+        actor.app()?, actor.state()?, actor.token()?, source, existing, true, false,
+    ).await?;
+    actor.seeding(instance, source, true).await?;
+    Ok(instance)
+}
+
+async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
     consent()?; // No input access or enrollment before explicit consent.
     ensure!(
         std::env::var("ELIXIR_MARKETPLACE_REMAINING_TWO_IDENTITY_LIVE_TEST").as_deref() == Ok("1"),
@@ -387,6 +410,10 @@ async fn catalog_workflow(lifecycle: bool) -> Result<()> {
     const CONSUMER: usize = 1;
     let sources = configured_fixtures()?;
     let descriptors = [descriptor(&sources[0], 2)?, descriptor(&sources[1], 4)?];
+    let sdk = use_sdk.then(sdk::PublisherSdk::configured).transpose()?;
+    if let Some(sdk) = &sdk {
+        sdk.preflight().await?;
+    }
     let provider = image()?;
     let guard = immutable_image("ELIXIR_MARKETPLACE_PROVIDER_GUARD_IMAGE")?;
     let worker = immutable_image("ELIXIR_MARKETPLACE_PROVIDER_WORKER_IMAGE")?;
@@ -425,21 +452,15 @@ async fn catalog_workflow(lifecycle: bool) -> Result<()> {
                 json!({"stage":"cross_peer_participant_layout","participant":n + 1,
                 "deployment":actors[n].rig.deployment,"recovery_root":actors[n].rig.root.path()})
             );
-            actors[n]
-                .start(&guard, &worker, topic, n == 0, &allocation)
-                .await?;
+            if n == 0 && sdk.is_some() {
+                // Upload/review does not need an active serving role. The
+                // original SDK seeding step below still requires that role.
+                actors[n].start_application(&guard, &worker, topic, true, &allocation).await?;
+            } else {
+                actors[n].start(&guard, &worker, topic, n == 0, &allocation).await?;
+            }
             if n == 0 {
-                let instance = install_with_updates(
-                    actors[n].app()?,
-                    actors[n].state()?,
-                    actors[n].token()?,
-                    &sources[0],
-                    None,
-                    true,
-                    false,
-                )
-                .await?;
-                actors[n].seeding(instance, &sources[0], true).await?;
+                let instance = publish_and_seed(&actors[n], &sources[0], None, sdk.as_ref()).await?;
                 holders.push(instance);
                 offer(&actors[n], &descriptors[0]).await?;
             }
@@ -470,17 +491,7 @@ async fn catalog_workflow(lifecycle: bool) -> Result<()> {
         // Publisher updates are the exact SECOND already-public approved source.
         // No new repository content or production extension is published.
         for n in 0..1 {
-            install_with_updates(
-                actors[n].app()?,
-                actors[n].state()?,
-                actors[n].token()?,
-                &sources[1],
-                Some(holders[n]),
-                true,
-                false,
-            )
-            .await?;
-            actors[n].seeding(holders[n], &sources[1], true).await?;
+            publish_and_seed(&actors[n], &sources[1], Some(holders[n]), sdk.as_ref()).await?;
             offer(&actors[n], &descriptors[1]).await?;
         }
         if lifecycle {
