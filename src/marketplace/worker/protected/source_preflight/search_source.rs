@@ -97,6 +97,20 @@ impl SearchSourceCache {
     }
 }
 impl Client {
+    #[cfg(test)]
+    pub(in crate::marketplace::worker::protected) fn fixture_cache_search_source(
+        &self,
+        metadata: &MetadataObservation,
+        source: &PublicSourceObservation,
+    ) -> Result<()> {
+        let (key, release) = self.search_metadata_plan(metadata, 0)?;
+        if source.release_id() != release {
+            bail!("search fixture release differs");
+        }
+        let fact = SearchSourceObservation::from_source(source)?;
+        self.0.search_source_cache.lock().unwrap().insert(key, &fact);
+        Ok(())
+    }
     pub(in crate::marketplace::worker::protected) fn search_batch_needed(
         &self,
         release: &Release,
@@ -115,11 +129,11 @@ impl Client {
             .get(key, id)
             .is_none())
     }
-    pub(in crate::marketplace::worker::protected) async fn request_search_metadata(
+    fn search_metadata_plan(
         &self,
         metadata: &MetadataObservation,
         location: usize,
-    ) -> Result<SearchSourceObservation> {
+    ) -> Result<(Digest, Digest)> {
         self.0.cache_admit()?;
         let policy = elixir_marketplace::evidence::IssuerPolicy::new(
             self.0.binding.issuer_keys.iter().copied(),
@@ -144,13 +158,37 @@ impl Client {
                 .as_str()
                 .as_bytes(),
         );
-        if let Some(value) = self
+        Ok((key, plan.release_id))
+    }
+    fn cached_search_source(
+        &self,
+        key: Digest,
+        release: Digest,
+    ) -> Result<Option<SearchSourceObservation>> {
+        Ok(self
             .0
             .search_source_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("search source cache unavailable"))?
-            .get(key, plan.release_id)
-        {
+            .get(key, release))
+    }
+    /// An exact cache hit only. A miss cannot launch a helper or imply source
+    /// authority; the caller still owns the durable currentness read.
+    pub(in crate::marketplace::worker::protected) fn cached_search_metadata_source(
+        &self,
+        metadata: &MetadataObservation,
+        location: usize,
+    ) -> Result<Option<SearchSourceObservation>> {
+        let (key, release) = self.search_metadata_plan(metadata, location)?;
+        self.cached_search_source(key, release)
+    }
+    pub(in crate::marketplace::worker::protected) async fn request_search_metadata(
+        &self,
+        metadata: &MetadataObservation,
+        location: usize,
+    ) -> Result<SearchSourceObservation> {
+        let (key, release) = self.search_metadata_plan(metadata, location)?;
+        if let Some(value) = self.cached_search_source(key, release)? {
             return Ok(value);
         }
         let source = self.request_metadata(metadata, location).await?;

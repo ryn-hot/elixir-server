@@ -112,10 +112,10 @@ impl Selection {
             client,
             selected: SelectionValue::Discovery(Box::new(InstalledSelected {
                 candidate: Selected {
-                    value: Arc::new(Verified {
-                        metadata: metadata.retained_copy(),
-                        source: SearchSourceObservation::from_source(&source)?,
-                    }),
+                    value: Arc::new(Verified::new(
+                        metadata.retained_copy(),
+                        SearchSourceObservation::from_source(&source)?,
+                    )?),
                     peers,
                     _capacity: Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned()?,
                 },

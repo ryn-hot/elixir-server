@@ -447,6 +447,7 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
     };
     f.owner.source_cache.lock().unwrap().insert(&native);
     let client = Client(f.owner.clone());
+    assert!(client.cached_search_metadata_source(&metadata, 0)?.is_none());
     let fact = client.request_search_metadata(&metadata, 0).await?;
     assert_eq!(fact.release_id(), native.release_id());
     f.owner
@@ -455,6 +456,18 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
         .unwrap()
         .entries_for_test_clear();
     let permit = f.owner.slots.clone().try_acquire_owned()?;
+    assert_eq!(
+        client
+            .cached_search_metadata_source(&metadata, 0)?
+            .unwrap()
+            .release_id(),
+        native.release_id()
+    );
+    assert!(
+        client
+            .cached_search_metadata_source(&metadata, usize::MAX)
+            .is_err()
+    );
     assert!(
         client.request_search_metadata(&metadata, 0).await.is_ok(),
         "a local fact needs no helper slot"
@@ -477,6 +490,7 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
         client.request_search_metadata(&metadata, 0).await.is_err(),
         "a source cache hit cannot renew expired metadata or ranking"
     );
+    assert!(client.cached_search_metadata_source(&metadata, 0).is_err());
     let mut current = metadata.retained_copy();
     current.observed = Instant::now();
     current.observed_utc = observation_utc()?;

@@ -115,14 +115,16 @@ struct Verified {
     source: SearchSourceObservation,
 }
 impl Verified {
-    fn valid_for(&self) -> Duration {
-        let Ok(bytes) = canonical::to_vec(&self.metadata.descriptor().release.payload) else {
-            return Duration::ZERO;
-        };
-        let release = Digest::of(bytes);
-        if self.source.release_id() != release {
-            return Duration::ZERO;
+    fn new(metadata: MetadataObservation, source: SearchSourceObservation) -> Result<Self> {
+        let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
+        if source.release_id() != release {
+            bail!("search source fact does not match the checked release");
         }
+        Ok(Self { metadata, source })
+    }
+    fn valid_for(&self) -> Duration {
+        // Both facts and their release binding are immutable. Their live
+        // expiry and protection checks are still required on every read.
         self.metadata.valid_for().min(self.source.valid_for())
     }
     fn card(&self, support: SupportSummary) -> Result<SearchCard> {
@@ -279,7 +281,7 @@ impl Live {
         descriptor_id: Digest,
         interest: &Interest,
         local_pending: bool,
-    ) -> Result<MetadataObservation> {
+    ) -> Result<(MetadataObservation, Option<SearchSourceObservation>)> {
         // Do not spend the once-per-page source attempt before metadata warming
         // succeeds. A resource/protection deferral retries the same candidate.
         let sources =
@@ -311,11 +313,11 @@ impl Live {
         source_warm?;
         let warm = self.session.lock().await.take_warm_admission(descriptor_id);
         if let Some(warm) = warm
-            && let Some(metadata) = self.client.use_warm_search_admission(warm).await?
+            && let Some(facts) = self.client.use_warm_search_admission(warm).await?
         {
-            return Ok(metadata);
+            return Ok(facts);
         }
-        self.client.verify_metadata(descriptor).await
+        Ok((self.client.verify_metadata(descriptor).await?, None))
     }
 
     async fn warm_sources(
@@ -468,8 +470,8 @@ impl Backend for Live {
             Some(warm) => self.client.use_warm_search_admission(warm).await?,
             None => None,
         };
-        let metadata = match metadata {
-            Some(metadata) => metadata,
+        let (metadata, cached_source) = match metadata {
+            Some(facts) => facts,
             None => {
                 self.prefetch_then_verify(&descriptor, descriptor_id, interest, local_pending)
                     .await?
@@ -478,6 +480,18 @@ impl Backend for Live {
         let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
         if metadata.descriptor().head.payload.stable_release_id != release {
             bail!("default search requires the stable head");
+        }
+        if local_pending && let Some(source) = cached_source {
+            if !interest.active() {
+                bail!("marketplace search is no longer requested");
+            }
+            let value = Verified::new(metadata, source)?;
+            if value.valid_for() < Duration::from_secs(2) {
+                bail!("marketplace checks need refresh");
+            }
+            // No cache mutation or grant. The UI still reads the fresh durable
+            // and private-head fences before showing this same observation.
+            return Ok(Arc::new(value));
         }
         // Only a session-owned local pending hint may defer this availability
         // veto to view()'s mandatory page check. It is NOT a display/selection
@@ -497,7 +511,7 @@ impl Backend for Live {
                 )
                 .await,
             ) {
-                let value = Arc::new(Verified { metadata, source });
+                let value = Arc::new(Verified::new(metadata, source)?);
                 if !local_pending {
                     if !interest.active() {
                         bail!("marketplace search is no longer requested");

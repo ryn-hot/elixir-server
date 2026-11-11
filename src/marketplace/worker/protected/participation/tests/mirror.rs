@@ -23,7 +23,7 @@ async fn prepared() -> Result<(RetentionFixture, Arc<security_mirror::Mirror>, i
 #[tokio::test]
 async fn warm_search_admissions_are_exact_owner_local_and_revision_bound() -> Result<()> {
     use crate::marketplace::security_state::{Rejection, catalog_admit, catalog_observe};
-    use crate::marketplace::worker::SecurityObservation;
+    use crate::marketplace::worker::{PublicSourceObservation, SecurityObservation};
     use elixir_marketplace::{records::Revocation, security_job::SecurityRecords};
 
     let (fixture, mirror, _owner) = prepared().await?;
@@ -86,11 +86,27 @@ async fn warm_search_admissions_are_exact_owner_local_and_revision_bound() -> Re
             .await?
             .is_none()
     );
-    let received = client
+    let (received, source) = client
         .use_warm_search_admission(admissions.remove(&second_id).unwrap())
         .await?
         .unwrap();
     assert_eq!(received.descriptor().to_bytes()?, descriptor.to_bytes()?);
+    assert!(
+        source.is_none(),
+        "a cache miss must stay on the ordinary source path"
+    );
+    let (native, source_owner) =
+        PublicSourceObservation::fixture_for_source(release, Digest::of(b"fixture license"));
+    preflight.fixture_cache_search_source(&second, &native)?;
+    let mut admissions = client.warm_local_search_admissions(&descriptors).await?;
+    let (received, fact) = client
+        .use_warm_search_admission(admissions.remove(&second_id).unwrap())
+        .await?
+        .context("expected an exact warm hit")?;
+    let fact = fact.context("positive source cache hit missing")?;
+    assert_eq!(received.descriptor().to_bytes()?, descriptor.to_bytes()?);
+    assert_eq!(fact.release_id(), release);
+    assert!(!fact.valid_for().is_zero());
     let mut admissions = client.warm_local_search_admissions(&descriptors).await?;
     let withdrawal = SignedRecord::sign(
         Revocation {
@@ -131,6 +147,15 @@ async fn warm_search_admissions_are_exact_owner_local_and_revision_bound() -> Re
         error.downcast_ref::<Rejection>(),
         Some(Rejection::Withdrawn)
     ));
+    assert!(
+        !fact.valid_for().is_zero(),
+        "withdrawal must reject even with a live source fact"
+    );
+    source_owner(false);
+    assert!(
+        fact.valid_for().is_zero(),
+        "warm path must not refresh the original owner"
+    );
     Ok(())
 }
 #[tokio::test]

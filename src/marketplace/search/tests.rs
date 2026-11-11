@@ -55,6 +55,31 @@ pub(super) fn descriptor(index: usize, weight: u8) -> Result<CandidateDescriptor
     }
     Ok(d)
 }
+#[test]
+fn verified_search_result_binds_release_once_but_still_expires_with_its_source() -> Result<()> {
+    let policy = IssuerPolicy::new([PublicKey::from_bytes(key(3).verifying_key().to_bytes())?])?;
+    let (metadata, _owner) =
+        MetadataObservation::fixture_for_verified_descriptor(descriptor(1, 1)?, &policy)?;
+    let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
+    let (wrong, _wrong_owner) = PublicSourceObservation::fixture_for_source(
+        Digest::of(b"different checked release"),
+        Digest::of(b"fixture license"),
+    );
+    assert!(
+        Verified::new(
+            metadata.retained_copy(),
+            SearchSourceObservation::from_source(&wrong)?,
+        )
+        .is_err()
+    );
+    let (source, source_owner) =
+        PublicSourceObservation::fixture_for_source(release, Digest::of(b"fixture license"));
+    let checked = Verified::new(metadata, SearchSourceObservation::from_source(&source)?)?;
+    assert!(!checked.valid_for().is_zero());
+    source_owner(false);
+    assert!(checked.valid_for().is_zero());
+    Ok(())
+}
 pub(super) struct Fake {
     page: SearchPage,
     owners: Mutex<Vec<Box<dyn Fn(bool) + Send + Sync>>>,
@@ -193,10 +218,10 @@ impl Backend for Fake {
             Box::new(owner) as Box<dyn Fn(bool) + Send + Sync>,
             Box::new(source_owner),
         ]);
-        Ok(Arc::new(Verified {
+        Ok(Arc::new(Verified::new(
             metadata,
-            source: SearchSourceObservation::from_source(&source)?,
-        }))
+            SearchSourceObservation::from_source(&source)?,
+        )?))
     }
     async fn current(&self, _: &Verified) -> Result<()> {
         if self.hold_current.swap(false, Ordering::SeqCst) {

@@ -12,6 +12,11 @@ pub(in crate::marketplace) struct WarmSearchAdmission {
     metadata: super::super::MetadataObservation,
 }
 
+pub(in crate::marketplace) type WarmSearchFacts = (
+    super::super::MetadataObservation,
+    Option<super::super::SearchSourceObservation>,
+);
+
 impl ParticipationClient {
     pub(in crate::marketplace) async fn warm_local_search_admissions(
         &self,
@@ -78,7 +83,7 @@ impl ParticipationClient {
     pub(in crate::marketplace) async fn use_warm_search_admission(
         &self,
         checked: WarmSearchAdmission,
-    ) -> Result<Option<super::super::MetadataObservation>> {
+    ) -> Result<Option<WarmSearchFacts>> {
         if self.snapshot().phase != ParticipationPhase::Running {
             bail!("marketplace participation is unavailable");
         }
@@ -101,13 +106,22 @@ impl ParticipationClient {
                 if *revision != checked.revision {
                     return Ok(None);
                 }
+                // The warm page already checked the complete merge. Read only
+                // the exact, positive source cache before the same fresh,
+                // revision-bound durable check below. A miss/error uses the
+                // ordinary before/after checks around actual source work.
+                let source = preflight
+                    .cached_search_metadata_source(&checked.metadata, 0)
+                    .ok()
+                    .flatten();
                 security_state::require_current_at(
                     &self.database,
                     &checked.metadata,
                     Some(*revision),
                 )
                 .await?;
-                Ok(Some(checked.metadata))
+                let source = source.filter(|fact| !fact.valid_for().is_zero());
+                Ok(Some((checked.metadata, source)))
             },
             false,
         )
