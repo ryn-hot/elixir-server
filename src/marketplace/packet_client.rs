@@ -134,6 +134,22 @@ fn command_deadline(base: Duration, command: &GuardCommand) -> Duration {
         _ => base,
     }
 }
+
+// The already-owned request supplies this closed label. Never format the
+// command itself: policy, traffic budget and setup details are not diagnostics.
+fn command_label(command: &GuardCommand) -> &'static str {
+    match command {
+        GuardCommand::Initialize { .. } => "initialize",
+        GuardCommand::InitializeProvider { .. } => "initialize_provider",
+        GuardCommand::Credit { .. } => "credit",
+        GuardCommand::Heartbeat => "heartbeat",
+        GuardCommand::Pause => "pause",
+        GuardCommand::Observe => "observe",
+        GuardCommand::CreditStatus => "credit_status",
+        GuardCommand::HostResources => "host_resources",
+        GuardCommand::ConfigureWireguard { .. } => "configure_wireguard",
+    }
+}
 impl PacketClient {
     pub(super) async fn new_joined(
         mut process: PrivateProcessStdio,
@@ -271,6 +287,7 @@ impl PacketClient {
             armed: true,
         };
         let deadline = command_deadline(self.deadline, &request.command);
+        let started = tokio::time::Instant::now();
         let operation = async {
             process
                 .input
@@ -382,6 +399,7 @@ impl PacketClient {
             Some(())=self.overflow.recv()=>Err(anyhow::anyhow!("packet actor diagnostic limit exceeded")),
         };
         if result.is_err() {
+            let elapsed = started.elapsed().as_millis();
             // stdout EOF can race the final stderr read. Allow a bounded drain
             // on failure only; this does not join/retire the native actor,
             // unpoison the channel or extend a kernel traffic lease. Timeout
@@ -410,7 +428,10 @@ impl PacketClient {
                     .and_then(|n| ERROR_KINDS.get(n as usize))
                     .copied()
                     .unwrap_or("unavailable");
-                result = result.with_context(|| format!("packet actor failed at {stage} ({kind})"));
+                let name = command_label(&request.command);
+                result = result.with_context(|| format!(
+                    "packet actor failed at {stage} ({kind}); operation={name} elapsed_ms={elapsed}"
+                ));
             }
         }
         if let Ok(reply) = &result {
@@ -852,6 +873,7 @@ for(let i=0;i<frame.length;i+=3)process.stdout.write(frame.subarray(i,i+3));
                 .await
                 .unwrap_err();
             let report = format!("{error:#}");
+            assert!(report.contains("operation=initialize elapsed_ms="));
             assert!(
                 report.contains("credit_read (Interrupted)"),
                 "{mode}: {report}"
