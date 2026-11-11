@@ -100,27 +100,39 @@ impl Rig {
         // state. Use normal migrations, never a synthetic consent/status watch.
         database.run_migrations().await?;
         let spec = Profile::network_spec(&deployment)?;
-        let network = runtime.ensure_packet_uplink(&spec).await?;
-        spec.verify(&network)?;
+        // The native daemon may commit CREATE after its CLI deadline. Keep
+        // the exact expected bridge profile even if no actor was enrolled and
+        // there is not yet an immutable network ID for the full descriptor.
+        root.describe_uplink_attempt(&spec)?;
+        let prepared = async {
+            let network = runtime.ensure_packet_uplink(&spec).await?;
+            spec.verify(&network)?;
+            ensure!(network.members.is_empty(), "WAN fixture uplink is occupied");
+            // Recovery knows the exact scope/image and NEVER enrolls a replacement.
+            // Installed fixtures switch to the normal application's manager.
+            root.describe(
+                &deployment,
+                scope,
+                image,
+                &network.id,
+                if installed {
+                    "native-public-source-install"
+                } else {
+                    "native-provider-guard"
+                },
+            )?;
+            Ok::<_, anyhow::Error>(network)
+        }
+        .await;
+        if prepared.is_err() {
+            root.preserve();
+        }
+        let network = prepared?;
         let emergency = Emergency {
             actors: vec![],
             network: spec,
             network_id: network.id.clone(),
         };
-        // Recovery knows this exact scope/image and NEVER enrolls a replacement.
-        // Guard fixtures keep their fixed test encryption owner. Installed
-        // fixtures switch to the normal application's manager before enrollment.
-        root.describe(
-            &deployment,
-            scope,
-            image,
-            &network.id,
-            if installed {
-                "native-public-source-install"
-            } else {
-                "native-provider-guard"
-            },
-        )?;
         Ok(Self {
             root,
             directory,

@@ -230,13 +230,23 @@ impl DockerRuntimeManager {
             .spawn()?;
         let stdout = child.stdout.take().context("missing network stdout")?;
         let stderr = child.stderr.take().context("missing network stderr")?;
-        let (out, err, status) = timeout(Duration::from_secs(10), async {
+        // Bridge creation programs the local daemon's network rules. Unlike
+        // inspection/removal it can legitimately outlast a ten-second CLI
+        // wait. The packet/lease limits and runtime checks do not change.
+        let creating = args.first().is_some_and(|arg| arg == "network")
+            && args.get(1).is_some_and(|arg| arg == "create");
+        let limit = Duration::from_secs(if creating { 30 } else { 10 });
+        let (out, err, status) = timeout(limit, async {
             tokio::try_join!(read(stdout, 65536), read(stderr, 4096), async {
                 child.wait().await.map_err(anyhow::Error::from)
             })
         })
         .await
-        .context("marketplace network command deadline")??;
+        .context(if creating {
+            "marketplace network create command deadline"
+        } else {
+            "marketplace network command deadline"
+        })??;
         Ok((status, String::from_utf8(out)?, String::from_utf8(err)?))
     }
     pub fn new(docker_bin: Option<String>) -> Self {
@@ -3280,16 +3290,44 @@ impl RuntimeManager for DockerRuntimeManager {
             args.extend(["--label".to_owned(), format!("{key}={value}")]);
         }
         args.push(spec.name().to_owned());
-        let (status, out, _) = self.packet_network_capture(&args).await?;
-        if !status.success() {
-            bail!("marketplace network creation failed; no replacement attempted");
+        let creation = async {
+            let (status, out, _) = self.packet_network_capture(&args).await?;
+            if !status.success() {
+                bail!("marketplace network creation failed");
+            }
+            let id = out.trim();
+            if !immutable_id(id) {
+                bail!("marketplace network creation omitted immutable ID");
+            }
+            Ok(id.to_owned())
         }
-        let id = out.trim();
-        if !immutable_id(id) {
-            bail!("marketplace network creation omitted immutable ID");
-        }
+        .await;
+        let id = match creation {
+            Ok(id) => id,
+            Err(error) => {
+                // The Docker CLI can lose its reply after the daemon commits
+                // CREATE. One read of the same deterministic name can recover
+                // that outcome. No replacement CREATE or removal is sent.
+                match self.inspect_packet_uplink(spec.name()).await {
+                    Ok(Some(actual)) => {
+                        spec.verify(&actual)?;
+                        actual.id
+                    }
+                    Ok(None) => {
+                        return Err(error.context(
+                            "marketplace uplink creation unconfirmed; no replacement attempted",
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(error.context(
+                            "marketplace uplink creation and exact inspection unconfirmed; no replacement attempted",
+                        ));
+                    }
+                }
+            }
+        };
         let actual = self
-            .inspect_packet_uplink(id)
+            .inspect_packet_uplink(&id)
             .await?
             .context("created marketplace network missing")?;
         spec.verify(&actual)?;
@@ -4964,6 +5002,64 @@ mod tests {
         assert!(status.success());
         assert_eq!(out, "{}");
         assert!(err.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn packet_network_lost_create_reply_uses_only_the_exact_owned_empty_bridge() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spec = PacketNetworkSpec::internet("provider-create-test", false)?;
+        let id = "a".repeat(64);
+        let expected = json!({"Id":id,"Name":spec.name(),"Driver":"bridge","Scope":"local",
+            "Internal":false,"EnableIPv4":true,"EnableIPv6":false,"Attachable":false,"Ingress":false,
+            "ConfigOnly":false,"ConfigFrom":{"Network":""},"Labels":spec.labels(),"Options":spec.options(),
+            "IPAM":{"Driver":"default","Options":null,"Config":[{"Subnet":"172.29.0.0/16","Gateway":"172.29.0.1"}]},"Containers":{}});
+        for scenario in ["owned", "missing", "foreign", "occupied", "different_id"] {
+            let dir = tempfile::tempdir()?;
+            let cli = dir.path().join("docker.mjs");
+            std::fs::write(dir.path().join("fixture.json"), serde_json::to_vec(&json!({
+                "scenario":scenario,"network":expected,
+            }))?)?;
+            std::fs::write(&cli, r#"#!/usr/bin/env node
+import fs from 'node:fs';
+const local=name=>new URL(name,import.meta.url);
+const {scenario,network}=JSON.parse(fs.readFileSync(local('fixture.json')));
+const [noun,verb,...args]=process.argv.slice(2);
+if(noun!=='network'||!['inspect','create'].includes(verb))process.exit(2);
+const target=args.at(-1);
+fs.appendFileSync(local('calls'),`${verb} ${target}\n`);
+if(verb==='create'){
+  if(target!==network.Name)process.exit(3);
+  fs.writeFileSync(local('created'),'1',{flag:'wx'});
+  process.stdout.write('x'.repeat(70000)); // daemon committed; CLI reply unusable
+}else if(!fs.existsSync(local('created'))||scenario==='missing'){
+  process.stderr.write('No such network\n');process.exitCode=1;
+}else{
+  if(target!==network.Name&&target!==network.Id)process.exit(4);
+  if(scenario==='foreign')network.Labels['elixir.managed']='false';
+  if(scenario==='occupied')network.Containers['b'.repeat(64)]={Name:'occupied',EndpointID:'c'.repeat(64)};
+  if(scenario==='different_id'&&target===network.Id)network.Id='d'.repeat(64);
+  process.stdout.write(JSON.stringify(network));
+}
+"#)?;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700))?;
+            let runtime = DockerRuntimeManager::new(Some(cli.to_string_lossy().into_owned()));
+            let recovered = runtime.ensure_packet_uplink(&spec).await;
+            if scenario == "owned" {
+                let recovered = recovered?;
+                assert_eq!(recovered.id, id);
+                assert!(recovered.members.is_empty());
+            } else {
+                assert!(recovered.is_err(), "{scenario} must fail closed");
+            }
+            let mut calls = format!("inspect {0}\ncreate {0}\ninspect {0}\n", spec.name());
+            if matches!(scenario, "owned" | "occupied" | "different_id") {
+                calls.push_str(&format!("inspect {id}\n"));
+            }
+            assert_eq!(std::fs::read_to_string(dir.path().join("calls"))?, calls);
+        }
         Ok(())
     }
 

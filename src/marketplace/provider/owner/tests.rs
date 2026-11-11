@@ -40,6 +40,21 @@ impl PreservedRoot {
         // Successful VPN retirement must not delete an uncertain source owner.
         self.2.set(true);
     }
+    fn describe_uplink_attempt(&self, spec: &PacketNetworkSpec) -> Result<()> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(self.path().join("provider-uplink-attempt.json"))?;
+        file.write_all(&elixir_marketplace::canonical::to_vec(&serde_json::json!({
+            "schema_version":1,"name":spec.name(),"labels":spec.labels(),"options":spec.options(),
+            "ipv6":spec.ipv6(),"internal":spec.internal(),
+        }))?)?;
+        file.sync_all()?;
+        Ok(())
+    }
     fn describe(
         &self,
         deployment: &str,
