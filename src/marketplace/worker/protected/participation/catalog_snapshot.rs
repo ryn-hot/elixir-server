@@ -19,26 +19,32 @@ pub(super) fn allows(descriptor: &CandidateDescriptor, state: &HeadResponse) -> 
     // Durable signature/anti-rollback/revocation checks still surround this
     // function; stale availability data grants no new authority. Otherwise a
     // retained old listing can permanently hide its own legitimate update.
-    if let Some(head) = &state.head {
-        if head.payload.extension_id != descriptor.release.payload.extension_id
-            || head.payload.publisher_state_id != Digest::of(canonical::to_vec(&state.publisher)?)
-        {
+    let observed = if let Some(head) = &state.head {
+        if head.payload.extension_id != descriptor.release.payload.extension_id {
             return Ok(false);
         }
-    }
+        let publisher = canonical::to_vec(&state.publisher)?;
+        if head.payload.publisher_state_id != Digest::of(&publisher) {
+            return Ok(false);
+        }
+        Some((head, publisher))
+    } else {
+        None
+    };
     if state.publisher.payload.sequence == descriptor.publisher.payload.sequence {
-        if canonical::to_vec(&state.publisher)? != canonical::to_vec(&descriptor.publisher)? {
-            return Ok(false);
-        }
-        let Some(head) = &state.head else {
+        let Some((head, publisher)) = observed else {
             return Ok(false);
         };
-        if head.payload.sequence > descriptor.head.payload.sequence
+        if publisher != canonical::to_vec(&descriptor.publisher)?
+            || head.payload.sequence > descriptor.head.payload.sequence
             || (head.payload.sequence == descriptor.head.payload.sequence
                 && canonical::to_vec(head)? != canonical::to_vec(&descriptor.head)?)
         {
             return Ok(false);
         }
+    }
+    if state.revocations.is_empty() {
+        return Ok(true);
     }
     let release = Digest::of(canonical::to_vec(&descriptor.release.payload)?);
     Ok(!state.revocations.iter().any(|record| {

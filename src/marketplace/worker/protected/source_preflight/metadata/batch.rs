@@ -227,6 +227,7 @@ async fn run(
         if let Some(support) = support {
             cache.insert(&MetadataObservation {
                 descriptor,
+                ids: OnceLock::new(),
                 support,
                 issuer_policy: policy,
                 observed,

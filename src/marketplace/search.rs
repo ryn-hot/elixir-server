@@ -116,7 +116,7 @@ struct Verified {
 }
 impl Verified {
     fn new(metadata: MetadataObservation, source: SearchSourceObservation) -> Result<Self> {
-        let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
+        let release = metadata.ids()?.release;
         if source.release_id() != release {
             bail!("search source fact does not match the checked release");
         }
@@ -361,8 +361,7 @@ impl Live {
                 {
                     cached += 1;
                 }
-                let release =
-                    Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
+                let release = metadata.ids()?.release;
                 if metadata.descriptor().head.payload.stable_release_id == release
                     && self.client.check_catalog_current(&metadata).await.is_ok()
                 {
@@ -477,7 +476,7 @@ impl Backend for Live {
                     .await?
             }
         };
-        let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
+        let release = metadata.ids()?.release;
         if metadata.descriptor().head.payload.stable_release_id != release {
             bail!("default search requires the stable head");
         }

@@ -216,6 +216,7 @@ impl Incoming {
 impl Incoming {
     fn metadata(value: &MetadataObservation) -> Result<Self> {
         let d = value.descriptor();
+        let ids = value.ids()?;
         let records = SecurityRecords {
             schema_version: SCHEMA_VERSION,
             extension_id: d.release.payload.extension_id.clone(),
@@ -229,10 +230,10 @@ impl Incoming {
             extension_id: records.extension_id.clone(),
             root_key: records.publisher.payload.root_key,
             publisher_sequence: records.publisher.payload.sequence,
-            publisher_payload_id: Digest::of(canonical::to_vec(&records.publisher.payload)?),
+            publisher_payload_id: ids.publisher_payload,
             head: Some(HeadState {
                 sequence: d.head.payload.sequence,
-                payload_id: Digest::of(canonical::to_vec(&d.head.payload)?),
+                payload_id: ids.head_payload,
             }),
             revocation_ids: records
                 .revocations
@@ -308,15 +309,16 @@ fn check(
     value: &MetadataObservation,
 ) -> Result<()> {
     let d = value.descriptor();
+    let ids = value.ids()?;
     check_candidate(
         publisher,
         extension,
         &CandidateFence {
             publisher_sequence: d.publisher.payload.sequence,
-            publisher_payload_id: Digest::of(canonical::to_vec(&d.publisher.payload)?),
+            publisher_payload_id: ids.publisher_payload,
             head_sequence: d.head.payload.sequence,
-            head_payload_id: Digest::of(canonical::to_vec(&d.head.payload)?),
-            release_id: Digest::of(canonical::to_vec(&d.release.payload)?),
+            head_payload_id: ids.head_payload,
+            release_id: ids.release,
             release_key: d.release.signer_key,
             head_key: d.head.signer_key,
         },

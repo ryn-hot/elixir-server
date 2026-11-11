@@ -10,6 +10,7 @@ use elixir_marketplace::{
     verifier::VerificationRequest,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 const MAX_REPLY: usize = 4096;
 mod batch;
@@ -89,6 +90,7 @@ impl ReceiptCache {
         }
         let value = MetadataObservation {
             descriptor: descriptor.clone(),
+            ids: OnceLock::new(),
             support: entry.support.clone(),
             issuer_policy: entry.issuer_policy,
             observed: entry.observed,
@@ -158,11 +160,19 @@ impl ReceiptCache {
 /// revocation state must still pass before a search result becomes visible.
 pub struct MetadataObservation {
     descriptor: CandidateDescriptor,
+    ids: OnceLock<MetadataIds>,
     support: SupportSummary,
     issuer_policy: Digest,
     observed: Instant,
     observed_utc: u64,
     protection: watch::Receiver<Snapshot>,
+}
+/// Pure identifiers of this owned immutable body. Never a freshness verdict,
+/// proof of availability, or additional entry in the compact receipt cache.
+pub(in crate::marketplace) struct MetadataIds {
+    pub release: Digest,
+    pub publisher_payload: Digest,
+    pub head_payload: Digest,
 }
 impl MetadataObservation {
     #[cfg(test)]
@@ -175,6 +185,7 @@ impl MetadataObservation {
     pub(in crate::marketplace) fn retained_copy(&self) -> Self {
         Self {
             descriptor: self.descriptor.clone(),
+            ids: OnceLock::new(),
             support: self.support.clone(),
             issuer_policy: self.issuer_policy,
             observed: self.observed,
@@ -217,6 +228,7 @@ impl MetadataObservation {
         Ok((
             Self {
                 descriptor,
+                ids: OnceLock::new(),
                 support,
                 issuer_policy: policy.fingerprint(),
                 observed: Instant::now(),
@@ -237,6 +249,18 @@ impl MetadataObservation {
     }
     pub fn descriptor(&self) -> &CandidateDescriptor {
         &self.descriptor
+    }
+    pub(in crate::marketplace) fn ids(&self) -> Result<&MetadataIds> {
+        if let Some(ids) = self.ids.get() {
+            return Ok(ids);
+        }
+        let d = self.descriptor();
+        let ids = MetadataIds {
+            release: Digest::of(canonical::to_vec(&d.release.payload)?),
+            publisher_payload: Digest::of(canonical::to_vec(&d.publisher.payload)?),
+            head_payload: Digest::of(canonical::to_vec(&d.head.payload)?),
+        };
+        Ok(self.ids.get_or_init(|| ids))
     }
     pub fn issuer_policy(&self) -> Digest {
         self.issuer_policy
@@ -573,6 +597,7 @@ async fn run(
     work.admit(owner, false)?;
     let observation = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: IssuerPolicy::new(owner.binding.issuer_keys.iter().copied())?.fingerprint(),
         observed: Instant::now(),

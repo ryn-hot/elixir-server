@@ -17,6 +17,7 @@ async fn sharing_renewal_requires_more_validity_than_an_aging_search_cache_hit()
     support.valid_until = Some(observation_utc()? + 3600);
     let metadata = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: IssuerPolicy::new(f.owner.binding.issuer_keys.iter().copied())?
             .fingerprint(),
@@ -132,6 +133,51 @@ fn fixture() -> Result<(CandidateDescriptor, Value, u64)> {
     Ok((descriptor, report, data["now"].as_u64().unwrap()))
 }
 
+#[test]
+fn memoized_metadata_ids_match_exact_bodies_without_renewing_protection() -> Result<()> {
+    let (descriptor, report, _) = fixture()?;
+    let mut support = parse_reply(&serde_json::to_vec(&report)?, 7, &descriptor)??;
+    let now = observation_utc()?;
+    support.valid_until = Some(now + 3600);
+    let (owner, protection) = watch::channel(Snapshot {
+        state: ProtectionState::Ready,
+        until: Some(Instant::now() + Duration::from_secs(3600)),
+    });
+    let value = MetadataObservation {
+        descriptor,
+        ids: OnceLock::new(),
+        support,
+        issuer_policy: Digest::of(b"synthetic memoization policy"),
+        observed: Instant::now(),
+        observed_utc: now,
+        protection,
+    };
+    let ids = value.ids()?;
+    let d = value.descriptor();
+    assert_eq!(
+        ids.release,
+        Digest::of(canonical::to_vec(&d.release.payload)?)
+    );
+    assert_eq!(
+        ids.publisher_payload,
+        Digest::of(canonical::to_vec(&d.publisher.payload)?)
+    );
+    assert_eq!(
+        ids.head_payload,
+        Digest::of(canonical::to_vec(&d.head.payload)?)
+    );
+    assert!(std::ptr::eq(ids, value.ids()?));
+    assert!(value.is_current());
+    owner.send_replace(Snapshot {
+        state: ProtectionState::Failed,
+        until: None,
+    });
+    assert!(std::ptr::eq(ids, value.ids()?));
+    assert!(!value.is_current());
+    assert!(value.support().is_err());
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -> Result<()> {
     let (descriptor, report, _) = fixture()?;
@@ -145,6 +191,7 @@ async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -
     });
     let mut value = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: policy,
         observed: Instant::now(),
@@ -332,6 +379,7 @@ async fn native_origin_receipt_still_expires_and_dies_with_its_protection_owner(
     // Synthetic test owner only, not evidence of real private-process origin.
     let mut observation = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: Digest::of(b"test-only-policy"),
         observed: Instant::now(),
@@ -378,6 +426,7 @@ async fn native_metadata_to_source_bridge_requires_a_current_metadata_owner_even
     // private-process origin and public fetching are separate native suites.
     let mut metadata = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: IssuerPolicy::new(fixture.owner.binding.issuer_keys.iter().copied())?
             .fingerprint(),
@@ -423,6 +472,7 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
     support.valid_until = Some(observation_utc()? + 3600);
     let metadata = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: IssuerPolicy::new(f.owner.binding.issuer_keys.iter().copied())?
             .fingerprint(),
@@ -517,6 +567,7 @@ async fn compact_metadata_hit_needs_no_new_process_or_headroom_but_keeps_its_own
     support.valid_until = Some(observation_utc()? + 3600);
     let metadata = MetadataObservation {
         descriptor,
+        ids: OnceLock::new(),
         support,
         issuer_policy: IssuerPolicy::new(f.owner.binding.issuer_keys.iter().copied())?
             .fingerprint(),
