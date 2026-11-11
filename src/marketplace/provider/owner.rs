@@ -184,14 +184,15 @@ impl Owner {
                 );
                 let stream = runtime.launch_provider(&handle, &profile, start).await?;
                 #[cfg(all(test, unix))]
-                if !resume {
+                {
                     // The fixed native actor waits for its private Start frame
                     // before spawning the vendor service or enrolling. This
                     // optional test barrier is never present in a release.
-                    super::guard::test_capture::provider_prestart(&deployment, &handle.id).await?;
+                    super::guard::test_capture::provider_prestart(&deployment, &handle.id, resume)
+                        .await?;
                     ensure!(
                         !request.is_cancelled(),
-                        "provider startup cancelled before enrollment"
+                        "provider startup cancelled before private Start"
                     );
                 }
                 let client = Client::start_shared(

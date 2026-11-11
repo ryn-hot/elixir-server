@@ -98,23 +98,43 @@ pub(in crate::marketplace) async fn finish() -> Result<()> {
     exchange(&path, serde_json::json!({"operation":"end"}), b"done\n").await
 }
 
-/// Attach before the initial Start frame only. Never delay saved-identity
-/// recovery, retirement or revocation on an observation socket.
+/// Test-only observation before the original actor's private Start frame.
+/// Resume has a separate opt-in. Retirement and revocation never wait here.
 pub(in crate::marketplace) async fn provider_prestart(
     deployment: &str,
     provider_id: &str,
+    resume: bool,
 ) -> Result<()> {
-    if std::env::var("ELIXIR_MARKETPLACE_TEST_PROVIDER_PRESTART").as_deref() != Ok("1") {
+    let flag = if resume {
+        "ELIXIR_MARKETPLACE_TEST_PROVIDER_RESUME_PRESTART"
+    } else {
+        "ELIXIR_MARKETPLACE_TEST_PROVIDER_PRESTART"
+    };
+    if std::env::var(flag).as_deref() != Ok("1") {
         return Ok(());
     }
-    let path = configured()?.context("explicit initial bootstrap capture socket required")?;
+    let path = configured()?.context("explicit bootstrap capture socket required")?;
     // The native actor is already waiting with its existing ten-second
     // startup bound. An absent observer fails without writing the Start frame.
-    tokio::time::timeout(std::time::Duration::from_secs(7), exchange(
-        &path,
-        serde_json::json!({"operation":"provider_prestart","deployment":deployment,"provider_id":provider_id}),
-        b"ready\n",
-    )).await.context("pre-enrollment capture readiness deadline")?
+    tokio::time::timeout(
+        std::time::Duration::from_secs(7),
+        exchange(
+            &path,
+            provider_prestart_frame(deployment, provider_id, resume),
+            b"ready\n",
+        ),
+    )
+    .await
+    .context("pre-Start capture readiness deadline")?
+}
+
+fn provider_prestart_frame(deployment: &str, provider_id: &str, resume: bool) -> serde_json::Value {
+    let operation = if resume {
+        "provider_resume_prestart"
+    } else {
+        "provider_prestart"
+    };
+    serde_json::json!({"operation":operation,"deployment":deployment,"provider_id":provider_id})
 }
 
 /// Bind the exact still-live namespace before an isolated route-loss fault.
@@ -168,6 +188,20 @@ fn guard_ready_frame(
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn bootstrap_start_frames_bind_only_the_owned_actor_and_start_mode() {
+        let id = "a".repeat(64);
+        for (resume, operation) in [
+            (false, "provider_prestart"),
+            (true, "provider_resume_prestart"),
+        ] {
+            assert_eq!(
+                provider_prestart_frame("fixture", &id, resume),
+                serde_json::json!({"operation":operation,"deployment":"fixture","provider_id":id})
+            );
+        }
+    }
 
     #[test]
     fn startup_ready_frame_is_closed_and_contains_no_transport_address() {
