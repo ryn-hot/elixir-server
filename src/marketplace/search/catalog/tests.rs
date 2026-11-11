@@ -19,6 +19,7 @@ struct Fixture {
     resume: Notify,
     broken: u8,
     empty_until_prepared: bool,
+    hold_reset: bool,
     resets: AtomicUsize,
     browses: AtomicUsize,
     stopped: AtomicBool,
@@ -43,6 +44,7 @@ impl Fixture {
             resume: Notify::new(),
             broken,
             empty_until_prepared: false,
+            hold_reset: false,
             resets: AtomicUsize::new(0),
             browses: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
@@ -144,6 +146,10 @@ impl Backend for Fixture {
     }
     async fn reset_browse(&self) -> Result<()> {
         self.resets.fetch_add(1, Ordering::SeqCst);
+        if self.hold_reset {
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
         if self.fail_reset {
             bail!("synthetic browse refresh failure");
         }
@@ -418,6 +424,7 @@ async fn an_empty_bootstrap_rechecks_once_after_population_without_promoting_war
 -> Result<()> {
     let mut fixture = Fixture::new(20, 0)?;
     fixture.empty_until_prepared = true;
+    fixture.hold_reset = true;
     fixture.hold.store(true, Ordering::SeqCst);
     let backend = Arc::new(fixture);
     let service = SearchService::default();
@@ -426,6 +433,12 @@ async fn an_empty_bootstrap_rechecks_once_after_population_without_promoting_war
     let empty = service.view(id).await?;
     assert!(empty.results.is_empty());
     assert!(!empty.preparation.unwrap().local_pass_complete);
+    backend.resume.notify_one();
+    timeout(Duration::from_secs(3), backend.started.notified()).await?;
+    let rechecking = service.view(id).await?;
+    assert!(rechecking.results.is_empty());
+    assert_eq!(rechecking.phase, SearchPhase::Checking);
+    assert!(rechecking.preparation.unwrap().local_pass_complete);
     backend.resume.notify_one();
     let view = prepared(&service, id).await?;
     service.join().await?;

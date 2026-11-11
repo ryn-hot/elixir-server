@@ -1189,13 +1189,21 @@ async fn run(inner: Arc<Inner>) {
             // succeeded, obtain a new independently checked page once, rather
             // than waiting for the owner to guess when to retry. Nonempty
             // pages/cursors remain stable; warming is not display authority.
+            let recheck_allowed = prepared.is_ok() && interest.active();
             let retry = prepared.is_ok()
-                && interest.active()
                 && inner.slot.lock().ok().is_some_and(|mut slot| {
                     let Some(query) = slot.query.as_mut().filter(|q| q.id == id) else {
                         return false;
                     };
-                    if !query.values.is_empty() {
+                    let Some(progress) = query.preparation.as_mut() else {
+                        return false;
+                    };
+                    // Never expose Ready + Complete + empty in between the
+                    // warming pass and its eligible first-page recheck: the
+                    // desktop treats that combination as terminal.
+                    progress.phase = catalog::Phase::Complete;
+                    progress.local_pass_complete = true;
+                    if !recheck_allowed || !query.values.is_empty() {
                         return false;
                     }
                     query.phase = SearchPhase::Checking;

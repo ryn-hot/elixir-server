@@ -205,10 +205,8 @@ pub(super) async fn prepare(
             }
         }
         if next.is_none() {
-            update(inner, interest, |p| {
-                p.phase = Phase::Complete;
-                p.local_pass_complete = true;
-            })?;
+            // The search owner publishes completion together with any
+            // first-page recheck, under its one query lock.
             return Ok(());
         }
         after = next;

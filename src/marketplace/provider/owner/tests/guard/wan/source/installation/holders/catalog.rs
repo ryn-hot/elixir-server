@@ -106,6 +106,103 @@ async fn discover_pair(actors: &[Participant]) -> Result<()> {
     }
 }
 
+fn setup_request() -> Value {
+    // The desktop sends the unfiltered first page with no cursor or known
+    // extension. A targeted search would not exercise cold setup discovery.
+    json!({"query":{"text":"","tags":[],"limit":20},"prepare_catalog":true})
+}
+
+#[test]
+fn sdk_catalog_setup_request_is_the_canonical_first_page() -> Result<()> {
+    let wire = setup_request();
+    let parsed = crate::marketplace::search::SearchRequest::parse(&serde_json::to_vec(&wire)?)?;
+    ensure!(parsed.prepare_catalog && parsed.query.text.is_empty());
+    ensure!(parsed.query.tags.is_empty() && parsed.query.limit == 20 && parsed.cursor.is_none());
+    assert_eq!(serde_json::to_value(parsed)?, wire);
+    Ok(())
+}
+
+fn verified_card<'a>(view: &'a Value, source: &SourceFixture) -> Result<&'a Value> {
+    let rows = view["results"]
+        .as_array()
+        .context("verified card missing")?;
+    ensure!(
+        rows.len() == 1
+            && rows[0]["extension_id"] == json!(source.publication.release.payload.extension_id)
+            && rows[0]["support"]["discovery_qualified"] == true
+            && rows[0]["support"]["verified_supporters"] == 5
+            && rows[0]["support"]["is_global_total"] == false
+            && rows[0]["metadata_only"] == true
+            && view["network_complete"] == false,
+        "HTTP card lost exact extension, public source or TEST rank binding: {view}"
+    );
+    Ok(&rows[0])
+}
+
+async fn setup_card(actor: &Participant, source: &SourceFixture) -> Result<Uuid> {
+    let began = tokio::time::Instant::now();
+    let request = setup_request();
+    let started = http(
+        actor.app()?,
+        actor.token()?,
+        "POST",
+        "/api/v1/marketplace/search",
+        Some(request.clone()),
+    )
+    .await?;
+    let id: Uuid = serde_json::from_value(started["query_id"].clone())?;
+    let path = format!("/api/v1/marketplace/search/{id}");
+    loop {
+        let view = http(actor.app()?, actor.token()?, "GET", &path, None).await?;
+        ensure!(
+            view["query_id"] == json!(id) && view["query"] == request["query"],
+            "setup query was replaced or filtered"
+        );
+        let phase = view["phase"].as_str();
+        let progress = &view["preparation"];
+        let progress_phase = progress["phase"].as_str();
+        let preparing = matches!(progress_phase, Some("checking" | "discovering" | "waiting"));
+        ensure!(
+            progress["schema_version"] == 1
+                && progress["scope"] == "current_local_catalog"
+                && progress["metadata_only"] == true
+                && progress["network_complete"] == false
+                && (preparing || matches!(progress_phase, Some("complete" | "limited" | "unavailable")))
+                && progress["local_pass_complete"] == json!(progress_phase == Some("complete")),
+            "invalid setup progress: {progress}"
+        );
+        ensure!(
+            matches!(phase, Some("checking" | "ready")),
+            "original setup search became unavailable: {view}"
+        );
+        let rows = view["results"]
+            .as_array()
+            .context("setup results missing")?;
+        if !rows.is_empty() {
+            let row = verified_card(&view, source)?;
+            ensure!(
+                row["release_id"] == json!(source.matched.release_id)
+                    && row["support"]["weighted_score"] == 10
+                    && view["valid_for_seconds"]
+                        .as_u64()
+                        .is_some_and(|ttl| ttl > 0),
+                "setup page did not contain the fresh verified v1 card"
+            );
+            eprintln!(
+                "{}",
+                json!({"stage":"cross_peer_verified_setup_page",
+                "elapsed_ms":began.elapsed().as_millis(),"simulated_support_only":true})
+            );
+            return Ok(id);
+        }
+        ensure!(
+            (phase != Some("ready") || preparing) && began.elapsed() < Duration::from_secs(600),
+            "original setup ended without a usable first page: {view}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn card(
     actor: &Participant,
     source: &SourceFixture,
@@ -135,25 +232,12 @@ async fn card(
         )
         .await?;
         if view["phase"] == "ready" {
-            let rows = view["results"]
-                .as_array()
-                .context("verified card missing")?;
-            ensure!(
-                rows.len() == 1
-                    && rows[0]["extension_id"]
-                        == json!(source.publication.release.payload.extension_id)
-                    && rows[0]["support"]["discovery_qualified"] == true
-                    && rows[0]["support"]["verified_supporters"] == 5
-                    && rows[0]["support"]["is_global_total"] == false
-                    && rows[0]["metadata_only"] == true
-                    && view["network_complete"] == false,
-                "HTTP card lost exact release, public source or TEST rank binding: {view}"
-            );
+            let row = verified_card(&view, source)?;
             if let Some((old_release, old_weight)) = previous
-                && rows[0]["release_id"] == json!(old_release)
+                && row["release_id"] == json!(old_release)
             {
                 ensure!(
-                    rows[0]["support"]["weighted_score"] == old_weight
+                    row["support"]["weighted_score"] == old_weight
                         && began.elapsed() < Duration::from_secs(900),
                     "known old card rank changed or bounded propagation deadline expired"
                 );
@@ -177,8 +261,8 @@ async fn card(
                 continue;
             }
             ensure!(
-                rows[0]["release_id"] == json!(source.matched.release_id)
-                    && rows[0]["support"]["weighted_score"] == weight,
+                row["release_id"] == json!(source.matched.release_id)
+                    && row["support"]["weighted_score"] == weight,
                 "HTTP card returned an unknown release or incorrect TEST rank"
             );
             eprintln!(
@@ -488,9 +572,16 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
             }}))).await?;
         ensure!(saved["settings"]["revision"] == 3, "consumer refresh choice was not saved");
         actors[CONSUMER].roles(false, 3).await?;
-        discover_pair(&actors).await?;
         private_parent_diagnostics()?;
-        let query = card(&actors[CONSUMER], &sources[0], 10, None).await?;
+        let query = if use_sdk {
+            // Let the ordinary worker discover the publisher; no known-peer
+            // configuration or forced refresh before setup begins. Reuse
+            // this very receipt for installation, as the desktop does.
+            setup_card(&actors[CONSUMER], &sources[0]).await?
+        } else {
+            discover_pair(&actors).await?;
+            card(&actors[CONSUMER], &sources[0], 10, None).await?
+        };
         let installed = install_card_with_policy(&actors[CONSUMER], &sources[0], query, None, lifecycle).await?;
         if lifecycle && std::env::var("ELIXIR_MARKETPLACE_FULL_LIFECYCLE_CAPTURE").as_deref() == Ok("1") {
             // Observation window BEFORE publishing the already-approved next
@@ -526,6 +617,7 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
             json!({"stage":"cross_peer_catalog_workflow_verified",
             "independent_vpn_namespaces":2,"approved_source_versions":2,"holders":1,
             "selected_card_install_and_update":true,"automatic_update":lifecycle,
+            "reused_setup_page_for_install":use_sdk,
             "owner_opt_out_and_protection_loss":lifecycle,"consumer_source_uploads":0,
             "test_supporters_per_release":5,"real_paid_credentials":0,
             "consumer_only":true,"unmetered_refresh":true,"production_enabled":false})
