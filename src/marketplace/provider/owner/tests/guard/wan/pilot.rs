@@ -2,6 +2,9 @@
 //! VPN/guard/network and exact-identity retirement as the two-rig fixture.
 use super::*;
 
+const CATALOG_LEAD_SECONDS: u64 = 180;
+const MIN_CATALOG_WARMUP: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Catalog,
@@ -62,6 +65,12 @@ struct Schedule {
     topic: Digest,
     receipt: Digest,
     start_at: u64,
+    network_at: u64,
+}
+
+struct Timing {
+    peer_ready: Duration,
+    catalog_warmup: Duration,
 }
 
 impl Schedule {
@@ -77,13 +86,19 @@ impl Schedule {
         let start_at: u64 = start_at
             .parse()
             .context("independent pilot start must be UTC epoch seconds")?;
+        let network_at = match role {
+            Role::Catalog => start_at
+                .checked_sub(CATALOG_LEAD_SECONDS)
+                .context("pilot catalog start underflows")?,
+            Role::Consumer => start_at,
+        };
         ensure!(
-            (90..=300).contains(&start_at.saturating_sub(current)),
-            "coordinate a pilot start between 90 and 300 seconds in the future"
+            (90..=300).contains(&network_at.saturating_sub(current)),
+            "launch between 90 and 300 seconds before this role's network start"
         );
         let topic = Digest::of(
             [
-                b"elixir-marketplace/offsite-empty-catalog/v1\0".as_slice(),
+                b"elixir-marketplace/offsite-steady-catalog/v2\0".as_slice(),
                 nonce.as_bytes(),
                 &start_at.to_be_bytes(),
             ]
@@ -91,7 +106,7 @@ impl Schedule {
         );
         let receipt = Digest::of(
             [
-                b"elixir-marketplace/offsite-receipt/v1\0".as_slice(),
+                b"elixir-marketplace/offsite-receipt/v2\0".as_slice(),
                 topic.as_bytes(),
                 &start_at.to_be_bytes(),
             ]
@@ -102,10 +117,19 @@ impl Schedule {
             topic,
             receipt,
             start_at,
+            network_at,
         })
     }
 
-    async fn run(&self, rig: &mut Rig, guard_image: &str, worker_image: &str) -> Result<Duration> {
+    async fn wait_for_start(at: u64) -> Result<()> {
+        let current = now()?;
+        ensure!(current <= at, "missed the coordinated pilot start");
+        tokio::time::sleep(Duration::from_secs(at - current)).await;
+        ensure!(now()?.abs_diff(at) <= 5, "clock drift at coordinated start");
+        Ok(())
+    }
+
+    async fn run(&self, rig: &mut Rig, guard_image: &str, worker_image: &str) -> Result<Timing> {
         rig.open(guard_image, worker_image)
             .await
             .context("independent protected startup")?;
@@ -115,16 +139,7 @@ impl Schedule {
             rig.worker()?.reconcile_native_catalog(&database).await?;
         }
         ready(rig.worker()?).await?;
-        let current = now()?;
-        ensure!(
-            current <= self.start_at,
-            "protection not ready before coordinated start"
-        );
-        tokio::time::sleep(Duration::from_secs(self.start_at - current)).await;
-        ensure!(
-            now()?.abs_diff(self.start_at) <= 5,
-            "clock drift at coordinated start"
-        );
+        Self::wait_for_start(self.network_at).await?;
         ready(rig.worker()?).await?;
         let began = tokio::time::Instant::now();
         let status = rig
@@ -139,6 +154,19 @@ impl Schedule {
                 && !status.adaptive,
             "independent pilot worker roles differ"
         );
+        let (began, catalog_warmup) = if catalog {
+            let warm = tokio::time::Instant::now();
+            Self::wait_for_start(self.start_at).await?;
+            let elapsed = warm.elapsed();
+            ensure!(
+                elapsed >= MIN_CATALOG_WARMUP,
+                "catalog startup did not leave enough warmup time"
+            );
+            ready(rig.worker()?).await?;
+            (tokio::time::Instant::now(), elapsed)
+        } else {
+            (began, Duration::ZERO)
+        };
         let connected = timeout(READINESS_WINDOW.saturating_sub(began.elapsed()), async {
             loop {
                 let status = rig.worker()?.network_status().await?;
@@ -178,7 +206,10 @@ impl Schedule {
             !rig.worker()?.stop_network().await?.active,
             "independent pilot role did not stop"
         );
-        Ok(elapsed)
+        Ok(Timing {
+            peer_ready: elapsed,
+            catalog_warmup,
+        })
     }
 }
 
@@ -227,16 +258,17 @@ async fn independent_site_empty_catalog_pilot() -> Result<()> {
     let retirement = rig.close().await;
     // Never emit a success receipt if operation or exact-identity cleanup fail.
     retirement.context("independent pilot same-identity retirement")?;
-    let elapsed = match outcome {
+    let timing = match outcome {
         Ok(result) => result?,
         Err(panic) => std::panic::resume_unwind(panic),
     };
     eprintln!(
         "{}",
         serde_json::json!({"stage":"independent_empty_catalog_pilot_receipt",
-        "schema_version":1,"run":schedule.receipt,"role":schedule.role.name(),
+        "schema_version":2,"run":schedule.receipt,"role":schedule.role.name(),
         "worker_image":worker_image,"guard_image":guard_image,"provider_image":provider_image,
-        "peer_ready_ms":elapsed.as_millis(),"authenticated_role_reply":true,
+        "peer_ready_ms":timing.peer_ready.as_millis(),
+        "catalog_warmup_ms":timing.catalog_warmup.as_millis(),"authenticated_role_reply":true,
         "identity_revoked":true,"test_only_empty_catalog":true})
     );
     Ok(())
@@ -245,24 +277,30 @@ async fn independent_site_empty_catalog_pilot() -> Result<()> {
 #[test]
 fn independent_pilot_requires_bounded_time_and_separates_topic_from_receipt() -> Result<()> {
     let nonce = Digest::of(b"independent pilot unit test only").to_string();
-    let a = Schedule::parse("catalog", &nonce, "1090", 1000)?;
-    let b = Schedule::parse("consumer", &nonce, "1090", 1000)?;
+    let a = Schedule::parse("catalog", &nonce, "1270", 1000)?;
+    let b = Schedule::parse("consumer", &nonce, "1270", 1000)?;
+    assert_eq!(a.network_at, 1090);
+    assert_eq!(b.network_at, b.start_at);
+    assert_eq!(a.start_at, b.start_at);
     assert_eq!(a.topic, b.topic);
     assert_eq!(a.receipt, b.receipt);
     assert_ne!(a.receipt, a.topic);
     assert_ne!(
         a.topic,
-        Schedule::parse("catalog", &nonce, "1091", 1000)?.topic
+        Schedule::parse("catalog", &nonce, "1271", 1000)?.topic
     );
     assert_ne!(
         a.receipt,
-        Schedule::parse("catalog", &nonce, "1091", 1000)?.receipt
+        Schedule::parse("catalog", &nonce, "1271", 1000)?.receipt
     );
     for (role, nonce, time) in [
-        ("routing", nonce.as_str(), "1090"),
-        ("catalog", "not-a-digest", "1090"),
-        ("catalog", nonce.as_str(), "1089"),
-        ("catalog", nonce.as_str(), "1301"),
+        ("routing", nonce.as_str(), "1270"),
+        ("catalog", "not-a-digest", "1270"),
+        ("catalog", nonce.as_str(), "1269"),
+        ("catalog", nonce.as_str(), "1481"),
+        ("catalog", nonce.as_str(), "1"),
+        ("consumer", nonce.as_str(), "1089"),
+        ("consumer", nonce.as_str(), "1301"),
     ] {
         assert!(Schedule::parse(role, nonce, time, 1000).is_err());
     }
