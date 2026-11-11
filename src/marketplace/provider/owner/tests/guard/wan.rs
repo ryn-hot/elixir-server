@@ -14,6 +14,7 @@ use elixir_marketplace::{
     worker_control::WorkerControlOutcome,
     worker_network::{BootstrapEndpoint, NetworkConfig, NetworkLimits, NetworkRoles},
 };
+use futures_util::FutureExt;
 use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -367,6 +368,20 @@ fn search() -> PeerOperation {
 #[ignore = "explicit two approved free providers and real public DHT/Noise through owned guarded VPN workers; no extensions"]
 async fn two_owned_provider_workers_discover_and_exchange_authenticated_metadata_over_wan()
 -> Result<()> {
+    qualify_owned_wan(false).await
+}
+
+#[tokio::test]
+#[ignore = "two approved free VPN identities; empty isolated topics; no source or package publication"]
+async fn old_and_candidate_noise_workers_exchange_metadata_in_both_roles_over_wan() -> Result<()> {
+    ensure!(
+        std::env::var("ELIXIR_MARKETPLACE_MIXED_NOISE_LIVE_TEST").as_deref() == Ok("1"),
+        "explicit mixed Noise qualification required"
+    );
+    qualify_owned_wan(true).await
+}
+
+async fn qualify_owned_wan(mixed: bool) -> Result<()> {
     ensure!(
         std::env::var("ELIXIR_MARKETPLACE_WARP_LIFECYCLE_LIVE_TEST").as_deref() == Ok("1")
             && std::env::var("ELIXIR_MARKETPLACE_WAN_LIVE_TEST").as_deref() == Ok("1"),
@@ -375,24 +390,65 @@ async fn two_owned_provider_workers_discover_and_exchange_authenticated_metadata
     let provider_image = image()?;
     let guard_image = immutable_image("ELIXIR_MARKETPLACE_PROVIDER_GUARD_IMAGE")?;
     let worker_image = immutable_image("ELIXIR_MARKETPLACE_PROVIDER_WORKER_IMAGE")?;
+    let second_image = if mixed {
+        immutable_image("ELIXIR_MARKETPLACE_MIXED_NOISE_WORKER_IMAGE")?
+    } else {
+        worker_image.clone()
+    };
     let runtime: Arc<dyn RuntimeManager> = Arc::new(DockerRuntimeManager::new(None));
-    ensure!(
-        runtime
-            .image_labels(&worker_image)
-            .await?
-            .get("elixir.marketplace.worker.wan_query_budget")
-            .map(String::as_str)
-            == Some("1"),
-        "WAN fixture requires the bounded WAN query budget before enrollment"
-    );
+    for (index, image) in [&worker_image, &second_image].into_iter().enumerate() {
+        let labels = runtime.image_labels(image).await?;
+        let label = |name: &str| {
+            labels
+                .get(&format!("elixir.marketplace.worker.{name}"))
+                .map(String::as_str)
+        };
+        ensure!(
+            label("wan_query_budget") == Some("1"),
+            "bounded WAN query budget required"
+        );
+        if mixed {
+            ensure!(
+                label("onion_transport") == Some("2") && label("onion_fixture") == Some("0"),
+                "mixed qualification requires both ordinary onion workers"
+            );
+            ensure!(
+                (index == 1) == (label("private_noise_candidate") == Some("1")),
+                "expected baseline and private Noise candidate in order"
+            );
+            if index == 1 {
+                ensure!(
+                    label("onion_publication_ready") == Some("0"),
+                    "candidate must not be publishable"
+                );
+            }
+        }
+    }
     let mut a = Rig::new(runtime.clone(), &provider_image).await?;
-    let mut b = Rig::new(runtime, &provider_image).await?;
-    let outcome = async {
+    let mut b = match Rig::new(runtime, &provider_image).await {
+        Ok(rig) => rig,
+        Err(error) => {
+            a.close()
+                .await
+                .context("retire first rig after second rig creation failed")?;
+            return Err(error);
+        }
+    };
+    if mixed {
+        for (index, rig) in [&a, &b].into_iter().enumerate() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"mixed_noise_fixture_layout","participant":index+1,
+                "deployment":rig.deployment,"recovery_root":rig.root.path()})
+            );
+        }
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
         a.open(&guard_image, &worker_image)
             .await
             .context("WAN catalog protected startup")?;
         eprintln!("WAN stage: catalog protected startup passed");
-        b.open(&guard_image, &worker_image)
+        b.open(&guard_image, &second_image)
             .await
             .context("WAN consumer protected startup")?;
         eprintln!("WAN stage: consumer protected startup passed");
@@ -401,98 +457,143 @@ async fn two_owned_provider_workers_discover_and_exchange_authenticated_metadata
                 != b.worker()?.profile().container_spec().network_mode,
             "WAN workers did not have independent namespaces"
         );
-        let database = a.database.clone();
-        a.worker()?.reconcile_native_catalog(&database).await?;
-        let topic = Digest::of(uuid::Uuid::new_v4().as_bytes());
-        ready(a.worker()?).await?;
-        let catalog = a
-            .worker()?
-            .start_network(config(topic, true)?)
-            .await
-            .context("WAN catalog DHT/listener startup")?;
-        ensure!(
-            catalog.active && catalog.catalog && !catalog.routing && !catalog.adaptive,
-            "WAN catalog roles differ"
-        );
-        ready(b.worker()?).await?;
-        let consumer = b
-            .worker()?
-            .start_network(config(topic, false)?)
-            .await
-            .context("WAN consumer DHT startup")?;
-        ensure!(
-            consumer.active && !consumer.catalog && !consumer.routing && !consumer.adaptive,
-            "WAN consumer roles differ"
-        );
-        eprintln!("WAN stage: both public discovery roles started");
-        let until = tokio::time::Instant::now() + Duration::from_secs(90);
-        let (catalog_peer, consumer_peer) = loop {
-            let left = a.worker()?.network_status().await?;
-            let right = b.worker()?.network_status().await?;
-            left.within_limits(&NetworkLimits::default())?;
-            right.within_limits(&NetworkLimits::default())?;
-            if left.peers.len() == 1 && right.peers.len() == 1 {
-                break (right.peers[0].clone(), left.peers[0].clone());
-            }
-            ensure!(
-                tokio::time::Instant::now() < until,
-                "actual WAN discovery/Noise did not converge: catalog={left:?}, consumer={right:?}"
+        exchange_empty_catalog(&mut a, &mut b).await?;
+        if mixed {
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"mixed_noise_direction_verified","catalog":"baseline"})
             );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-        ready(b.worker()?).await?;
-        let response = b
-            .worker()?
-            .request_peer(catalog_peer, search())
-            .await
-            .context("actual WAN Noise marketplace request")?;
-        let WorkerControlOutcome::NetworkReply {
-            response,
-            control_bytes,
-            ..
-        } = response.control_response
-        else {
-            anyhow::bail!("actual WAN peer did not return a marketplace reply");
-        };
-        ensure!(
-            control_bytes > 0 && matches!(response.response, PeerOutcome::Search { .. }),
-            "WAN search was not an authenticated marketplace response"
-        );
-        ready(a.worker()?).await?;
-        let response = a.worker()?.request_peer(consumer_peer, search()).await?;
-        let WorkerControlOutcome::NetworkReply { response, .. } = response.control_response else {
-            anyhow::bail!("WAN consumer refusal unavailable");
-        };
-        ensure!(
-            matches!(
-                response.response,
-                PeerOutcome::Rejected {
-                    code: RejectionCode::Unauthorized
-                }
-            ),
-            "WAN consumer silently served its cache"
-        );
-        ensure!(
-            !a.worker()?.stop_network().await?.active && !b.worker()?.stop_network().await?.active,
-            "WAN stop did not close public roles"
-        );
+            exchange_empty_catalog(&mut b, &mut a).await?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"mixed_noise_direction_verified","catalog":"candidate"})
+            );
+        }
         Ok::<(), anyhow::Error>(())
-    }
+    })
+    .catch_unwind()
     .await;
-    // Always join BOTH original cleanup paths, including when discovery fails.
+    // Join both same-identity cleanup paths before reporting any failure.
     let left = a.close().await;
     let right = b.close().await;
-    // Preserve the operation failure as well as retirement failures. Otherwise
-    // a later allowance-stop error masks the first causal failure completely.
-    if let Err(error) = &outcome {
+    if let Ok(Err(error)) = &outcome {
         eprintln!("WAN operation failed before retirement: {error:#}");
     }
-    left.context("WAN catalog same-identity cleanup/revocation")?;
-    right.context("WAN consumer same-identity cleanup/revocation")?;
-    outcome?;
+    if mixed {
+        for (index, retired) in [&left, &right].into_iter().enumerate() {
+            if retired.is_ok() {
+                let enrollment_started = if index == 0 {
+                    a.enrollment_started
+                } else {
+                    b.enrollment_started
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"stage":"mixed_noise_fixture_retired","participant":index+1,
+                    "enrollment_started":enrollment_started})
+                );
+            }
+        }
+    }
+    left.context("WAN first same-identity cleanup/revocation")?;
+    right.context("WAN second same-identity cleanup/revocation")?;
+    match outcome {
+        Ok(result) => result?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
     eprintln!(
         "{}",
-        serde_json::json!({"actual_public_dht":true,"independent_vpn_namespaces":2,"authenticated_noise_marketplace_exchange":true,"consumer_does_not_serve":true,"owned_retirement":true,"free_identities_revoked":2,"excludes":"persistent routing reachability, different physical ISPs/sites, long soak, source/package transfer, paid issuer, full crash/power loss, aggregate playback and production distribution"})
+        serde_json::json!({"actual_public_dht":true,"independent_vpn_namespaces":2,"authenticated_noise_marketplace_exchange":true,"consumer_does_not_serve":true,"owned_retirement":true,"free_identities_revoked":2,"mixed_noise_roles":mixed,"excludes":"persistent routing reachability, different physical ISPs/sites, long soak, source/package transfer, paid issuer, full crash/power loss, aggregate playback and production distribution"})
+    );
+    Ok(())
+}
+
+async fn exchange_empty_catalog(a: &mut Rig, b: &mut Rig) -> Result<()> {
+    let database = a.database.clone();
+    a.worker()?.reconcile_native_catalog(&database).await?;
+    let topic = Digest::of(uuid::Uuid::new_v4().as_bytes());
+    ready(a.worker()?).await?;
+    let catalog = a
+        .worker()?
+        .start_network(config(topic, true)?)
+        .await
+        .context("WAN catalog DHT/listener startup")?;
+    ensure!(
+        catalog.active && catalog.catalog && !catalog.routing && !catalog.adaptive,
+        "WAN catalog roles differ"
+    );
+    ready(b.worker()?).await?;
+    let consumer = b
+        .worker()?
+        .start_network(config(topic, false)?)
+        .await
+        .context("WAN consumer DHT startup")?;
+    ensure!(
+        consumer.active && !consumer.catalog && !consumer.routing && !consumer.adaptive,
+        "WAN consumer roles differ"
+    );
+    eprintln!("WAN stage: both public discovery roles started");
+    let until = tokio::time::Instant::now() + Duration::from_secs(90);
+    let (catalog_peer, consumer_peer) = loop {
+        let left = a.worker()?.network_status().await?;
+        let right = b.worker()?.network_status().await?;
+        left.within_limits(&NetworkLimits::default())?;
+        right.within_limits(&NetworkLimits::default())?;
+        if left.peers.len() == 1 && right.peers.len() == 1 {
+            ensure!(
+                right.peers[0] != left.peers[0],
+                "WAN peers were not distinct"
+            );
+            break (right.peers[0].clone(), left.peers[0].clone());
+        }
+        ensure!(
+            tokio::time::Instant::now() < until,
+            "actual WAN discovery/Noise did not converge"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    ready(b.worker()?).await?;
+    let response = b
+        .worker()?
+        .request_peer(catalog_peer, search())
+        .await
+        .context("actual WAN Noise marketplace request")?;
+    let WorkerControlOutcome::NetworkReply {
+        response,
+        control_bytes,
+        ..
+    } = response.control_response
+    else {
+        anyhow::bail!("actual WAN peer did not return a marketplace reply");
+    };
+    let PeerOutcome::Search { page } = response.response else {
+        anyhow::bail!("WAN search was not an authenticated marketplace response");
+    };
+    ensure!(
+        control_bytes > 0
+            && page.results.is_empty()
+            && page.next_cursor.is_none()
+            && !page.network_complete
+            && page.metadata_only,
+        "WAN fixture returned a nonempty or unbounded page"
+    );
+    ready(a.worker()?).await?;
+    let response = a.worker()?.request_peer(consumer_peer, search()).await?;
+    let WorkerControlOutcome::NetworkReply { response, .. } = response.control_response else {
+        anyhow::bail!("WAN consumer refusal unavailable");
+    };
+    ensure!(
+        matches!(
+            response.response,
+            PeerOutcome::Rejected {
+                code: RejectionCode::Unauthorized
+            }
+        ),
+        "WAN consumer silently served its cache"
+    );
+    ensure!(
+        !a.worker()?.stop_network().await?.active && !b.worker()?.stop_network().await?.active,
+        "WAN stop did not close public roles"
     );
     Ok(())
 }
