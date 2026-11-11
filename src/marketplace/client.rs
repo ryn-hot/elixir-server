@@ -16,14 +16,18 @@ use elixir_marketplace::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
+use tracing::instrument::WithSubscriber;
 
 use crate::runtime::PrivateProcessStdio;
 
 const PRIVATE_DEADLINE: Duration = Duration::from_secs(10);
 const NETWORK_START_DEADLINE: Duration = Duration::from_secs(45);
+const ATTACHMENT_CLOSE_WAIT: Duration = Duration::from_secs(2);
+const DIAGNOSTIC_DRAIN_GRACE: Duration = Duration::from_millis(25);
 mod compact_search;
+mod worker_fault;
 
 fn control_deadline(base: Duration, operation: &WorkerControlOperation) -> Duration {
     // Preserve deliberately shorter diagnostic/test deadlines. Starting a WAN
@@ -57,22 +61,22 @@ impl PrivateWorkerClient {
         let (sender, receiver) = mpsc::channel(1);
         // Remove diagnostics from the process without exposing any peer text
         // as logs. The helper drains at most 64 KiB, not an infinite stream.
-        let mut diagnostic = process
+        let diagnostic = process
             .diagnostics
             .take()
             .context("missing private diagnostics")?;
-        let diagnostics = tokio::spawn(async move {
-            let mut buffer = [0u8; 1024];
-            let mut bytes = 0;
-            while bytes <= 64 * 1024 {
-                let remaining = (64 * 1024 + 1 - bytes).min(buffer.len());
-                match diagnostic.read(&mut buffer[..remaining]).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => bytes += read,
+        let diagnostics = tokio::spawn(
+            async move {
+                if worker_fault::drain(diagnostic, |code| {
+                    tracing::warn!(worker_failure = code, "marketplace worker reported a failure");
+                })
+                .await
+                {
+                    let _ = sender.send(()).await;
                 }
             }
-            let _ = sender.send(()).await;
-        });
+            .with_current_subscriber(),
+        );
         let random = uuid::Uuid::new_v4();
         let prefix =
             u64::from(u32::from_be_bytes(random.as_bytes()[..4].try_into().unwrap()) & 0x7fff_ffff)
@@ -308,14 +312,24 @@ impl PrivateWorkerClient {
             child: &mut process.child,
             armed: true,
         };
-        let status = match timeout(Duration::from_secs(2), cancellation.child.wait()).await {
+        let mut until = Instant::now() + ATTACHMENT_CLOSE_WAIT;
+        let status = match timeout_at(until, cancellation.child.wait()).await {
             Ok(result) => result?,
             Err(_) => {
                 let _ = cancellation.child.start_kill();
-                timeout(Duration::from_secs(2), cancellation.child.wait()).await??
+                until = Instant::now() + ATTACHMENT_CLOSE_WAIT;
+                timeout_at(until, cancellation.child.wait()).await??
             }
         };
         cancellation.armed = false;
+        // The original child has exited. Let its existing reader consume any
+        // buffered marker, without extending the existing phase deadline or
+        // adding a wait to the request path. Missing diagnostics are not proof.
+        let _ = timeout_at(
+            until.min(Instant::now() + DIAGNOSTIC_DRAIN_GRACE),
+            &mut self.diagnostics,
+        )
+        .await;
         self.diagnostics.abort();
         Ok(status)
     }
@@ -796,6 +810,10 @@ mod tests {
               const length=input.readUInt32BE(0),request=JSON.parse(input.subarray(4,4+length)); input=input.subarray(4+length);
               if(mode==='stall') return;
               if(mode==='diagnostics'){ process.stderr.write(Buffer.alloc(70000,120)); return; }
+              if(mode==='closed_fault'){
+                process.stderr.write('private fixture text\nmarketplace worker first failure: tor_state_socket\nmarketplace worker first failure: private_output\n',()=>process.exit(1));
+                return;
+              }
               if(mode==='partial'){ process.stdout.write(Buffer.from([0,0])); return; }
               if(mode==='oversize'){ const header=Buffer.alloc(4); header.writeUInt32BE(262145); process.stdout.write(header); return; }
               if(mode==='control_frame_excess'){ const header=Buffer.alloc(4); header.writeUInt32BE(4097); process.stdout.write(header); return; }
@@ -1382,6 +1400,43 @@ mod tests {
             assert!(client.poisoned);
             client.close().await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn original_attachment_logs_only_the_first_closed_fault_and_stays_poisoned() -> Result<()> {
+        use std::{
+            io::Write,
+            sync::{Arc, Mutex},
+        };
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(sink.clone()))
+            .finish();
+        let mut client = tracing::subscriber::with_default(subscriber, || {
+            fake("closed_fault", Duration::from_secs(3))
+        })?;
+        assert!(client.request(query()).await.is_err());
+        assert!(client.poisoned);
+        assert!(client.request(query()).await.is_err());
+        assert!(!client.close_attachment().await?.success());
+        let contents = String::from_utf8(log.lock().unwrap().clone())?;
+        assert_eq!(contents.matches("tor_state_socket").count(), 1);
+        assert!(!contents.contains("private fixture text"));
+        assert!(!contents.contains("private_output"));
         Ok(())
     }
 
