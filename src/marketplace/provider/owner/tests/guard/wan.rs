@@ -19,6 +19,7 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
+mod pilot;
 mod source;
 
 fn now() -> Result<u64> {
