@@ -2,11 +2,17 @@
 //! identity only. The observer must ACK before either guard handoff begins.
 use super::*;
 mod route_loss;
+#[derive(Clone, Copy)]
+enum Fault {
+    Guard,
+    PhysicalRoute,
+    VpnRoute,
+}
 
 #[tokio::test]
 #[ignore = "explicit consent, pinned native images, private capture socket and approved public fixtures"]
 async fn initial_and_recovered_guard_handoffs_are_packet_observed() -> Result<()> {
-    qualify(false).await
+    qualify(Fault::Guard).await
 }
 
 #[tokio::test]
@@ -17,10 +23,22 @@ async fn isolated_route_loss_closes_old_authority_and_recovers_without_direct_eg
         std::env::var("ELIXIR_MARKETPLACE_ROUTE_LOSS_CAPTURE").as_deref() == Ok("1"),
         "explicit isolated route-loss capture required"
     );
-    qualify(true).await
+    qualify(Fault::PhysicalRoute).await
 }
 
-async fn qualify(route_loss: bool) -> Result<()> {
+#[tokio::test]
+#[ignore = "standing-approved one free identity; remove exact VPN route while retaining physical default; captured fresh-source denial and normal recovery"]
+async fn vpn_route_fallthrough_preserves_physical_uplink_but_denies_direct_source() -> Result<()> {
+    ensure!(
+        std::env::var("ELIXIR_MARKETPLACE_VPN_ROUTE_LOSS_CAPTURE").as_deref() == Ok("1"),
+        "explicit isolated VPN-route-loss capture required"
+    );
+    qualify(Fault::VpnRoute).await
+}
+
+async fn qualify(fault: Fault) -> Result<()> {
+    let route_loss = !matches!(fault, Fault::Guard);
+    let vpn_route_loss = matches!(fault, Fault::VpnRoute);
     for flag in ["WARP_LIFECYCLE", "WAN", "PUBLIC_SOURCE"] {
         ensure!(
             std::env::var(format!("ELIXIR_MARKETPLACE_{flag}_LIVE_TEST")).as_deref() == Ok("1"),
@@ -69,8 +87,16 @@ async fn qualify(route_loss: bool) -> Result<()> {
         }
         eprintln!("{}", json!({"stage":"handoff_initial_source_verified"}));
         if route_loss {
-            route_loss::apply(&actor, &image).await?;
-            eprintln!("{}", json!({"stage":"isolated_route_loss_applied","actual_ipv4_default_removed":true,"host_routes_unchanged":true}));
+            route_loss::apply(&actor, &image, vpn_route_loss).await?;
+            eprintln!("{}", json!({"stage":"isolated_route_loss_applied","actual_ipv4_default_removed":!vpn_route_loss,
+                "vpn_ipv4_default_removed":vpn_route_loss,"physical_default_preserved":vpn_route_loss,
+                "worker_physical_route_observed":vpn_route_loss,"host_routes_unchanged":true}));
+            if vpn_route_loss {
+                let denied = tokio::time::timeout(Duration::from_secs(30), stale.preflight_fresh_publication(&metadata, 0))
+                    .await.context("original VPN-route source rejection deadline")?;
+                ensure!(denied.is_err(), "VPN route loss retained fresh public-source admission");
+                eprintln!("{}", json!({"stage":"vpn_route_loss_source_rejected","actual_fresh_source_request_denied":true}));
+            }
         } else {
         let label = format!("label=elixir.deployment_id={}", actor.rig.deployment);
         let ids = docker(&[
@@ -170,7 +196,8 @@ async fn qualify(route_loss: bool) -> Result<()> {
         eprintln!(
             "{}",
             json!({"stage":"handoff_recovery_verified", "same_original_identity":true,
-            "normal_startup_retry":true,"stale_capability_closed":true,"fresh_public_source":true,"isolated_route_loss":route_loss})
+            "normal_startup_retry":true,"stale_capability_closed":true,"fresh_public_source":true,
+            "isolated_route_loss":route_loss,"vpn_route_loss":vpn_route_loss})
         );
         Ok::<_, anyhow::Error>(())
     }))
