@@ -10,6 +10,7 @@ use elixir_marketplace::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 mod deferral;
+mod first_view;
 mod ranking_ready;
 mod selection;
 mod view_progress;

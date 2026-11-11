@@ -451,7 +451,7 @@ impl MarketplaceService {
         self.search.start(self.client()?, request)
     }
     pub async fn search_view(&self, id: uuid::Uuid) -> Result<super::search::SearchView> {
-        self.search.view(id).await
+        self.search.interactive_view(id).await
     }
     /// Owner-selected source preparation only, never a legacy install request.
     /// The owned task survives HTTP cancellation and waits at permission review;

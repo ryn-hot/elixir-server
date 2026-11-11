@@ -43,6 +43,7 @@ fn context(limit: usize) -> (Arc<Inner>, Interest, SearchRequest) {
         values: vec![],
         preparation: None,
         preparation_until: None,
+        first_view: FirstView::Unclaimed,
     });
     let interest = Interest {
         inner: Arc::downgrade(&inner),

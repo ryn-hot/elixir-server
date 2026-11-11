@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
     task::JoinHandle,
     time::{Instant, timeout},
 };
@@ -635,6 +635,22 @@ impl Backend for Live {
             .evidence_origins(Digest::of(canonical::to_vec(value.metadata.descriptor())?)))
     }
 }
+// A single presentation-only wait on the first interactive read of a query.
+// Replacing or stopping the query drops its sender, which wakes the old read.
+enum FirstView {
+    Unclaimed,
+    Waiting(oneshot::Sender<()>),
+    Finished,
+}
+impl FirstView {
+    fn finish(&mut self) {
+        if let Self::Waiting(sender) = std::mem::replace(self, Self::Finished) {
+            let _ = sender.send(());
+        }
+    }
+}
+const FIRST_VIEW_WAIT: Duration = Duration::from_millis(100);
+
 struct Query {
     id: Uuid,
     request: SearchRequest,
@@ -648,6 +664,7 @@ struct Query {
     values: Vec<Arc<Verified>>,
     preparation: Option<catalog::Progress>,
     preparation_until: Option<Instant>,
+    first_view: FirstView,
 }
 #[derive(Default)]
 struct Slot {
@@ -797,6 +814,7 @@ impl SearchService {
             values: vec![],
             preparation,
             preparation_until: None,
+            first_view: FirstView::Unclaimed,
         });
         if !slot.running {
             // At most one active task and one replaceable latest query. Old
@@ -818,6 +836,7 @@ impl SearchService {
                         if let Some(query) = slot.query.as_mut() {
                             query.phase = SearchPhase::Unavailable;
                             query.values.clear();
+                            query.first_view.finish();
                         }
                     }
                     tracing::error!("marketplace search task failed; no results retained");
@@ -855,6 +874,43 @@ impl SearchService {
             joined?;
         }
     }
+    /// Owner HTTP only. If the first local page is nearly done, avoid an
+    /// empty round-trip plus a UI polling interval. No view permit is held
+    /// during the wait, and the ordinary view still rechecks every card.
+    pub(super) async fn interactive_view(&self, id: Uuid) -> Result<SearchView> {
+        let receiver = {
+            let mut slot = self
+                .inner
+                .slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("search owner unavailable"))?;
+            let query = slot
+                .query
+                .as_mut()
+                .filter(|query| query.id == id)
+                .context("search query was replaced or stopped")?;
+            if !matches!(query.first_view, FirstView::Unclaimed) {
+                None
+            } else if query.request.prepare_catalog
+                || query.request.cursor.is_some()
+                || query.phase != SearchPhase::Checking
+                || !query.values.is_empty()
+                || query.backend.searching_peers()
+            {
+                query.first_view.finish();
+                None
+            } else {
+                let (sender, receiver) = oneshot::channel();
+                query.first_view = FirstView::Waiting(sender);
+                Some(receiver)
+            }
+        };
+        if let Some(receiver) = receiver {
+            let _ = timeout(FIRST_VIEW_WAIT, receiver).await;
+        }
+        self.view(id).await
+    }
+
     pub(super) async fn view(&self, id: Uuid) -> Result<SearchView> {
         #[cfg(test)]
         let (timing, began) = (super::search_timing::view(id), std::time::Instant::now());
@@ -1056,6 +1112,7 @@ async fn run(inner: Arc<Inner>) {
             } else {
                 SearchPhase::Unavailable
             };
+            query.first_view.finish();
             if result.is_ok() && request.prepare_catalog && still_requested {
                 // Explicit setup work may continue behind other application
                 // screens. Its fixed deadline is never extended by HTTP polls.
