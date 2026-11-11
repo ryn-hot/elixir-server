@@ -2,6 +2,7 @@
 //! identity, real source/review/install, kernel OOM, ordinary retry and retained
 //! installed invocation. Fault pressure never modifies shipping limits or code.
 use super::*;
+mod storage;
 
 fn oom_event(bytes: &str, id: &str, deployment: &str, since: u64) -> Result<()> {
     ensure!(bytes.len() <= 16384, "owned OOM event bounds");
