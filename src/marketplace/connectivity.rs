@@ -4,7 +4,7 @@
 mod bootstrap;
 pub(super) mod refresh;
 pub use bootstrap::BOOTSTRAP_PROBE_BYTES;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use elixir_marketplace::{
@@ -20,7 +20,8 @@ use tokio::{
 };
 
 use super::{
-    packet::PacketGuardController, runtime::inspect_fixed_worker, storage::FixedWorkerSpec,
+    observation_time::ObservationTime, packet::PacketGuardController,
+    runtime::inspect_fixed_worker, storage::FixedWorkerSpec,
 };
 use crate::runtime::{PrivateProcessStdio, RuntimeManager, model::ContainerHandle};
 
@@ -124,7 +125,7 @@ async fn exchange(
 pub struct ConnectivityObservation {
     guard_id: String,
     epoch: Digest,
-    started: Instant,
+    started: ObservationTime,
     report: ConnectivityReply,
 }
 
@@ -135,7 +136,7 @@ pub struct ProbePolicy {
     pub require_warp: bool,
 }
 impl ConnectivityObservation {
-    pub(super) fn started_at(&self) -> Instant {
+    pub(super) fn started_at(&self) -> ObservationTime {
         self.started
     }
     pub fn report(&self) -> &ConnectivityReply {
@@ -145,7 +146,7 @@ impl ConnectivityObservation {
         self.guard_id == guard.handle().id
             && self.epoch == guard.profile().policy().epoch
             && self.report.kernel.network_namespace_inode == guard.namespace_inode()
-            && self.started.elapsed() <= MAX_OBSERVATION_AGE
+            && self.started.is_current(MAX_OBSERVATION_AGE)
             && guard.channel_usable()
     }
     fn check_policy(&self, guard: &PacketGuardController, policy: ProbePolicy) -> Result<()> {
@@ -200,7 +201,7 @@ pub(super) async fn observe_fixed_worker(
     binding: ProbeBinding,
     policy: ProbePolicy,
 ) -> Result<ConnectivityObservation> {
-    let started = Instant::now();
+    let started = ObservationTime::now();
     let process = timeout(
         Duration::from_secs(10),
         runtime.exec_marketplace_connectivity_probe(handle, &profile.container_spec().labels),

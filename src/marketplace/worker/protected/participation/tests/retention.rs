@@ -93,10 +93,10 @@ impl RetentionFixture {
             ..ParticipationSnapshot::default()
         };
         let (status, seen) = watch::channel(snapshot);
-        let (protection, protected) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        });
+        let (protection, protected) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ));
         let (credits, _) = mpsc::channel(1);
         let (faults, _) = mpsc::channel(1);
         Ok(Self {
@@ -1204,10 +1204,9 @@ async fn cached_progress_ages_and_protection_loss_removes_it_without_new_rpc() -
     let value = fixture.client.snapshot().catalog.unwrap();
     assert_eq!(value.phase, catalog_progress::Phase::Unavailable);
     assert_eq!(value.last_peer_scan_seconds, Some(31));
-    fixture._protection.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    fixture
+        ._protection
+        .send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(fixture.client.snapshot().catalog.is_none());
     assert!(fixture.requests.try_recv().is_err());
     Ok(())

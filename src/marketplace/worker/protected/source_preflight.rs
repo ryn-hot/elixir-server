@@ -241,10 +241,10 @@ impl PublicSourceObservation {
         release_id: Digest,
         license_sha256: Digest,
     ) -> (Self, impl Fn(bool)) {
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(600)),
-        });
+        let (owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(600),
+        ));
         (
             Self {
                 release_id,
@@ -255,14 +255,14 @@ impl PublicSourceObservation {
                 protection,
             },
             move |healthy| {
-                owner.send_replace(Snapshot {
-                    state: if healthy {
+                owner.send_replace(Snapshot::timed(
+                    if healthy {
                         ProtectionState::Ready
                     } else {
                         ProtectionState::Failed
                     },
-                    until: Some(Instant::now() + Duration::from_secs(600)),
-                });
+                    Duration::from_secs(600),
+                ));
             },
         )
     }

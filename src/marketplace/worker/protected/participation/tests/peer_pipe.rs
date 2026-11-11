@@ -176,10 +176,10 @@ impl Fixture {
             }),
             ..Default::default()
         });
-        let (protection, observed) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(600)),
-        });
+        let (protection, observed) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(600),
+        ));
         sqlx::any::install_default_drivers();
         let client = ParticipationClient {
             blob_discovery,

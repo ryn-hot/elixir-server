@@ -261,10 +261,10 @@ async fn near_expiry_preview_requires_new_native_work_not_a_renewed_cache_timest
         .unwrap()
         .fixture_insert(&metadata)?;
     tokio::time::advance(Duration::from_secs(271)).await;
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     f.facts
         .send_modify(|facts| facts.as_mut().unwrap().observed = Instant::now());
     let held = f.owner.slots.clone().try_acquire_owned()?;

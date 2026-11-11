@@ -221,10 +221,10 @@ impl MetadataObservation {
             &mut elixir_marketplace::records::SignatureCache::new(128)?,
         )?;
         let support = verified.admitted_support().clone();
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        });
+        let (owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ));
         Ok((
             Self {
                 descriptor,
@@ -236,14 +236,14 @@ impl MetadataObservation {
                 protection,
             },
             move |active| {
-                owner.send_replace(Snapshot {
-                    state: if active {
+                owner.send_replace(Snapshot::timed(
+                    if active {
                         ProtectionState::Ready
                     } else {
                         ProtectionState::Failed
                     },
-                    until: Some(Instant::now() + Duration::from_secs(3600)),
-                });
+                    Duration::from_secs(3600),
+                ));
             },
         ))
     }

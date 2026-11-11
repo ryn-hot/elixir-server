@@ -3,10 +3,10 @@ use super::super::tests::fixture;
 use super::*;
 
 fn checking(sender: &watch::Sender<Snapshot>, seconds: u64) {
-    sender.send_replace(Snapshot {
-        state: ProtectionState::Checking,
-        until: Some(Instant::now() + Duration::from_secs(seconds)),
-    });
+    sender.send_replace(Snapshot::timed(
+        ProtectionState::Checking,
+        Duration::from_secs(seconds),
+    ));
 }
 
 #[tokio::test]
@@ -56,10 +56,10 @@ async fn healthy_checking_defers_only_before_native_launch() -> Result<()> {
         .unwrap_err();
         assert_eq!(verification_deferred(&error), before_launch);
     }
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     Work::Background.admit_start(&f.owner)?;
     assert_eq!(f.owner.slots.available_permits(), 1);
     Ok(())
@@ -212,10 +212,10 @@ async fn local_restrictions_wait_for_the_same_ready_event_before_launch_or_input
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(futures_util::poll!(wait.as_mut()).is_pending());
         assert_eq!(f.owner.slots.available_permits(), 0);
-        f.protection.send_replace(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(15)),
-        });
+        f.protection.send_replace(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(15),
+        ));
         wait.await?;
         Work::Restrictions.admit(&f.owner, true)?;
         assert!(!f.owner.failed.load(Ordering::SeqCst));
@@ -332,10 +332,10 @@ async fn prelaunch_wait_survives_a_health_check_longer_than_a_native_renewal() -
     assert!(futures_util::poll!(wait.as_mut()).is_pending());
     assert_eq!(f.owner.slots.available_permits(), 0);
     assert!(Work::Foreground.admit(&f.owner, true).is_err());
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     wait.await?;
     assert!(!f.owner.failed.load(Ordering::SeqCst));
     drop(permit);
@@ -399,10 +399,10 @@ async fn foreground_waits_on_the_same_slot_but_background_defers_immediately() -
             .await
             .is_err()
     );
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     wait.await?;
     assert_eq!(f.owner.slots.available_permits(), 0);
     assert!(!f.owner.failed.load(Ordering::SeqCst));

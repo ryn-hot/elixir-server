@@ -72,10 +72,10 @@ mod tests {
         }
     }
     fn owner() -> (watch::Sender<Snapshot>, watch::Receiver<Snapshot>) {
-        watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        })
+        watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ))
     }
 
     #[tokio::test(start_paused = true)]
@@ -95,10 +95,7 @@ mod tests {
         assert!(!copied.current_for_id(entry.release_id));
         let entry = observation(1, &protection);
         cache.insert(&entry);
-        owner.send_replace(Snapshot {
-            state: ProtectionState::Failed,
-            until: None,
-        });
+        owner.send_replace(Snapshot::inactive(ProtectionState::Failed));
         assert!(cache.get(entry.release_id, entry.location_id).is_none());
         cache.insert(&entry);
         assert!(cache.entries.is_empty());

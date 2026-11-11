@@ -29,10 +29,10 @@ pub(in crate::marketplace) fn owner() -> Owner {
         }),
         ..Default::default()
     });
-    let (protection, observed) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    let (protection, observed) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     sqlx::any::install_default_drivers();
     Owner {
         client: ParticipationClient {
@@ -558,10 +558,9 @@ async fn completed_lookup_rejections_clean_up_without_reconsuming_hints_or_renew
             0 => LookupCompletion::not_dispatched(anyhow::anyhow!("local pre-dispatch rejection")),
             1 => LookupCompletion::replied(Err(anyhow::anyhow!("actual reply rejected"))),
             2 => {
-                owner.protection.send_replace(Snapshot {
-                    state: ProtectionState::Failed,
-                    until: None,
-                });
+                owner
+                    .protection
+                    .send_replace(Snapshot::inactive(ProtectionState::Failed));
                 LookupCompletion::replied(Ok(vec![peer]))
             }
             _ => LookupCompletion::replied(Ok(vec![peer.clone(), peer])),
@@ -1002,10 +1001,9 @@ async fn blob_reader_cannot_drain_buffered_data_after_owner_loss_and_full_cancel
         }))
         .ok();
     let mut reader = receive.await??;
-    owner.protection.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    owner
+        .protection
+        .send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(reader.read(&mut [0]).await.is_err());
     let (send, _) = oneshot::channel();
     owner.client.requests.try_send(Request::Peers(send)).ok();

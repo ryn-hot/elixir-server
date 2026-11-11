@@ -2,8 +2,8 @@
 //! uses only prepaid protected traffic, and never enables a public worker.
 use super::{ConnectivityMonitor, ConnectivityObservation, ProbePolicy, exchange};
 use crate::marketplace::{
-    accounting::CommittedTransferReservation, packet::PacketGuardController,
-    runtime::image_is_pinned,
+    accounting::CommittedTransferReservation, observation_time::ObservationTime,
+    packet::PacketGuardController, runtime::image_is_pinned,
 };
 use crate::runtime::{
     RuntimeManager,
@@ -20,10 +20,7 @@ use elixir_marketplace::{
     network_probe::WireguardIdentity,
     policy::OrdinaryLimits,
 };
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
 use tokio::time::timeout;
 
 pub const BOOTSTRAP_PROBE_BYTES: u64 = 64 * 1024;
@@ -315,7 +312,7 @@ impl ConnectivityMonitor {
         .await?;
         guard.apply_credit(runtime, debit).await?;
         guard.renew_bootstrap_lease(runtime).await?;
-        let started = Instant::now();
+        let started = ObservationTime::now();
         let handle = match timeout(
             Duration::from_secs(20),
             runtime.ensure_container(&profile.spec),

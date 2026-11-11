@@ -26,6 +26,7 @@ use crate::{
         connectivity::{ConnectivityMonitor, ProbePolicy},
         lease::ControllerLease,
         lifecycle::Exit,
+        observation_time::ObservationTime,
         packet::PacketGuardController,
         runtime::{image_is_pinned, inspect_fixed_worker},
         storage::{FixedStateVolume, FixedWorkerSpec},
@@ -101,15 +102,54 @@ impl std::error::Error for ProtectionCheckInProgress {}
 #[derive(Clone, Copy)]
 struct Snapshot {
     state: ProtectionState,
-    until: Option<Instant>,
+    window: Option<(ObservationTime, Duration)>,
 }
 impl Snapshot {
+    const fn inactive(state: ProtectionState) -> Self {
+        Self {
+            state,
+            window: None,
+        }
+    }
+
+    fn timed(state: ProtectionState, maximum: Duration) -> Self {
+        Self::anchored(
+            state,
+            ObservationTime::capture(Instant::now().into_std()),
+            maximum,
+        )
+    }
+
+    const fn anchored(state: ProtectionState, started: ObservationTime, maximum: Duration) -> Self {
+        Self {
+            state,
+            window: Some((started, maximum)),
+        }
+    }
+
+    // Scheduling only. Authority still uses the stricter dual-clock state().
+    fn monotonic_deadline(self) -> Option<Instant> {
+        let (started, maximum) = self.window?;
+        started.monotonic_deadline(maximum).map(Instant::from_std)
+    }
+
     fn state(self) -> ProtectionState {
+        self.state_at(Instant::now().into_std(), std::time::SystemTime::now())
+    }
+
+    fn state_at(
+        self,
+        monotonic: std::time::Instant,
+        wall: std::time::SystemTime,
+    ) -> ProtectionState {
         if matches!(
             self.state,
             ProtectionState::Ready | ProtectionState::Checking
-        ) && self.until.is_none_or(|until| Instant::now() >= until)
-        {
+        ) && self.window.is_none_or(|(started, maximum)| {
+            started
+                .checked_age_at(monotonic, wall)
+                .is_none_or(|elapsed| elapsed >= maximum)
+        }) {
             ProtectionState::Expired
         } else {
             self.state
@@ -204,10 +244,7 @@ impl Drop for StopOnChannelLoss<'_> {
 impl<C: Send + 'static> Supervisor<C> {
     fn spawn<P: Protection<Credit = C>>(mut protection: P) -> (Self, oneshot::Receiver<()>) {
         let (credits, receiver) = mpsc::channel(1);
-        let (status, observed) = watch::channel(Snapshot {
-            state: ProtectionState::Starting,
-            until: None,
-        });
+        let (status, observed) = watch::channel(Snapshot::inactive(ProtectionState::Starting));
         let (stop, stopped) = oneshot::channel();
         let (faults, mut failed) = mpsc::channel(1);
         let (ready, readiness) = oneshot::channel();
@@ -219,14 +256,11 @@ impl<C: Send + 'static> Supervisor<C> {
                 result = supervise(&mut protection, receiver, &status, ready) => result,
             };
             // Publish terminal state before potentially slow Docker cleanup.
-            status.send_replace(Snapshot {
-                state: if result.is_ok() {
-                    ProtectionState::Stopped
-                } else {
-                    ProtectionState::Failed
-                },
-                until: None,
-            });
+            status.send_replace(Snapshot::inactive(if result.is_ok() {
+                ProtectionState::Stopped
+            } else {
+                ProtectionState::Failed
+            }));
             let cleanup = timeout(CLEANUP_DEADLINE, protection.shutdown())
                 .await
                 .context("protected worker cleanup deadline")
@@ -332,10 +366,10 @@ async fn supervise<P: Protection>(
     let mut next_inspection = Instant::now();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        status.send_replace(Snapshot {
-            state: ProtectionState::Checking,
-            until: Some(Instant::now() + CHECKING_DEADLINE),
-        });
+        status.send_replace(Snapshot::timed(
+            ProtectionState::Checking,
+            CHECKING_DEADLINE,
+        ));
         if Instant::now() >= next_inspection {
             timeout(INSPECTION_INTERVAL, protection.inspect_worker())
                 .await
@@ -357,18 +391,19 @@ async fn supervise<P: Protection>(
                 .context("protected worker DNS/TLS refresh")?;
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
-        let started = Instant::now();
+        let started = ObservationTime::capture(Instant::now().into_std());
         let lease = timeout(RENEW_DEADLINE, protection.renew())
             .await
             .context("protected worker renewal deadline")?
             .context("protected worker lease renewal")?;
-        if lease.is_zero() || lease > Duration::from_secs(15) || started + lease <= Instant::now() {
+        let renewed = Snapshot::anchored(ProtectionState::Ready, started, lease);
+        if lease.is_zero()
+            || lease > Duration::from_secs(15)
+            || renewed.state() != ProtectionState::Ready
+        {
             bail!("invalid or already expired protection lease");
         }
-        status.send_replace(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(started + lease),
-        });
+        status.send_replace(renewed);
         if let Some(ready) = ready.take() {
             let _ = ready.send(());
         }
@@ -379,7 +414,7 @@ async fn supervise<P: Protection>(
             biased;
             _ = sleep_until(next_check) => {},
             Some(request) = credits.recv() => {
-                status.send_replace(Snapshot { state: ProtectionState::Checking, until: Some(Instant::now() + Duration::from_secs(20)) });
+                status.send_replace(Snapshot::timed(ProtectionState::Checking, Duration::from_secs(20)));
                 let result = timeout(Duration::from_secs(20), protection.credit(request.credit)).await
                     .context("protected worker credit deadline").and_then(|result| result);
                 let _ = request.reply.send(if result.is_ok() { Ok(()) } else { Err("marketplace credit apply failed") });
@@ -1552,10 +1587,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn background_admission_defers_routine_checks_but_rejects_expiry_and_lost_owner()
     -> Result<()> {
-        let (sender, status) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(15)),
-        });
+        let (sender, status) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(15),
+        ));
         let (credits, _) = mpsc::channel::<CreditRequest<u64>>(1);
         let (faults, _) = mpsc::channel(1);
         let supervisor = Supervisor {
@@ -1567,10 +1602,10 @@ mod tests {
         };
         assert!(supervisor.background_ready()?);
         supervisor.require_ready()?;
-        sender.send_replace(Snapshot {
-            state: ProtectionState::Checking,
-            until: Some(Instant::now() + Duration::from_secs(15)),
-        });
+        sender.send_replace(Snapshot::timed(
+            ProtectionState::Checking,
+            Duration::from_secs(15),
+        ));
         assert!(!supervisor.background_ready()?);
         assert!(supervisor.require_active().is_ok());
         assert!(
@@ -1593,10 +1628,10 @@ mod tests {
                 .unwrap_err()
                 .is::<ProtectionCheckInProgress>()
         );
-        sender.send_replace(Snapshot {
-            state: ProtectionState::Checking,
-            until: Some(Instant::now() + Duration::from_secs(15)),
-        });
+        sender.send_replace(Snapshot::timed(
+            ProtectionState::Checking,
+            Duration::from_secs(15),
+        ));
         drop(sender);
         assert_eq!(supervisor.state(), ProtectionState::Failed);
         assert!(supervisor.background_ready().is_err());
@@ -1611,17 +1646,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stale_or_closed_status_cannot_remain_ready() -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let snapshot = Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(deadline),
-        };
+        let snapshot = Snapshot::timed(ProtectionState::Ready, Duration::from_secs(15));
         assert_eq!(snapshot.state(), ProtectionState::Ready);
         tokio::time::sleep(Duration::from_secs(16)).await;
         assert_eq!(snapshot.state(), ProtectionState::Expired);
         let (sender, status) = watch::channel(Snapshot {
             state: ProtectionState::Checking,
-            until: Some(deadline),
+            ..snapshot
         });
         let (credits, _) = mpsc::channel::<CreditRequest<u64>>(1);
         let (faults, _) = mpsc::channel(1);
@@ -1636,6 +1667,30 @@ mod tests {
         assert_eq!(supervisor.state(), ProtectionState::Failed);
         assert!(supervisor.require_active().is_err());
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspended_monotonic_clock_does_not_keep_a_protected_state_fresh() {
+        let maximum = Duration::from_secs(15);
+        let monotonic = Instant::now().into_std();
+        let started = ObservationTime::capture(monotonic);
+        let wall = std::time::SystemTime::now();
+        for state in [ProtectionState::Ready, ProtectionState::Checking] {
+            let snapshot = Snapshot::anchored(state, started, maximum);
+            assert_eq!(
+                snapshot.monotonic_deadline(),
+                Some(Instant::from_std(monotonic + maximum))
+            );
+            assert_eq!(snapshot.state_at(monotonic, wall), state);
+            assert_eq!(
+                snapshot.state_at(monotonic, wall + maximum),
+                ProtectionState::Expired
+            );
+            assert_eq!(
+                snapshot.state_at(monotonic, wall - maximum),
+                ProtectionState::Expired
+            );
+        }
     }
 
     #[cfg(unix)]

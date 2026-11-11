@@ -143,7 +143,7 @@ impl Work {
         loop {
             // Mark before checking so a concurrent update cannot be missed
             // between the admission read and changed(). No guard crosses await.
-            let expires = protection.borrow_and_update().until;
+            let expires = protection.borrow_and_update().monotonic_deadline();
             settings.borrow_and_update();
             facts.borrow_and_update();
             if completion.is_closed() {

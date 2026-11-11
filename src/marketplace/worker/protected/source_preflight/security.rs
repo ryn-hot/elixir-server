@@ -20,10 +20,8 @@ impl SecurityObservation {
         records: SecurityRecords,
     ) -> Result<(Self, impl Fn(bool) + Send + Sync)> {
         let summary = records.verify(observation_utc()?)?;
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + OBSERVATION_TTL),
-        });
+        let (owner, protection) =
+            watch::channel(Snapshot::timed(ProtectionState::Ready, OBSERVATION_TTL));
         Ok((
             Self {
                 records,
@@ -33,14 +31,14 @@ impl SecurityObservation {
                 protection,
             },
             move |ready| {
-                owner.send_replace(Snapshot {
-                    state: if ready {
+                owner.send_replace(Snapshot::timed(
+                    if ready {
                         ProtectionState::Ready
                     } else {
                         ProtectionState::Failed
                     },
-                    until: Some(Instant::now() + OBSERVATION_TTL),
-                });
+                    OBSERVATION_TTL,
+                ));
             },
         ))
     }

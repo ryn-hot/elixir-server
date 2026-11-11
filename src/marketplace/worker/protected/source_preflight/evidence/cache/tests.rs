@@ -38,10 +38,10 @@ fn synthetic_batch(
         pairs,
         next_cursor: None,
     };
-    let (owner, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    let (owner, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     let observation = EvidenceObservation {
         extension_id: metadata.descriptor().release.payload.extension_id.clone(),
         release_id: release,
@@ -185,10 +185,10 @@ async fn cache_revalidates_immutable_signatures_beyond_receipt_ttl_without_nativ
     tokio::time::advance(Duration::from_secs(301)).await;
     assert!(!old.is_current());
     // The synthetic guard must be live again; cache reuse alone cannot do it.
-    source.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    source.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     let (fresh, _fresh_owner) =
         MetadataObservation::fixture_for_verified_descriptor(descriptor, &policy)?;
     let reply = client.verify_evidence(&fresh, &batch).await?;

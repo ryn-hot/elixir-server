@@ -108,7 +108,11 @@ impl Client {
             bail!("search fixture release differs");
         }
         let fact = SearchSourceObservation::from_source(source)?;
-        self.0.search_source_cache.lock().unwrap().insert(key, &fact);
+        self.0
+            .search_source_cache
+            .lock()
+            .unwrap()
+            .insert(key, &fact);
         Ok(())
     }
     pub(in crate::marketplace::worker::protected) fn search_batch_needed(
@@ -244,10 +248,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn search_only_facts_preserve_time_scope_and_die_with_their_owner() -> Result<()> {
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + SEARCH_SOURCE_TTL * 2),
-        });
+        let (owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            SEARCH_SOURCE_TTL * 2,
+        ));
         let native = source(1, &protection);
         let fact = SearchSourceObservation::from_source(&native)?;
         let mut cache = SearchSourceCache::default();
@@ -294,10 +298,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn ten_thousand_search_facts_retain_no_packages_or_event_history() -> Result<()> {
-        let (_owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        });
+        let (_owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ));
         let mut cache = SearchSourceCache::default();
         for n in 0..10_064 {
             let fact = SearchSourceObservation::from_source(&source(n, &protection))?;

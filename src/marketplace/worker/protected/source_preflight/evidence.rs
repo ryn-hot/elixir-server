@@ -387,10 +387,10 @@ impl EvidenceObservation {
         let report = elixir_marketplace::verifier::Verifier::new(policy.clone())?
             .process(&bytes, observation_utc()?);
         let verified = parse(&canonical::to_vec(&report)?, id, &extension, batch, policy)??;
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        });
+        let (owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ));
         Ok((
             Self {
                 extension_id: extension,
@@ -406,14 +406,14 @@ impl EvidenceObservation {
                 protection,
             },
             move |active| {
-                owner.send_replace(Snapshot {
-                    state: if active {
+                owner.send_replace(Snapshot::timed(
+                    if active {
                         ProtectionState::Ready
                     } else {
                         ProtectionState::Failed
                     },
-                    until: Some(Instant::now() + Duration::from_secs(3600)),
-                });
+                    Duration::from_secs(3600),
+                ));
             },
         ))
     }

@@ -590,10 +590,10 @@ fn fixture() -> (
     let observed = Arc::new(Observed::default());
     let (settings_send, settings) = watch::channel(confirmed());
     let (facts_send, facts) = watch::channel(Some(healthy()));
-    let (protection_send, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    let (protection_send, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     let sample_state = observed.clone();
     let sampler = metrics::Sampler::fixture(
         limits.clone(),
@@ -613,14 +613,14 @@ fn fixture() -> (
                 facts_send.send_replace(
                     (!sample_state.missing_samples.load(Ordering::SeqCst)).then_some(sample),
                 );
-                protection_send.send_replace(Snapshot {
-                    state: if sample_state.checking.load(Ordering::SeqCst) {
+                protection_send.send_replace(Snapshot::timed(
+                    if sample_state.checking.load(Ordering::SeqCst) {
                         ProtectionState::Checking
                     } else {
                         ProtectionState::Ready
                     },
-                    until: Some(Instant::now() + Duration::from_secs(15)),
-                });
+                    Duration::from_secs(15),
+                ));
             }
         }),
     );

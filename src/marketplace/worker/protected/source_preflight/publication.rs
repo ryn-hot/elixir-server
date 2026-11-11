@@ -95,10 +95,10 @@ impl PublicationObservation {
     ) -> Result<(Self, impl Fn(bool) + use<>)> {
         let observed_utc = observation_utc()?;
         let summary = publication.verify(observed_utc)?;
-        let (owner, protection) = watch::channel(Snapshot {
-            state: ProtectionState::Ready,
-            until: Some(Instant::now() + Duration::from_secs(3600)),
-        });
+        let (owner, protection) = watch::channel(Snapshot::timed(
+            ProtectionState::Ready,
+            Duration::from_secs(3600),
+        ));
         Ok((
             Self {
                 publication,
@@ -108,14 +108,14 @@ impl PublicationObservation {
                 protection,
             },
             move |healthy| {
-                owner.send_replace(Snapshot {
-                    state: if healthy {
+                owner.send_replace(Snapshot::timed(
+                    if healthy {
                         ProtectionState::Ready
                     } else {
                         ProtectionState::Failed
                     },
-                    until: Some(Instant::now() + Duration::from_secs(3600)),
-                });
+                    Duration::from_secs(3600),
+                ));
             },
         ))
     }

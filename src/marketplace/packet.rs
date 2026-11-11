@@ -3,8 +3,8 @@
 //! Isolation/credits are NOT VPN health,
 //! a public-worker capability, installation permission or billing eligibility.
 use super::{
-    accounting::CommittedTransferReservation, lease::ControllerLease, packet_client::PacketClient,
-    runtime::image_is_pinned,
+    accounting::CommittedTransferReservation, lease::ControllerLease,
+    observation_time::ObservationTime, packet_client::PacketClient, runtime::image_is_pinned,
 };
 use crate::runtime::{
     RuntimeManager,
@@ -487,7 +487,7 @@ pub struct KernelTunnelObservation {
     epoch: Digest,
     namespace_inode: u64,
     sequence: u64,
-    started: Instant,
+    started: ObservationTime,
     snapshot: WireguardSnapshot,
 }
 impl KernelTunnelObservation {
@@ -500,7 +500,7 @@ impl KernelTunnelObservation {
             && self.epoch == controller.profile.policy.epoch
             && self.namespace_inode == controller.namespace_inode()
             && controller.network_observation_sequence == Some(self.sequence)
-            && self.started.elapsed() <= Duration::from_secs(3)
+            && self.started.is_current(Duration::from_secs(3))
             && !controller.client.is_poisoned()
     }
 }
@@ -858,7 +858,7 @@ impl PacketGuardController {
             if !self.network_probe_available {
                 bail!("packet actor lacks kernel network observation support");
             }
-            let started = Instant::now();
+            let started = ObservationTime::now();
             let reply = self.client.request(GuardCommand::Observe).await?;
             let snapshot = match reply
                 .network
@@ -872,7 +872,7 @@ impl PacketGuardController {
                     bail!("kernel tunnel observation unavailable: {reason:?}")
                 }
             };
-            if started.elapsed() > Duration::from_secs(3) {
+            if !started.is_current(Duration::from_secs(3)) {
                 bail!("kernel tunnel observation is stale");
             }
             let now = SystemTime::now()
@@ -963,7 +963,7 @@ impl PacketGuardController {
             }
             self.inspect_owned(runtime).await?;
             // Inspection itself may stall; do not turn a previously fresh
-            // sample into permission to renew after its monotonic deadline.
+            // sample into permission to renew after either clock's deadline.
             if !observation.is_recent_for(self) {
                 bail!("kernel tunnel observation expired before lease renewal");
             }

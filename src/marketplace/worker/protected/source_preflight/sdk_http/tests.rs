@@ -76,7 +76,7 @@ async fn readiness_wait_rechecks_revocation_pressure_expiry_and_closed_owner() -
                 .send_modify(|facts| facts.as_mut().unwrap().foreground_resource_pressure = true),
             "expiry" => f
                 .protection
-                .send_modify(|snapshot| snapshot.until = Some(Instant::now())),
+                .send_modify(|snapshot| *snapshot = Snapshot::timed(snapshot.state, Duration::ZERO)),
             _ => {}
         }
         f.protection
@@ -379,10 +379,10 @@ async fn foreground_does_not_require_background_contribution_but_keeps_resource_
         assert!(error.contains(reason), "{change}: {error}");
         f.facts.send_replace(saved);
     }
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Checking,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Checking,
+        Duration::from_secs(15),
+    ));
     assert!(f.owner.admit_http(true).is_err());
     assert!(f.owner.admit_http(false).is_ok());
     f.settings
@@ -489,10 +489,8 @@ async fn protection_loss_closes_lifeline_and_waits_for_original_failure_marker()
             .await
             .is_err()
     );
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    f.protection
+        .send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(matches!(
         timeout(Duration::from_secs(5), call.finish()).await??,
         SourceSdkReply::Unavailable

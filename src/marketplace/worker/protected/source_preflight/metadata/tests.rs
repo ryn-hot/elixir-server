@@ -8,10 +8,10 @@ async fn sharing_renewal_requires_more_validity_than_an_aging_search_cache_hit()
     let f = super::super::tests::fixture()?;
     f.settings
         .send_modify(|settings| settings.mode = elixir_marketplace::policy::ContributionMode::On);
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    f.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     assert!(SHARING_RENEWAL_LEAD > super::super::super::CHECKING_DEADLINE);
     let mut support = parse_reply(&serde_json::to_vec(&report)?, 7, &descriptor)??;
     support.valid_until = Some(observation_utc()? + 3600);
@@ -139,10 +139,10 @@ fn memoized_metadata_ids_match_exact_bodies_without_renewing_protection() -> Res
     let mut support = parse_reply(&serde_json::to_vec(&report)?, 7, &descriptor)??;
     let now = observation_utc()?;
     support.valid_until = Some(now + 3600);
-    let (owner, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    let (owner, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     let value = MetadataObservation {
         descriptor,
         ids: OnceLock::new(),
@@ -168,10 +168,7 @@ fn memoized_metadata_ids_match_exact_bodies_without_renewing_protection() -> Res
     );
     assert!(std::ptr::eq(ids, value.ids()?));
     assert!(value.is_current());
-    owner.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    owner.send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(std::ptr::eq(ids, value.ids()?));
     assert!(!value.is_current());
     assert!(value.support().is_err());
@@ -185,10 +182,10 @@ async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -
     let now = observation_utc()?;
     support.valid_until = Some(now + 3600);
     let policy = Digest::of(b"synthetic cache policy");
-    let (owner, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    let (owner, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     let mut value = MetadataObservation {
         descriptor,
         ids: OnceLock::new(),
@@ -372,10 +369,10 @@ async fn native_origin_receipt_still_expires_and_dies_with_its_protection_owner(
     let mut support = parse_reply(&serde_json::to_vec(&report)?, 7, &descriptor)??;
     let now = chrono::Utc::now().timestamp() as u64;
     support.valid_until = Some(now + 3600);
-    let (owner, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(600)),
-    });
+    let (owner, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(600),
+    ));
     // Synthetic test owner only, not evidence of real private-process origin.
     let mut observation = MetadataObservation {
         descriptor,
@@ -404,10 +401,10 @@ async fn native_origin_receipt_still_expires_and_dies_with_its_protection_owner(
     tokio::time::advance(Duration::from_secs(301)).await;
     assert!(!observation.is_current());
     observation.observed = Instant::now();
-    owner.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(600)),
-    });
+    owner.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(600),
+    ));
     assert!(observation.is_current());
     drop(owner);
     assert!(observation.support().is_err());
@@ -497,7 +494,11 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
     };
     f.owner.source_cache.lock().unwrap().insert(&native);
     let client = Client(f.owner.clone());
-    assert!(client.cached_search_metadata_source(&metadata, 0)?.is_none());
+    assert!(
+        client
+            .cached_search_metadata_source(&metadata, 0)?
+            .is_none()
+    );
     let fact = client.request_search_metadata(&metadata, 0).await?;
     assert_eq!(fact.release_id(), native.release_id());
     f.owner
@@ -531,7 +532,7 @@ async fn search_fact_hits_do_not_create_an_install_source_capability() -> Result
     // Synthetic healthy-owner/metadata renewal only. Neither renewal changes
     // the original source-check timestamps or grants a new native source fact.
     f.protection.send_modify(|snapshot| {
-        snapshot.until = Some(Instant::now() + Duration::from_secs(15));
+        *snapshot = Snapshot::timed(snapshot.state, Duration::from_secs(15));
     });
     f.facts.send_modify(|facts| {
         facts.as_mut().unwrap().observed = Instant::now();
@@ -599,10 +600,8 @@ async fn compact_metadata_hit_needs_no_new_process_or_headroom_but_keeps_its_own
         .context("new helper ignored playback startup")?;
     f.owner.playback.set_test_startup_queue_len(0);
     assert!(error.to_string().contains("playback startup"));
-    f.protection.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    f.protection
+        .send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(client.verify_metadata(&metadata.descriptor).await.is_err());
     Ok(())
 }

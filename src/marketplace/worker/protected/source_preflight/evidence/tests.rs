@@ -386,10 +386,10 @@ async fn compact_native_facts_expire_and_cannot_outlive_their_protection_owner()
         &policy,
     )??;
     let now = observation_utc()?;
-    let (owner, protection) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(3600)),
-    });
+    let (owner, protection) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(3600),
+    ));
     let mut observation = EvidenceObservation {
         extension_id: extension,
         release_id: batch.release_id,

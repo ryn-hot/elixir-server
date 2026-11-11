@@ -24,16 +24,17 @@ mod local_http;
 pub mod manifest;
 #[cfg(all(test, unix))]
 pub(in crate::marketplace) mod network_lab;
+mod observation_time;
 pub mod packet;
 mod packet_client;
 pub mod preferences;
-pub(crate) mod provider_setup;
 mod preparation;
 #[cfg(unix)]
 pub mod provider;
 #[cfg(unix)]
 mod provider_client;
 mod provider_lookup;
+pub(crate) mod provider_setup;
 #[cfg(unix)]
 mod provider_state;
 pub mod quarantine;
@@ -50,5 +51,5 @@ pub mod startup;
 pub mod storage;
 #[cfg(unix)]
 mod updates;
-pub mod worker;
 pub(crate) mod withdrawal;
+pub mod worker;

@@ -105,7 +105,7 @@ async fn sandboxed_source_batch_populates_only_search_cache_through_real_server_
         owner.binding.namespace=namespace;owner.binding.issuer_keys=vec![issuer];
         fixture.settings.send_modify(|s|{s.metering=Metering::Metered;s.accepted_disclosure_version=None;});
         fixture.facts.send_modify(|f|{let f=f.as_mut().unwrap();f.playback_pressure=true;f.background_allowance=false;});
-        fixture.protection.send_modify(|s|s.until=Some(Instant::now()+Duration::from_secs(300)));
+        fixture.protection.send_modify(|s|*s=Snapshot::timed(s.state,Duration::from_secs(300)));
         let client=Client(fixture.owner.clone());
         assert!(Work::Background.admit(&fixture.owner,true).is_err());
         // Real native signature/adoption verification, but the issuer deliberately
@@ -151,7 +151,7 @@ async fn sandboxed_source_batch_populates_only_search_cache_through_real_server_
         assert!(client.request_fresh_metadata(&first,0).await.is_err(),"warm browsing must not bypass playback admission for fresh installation checks");
         fixture.owner.playback.set_test_startup_queue_len(0);
         assert!(!fixture.owner.failed.load(Ordering::SeqCst));
-        fixture.protection.send_modify(|s|{s.state=ProtectionState::Stopped;s.until=None;});
+        fixture.protection.send_replace(Snapshot::inactive(ProtectionState::Stopped));
         assert!(facts.iter().all(|f|f.valid_for().is_zero()));
         eprintln!("{}",serde_json::json!({"native_source_batch_bridge":true,"inputs":20,"search_positive":19,"unavailable":1,
             "elapsed_ms":elapsed.as_millis(),"install_source_facts":0,"background_admitted":false,

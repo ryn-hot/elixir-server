@@ -229,10 +229,8 @@ async fn protection_loss_and_revocation_retire_held_io_without_faulting_the_shar
         if revoke {
             authority.0.store(false, Ordering::SeqCst);
         } else {
-            f.protection.send_replace(Snapshot {
-                state: ProtectionState::Failed,
-                until: None,
-            });
+            f.protection
+                .send_replace(Snapshot::inactive(ProtectionState::Failed));
         }
         assert!(matches!(
             timeout(Duration::from_secs(5), call.read(4096)).await??,

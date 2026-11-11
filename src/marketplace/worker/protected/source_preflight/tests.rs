@@ -30,10 +30,10 @@ pub(super) struct Fixture {
     pub(super) faults: mpsc::Receiver<()>,
 }
 pub(super) fn fixture() -> Result<Fixture> {
-    let (protection, p) = watch::channel(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    let (protection, p) = watch::channel(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     let (settings, s) = watch::channel(ParticipationSettings {
         revision: Some(1),
         mode: ContributionMode::Off,
@@ -526,10 +526,10 @@ async fn foreground_input_rechecks_live_startup_before_sending_any_frame() -> Re
 async fn foreground_launched_helper_receives_no_input_until_the_original_protection_is_ready()
 -> Result<()> {
     let fixture = fixture()?;
-    fixture.protection.send_replace(Snapshot {
-        state: ProtectionState::Checking,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    fixture.protection.send_replace(Snapshot::timed(
+        ProtectionState::Checking,
+        Duration::from_secs(15),
+    ));
     let directory = tempfile::tempdir()?;
     let witness = directory.path().join("input");
     let process = input_probe(&witness)?;
@@ -553,10 +553,10 @@ async fn foreground_launched_helper_receives_no_input_until_the_original_protect
     assert!(!task.is_finished());
     assert!(!witness.exists(), "Checking sent a helper input frame");
     assert_eq!(fixture.owner.slots.available_permits(), 0);
-    fixture.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(15)),
-    });
+    fixture.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(15),
+    ));
     assert_eq!(timeout(Duration::from_secs(5), task).await????, b"ok");
     assert!(witness.exists());
     assert_eq!(fixture.owner.slots.available_permits(), 1);
@@ -569,10 +569,10 @@ async fn foreground_waiting_input_cancellation_or_protection_loss_joins_without_
 -> Result<()> {
     for cancel in [true, false] {
         let fixture = fixture()?;
-        fixture.protection.send_replace(Snapshot {
-            state: ProtectionState::Checking,
-            until: Some(Instant::now() + Duration::from_secs(15)),
-        });
+        fixture.protection.send_replace(Snapshot::timed(
+            ProtectionState::Checking,
+            Duration::from_secs(15),
+        ));
         let directory = tempfile::tempdir()?;
         let witness = directory.path().join("unexpected-input");
         let process = input_probe(&witness)?;
@@ -598,10 +598,9 @@ async fn foreground_waiting_input_cancellation_or_protection_loss_joins_without_
         if cancel {
             drop(response);
         } else {
-            fixture.protection.send_replace(Snapshot {
-                state: ProtectionState::Failed,
-                until: None,
-            });
+            fixture
+                .protection
+                .send_replace(Snapshot::inactive(ProtectionState::Failed));
         }
         assert!(timeout(Duration::from_secs(5), task).await???.is_err());
         assert!(!witness.exists());
@@ -709,7 +708,7 @@ async fn native_foreground_metadata_keeps_crypto_and_limits_while_background_is_
         // This fixture has no real guard. Keep its explicitly synthetic owner
         // alive across serial native helpers; this is not VPN qualification.
         fixture.protection.send_modify(|s| {
-            s.until = Some(Instant::now() + Duration::from_secs(300));
+            *s = Snapshot::timed(s.state, Duration::from_secs(300));
         });
         assert!(Work::Background.admit(&fixture.owner, true).is_err());
         let client = Client(fixture.owner.clone());
@@ -957,10 +956,9 @@ async fn protection_or_resource_loss_closes_the_lifeline_but_waits_for_exit() ->
         });
         tokio::time::sleep(Duration::from_millis(75)).await;
         if lose_protection {
-            fixture.protection.send_replace(Snapshot {
-                state: ProtectionState::Expired,
-                until: None,
-            });
+            fixture
+                .protection
+                .send_replace(Snapshot::inactive(ProtectionState::Expired));
         } else {
             fixture
                 .facts
@@ -1019,10 +1017,10 @@ async fn background_admission_never_treats_unknown_metering_stale_samples_or_pla
     fixture
         .settings
         .send_modify(|settings| settings.metering = Metering::Unmetered);
-    fixture.protection.send_replace(Snapshot {
-        state: ProtectionState::Checking,
-        until: Some(Instant::now() + Duration::from_secs(100)),
-    });
+    fixture.protection.send_replace(Snapshot::timed(
+        ProtectionState::Checking,
+        Duration::from_secs(100),
+    ));
     assert!(fixture.owner.admit(true).is_err());
     assert!(fixture.owner.admit(false).is_ok());
     tokio::time::advance(Duration::from_secs(31)).await;
@@ -1108,15 +1106,14 @@ async fn availability_tokens_expire_and_cannot_survive_their_protection_owner() 
         protection: fixture.owner.protection.clone(),
     };
     assert!(observation.is_current_for(&release));
-    fixture.protection.send_replace(Snapshot {
-        state: ProtectionState::Failed,
-        until: None,
-    });
+    fixture
+        .protection
+        .send_replace(Snapshot::inactive(ProtectionState::Failed));
     assert!(!observation.is_current_for(&release));
-    fixture.protection.send_replace(Snapshot {
-        state: ProtectionState::Ready,
-        until: Some(Instant::now() + Duration::from_secs(600)),
-    });
+    fixture.protection.send_replace(Snapshot::timed(
+        ProtectionState::Ready,
+        Duration::from_secs(600),
+    ));
     tokio::time::advance(Duration::from_secs(301)).await;
     assert!(!observation.is_current_for(&release));
     Ok(())

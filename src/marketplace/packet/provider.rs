@@ -13,7 +13,7 @@ pub(in crate::marketplace) struct ProviderConnectivity {
     epoch: Digest,
     namespace: u64,
     nonce: Digest,
-    started: Instant,
+    started: ObservationTime,
     family: ProbeFamily,
 }
 impl ProviderConnectivity {
@@ -24,7 +24,7 @@ impl ProviderConnectivity {
             && guard.provider_connectivity_nonce == Some(self.nonce)
             && guard.provider.is_some()
             && guard.channel_usable()
-            && self.started.elapsed() <= MAX_OBSERVATION_AGE
+            && self.started.is_current(MAX_OBSERVATION_AGE)
     }
     pub(in crate::marketplace) fn family(&self) -> ProbeFamily {
         self.family
@@ -153,7 +153,7 @@ impl PacketGuardController {
             self.check_provider_transport(runtime).await?;
             self.apply_credit(runtime, debit).await?;
             self.renew_bootstrap_lease(runtime).await?;
-            let started = Instant::now();
+            let started = ObservationTime::now();
             let probed = {
                 let provider = self.provider.as_ref().context("provider owner missing")?;
                 let probe = provider.probe_exit(family == ProbeFamily::Ipv6);
@@ -218,7 +218,7 @@ impl PacketGuardController {
             );
             self.check_provider_transport(runtime).await?;
             ensure!(
-                health.started.elapsed() <= MAX_OBSERVATION_AGE,
+                health.started.is_current(MAX_OBSERVATION_AGE),
                 "protected provider connectivity observation expired"
             );
             self.client.request(GuardCommand::Heartbeat).await?;
