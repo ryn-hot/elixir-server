@@ -24,6 +24,7 @@ pub(super) struct Context {
     pub view_id: Uuid,
 }
 tokio::task_local! { static CONTEXT: Context; }
+tokio::task_local! { static INTERACTIVE_WAIT: (u64, bool); }
 pub(super) fn context() -> Option<Context> {
     CONTEXT.try_with(|c| *c).ok()
 }
@@ -43,6 +44,18 @@ pub(super) async fn scope<T>(context: Option<Context>, future: impl Future<Outpu
         Some(c) => CONTEXT.scope(c, future).await,
         None => future.await,
     }
+}
+pub(super) async fn interactive_wait<T>(
+    wait_us: u64,
+    partial_settle: bool,
+    future: impl Future<Output = T>,
+) -> T {
+    INTERACTIVE_WAIT
+        .scope((wait_us, partial_settle), future)
+        .await
+}
+pub(super) fn interactive_wait_observation() -> Option<(u64, bool)> {
+    INTERACTIVE_WAIT.try_with(|wait| *wait).ok()
 }
 pub(super) fn micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -76,6 +89,7 @@ pub(super) enum Event {
     },
     SearchViewTiming {
         context: Context,
+        interactive_wait: Option<(u64, bool)>,
         supports_us: u64,
         total_us: u64,
         cards: usize,

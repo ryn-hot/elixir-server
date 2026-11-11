@@ -193,6 +193,9 @@ trait Backend: Send + Sync {
     fn searching_peers(&self) -> bool {
         false
     }
+    fn local_only_so_far(&self) -> bool {
+        false
+    }
     fn local_page_complete(&self, _query: Uuid) -> bool {
         false
     }
@@ -411,6 +414,9 @@ impl Backend for Live {
     }
     fn searching_peers(&self) -> bool {
         self.discovery_progress.waiting()
+    }
+    fn local_only_so_far(&self) -> bool {
+        !self.discovery_progress.started()
     }
     fn local_page_complete(&self, query: Uuid) -> bool {
         self.client.snapshot().phase == ParticipationPhase::Running
@@ -650,6 +656,7 @@ impl FirstView {
     }
 }
 const FIRST_VIEW_WAIT: Duration = Duration::from_millis(100);
+const FIRST_LOCAL_SETTLE: Duration = Duration::from_millis(25);
 
 struct Query {
     id: Uuid,
@@ -665,6 +672,17 @@ struct Query {
     preparation: Option<catalog::Progress>,
     preparation_until: Option<Instant>,
     first_view: FirstView,
+}
+impl Query {
+    fn local_page_almost_ready(&self) -> bool {
+        // Presentation only. These are owner-local progress counts, not
+        // verification facts. Never wait on a remote or incomplete-size page.
+        self.phase == SearchPhase::Checking
+            && !self.values.is_empty()
+            && self.total == self.request.query.limit
+            && (1..=5).contains(&self.total.saturating_sub(self.checked))
+            && self.backend.local_only_so_far()
+    }
 }
 #[derive(Default)]
 struct Slot {
@@ -874,11 +892,11 @@ impl SearchService {
             joined?;
         }
     }
-    /// Owner HTTP only. If the first local page is nearly done, avoid an
-    /// empty round-trip plus a UI polling interval. No view permit is held
-    /// during the wait, and the ordinary view still rechecks every card.
+    /// Owner HTTP only. Avoid an empty round-trip, or an extra head read and
+    /// poll for a nearly complete local page. No view permit is held during
+    /// the wait, and the ordinary view still rechecks every returned card.
     pub(super) async fn interactive_view(&self, id: Uuid) -> Result<SearchView> {
-        let receiver = {
+        let wait = {
             let mut slot = self
                 .inner
                 .slot
@@ -894,19 +912,51 @@ impl SearchService {
             } else if query.request.prepare_catalog
                 || query.request.cursor.is_some()
                 || query.phase != SearchPhase::Checking
-                || !query.values.is_empty()
                 || query.backend.searching_peers()
             {
                 query.first_view.finish();
                 None
             } else {
-                let (sender, receiver) = oneshot::channel();
-                query.first_view = FirstView::Waiting(sender);
-                Some(receiver)
+                let duration = if query.values.is_empty() {
+                    Some(FIRST_VIEW_WAIT)
+                } else if query.local_page_almost_ready() {
+                    Some(FIRST_LOCAL_SETTLE)
+                } else {
+                    None
+                };
+                if let Some(duration) = duration {
+                    let (sender, receiver) = oneshot::channel();
+                    query.first_view = FirstView::Waiting(sender);
+                    Some((receiver, duration))
+                } else {
+                    query.first_view.finish();
+                    None
+                }
             }
         };
-        if let Some(receiver) = receiver {
-            let _ = timeout(FIRST_VIEW_WAIT, receiver).await;
+        if let Some((mut receiver, duration)) = wait {
+            #[cfg(test)]
+            let wait_started = std::time::Instant::now();
+            let settle_after_empty = timeout(duration, &mut receiver).await.is_err()
+                && duration == FIRST_VIEW_WAIT
+                && self.inner.slot.lock().is_ok_and(|slot| {
+                    slot.query
+                        .as_ref()
+                        .is_some_and(|query| query.id == id && query.local_page_almost_ready())
+                });
+            if settle_after_empty {
+                // The empty wait may have become a nearly complete local
+                // page. Give the SAME waiter one short settle; stop or query
+                // replacement still closes it immediately.
+                let _ = timeout(FIRST_LOCAL_SETTLE, receiver).await;
+            }
+            #[cfg(test)]
+            return super::search_timing::interactive_wait(
+                super::search_timing::micros(wait_started),
+                settle_after_empty || duration == FIRST_LOCAL_SETTLE,
+                self.view(id),
+            )
+            .await;
         }
         self.view(id).await
     }
@@ -1071,6 +1121,7 @@ impl SearchService {
         if let Some(context) = timing {
             super::search_timing::emit(super::search_timing::Event::SearchViewTiming {
                 context,
+                interactive_wait: super::search_timing::interactive_wait_observation(),
                 supports_us,
                 total_us: super::search_timing::micros(began),
                 cards: view.results.len(),

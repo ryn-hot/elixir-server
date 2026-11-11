@@ -27,11 +27,15 @@ pub(super) struct DiscoveryProgress(Arc<DiscoveryState>);
 #[derive(Default)]
 struct DiscoveryState {
     waiting: AtomicBool,
+    started: AtomicBool,
     local_page_complete: Mutex<Option<Uuid>>,
 }
 impl DiscoveryProgress {
     pub(super) fn waiting(&self) -> bool {
         self.0.waiting.load(Ordering::SeqCst)
+    }
+    pub(super) fn started(&self) -> bool {
+        self.0.started.load(Ordering::SeqCst)
     }
     pub(super) fn local_page_complete(&self, query: Uuid) -> bool {
         self.0
@@ -40,6 +44,7 @@ impl DiscoveryProgress {
             .is_ok_and(|current| *current == Some(query))
     }
     fn begin(&self) -> DiscoveryWait {
+        self.0.started.store(true, Ordering::SeqCst);
         self.0.waiting.store(true, Ordering::SeqCst);
         DiscoveryWait(self.0.clone())
     }

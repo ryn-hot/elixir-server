@@ -87,6 +87,8 @@ pub(super) struct Fake {
     current: AtomicBool,
     calls: AtomicUsize,
     hold_first: AtomicBool,
+    hold_second_admission: AtomicBool,
+    peer_lookup_started: AtomicBool,
     started: Notify,
     resume: Notify,
     queries: Mutex<Vec<String>>,
@@ -137,6 +139,8 @@ impl Fake {
             current: AtomicBool::new(true),
             calls: AtomicUsize::new(0),
             hold_first: AtomicBool::new(false),
+            hold_second_admission: AtomicBool::new(false),
+            peer_lookup_started: AtomicBool::new(false),
             started: Notify::new(),
             resume: Notify::new(),
             queries: Mutex::new(vec![]),
@@ -160,6 +164,9 @@ impl Fake {
 }
 #[async_trait]
 impl Backend for Fake {
+    fn local_only_so_far(&self) -> bool {
+        !self.peer_lookup_started.load(Ordering::SeqCst)
+    }
     async fn page(&self, request: &SearchRequest, _interest: &Interest) -> Result<SearchPage> {
         assert!(
             !self.panic_page.swap(false, Ordering::SeqCst),
@@ -181,6 +188,16 @@ impl Backend for Fake {
         descriptor: CandidateDescriptor,
         _interest: &Interest,
     ) -> Result<Arc<Verified>> {
+        if self.hold_second_admission.load(Ordering::SeqCst)
+            && self.page.results.get(1).is_some_and(|item| {
+                item.descriptor.release.payload.extension_id
+                    == descriptor.release.payload.extension_id
+            })
+        {
+            self.hold_second_admission.store(false, Ordering::SeqCst);
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
         let policy =
             IssuerPolicy::new([PublicKey::from_bytes(key(3).verifying_key().to_bytes())?])?;
         descriptor.verify_metadata(
@@ -229,9 +246,8 @@ impl Backend for Fake {
             self.current_started.notify_one();
             self.current_resume.notified().await;
         }
-        if self.delay_second_current.load(Ordering::SeqCst)
-            && self.current_calls.fetch_add(1, Ordering::SeqCst) == 1
-        {
+        let current_call = self.current_calls.fetch_add(1, Ordering::SeqCst);
+        if self.delay_second_current.load(Ordering::SeqCst) && current_call == 1 {
             tokio::time::sleep(Duration::from_secs(301)).await;
         }
         if !self.current.load(Ordering::SeqCst) {
