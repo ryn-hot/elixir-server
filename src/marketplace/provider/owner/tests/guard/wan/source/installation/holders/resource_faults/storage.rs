@@ -108,6 +108,7 @@ fn private_directory(root: &tempfile::TempDir, name: &str) -> Result<PathBuf> {
 #[test]
 fn storage_permission_fault_is_real_and_restores_original_inode_on_unwind() -> Result<()> {
     let root = tempfile::tempdir()?;
+    std::fs::set_permissions(root.path(), Permissions::from_mode(0o700))?;
     let path = private_directory(&root, "retained")?;
     let original = std::fs::metadata(&path)?;
     {
@@ -132,6 +133,7 @@ fn storage_permission_fault_is_real_and_restores_original_inode_on_unwind() -> R
 #[test]
 fn storage_permission_fault_refuses_foreign_linked_or_nonprivate_directories() -> Result<()> {
     let root = tempfile::tempdir()?;
+    std::fs::set_permissions(root.path(), Permissions::from_mode(0o700))?;
     let foreign = tempfile::tempdir()?;
     let outside = private_directory(&foreign, "outside")?;
     assert!(UnwritableDirectory::apply(root.path(), &outside).is_err());
@@ -237,6 +239,7 @@ async fn unavailable_archive_preserves_installed_source_and_manual_update_retrie
         let original_grant = grant(&actor, &sources[0]).await?;
         ensure!(original_grant.2 == 0, "storage fixture must not enable automatic updates");
         let (id, review) = begin_update(&actor, &sources[1], instance).await?;
+        eprintln!("{}", json!({"stage":"storage_update_review_ready"}));
         let paths = crate::runtime::RuntimePaths::from_roots(&actor.state()?.settings.extensions.storage_root, &actor.state()?.settings.library.local_root);
         let path = Path::new(&paths.data_root).canonicalize()?.join("marketplace/worker/source-archives/releases");
         let mut fault = UnwritableDirectory::apply(actor.rig.root.path(), &path)?;
@@ -252,18 +255,23 @@ async fn unavailable_archive_preserves_installed_source_and_manual_update_retrie
         // not pretend it never happened or roll back a concurrent revocation.
         let approved = grant(&actor, &sources[1]).await?;
         ensure!(approved.0 == original_grant.0 + 1 && approved.2 == 0, "exact manual approval or opt-in changed");
-        provider(actor.state()?, &actor.rig.database, user, instance, "1.0.0").await?;
+        eprintln!("{}", json!({"stage":"storage_update_failed_closed","original_installed_record_unchanged":true,"original_mode_restored":true}));
+        // The original command deliberately owns the single execution
+        // controller until cancellation joins its unresolved cleanup. Do not
+        // open a second controller or invoke through a copied DB observation.
         action(actor.app()?, actor.token()?, id, json!({"action":"cancel","mutation_id":Uuid::new_v4()})).await?;
         phase(actor.app()?, actor.token()?, id, "cancelled", None).await?;
         actor.state()?.marketplace.fixture_original_installation().fixture_join_original(id).await?;
         ensure!(installed_record(&actor, &sources[0], instance).await? == original && grant(&actor, &sources[1]).await? == approved,
             "cancellation changed installed source or lost the real owner approval");
+        provider(actor.state()?, &actor.rig.database, user, instance, "1.0.0").await?;
+        eprintln!("{}", json!({"stage":"storage_update_original_cancel_joined","old_version_invoked_after_cleanup":true}));
         let updated = install_with_updates(actor.app()?, actor.state()?, actor.token()?, &sources[1], Some(instance), true, false).await?;
         ensure!(updated == instance, "retry replaced configured instance");
         provider(actor.state()?, &actor.rig.database, user, instance, "1.1.0").await?;
         ensure!(grant(&actor, &sources[1]).await?.2 == 0, "manual retry enabled unattended updates");
         eprintln!("{}", json!({"stage":"storage_update_recovery_verified","original_installed_record_unchanged":true,
-            "old_version_invoked_after_failure":true,"original_cancel_joined":true,"original_mode_restored":true,
+            "old_version_invoked_after_cleanup":true,"original_cancel_joined":true,"original_mode_restored":true,
             "same_instance_updated":true,"updated_version_invoked":true,"automatic_updates_disabled":true,"same_original_identity":true}));
         Ok::<_, anyhow::Error>(())
     })).catch_unwind().await;
