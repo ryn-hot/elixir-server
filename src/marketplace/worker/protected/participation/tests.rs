@@ -396,6 +396,7 @@ struct Observed {
     background: Mutex<Vec<(bool, bool)>>,
     background_requests_completed: Mutex<Vec<usize>>,
     requests_completed: AtomicUsize,
+    request_order: Mutex<Vec<bool>>,
     transfer_completed: AtomicUsize,
     defer_requests: AtomicBool,
     deferred: Notify,
@@ -455,6 +456,11 @@ impl Network for Fixture {
         Ok(true)
     }
     async fn request(&mut self, request: Request) -> Option<Request> {
+        self.observed
+            .request_order
+            .lock()
+            .unwrap()
+            .push(request.local_catalog_read());
         if self.observed.defer_requests.load(Ordering::SeqCst)
             && matches!(&request, Request::Peer(..))
         {
@@ -842,6 +848,52 @@ async fn queued_foreground_work_precedes_background_ticks_and_bad_control_is_ter
     observed(&client, |s| s.phase == ParticipationPhase::Failed).await;
     assert!(owner.stop().await.is_err());
     assert_eq!(state.shutdowns.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_local_read_has_one_priority_turn_without_delaying_an_idle_read() -> Result<()> {
+    let (owner, _settings, state) = fixture();
+    let client = owner.client();
+    warmed(&client).await;
+
+    async fn compete(client: &ParticipationClient) -> Result<()> {
+        let (regular_send, regular_reply) = oneshot::channel();
+        let (local_send, local_reply) = oneshot::channel();
+        // Fill both slots before yielding, with regular arriving first.
+        client
+            .requests
+            .try_send(Request::Peer(fixture_peer(), query(), regular_send))
+            .ok()
+            .context("regular slot")?;
+        client
+            .local_reads
+            .try_send(Request::Cached(query(), local_send))
+            .ok()
+            .context("local slot")?;
+        assert!(local_reply.await??.request_id.is_some());
+        assert_eq!(regular_reply.await??.request_id, 1);
+        Ok(())
+    }
+
+    compete(&client).await?;
+    assert_eq!(*state.request_order.lock().unwrap(), [true, false]);
+    // Local can run even after using its preferred turn, if nobody else
+    // is ready. A subsequent contest still owes regular work its turn.
+    for _ in 0..2 {
+        assert!(
+            timeout(Duration::from_millis(50), client.request(query()))
+                .await??
+                .request_id
+                .is_some()
+        );
+    }
+    compete(&client).await?;
+    assert_eq!(
+        *state.request_order.lock().unwrap(),
+        [true, false, true, true, false, true]
+    );
+    owner.stop().await?;
     Ok(())
 }
 

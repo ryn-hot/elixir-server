@@ -220,9 +220,48 @@ struct RequestInbox {
     local_reads: mpsc::Receiver<Request>,
 }
 
+enum InboxWork {
+    Retry,
+    Transfer(Option<Request>),
+    Regular(Option<Request>),
+    Local(Option<Request>),
+}
+
 impl RequestInbox {
     fn is_empty(&self) -> bool {
         self.regular.is_empty() && self.transfer.is_empty() && self.local_reads.is_empty()
+    }
+
+    async fn next(
+        &mut self,
+        retry: &mut tokio::time::Interval,
+        deferred: bool,
+        local_turn: bool,
+    ) -> InboxWork {
+        use std::task::Poll::Ready;
+        std::future::poll_fn(|cx| {
+            // Check priority at wakeup, not when the idle actor first starts
+            // waiting. A queued transfer still wins over a local read.
+            if local_turn && !self.local_reads.is_empty() {
+                if let Ready(request) = self.transfer.poll_recv(cx) {
+                    return Ready(InboxWork::Transfer(request));
+                }
+                if let Ready(request) = self.local_reads.poll_recv(cx) {
+                    return Ready(InboxWork::Local(request));
+                }
+            }
+            if deferred && retry.poll_tick(cx).is_ready() {
+                return Ready(InboxWork::Retry);
+            }
+            if let Ready(request) = self.transfer.poll_recv(cx) {
+                return Ready(InboxWork::Transfer(request));
+            }
+            if !deferred && let Ready(request) = self.regular.poll_recv(cx) {
+                return Ready(InboxWork::Regular(request));
+            }
+            self.local_reads.poll_recv(cx).map(InboxWork::Local)
+        })
+        .await
     }
 }
 
@@ -2100,6 +2139,7 @@ async fn drive(
     catalog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pending = None;
+    let mut local_turn = true;
     let mut retry = tokio::time::interval(Duration::from_millis(250));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -2183,37 +2223,39 @@ async fn drive(
             result=protection.changed()=>{result.context("protection owner stopped")?;},
             _=tick.tick()=>{},
             _=catalog_tick.tick()=>{if pending.is_none() && requests.is_empty() {network.background(population,maintenance).await?;}},
-            _=retry.tick(),if pending.is_some()=>{
-                // Yield between polls so Off, host pressure and protection
-                // observations stay responsive while the existing bounded
-                // catalog job retires. Do not overlap that peer's packet RPC.
-                pending=network.request(pending.take().expect("pending request")).await;
-            },
-            request=requests.transfer.recv()=>{
-                let request=request.context("transfer clients stopped")?;
-                if !request.transfer_io() {
-                    bail!("invalid transfer-lane operation");
+            work=requests.next(&mut retry,pending.is_some(),local_turn)=>match work {
+                InboxWork::Retry=>{
+                    // Yield between polls so Off, host pressure and protection
+                    // observations stay responsive. Never overlap pipe calls.
+                    pending=network.request(pending.take().expect("pending request")).await;
+                    local_turn=true;
                 }
-                // These operations cannot be pre-dispatch deferred. Never
-                // displace the original pending request or send parallel IPC.
-                if network.request(request).await.is_some() {
-                    bail!("transfer I/O was unexpectedly deferred");
+                InboxWork::Transfer(request)=>{
+                    let request=request.context("transfer clients stopped")?;
+                    if !request.transfer_io() {
+                        bail!("invalid transfer-lane operation");
+                    }
+                    if network.request(request).await.is_some() {
+                        bail!("transfer I/O was unexpectedly deferred");
+                    }
                 }
-            },
-            request=requests.regular.recv(),if pending.is_none()=>{
-                let request=request.context("participation clients stopped")?;
-                pending=network.request(request).await;
-            },
-            request=requests.local_reads.recv()=>{
-                let request=request.context("local catalog clients stopped")?;
-                if !request.local_catalog_read() {
-                    bail!("invalid local catalog read");
+                InboxWork::Regular(request)=>{
+                    let request=request.context("participation clients stopped")?;
+                    pending=network.request(request).await;
+                    local_turn=true;
                 }
-                // The pending operation still owns its original deadline and
-                // receiver. These are existing local checks, never WAN work
-                // or authority, and cannot occupy the deferred slot.
-                if network.request(request).await.is_some() {
-                    bail!("local catalog read was unexpectedly deferred");
+                InboxWork::Local(request)=>{
+                    let request=request.context("local catalog clients stopped")?;
+                    if !request.local_catalog_read() {
+                        bail!("invalid local catalog read");
+                    }
+                    // The pending operation retains its deadline and receiver.
+                    if network.request(request).await.is_some() {
+                        bail!("local catalog read was unexpectedly deferred");
+                    }
+                    // Only one priority turn. Already-ready regular work can
+                    // then run, but an idle regular lane won't delay a read.
+                    local_turn=false;
                 }
             },
         }
