@@ -194,19 +194,36 @@ impl Request {
         matches!(self, Self::Sharing(..))
             || matches!(self, Self::Blob(operation, _) if transfer_io(operation))
     }
+
+    fn local_catalog_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Cached(
+                PeerOperation::Search { .. } | PeerOperation::GetHead { .. },
+                _
+            ) | Self::Heads(..)
+        )
+    }
 }
 
 fn transfer_io(operation: &WorkerControlOperation) -> bool {
     matches!(operation, WorkerControlOperation::BlobRead { .. })
 }
 
-// One slot per lane, still one serial native owner. A known-unsent metadata
-// request may wait through Checking without withholding the commands that
-// renew/drain an existing transfer. START/discovery never use this lane. CANCEL
-// stays ordered behind START so an early no-op cancel cannot launch work later.
+// One slot per lane, still one serial native owner. A cooperatively deferred
+// WAN request must not withhold existing transfer I/O or read-only local
+// hints. Offers, security writes, discovery and START/CANCEL stay on the
+// regular lane. In particular, CANCEL cannot acknowledge before its START.
 struct RequestInbox {
     regular: mpsc::Receiver<Request>,
     transfer: mpsc::Receiver<Request>,
+    local_reads: mpsc::Receiver<Request>,
+}
+
+impl RequestInbox {
+    fn is_empty(&self) -> bool {
+        self.regular.is_empty() && self.transfer.is_empty() && self.local_reads.is_empty()
+    }
 }
 
 // Local negative provenance only: try_send returned Full before any IPC.
@@ -242,6 +259,7 @@ pub struct ParticipationClient {
     database: Database,
     requests: mpsc::Sender<Request>,
     transfer_requests: mpsc::Sender<Request>,
+    local_reads: mpsc::Sender<Request>,
     status: watch::Receiver<ParticipationSnapshot>,
     protection: watch::Receiver<Snapshot>,
     credits: mpsc::Sender<CreditRequest<CommittedTransferReservation>>,
@@ -605,6 +623,15 @@ impl ParticipationClient {
         }
         snapshot
     }
+    fn request_queue(&self, request: &Request) -> &mpsc::Sender<Request> {
+        if request.transfer_io() {
+            &self.transfer_requests
+        } else if request.local_catalog_read() {
+            &self.local_reads
+        } else {
+            &self.requests
+        }
+    }
     async fn enqueue<T>(&self, request: Request, reply: oneshot::Receiver<Result<T>>) -> Result<T> {
         let acknowledgement = match &request {
             // These requests may retain their ORIGINAL receiver while a known
@@ -622,17 +649,14 @@ impl ParticipationClient {
         ) {
             bail!("marketplace participation is unavailable");
         }
-        let queue = if request.transfer_io() {
-            &self.transfer_requests
-        } else {
-            &self.requests
-        };
-        queue.try_send(request).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => anyhow::Error::from(RequestQueueBusy),
-            mpsc::error::TrySendError::Closed(_) => {
-                anyhow::anyhow!("marketplace request owner stopped")
-            }
-        })?;
+        self.request_queue(&request)
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => anyhow::Error::from(RequestQueueBusy),
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("marketplace request owner stopped")
+                }
+            })?;
         timeout(acknowledgement, reply)
             .await
             .context("marketplace request acknowledgement deadline")?
@@ -674,7 +698,7 @@ impl ParticipationClient {
         };
         current()?;
         let deadline = Instant::now() + Duration::from_secs(30);
-        let permit = tokio::time::timeout_at(deadline, self.requests.reserve())
+        let permit = tokio::time::timeout_at(deadline, self.request_queue(&request).reserve())
             .await
             .context("marketplace local capacity deadline before dispatch")?
             .context("marketplace request owner stopped before dispatch")?;
@@ -1469,6 +1493,7 @@ impl ParticipatingWorker {
         let faults = worker.supervisor.faults.clone();
         let (requests, receiver) = mpsc::channel(1);
         let (transfer_requests, transfer_receiver) = mpsc::channel(1);
+        let (local_reads, local_receiver) = mpsc::channel(1);
         let (status, observed) = watch::channel(ParticipationSnapshot::default());
         let (stop, stopped) = oneshot::channel();
         let (retirement_owner, retirement) = retirement::channel();
@@ -1487,6 +1512,7 @@ impl ParticipatingWorker {
             source_jobs: Some(source),
             requests,
             transfer_requests,
+            local_reads,
             status: observed,
             protection: protection.clone(),
             credits,
@@ -1515,6 +1541,7 @@ impl ParticipatingWorker {
             RequestInbox {
                 regular: receiver,
                 transfer: transfer_receiver,
+                local_reads: local_receiver,
             },
             status,
             retirement_owner,
@@ -2155,7 +2182,7 @@ async fn drive(
             result=facts.changed()=>{result.context("host observation owner stopped")?;},
             result=protection.changed()=>{result.context("protection owner stopped")?;},
             _=tick.tick()=>{},
-            _=catalog_tick.tick()=>{if pending.is_none() && requests.regular.is_empty() && requests.transfer.is_empty() {network.background(population,maintenance).await?;}},
+            _=catalog_tick.tick()=>{if pending.is_none() && requests.is_empty() {network.background(population,maintenance).await?;}},
             _=retry.tick(),if pending.is_some()=>{
                 // Yield between polls so Off, host pressure and protection
                 // observations stay responsive while the existing bounded
@@ -2176,6 +2203,18 @@ async fn drive(
             request=requests.regular.recv(),if pending.is_none()=>{
                 let request=request.context("participation clients stopped")?;
                 pending=network.request(request).await;
+            },
+            request=requests.local_reads.recv()=>{
+                let request=request.context("local catalog clients stopped")?;
+                if !request.local_catalog_read() {
+                    bail!("invalid local catalog read");
+                }
+                // The pending operation still owns its original deadline and
+                // receiver. These are existing local checks, never WAN work
+                // or authority, and cannot occupy the deferred slot.
+                if network.request(request).await.is_some() {
+                    bail!("local catalog read was unexpectedly deferred");
+                }
             },
         }
     }

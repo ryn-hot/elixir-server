@@ -45,6 +45,7 @@ pub(in crate::marketplace) fn owner() -> Owner {
                     .unwrap(),
             },
             transfer_requests: requests.clone(),
+            local_reads: requests.clone(),
             requests,
             status: seen,
             protection: observed,

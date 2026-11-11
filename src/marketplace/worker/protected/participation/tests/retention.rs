@@ -105,6 +105,7 @@ impl RetentionFixture {
                 blob_sharing: false,
                 database,
                 transfer_requests: requests.clone(),
+                local_reads: requests.clone(),
                 requests,
                 status: seen,
                 protection: protected,

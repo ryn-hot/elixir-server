@@ -189,6 +189,7 @@ impl Fixture {
                 pool: sqlx::any::AnyPoolOptions::new().connect_lazy("sqlite::memory:")?,
             },
             transfer_requests: requests.clone(),
+            local_reads: requests.clone(),
             requests,
             status: seen,
             protection: observed,

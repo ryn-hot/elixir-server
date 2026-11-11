@@ -168,6 +168,14 @@ fn query() -> PeerOperation {
         cursor: None,
     }
 }
+fn fixture_peer() -> PeerKey {
+    PeerKey::try_from("1".repeat(64)).unwrap()
+}
+fn fixture_local_head() -> ExtensionId {
+    "elx:gr2q7gf5lh6pzfdnurnkvputhpqvjjfvbfhbysv7ikdgkbptzf7a/fixture-provider"
+        .parse()
+        .unwrap()
+}
 
 #[tokio::test]
 async fn only_typed_predispatch_deferral_retains_the_original_receiver() -> Result<()> {
@@ -447,7 +455,9 @@ impl Network for Fixture {
         Ok(true)
     }
     async fn request(&mut self, request: Request) -> Option<Request> {
-        if self.observed.defer_requests.load(Ordering::SeqCst) && !request.transfer_io() {
+        if self.observed.defer_requests.load(Ordering::SeqCst)
+            && matches!(&request, Request::Peer(..))
+        {
             self.observed.deferred.notify_one();
             return Some(request);
         }
@@ -510,6 +520,15 @@ impl Network for Fixture {
                     schema_version: 1,
                     request_id: Some(1),
                     response: elixir_marketplace::peer::PeerOutcome::Rejected {
+                        code: elixir_marketplace::peer::RejectionCode::Stale,
+                    },
+                }));
+            }
+            Request::Peer(_, _, reply) | Request::Heads(_, reply) => {
+                let _ = reply.send(Ok(WorkerControlResponse {
+                    schema_version: 1,
+                    request_id: 1,
+                    control_response: WorkerControlOutcome::Rejected {
                         code: elixir_marketplace::peer::RejectionCode::Stale,
                     },
                 }));
@@ -601,6 +620,7 @@ fn fixture() -> (
     );
     let (requests, receiver) = mpsc::channel(1);
     let (transfer_requests, transfer_receiver) = mpsc::channel(1);
+    let (local_reads, local_receiver) = mpsc::channel(1);
     let (status, seen) = watch::channel(ParticipationSnapshot::default());
     let (stop, stopped) = oneshot::channel();
     let (retirement_owner, retirement) = retirement::channel();
@@ -621,6 +641,7 @@ fn fixture() -> (
         security_mirror: None,
         requests,
         transfer_requests,
+        local_reads,
         status: seen,
         protection: protection.clone(),
         credits,
@@ -640,6 +661,7 @@ fn fixture() -> (
         RequestInbox {
             regular: receiver,
             transfer: transfer_receiver,
+            local_reads: local_receiver,
         },
         status,
         retirement_owner,
@@ -799,7 +821,7 @@ async fn queued_foreground_work_precedes_background_ticks_and_bad_control_is_ter
     let (send, reply) = oneshot::channel();
     assert!(
         client
-            .requests
+            .local_reads
             .try_send(Request::Cached(query(), send))
             .is_ok()
     );
@@ -835,7 +857,7 @@ async fn deferred_foreground_requests_pause_new_background_work_without_blocking
     other.stop().await?;
     state.defer_requests.store(true, Ordering::SeqCst);
     let asking = client.clone();
-    let task = tokio::spawn(async move { asking.request(query()).await });
+    let task = tokio::spawn(async move { asking.request_peer(fixture_peer(), query()).await });
     state.deferred.notified().await;
     state.background.lock().unwrap().clear();
     settings.send_replace(ParticipationSettings {
@@ -852,7 +874,70 @@ async fn deferred_foreground_requests_pause_new_background_work_without_blocking
     assert!(!task.is_finished());
     state.defer_requests.store(false, Ordering::SeqCst);
     step(1).await;
-    assert!(task.await??.request_id.is_some());
+    assert_eq!(task.await??.request_id, 1);
+    owner.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_wan_request_and_full_regular_slot_do_not_block_local_catalog_reads() -> Result<()>
+{
+    let (owner, _settings, state) = fixture();
+    let client = owner.client();
+    warmed(&client).await;
+    state.defer_requests.store(true, Ordering::SeqCst);
+    let asking = client.clone();
+    let original = tokio::spawn(async move { asking.request_peer(fixture_peer(), query()).await });
+    state.deferred.notified().await;
+    let (queued, mut queued_reply) = oneshot::channel();
+    client
+        .requests
+        .try_send(Request::Peer(fixture_peer(), query(), queued))
+        .ok()
+        .context("one queued WAN request")?;
+    let id = fixture_local_head();
+    timeout(Duration::from_millis(50), async {
+        assert!(client.request(query()).await?.request_id.is_some());
+        let (send, reply) = oneshot::channel();
+        assert!(
+            client
+                .enqueue_after_capacity(
+                    Request::Cached(
+                        PeerOperation::GetHead {
+                            extension_id: id.clone()
+                        },
+                        send
+                    ),
+                    reply
+                )
+                .await?
+                .request_id
+                .is_some()
+        );
+        let (send, reply) = oneshot::channel();
+        assert_eq!(
+            client
+                .enqueue_after_capacity(Request::Heads(vec![id], send), reply)
+                .await?
+                .request_id,
+            1
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("local reads waited behind deferred WAN work")??;
+    assert_eq!(state.requests_completed.load(Ordering::SeqCst), 3);
+    assert!(!original.is_finished());
+    assert!(matches!(
+        queued_reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(client.requests.capacity(), 0);
+    state.defer_requests.store(false, Ordering::SeqCst);
+    step(1).await;
+    assert_eq!(original.await??.request_id, 1);
+    assert_eq!(queued_reply.await??.request_id, 1);
+    assert_eq!(state.requests_completed.load(Ordering::SeqCst), 5);
     owner.stop().await?;
     Ok(())
 }
@@ -872,12 +957,12 @@ async fn deferred_metadata_and_full_regular_slot_do_not_starve_transfer_io() -> 
     );
     state.defer_requests.store(true, Ordering::SeqCst);
     let asking = client.clone();
-    let original = tokio::spawn(async move { asking.request(query()).await });
+    let original = tokio::spawn(async move { asking.request_peer(fixture_peer(), query()).await });
     state.deferred.notified().await;
     let (queued, queued_reply) = oneshot::channel();
     client
         .requests
-        .try_send(Request::Cached(query(), queued))
+        .try_send(Request::Peer(fixture_peer(), query(), queued))
         .ok()
         .context("one queued metadata request")?;
     assert_eq!(client.requests.capacity(), 0);
@@ -935,7 +1020,7 @@ async fn deferred_metadata_and_full_regular_slot_do_not_starve_transfer_io() -> 
 }
 
 #[tokio::test(start_paused = true)]
-async fn transfer_lane_remains_one_slot_and_stop_cancels_both_lanes() -> Result<()> {
+async fn all_lanes_remain_bounded_and_stop_cancels_active_and_queued_calls() -> Result<()> {
     let (owner, _settings, state) = fixture();
     let client = owner.client();
     warmed(&client).await;
@@ -946,7 +1031,7 @@ async fn transfer_lane_remains_one_slot_and_stop_cancels_both_lanes() -> Result<
     let (regular, regular_reply) = oneshot::channel();
     client
         .requests
-        .try_send(Request::Cached(query(), regular))
+        .try_send(Request::Peer(fixture_peer(), query(), regular))
         .ok()
         .context("fill regular lane")?;
     let (transfer, transfer_reply) = oneshot::channel();
@@ -958,8 +1043,15 @@ async fn transfer_lane_remains_one_slot_and_stop_cancels_both_lanes() -> Result<
         ))
         .ok()
         .context("fill transfer lane")?;
+    let (local, local_reply) = oneshot::channel();
+    client
+        .local_reads
+        .try_send(Request::Cached(query(), local))
+        .ok()
+        .context("fill local lane")?;
     assert_eq!(client.requests.max_capacity(), 1);
     assert_eq!(client.transfer_requests.max_capacity(), 1);
+    assert_eq!(client.local_reads.max_capacity(), 1);
     let (extra, extra_reply) = oneshot::channel();
     let error = client
         .enqueue(
@@ -973,6 +1065,7 @@ async fn transfer_lane_remains_one_slot_and_stop_cancels_both_lanes() -> Result<
     assert!(original.await?.is_err());
     assert!(regular_reply.await.is_err());
     assert!(transfer_reply.await.is_err());
+    assert!(local_reply.await.is_err());
     assert_eq!(state.cancelled.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -985,7 +1078,7 @@ async fn transfer_lane_does_not_bypass_off_while_metadata_is_deferred() -> Resul
     warmed(&client).await;
     state.defer_requests.store(true, Ordering::SeqCst);
     let asking = client.clone();
-    let original = tokio::spawn(async move { asking.request(query()).await });
+    let original = tokio::spawn(async move { asking.request_peer(fixture_peer(), query()).await });
     state.deferred.notified().await;
     settings.send_replace(ParticipationSettings {
         mode: ContributionMode::Off,
@@ -1118,7 +1211,7 @@ async fn one_request_slot_rejects_overflow_and_owner_stop_preempts_a_stalled_cat
     let (send, queued) = oneshot::channel();
     assert!(
         client
-            .requests
+            .local_reads
             .try_send(Request::Cached(query(), send))
             .is_ok()
     );
