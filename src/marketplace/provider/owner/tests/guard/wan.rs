@@ -395,6 +395,8 @@ async fn qualify_owned_wan(mixed: bool) -> Result<()> {
     } else {
         worker_image.clone()
     };
+    let observe_dial = mixed
+        && std::env::var("ELIXIR_MARKETPLACE_MIXED_NOISE_DIAL_OBSERVATION").as_deref() == Ok("1");
     let runtime: Arc<dyn RuntimeManager> = Arc::new(DockerRuntimeManager::new(None));
     for (index, image) in [&worker_image, &second_image].into_iter().enumerate() {
         let labels = runtime.image_labels(image).await?;
@@ -420,6 +422,13 @@ async fn qualify_owned_wan(mixed: bool) -> Result<()> {
                 ensure!(
                     label("onion_publication_ready") == Some("0"),
                     "candidate must not be publishable"
+                );
+            }
+            if observe_dial {
+                ensure!(
+                    label("private_discovery_trace") == Some("1")
+                        && label("onion_publication_ready") == Some("0"),
+                    "dial observation requires both private trace images"
                 );
             }
         }
@@ -457,13 +466,13 @@ async fn qualify_owned_wan(mixed: bool) -> Result<()> {
                 != b.worker()?.profile().container_spec().network_mode,
             "WAN workers did not have independent namespaces"
         );
-        exchange_empty_catalog(&mut a, &mut b).await?;
+        exchange_empty_catalog(&mut a, &mut b, observe_dial.then_some("baseline")).await?;
         if mixed {
             eprintln!(
                 "{}",
                 serde_json::json!({"stage":"mixed_noise_direction_verified","catalog":"baseline"})
             );
-            exchange_empty_catalog(&mut b, &mut a).await?;
+            exchange_empty_catalog(&mut b, &mut a, observe_dial.then_some("candidate")).await?;
             eprintln!(
                 "{}",
                 serde_json::json!({"stage":"mixed_noise_direction_verified","catalog":"candidate"})
@@ -508,7 +517,59 @@ async fn qualify_owned_wan(mixed: bool) -> Result<()> {
     Ok(())
 }
 
-async fn exchange_empty_catalog(a: &mut Rig, b: &mut Rig) -> Result<()> {
+const READINESS_WINDOW: Duration = Duration::from_secs(90);
+// Test-only observation of the already in-flight consumer dial: Tor's 120 s
+// SOCKS allowance, Noise's 15 s allowance and one polling margin. This never
+// changes the worker's deadlines, refreshes discovery, or starts a new dial.
+const DIAL_OBSERVATION_WINDOW: Duration = Duration::from_secs(140);
+
+fn wait_for_wan_peer(
+    elapsed: Duration,
+    observe: bool,
+    first_dial: Option<Duration>,
+    pending: bool,
+) -> bool {
+    elapsed < READINESS_WINDOW
+        || (observe
+            && pending
+            && first_dial.is_some_and(|started| {
+                elapsed < started.min(READINESS_WINDOW) + DIAL_OBSERVATION_WINDOW
+            }))
+}
+
+#[test]
+fn wan_observation_extends_only_for_a_pending_dial_within_a_fixed_window() {
+    let seconds = Duration::from_secs;
+    assert!(wait_for_wan_peer(seconds(89), false, None, false));
+    assert!(!wait_for_wan_peer(
+        seconds(90),
+        false,
+        Some(seconds(5)),
+        true
+    ));
+    assert!(!wait_for_wan_peer(seconds(90), true, None, false));
+    assert!(!wait_for_wan_peer(
+        seconds(90),
+        true,
+        Some(seconds(5)),
+        false
+    ));
+    assert!(wait_for_wan_peer(seconds(90), true, Some(seconds(5)), true));
+    assert!(!wait_for_wan_peer(
+        seconds(145),
+        true,
+        Some(seconds(5)),
+        true
+    ));
+    assert!(!wait_for_wan_peer(
+        seconds(230),
+        true,
+        Some(seconds(110)),
+        true
+    ));
+}
+
+async fn exchange_empty_catalog(a: &mut Rig, b: &mut Rig, observation: Option<&str>) -> Result<()> {
     let database = a.database.clone();
     a.worker()?.reconcile_native_catalog(&database).await?;
     let topic = Digest::of(uuid::Uuid::new_v4().as_bytes());
@@ -533,25 +594,61 @@ async fn exchange_empty_catalog(a: &mut Rig, b: &mut Rig) -> Result<()> {
         "WAN consumer roles differ"
     );
     eprintln!("WAN stage: both public discovery roles started");
-    let until = tokio::time::Instant::now() + Duration::from_secs(90);
-    let (catalog_peer, consumer_peer) = loop {
+    let started = tokio::time::Instant::now();
+    let mut first_dial = None;
+    let mut readiness_missed = false;
+    let (catalog_peer, consumer_peer, ready_elapsed, pending_at_ready) = loop {
         let left = a.worker()?.network_status().await?;
         let right = b.worker()?.network_status().await?;
         left.within_limits(&NetworkLimits::default())?;
         right.within_limits(&NetworkLimits::default())?;
+        let elapsed = started.elapsed();
+        let pending = right.pending_dials > 0;
+        if pending && elapsed < READINESS_WINDOW {
+            first_dial.get_or_insert(elapsed);
+        }
+        if let Some(catalog) = observation
+            && elapsed >= READINESS_WINDOW
+            && !readiness_missed
+        {
+            readiness_missed = true;
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"mixed_noise_readiness_missed","catalog":catalog,
+                    "elapsed_ms":elapsed.as_millis(),"pending":pending})
+            );
+        }
         if left.peers.len() == 1 && right.peers.len() == 1 {
             ensure!(
                 right.peers[0] != left.peers[0],
                 "WAN peers were not distinct"
             );
-            break (right.peers[0].clone(), left.peers[0].clone());
+            break (
+                right.peers[0].clone(),
+                left.peers[0].clone(),
+                elapsed,
+                pending,
+            );
         }
-        ensure!(
-            tokio::time::Instant::now() < until,
-            "actual WAN discovery/Noise did not converge"
-        );
+        if !wait_for_wan_peer(elapsed, observation.is_some(), first_dial, pending) {
+            if let Some(catalog) = observation {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"stage":"mixed_noise_peer_observation_finished","catalog":catalog,
+                        "elapsed_ms":elapsed.as_millis(),"ready":false,"pending":pending})
+                );
+            }
+            anyhow::bail!("actual WAN discovery/Noise did not converge");
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
+    if let Some(catalog) = observation {
+        eprintln!(
+            "{}",
+            serde_json::json!({"stage":"mixed_noise_peer_observation_finished","catalog":catalog,
+                "elapsed_ms":ready_elapsed.as_millis(),"ready":true,"pending":pending_at_ready})
+        );
+    }
     ready(b.worker()?).await?;
     let response = b
         .worker()?
