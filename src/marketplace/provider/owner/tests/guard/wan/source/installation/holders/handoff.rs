@@ -28,7 +28,7 @@ async fn isolated_route_loss_closes_old_authority_and_recovers_without_direct_eg
 
 #[tokio::test]
 #[ignore = "standing-approved one free identity; remove exact VPN route while retaining physical default; captured fresh-source denial and normal recovery"]
-async fn vpn_route_loss_with_unchanged_physical_uplink_denies_fresh_source() -> Result<()> {
+async fn vpn_route_loss_preserves_uplink_through_observed_protection_closure() -> Result<()> {
     ensure!(
         std::env::var("ELIXIR_MARKETPLACE_VPN_ROUTE_LOSS_CAPTURE").as_deref() == Ok("1"),
         "explicit isolated VPN-route-loss capture required"
@@ -84,15 +84,22 @@ async fn qualify(fault: Fault) -> Result<()> {
             crate::marketplace::provider::guard::test_capture::finish().await?;
         }
         eprintln!("{}", json!({"stage":"handoff_initial_source_verified"}));
+        let mut transition_source = None;
         if route_loss {
             // In VPN mode the observer applies and independently verifies the
             // exact namespace/table fault before acknowledging this marker.
             crate::marketplace::provider::guard::test_capture::route_loss().await?;
             if vpn_route_loss {
-                let denied = tokio::time::timeout(Duration::from_secs(30), Box::pin(stale.preflight_fresh_publication(&metadata, 0)))
-                    .await.context("original VPN-route source rejection deadline")?;
-                ensure!(denied.is_err(), "VPN route loss retained fresh public-source admission");
-                eprintln!("{}", json!({"stage":"vpn_route_loss_source_rejected","actual_fresh_source_request_denied":true}));
+                // The independent kernel policy still applies during the
+                // original bounded lease. Record the actual fetch outcome;
+                // do not end capture before normal route-health detection.
+                let attempted = tokio::time::timeout(Duration::from_secs(30), Box::pin(stale.preflight_fresh_publication(&metadata, 0)))
+                    .await.context("original VPN-route source attempt deadline")?;
+                if let Ok(source) = &attempted {
+                    ensure!(source.release_id() == sources[0].matched.release_id, "in-lease source attempt changed release");
+                }
+                eprintln!("{}", json!({"stage":"vpn_route_loss_source_attempted","returned_before_observed_closure":attempted.is_ok()}));
+                transition_source = attempted.ok();
             } else {
                 Box::pin(route_loss::apply(&actor, &image)).await?;
                 eprintln!("{}", json!({"stage":"isolated_route_loss_applied","actual_ipv4_default_removed":true,"host_routes_unchanged":true}));
@@ -159,6 +166,12 @@ async fn qualify(fault: Fault) -> Result<()> {
             "old network/source capability survived guard loss"
         );
         if route_loss {
+            if vpn_route_loss {
+                ensure!(transition_source.as_ref().is_none_or(|source| source.valid_for().is_zero()),
+                    "closed route authority retained a usable source observation");
+                eprintln!("{}", json!({"stage":"vpn_route_loss_source_rejected","actual_fresh_source_request_denied":true,
+                    "returned_receipt_usable":false}));
+            }
             crate::marketplace::provider::guard::test_capture::finish().await?;
             eprintln!("{}", json!({"stage":"isolated_route_loss_closed","old_capability_closed":true}));
         }
