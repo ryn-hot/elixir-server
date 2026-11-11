@@ -46,7 +46,7 @@ pub(super) struct PacketClient {
     host_sampled: bool,
     provider_initial_credit: bool,
 }
-const STAGES: [&str; 11] = [
+const STAGES: [&str; 16] = [
     "frame",
     "initial_read",
     "initial_shape",
@@ -58,6 +58,11 @@ const STAGES: [&str; 11] = [
     "usage",
     "reply",
     "host_resources",
+    "firewall_apply",
+    "firewall_commit",
+    "wireguard_secret",
+    "wireguard_config",
+    "command_expired",
 ];
 const ERROR_KINDS: [&str; 11] = [
     "Other",
@@ -541,6 +546,14 @@ mod tests {
         assert_eq!(
             diagnostic_stage(b"marketplace packet stage=host_resources kind=TimedOut\n"),
             11 | (2 << 8)
+        );
+        assert_eq!(
+            diagnostic_stage(b"marketplace packet stage=firewall_apply kind=TimedOut\n"),
+            12 | (2 << 8)
+        );
+        assert_eq!(
+            diagnostic_stage(b"marketplace packet stage=command_expired kind=TimedOut\n"),
+            16 | (2 << 8)
         );
         assert_eq!(
             diagnostic_stage(b"ignored\nmarketplace packet stage=probe kind=secret-value\n"),

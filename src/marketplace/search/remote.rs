@@ -593,7 +593,28 @@ impl Session {
             // Local pages are emitted before discovering or sampling peers.
             // A slow/offline onion network must not hold cached cards hostage.
             // Once needed, peer pages retain their own snapshot/cursor/queue.
-            for source in &mut self.sources {
+            // For the first browsable candidate, do not serially wait on the
+            // other peers after one returned data. It is still only a hint;
+            // admission, currentness and source checks run before display.
+            // After the first examined hint (including rejection), preserve
+            // the ordinary merge and its fallback scheduling.
+            // Automatic update checks keep their existing scheduling.
+            let first_hint = emission_limit == 1 && self.page_examined == 0 && !self.remote_only;
+            let count = self.sources.len();
+            let buffered = first_hint
+                && self
+                    .sources
+                    .iter()
+                    .any(|s| s.enabled && !s.pending.is_empty());
+            for offset in 0..if buffered { 0 } else { count } {
+                // Reuse the emission rotor when recovering from an omitted
+                // first hint; an earlier source cannot monopolize the slot.
+                let index = if first_hint {
+                    (self.next + offset) % count
+                } else {
+                    offset
+                };
+                let source = &mut self.sources[index];
                 if source.enabled
                     && !source.done
                     && source.pending.is_empty()
@@ -658,6 +679,9 @@ impl Session {
                     source.cursor = page.next_cursor;
                     source.done = source.cursor.is_none() || source.pages >= MAX_SOURCE_PAGES;
                     source.pending = page.results.into();
+                    if first_hint && !source.pending.is_empty() {
+                        break;
+                    }
                 }
             }
             while results.len() < emission_limit.min(query.limit)

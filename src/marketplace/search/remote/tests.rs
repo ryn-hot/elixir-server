@@ -775,6 +775,77 @@ async fn cached_first_cards_do_not_wait_for_or_contact_peer_discovery() -> Resul
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn first_remote_hint_does_not_wait_for_the_next_peer_but_keeps_its_work() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct FastThenSlow {
+        fetched: AtomicUsize,
+        second_ready: AtomicBool,
+    }
+    #[async_trait]
+    impl Transport for FastThenSlow {
+        async fn peers(&self, _: &Interest) -> Result<Vec<PeerKey>> {
+            Ok(vec![peer(1), peer(2)])
+        }
+        async fn fetch(
+            &self,
+            location: &Location,
+            _: &SearchQuery,
+            cursor: Option<String>,
+            _: &Interest,
+        ) -> Result<SearchPage> {
+            assert!(cursor.is_none(), "each peer gets its own fresh search");
+            let results = if matches!(location, Location::Peer(_)) {
+                let n = self.fetched.fetch_add(1, Ordering::SeqCst);
+                if n > 0 && !self.second_ready.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                vec![candidate(n + 1)]
+            } else {
+                vec![]
+            };
+            Ok(SearchPage {
+                schema_version: SCHEMA_VERSION,
+                snapshot_id: Digest::of(b"private pagination fixture"),
+                results,
+                next_cursor: None,
+                network_complete: false,
+                metadata_only: true,
+            })
+        }
+    }
+    let (_owner, interest, request) = context(20);
+    let transport = FastThenSlow::default();
+    let mut session = Session::default();
+    session.begin_page();
+    let page = tokio::time::timeout(
+        Duration::from_millis(100),
+        session.read_chunk(&transport, &request, &interest, 1),
+    )
+    .await??;
+    assert_eq!(transport.fetched.load(Ordering::SeqCst), 1);
+    assert_eq!(page.results.len(), 1);
+    assert!(!page.network_complete && page.next_cursor.is_some());
+    assert!(session.admitted.is_empty(), "a peer hint is not admission");
+    let id = Digest::of(canonical::to_vec(&page.results[0].descriptor)?);
+    session.admission_result(id, AdmissionFeedback::Accepted)?;
+    transport.second_ready.store(true, Ordering::SeqCst);
+    let remainder = session
+        .more_from(&transport, &request, &interest)
+        .await?
+        .unwrap();
+    assert_eq!(transport.fetched.load(Ordering::SeqCst), 2);
+    assert_eq!(remainder.results.len(), 1);
+    assert_ne!(
+        remainder.results[0].descriptor.to_bytes()?,
+        page.results[0].descriptor.to_bytes()?
+    );
+    assert!(!remainder.network_complete);
+    Ok(())
+}
+
 #[tokio::test]
 async fn local_results_precede_peer_discovery_and_errors_do_not_hide_a_local_page() -> Result<()> {
     let (_owner, interest, request) = context(20);

@@ -75,8 +75,18 @@ async fn discover_pair(actors: &[Participant]) -> Result<()> {
     let until = tokio::time::Instant::now() + Duration::from_secs(600);
     let mut refresh = tokio::time::Instant::now();
     loop {
-        let a = actors[0].client()?.network_status().await?;
-        let b = actors[1].client()?.network_status().await?;
+        let a = actors[0]
+            .client()
+            .context("publisher client unavailable during peer discovery")?
+            .network_status()
+            .await
+            .context("publisher network status failed during peer discovery")?;
+        let b = actors[1]
+            .client()
+            .context("consumer client unavailable during peer discovery")?
+            .network_status()
+            .await
+            .context("consumer network status failed during peer discovery")?;
         a.within_limits(&NetworkLimits::default())?;
         b.within_limits(&NetworkLimits::default())?;
         if a.peers.len() == 1 && b.peers.len() == 1 && a.peers[0] != b.peers[0] {
@@ -533,9 +543,6 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
         // error transcript; never require a second live run just to recover
         // the cause. These approved synthetic-only test logs remain private.
         for (index, actor) in actors.iter().enumerate() {
-            if let Ok(client) = actor.client() {
-                eprintln!("{}", failure_snapshot(index + 1, &client.snapshot()));
-            }
             if let Some(state) = &actor.state
                 && let Ok((original, cleanup)) =
                     state.marketplace.fixture_original_installation_failures()
@@ -551,6 +558,20 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
                             index + 1
                         );
                     }
+                }
+            }
+            if let Some(state) = &actor.state {
+                // Read-only diagnostic even when a failed owner cannot vend a
+                // live client. A missing participation snapshot is not healthy.
+                let runtime = state.marketplace.snapshot();
+                if let Some(participation) = runtime.participation {
+                    eprintln!("{}", failure_snapshot(index + 1, &participation));
+                } else {
+                    eprintln!(
+                        "{}",
+                        json!({"stage":"cross_peer_failure_runtime","participant":index + 1,
+                            "phase":runtime.phase,"participation_available":false})
+                    );
                 }
             }
         }
