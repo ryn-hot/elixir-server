@@ -23,6 +23,7 @@ use crate::runtime::PrivateProcessStdio;
 
 const PRIVATE_DEADLINE: Duration = Duration::from_secs(10);
 const NETWORK_START_DEADLINE: Duration = Duration::from_secs(45);
+mod compact_search;
 
 fn control_deadline(base: Duration, operation: &WorkerControlOperation) -> Duration {
     // Preserve deliberately shorter diagnostic/test deadlines. Starting a WAN
@@ -44,6 +45,7 @@ pub struct PrivateWorkerClient {
     sequence: u32,
     poisoned: bool,
     deadline: Duration,
+    compact_search: Option<compact_search::SearchDictionary>,
 }
 
 impl PrivateWorkerClient {
@@ -83,6 +85,7 @@ impl PrivateWorkerClient {
             sequence: 0,
             poisoned: false,
             deadline,
+            compact_search: None,
         })
     }
 
@@ -97,6 +100,15 @@ impl PrivateWorkerClient {
     }
 
     pub async fn request(&mut self, operation: PeerOperation) -> Result<PeerResponse> {
+        let search = matches!(&operation, PeerOperation::Search { .. });
+        if self
+            .compact_search
+            .as_ref()
+            .is_some_and(|cache| !cache.is_empty())
+            && let PeerOperation::Search { query, cursor } = operation
+        {
+            return self.request_compact_search(query, cursor).await;
+        }
         let id = self.next_id()?;
         let request = PeerRequest {
             schema_version: 1,
@@ -115,24 +127,29 @@ impl PrivateWorkerClient {
                 )
             })
             .flatten();
-        self.exchange(
-            &encoded,
-            MAX_CONTROL_FRAME_BYTES,
-            self.deadline,
-            #[cfg(test)]
-            timing,
-            |bytes| {
-                let response = PeerResponse::parse(bytes)?;
-                if response.request_id != Some(id) {
-                    bail!("private response correlation mismatch");
-                }
-                if !peer_kind_matches(&request.request, &response.response) {
-                    bail!("private response operation differs from request");
-                }
-                Ok(response)
-            },
-        )
-        .await
+        let response = self
+            .exchange(
+                &encoded,
+                MAX_CONTROL_FRAME_BYTES,
+                self.deadline,
+                #[cfg(test)]
+                timing,
+                |bytes| {
+                    let response = PeerResponse::parse(bytes)?;
+                    if response.request_id != Some(id) {
+                        bail!("private response correlation mismatch");
+                    }
+                    if !peer_kind_matches(&request.request, &response.response) {
+                        bail!("private response operation differs from request");
+                    }
+                    Ok(response)
+                },
+            )
+            .await?;
+        if search && let Some(cache) = &mut self.compact_search {
+            *cache = compact_search::SearchDictionary::from_response(&response)?;
+        }
+        Ok(response)
     }
 
     /// Controller-scheduled cache work only. The caller separately admits the
@@ -167,18 +184,16 @@ impl PrivateWorkerClient {
         let reply_limit = request.control.reply_limit();
         let deadline = control_deadline(self.deadline, &request.control);
         #[cfg(test)]
-        let timing = matches!(
-            &request.control,
-            WorkerControlOperation::CatalogHeads { .. }
-        )
-        .then(|| {
-            super::search_timing::Rpc::begin(
-                id,
-                super::search_timing::RpcKind::CatalogHeads,
-                encoded.len(),
-            )
-        })
-        .flatten();
+        let timing = match &request.control {
+            WorkerControlOperation::CatalogHeads { .. } => {
+                Some(super::search_timing::RpcKind::CatalogHeads)
+            }
+            WorkerControlOperation::CatalogSearch { .. } => {
+                Some(super::search_timing::RpcKind::LocalSearch)
+            }
+            _ => None,
+        }
+        .and_then(|kind| super::search_timing::Rpc::begin(id, kind, encoded.len()));
         self.exchange(
             &encoded,
             reply_limit,
@@ -327,6 +342,18 @@ fn peer_kind_matches(request: &PeerOperation, response: &PeerOutcome) -> bool {
 fn control_kind_matches(request: &WorkerControlOperation, response: &WorkerControlOutcome) -> bool {
     match (request, response) {
         (_, WorkerControlOutcome::Rejected { .. }) => true,
+        (
+            WorkerControlOperation::CatalogSearch { query, known, .. },
+            WorkerControlOutcome::CatalogSearch { page },
+        ) => {
+            page.results.len() <= query.limit
+                && page.results.iter().all(|row| match row {
+                    elixir_marketplace::worker_control::CatalogSearchResult::Reference(row) => {
+                        known.contains(&row.descriptor_id)
+                    }
+                    elixir_marketplace::worker_control::CatalogSearchResult::Full(_) => true,
+                })
+        }
         (
             WorkerControlOperation::CatalogHeads { extension_ids },
             WorkerControlOutcome::CatalogHeads { rows },

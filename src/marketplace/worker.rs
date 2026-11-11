@@ -232,6 +232,17 @@ impl WorkerProcess {
                 bail!("fixed worker did not become ready");
             }
             let isolation = inspect_fixed_worker(runtime, &handle, &profile).await?;
+            if runtime
+                .image_labels(&profile.container_spec().image)
+                .await
+                .is_ok_and(|labels| {
+                    labels
+                        .get("elixir.marketplace.worker.compact_search")
+                        .is_some_and(|value| value == "1")
+                })
+            {
+                client.enable_compact_search();
+            }
             Ok((client, isolation))
         }
         .await;
