@@ -1644,7 +1644,12 @@ trait Network: Send + 'static {
     fn applied(&self) -> Option<NetworkRoles>;
     async fn apply(&mut self, roles: NetworkRoles) -> Result<bool>;
     async fn request(&mut self, request: Request) -> Option<Request>;
-    async fn background(&mut self, population: bool, maintenance: bool) -> Result<()>;
+    async fn background(
+        &mut self,
+        population: bool,
+        maintenance: bool,
+        still_idle: &(dyn Fn() -> bool + Sync),
+    ) -> Result<()>;
     async fn shutdown(self) -> Result<crate::marketplace::lifecycle::Exit>;
 }
 struct Live {
@@ -1906,11 +1911,19 @@ impl Network for Live {
         }
         None
     }
-    async fn background(&mut self, population: bool, maintenance: bool) -> Result<()> {
+    async fn background(
+        &mut self,
+        population: bool,
+        maintenance: bool,
+        still_idle: &(dyn Fn() -> bool + Sync),
+    ) -> Result<()> {
         if !self.security_mirror.current(&self.database).await? {
             return Ok(());
         }
-        if (!population && !maintenance) || !self.worker.catalog_jobs_supported() {
+        // The first gate was checked before the durable read. Let an arrived
+        // request or newer host/protection observation run before another IPC.
+        // Once a command is sent, always join its original reply.
+        if !still_idle() || (!population && !maintenance) || !self.worker.catalog_jobs_supported() {
             return Ok(());
         }
         let Some(state) = self
@@ -1921,7 +1934,7 @@ impl Network for Live {
             return Ok(());
         };
         self.catalog_progress.observed(&state);
-        if state.phase == CatalogJobPhase::Running {
+        if state.phase == CatalogJobPhase::Running || !still_idle() {
             return Ok(());
         }
         if maintenance && Instant::now() >= self.next_maintenance {
@@ -1935,6 +1948,9 @@ impl Network for Live {
             }
         } else if population {
             let status = self.worker.network_status().await?;
+            if !still_idle() {
+                return Ok(());
+            }
             if status.peers.is_empty() {
                 self.worker.refresh_background_network().await?;
                 return Ok(());
@@ -2222,7 +2238,15 @@ async fn drive(
             result=facts.changed()=>{result.context("host observation owner stopped")?;},
             result=protection.changed()=>{result.context("protection owner stopped")?;},
             _=tick.tick()=>{},
-            _=catalog_tick.tick()=>{if pending.is_none() && requests.is_empty() {network.background(population,maintenance).await?;}},
+            _=catalog_tick.tick()=>{
+                let still_idle = || requests.is_empty()
+                    && matches!(settings.has_changed(), Ok(false))
+                    && matches!(facts.has_changed(), Ok(false))
+                    && matches!(protection.has_changed(), Ok(false));
+                if pending.is_none() && still_idle() {
+                    network.background(population, maintenance, &still_idle).await?;
+                }
+            },
             work=requests.next(&mut retry,pending.is_some(),local_turn)=>match work {
                 InboxWork::Retry=>{
                     // Yield between polls so Off, host pressure and protection

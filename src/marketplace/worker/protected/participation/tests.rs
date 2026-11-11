@@ -401,6 +401,10 @@ struct Observed {
     defer_requests: AtomicBool,
     deferred: Notify,
     fail_background: AtomicBool,
+    hold_background_step: AtomicBool,
+    background_step_started: Notify,
+    background_step_resume: Notify,
+    background_yielded: AtomicUsize,
     shutdowns: AtomicUsize,
     fail_catalog: AtomicBool,
     fail_stop: AtomicBool,
@@ -546,7 +550,12 @@ impl Network for Fixture {
             .fetch_add(1, Ordering::SeqCst);
         None
     }
-    async fn background(&mut self, population: bool, maintenance: bool) -> Result<()> {
+    async fn background(
+        &mut self,
+        population: bool,
+        maintenance: bool,
+        still_idle: &(dyn Fn() -> bool + Sync),
+    ) -> Result<()> {
         self.observed
             .background
             .lock()
@@ -557,6 +566,20 @@ impl Network for Fixture {
             .lock()
             .unwrap()
             .push(self.observed.requests_completed.load(Ordering::SeqCst));
+        if self
+            .observed
+            .hold_background_step
+            .swap(false, Ordering::SeqCst)
+        {
+            self.observed.background_step_started.notify_one();
+            self.observed.background_step_resume.notified().await;
+            if !still_idle() {
+                self.observed
+                    .background_yielded
+                    .fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
         if self.observed.fail_background.load(Ordering::SeqCst) {
             bail!("fixture private background channel failed");
         }
@@ -848,6 +871,39 @@ async fn queued_foreground_work_precedes_background_ticks_and_bad_control_is_ter
     observed(&client, |s| s.phase == ParticipationPhase::Failed).await;
     assert!(owner.stop().await.is_err());
     assert_eq!(state.shutdowns.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_does_not_start_the_next_call_after_a_local_read_queues() -> Result<()> {
+    let (owner, _settings, state) = fixture();
+    let client = owner.client();
+    warmed(&client).await;
+    state.hold_background_step.store(true, Ordering::SeqCst);
+    timeout(
+        Duration::from_secs(2),
+        state.background_step_started.notified(),
+    )
+    .await?;
+
+    let (send, reply) = oneshot::channel();
+    client
+        .local_reads
+        .try_send(Request::Cached(query(), send))
+        .ok()
+        .context("local slot")?;
+    assert_eq!(state.requests_completed.load(Ordering::SeqCst), 0);
+    // Complete the original background call normally. The queued local read
+    // takes the pipe before optional work can start a second call.
+    state.background_step_resume.notify_one();
+    assert!(
+        timeout(Duration::from_secs(1), reply)
+            .await???
+            .request_id
+            .is_some()
+    );
+    assert_eq!(state.background_yielded.load(Ordering::SeqCst), 1);
+    owner.stop().await?;
     Ok(())
 }
 
