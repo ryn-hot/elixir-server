@@ -19,6 +19,120 @@ async fn prepared() -> Result<(RetentionFixture, Arc<security_mirror::Mirror>, i
     fixture.client.security_mirror = Some(mirror.clone());
     Ok((fixture, mirror, owner))
 }
+
+#[tokio::test]
+async fn warm_search_admissions_are_exact_owner_local_and_revision_bound() -> Result<()> {
+    use crate::marketplace::security_state::{Rejection, catalog_admit, catalog_observe};
+    use crate::marketplace::worker::SecurityObservation;
+    use elixir_marketplace::{records::Revocation, security_job::SecurityRecords};
+
+    let (fixture, mirror, _owner) = prepared().await?;
+    let first = &fixture.inputs.metadata;
+    let mut descriptor = first.descriptor().clone();
+    let id = ExtensionId::new(&descriptor.publisher.payload.root_key, "warm-sibling")?;
+    let release_key = SigningKey::from_bytes(&[2; 32]);
+    descriptor.release.payload.extension_id = id.clone();
+    descriptor.release = SignedRecord::sign(
+        descriptor.release.payload,
+        descriptor.release.authority_record_id,
+        &release_key,
+    )?;
+    let release = Digest::of(canonical::to_vec(&descriptor.release.payload)?);
+    descriptor.head.payload.extension_id = id.clone();
+    descriptor.head.payload.stable_release_id = release;
+    descriptor.head = SignedRecord::sign(
+        descriptor.head.payload,
+        descriptor.head.authority_record_id,
+        &release_key,
+    )?;
+    for (index, pair) in descriptor.gate_evidence.iter_mut().enumerate() {
+        pair.credential.payload.extension_id = id.clone();
+        pair.credential = SignedRecord::sign(
+            pair.credential.payload.clone(),
+            None,
+            &SigningKey::from_bytes(&[3; 32]),
+        )?;
+        pair.endorsement.payload.extension_id = id.clone();
+        pair.endorsement.payload.release_id = release;
+        pair.endorsement.payload.credential_id = Digest::of(pair.credential.to_bytes()?);
+        pair.endorsement = SignedRecord::sign(
+            pair.endorsement.payload.clone(),
+            None,
+            &SigningKey::from_bytes(&[10 + index as u8; 32]),
+        )?;
+    }
+    let (second, _second_owner) =
+        MetadataObservation::fixture_for_verified_descriptor(descriptor.clone(), &fixture.policy)?;
+    let client = &fixture.client;
+    let preflight = client.source_preflight.as_ref().unwrap();
+    preflight.fixture_cache_metadata(first)?;
+    preflight.fixture_cache_metadata(&second)?;
+    let database = &client.database;
+    let current = catalog_admit(database, &second, 1).await?.revision();
+    *mirror.revision.lock().await = current;
+    let descriptors = [first.descriptor().clone(), descriptor.clone()];
+    let first_id = Digest::of(descriptors[0].to_bytes()?);
+    let second_id = Digest::of(descriptor.to_bytes()?);
+    let mut admissions = client.warm_local_search_admissions(&descriptors).await?;
+    assert_eq!(admissions.len(), 2);
+    let mut other = client.clone();
+    other.security_mirror = Some(Arc::new(security_mirror::Mirror::fixture(
+        Digest::of(b"another owner"),
+        current,
+    )));
+    assert!(
+        other
+            .use_warm_search_admission(admissions.remove(&first_id).unwrap())
+            .await?
+            .is_none()
+    );
+    let received = client
+        .use_warm_search_admission(admissions.remove(&second_id).unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(received.descriptor().to_bytes()?, descriptor.to_bytes()?);
+    let mut admissions = client.warm_local_search_admissions(&descriptors).await?;
+    let withdrawal = SignedRecord::sign(
+        Revocation {
+            root_key: descriptor.publisher.payload.root_key,
+            extension_id: id.clone(),
+            release_ids: vec![release],
+            release_keys: vec![],
+            reason: "withdrawn".into(),
+        },
+        None,
+        &SigningKey::from_bytes(&[1; 32]),
+    )?;
+    let (updated, _updated_owner) = SecurityObservation::fixture_for_withdrawal(SecurityRecords {
+        schema_version: elixir_marketplace::SCHEMA_VERSION,
+        extension_id: id,
+        publisher: descriptor.publisher,
+        head: None,
+        revocations: vec![withdrawal],
+    })?;
+    let next = catalog_observe(database, &updated, current)
+        .await?
+        .revision();
+    assert_eq!(next, current + 1);
+    *mirror.revision.lock().await = next;
+    assert!(
+        client
+            .use_warm_search_admission(admissions.remove(&second_id).unwrap())
+            .await?
+            .is_none()
+    );
+    let mut admissions = client.warm_local_search_admissions(&descriptors).await?;
+    let error = client
+        .use_warm_search_admission(admissions.remove(&second_id).unwrap())
+        .await
+        .err()
+        .context("withdrawn no-op must not count as current")?;
+    assert!(matches!(
+        error.downcast_ref::<Rejection>(),
+        Some(Rejection::Withdrawn)
+    ));
+    Ok(())
+}
 #[tokio::test]
 async fn setup_page_uses_the_same_existing_request_slot_and_checked_client_admission() -> Result<()>
 {

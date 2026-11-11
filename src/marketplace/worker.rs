@@ -2,10 +2,11 @@
 //! contribution scheduler are not activated by creating this worker.
 mod protected;
 pub(in crate::marketplace) use protected::IndependentAdmission;
-pub(in crate::marketplace) use protected::Retirement;
 #[cfg(all(test, unix))]
 pub(in crate::marketplace) use protected::PeerPipeFixture;
+pub(in crate::marketplace) use protected::Retirement;
 pub(in crate::marketplace) use protected::SourceResourceWait;
+pub(in crate::marketplace) use protected::WarmSearchAdmission;
 #[cfg(test)]
 pub(in crate::marketplace) use protected::synthetic_blob_owner;
 pub use protected::{

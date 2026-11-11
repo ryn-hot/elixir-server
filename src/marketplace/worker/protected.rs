@@ -42,6 +42,7 @@ mod participation;
 pub(in crate::marketplace) use participation::IndependentAdmission;
 pub(in crate::marketplace) use participation::Retirement;
 pub(in crate::marketplace) use participation::SourceResourceWait;
+pub(in crate::marketplace) use participation::WarmSearchAdmission;
 #[cfg(all(test, unix))]
 pub(in crate::marketplace) use participation::tests::peer_pipe::Fixture as PeerPipeFixture;
 #[cfg(test)]

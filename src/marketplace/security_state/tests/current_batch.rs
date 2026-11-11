@@ -2,7 +2,7 @@
 //! or release-mode performance qualification.
 use super::*;
 
-fn renamed(base: &CandidateDescriptor, slug: &str) -> Result<CandidateDescriptor> {
+pub(super) fn renamed(base: &CandidateDescriptor, slug: &str) -> Result<CandidateDescriptor> {
     let mut descriptor = base.clone();
     let id = ExtensionId::new(&descriptor.publisher.payload.root_key, slug)?;
     descriptor.release.payload.extension_id = id.clone();

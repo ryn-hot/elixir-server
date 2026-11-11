@@ -390,13 +390,31 @@ fn descriptor_request(descriptor: &CandidateDescriptor) -> Result<(u64, Vec<u8>)
 }
 
 impl Client {
+    #[cfg(test)]
+    pub(in crate::marketplace::worker::protected) fn fixture_cache_metadata(
+        &self,
+        value: &MetadataObservation,
+    ) -> Result<()> {
+        self.0.metadata_cache.lock().unwrap().insert(value)
+    }
     /// Missing/negative batch results never launch another verifier for a
     /// warming neighbor. Only a current exact positive receipt is returned.
     pub(in crate::marketplace::worker::protected) fn cached_metadata(
         &self,
         descriptor: &CandidateDescriptor,
     ) -> Result<Option<MetadataObservation>> {
+        Ok(self
+            .cached_metadata_with_id(descriptor)?
+            .map(|(_, value)| value))
+    }
+    pub(in crate::marketplace::worker::protected) fn cached_metadata_with_id(
+        &self,
+        descriptor: &CandidateDescriptor,
+    ) -> Result<Option<(Digest, MetadataObservation)>> {
         self.0.cache_admit()?;
+        if !self.0.binding.metadata_verifier {
+            bail!("independent metadata verification is unavailable");
+        }
         let policy = IssuerPolicy::new(self.0.binding.issuer_keys.iter().copied())?.fingerprint();
         let input = CheckedDescriptor::new(descriptor)?;
         Ok(self
@@ -404,7 +422,18 @@ impl Client {
             .metadata_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("metadata receipt cache unavailable"))?
-            .get(&input, policy))
+            .get(&input, policy)
+            .map(|value| (input.id(), value)))
+    }
+    pub(in crate::marketplace::worker::protected) fn warm_metadata_current(
+        &self,
+        value: &MetadataObservation,
+    ) -> Result<bool> {
+        self.0.cache_admit()?;
+        let policy = IssuerPolicy::new(self.0.binding.issuer_keys.iter().copied())?.fingerprint();
+        Ok(self.0.binding.metadata_verifier
+            && value.issuer_policy() == policy
+            && value.is_current())
     }
     pub(in crate::marketplace::worker::protected) async fn verify_metadata(
         &self,

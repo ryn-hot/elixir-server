@@ -113,6 +113,33 @@ pub(in crate::marketplace) async fn catalog_admit(
     }
     mutate_at(database, input, true, Some(expected_revision)).await
 }
+/// Check complete no-op merges from one snapshot. A positive row still needs
+/// fresh revision/currentness at use and gives no source or install authority.
+pub(in crate::marketplace) async fn warm_no_change_page(
+    database: &Database,
+    values: &[&MetadataObservation],
+    revision: u64,
+) -> Result<Vec<bool>> {
+    if values.len() > elixir_marketplace::MAX_SEARCH_RESULTS {
+        bail!("warm security page bounds");
+    }
+    let mut result = vec![false; values.len()];
+    let (indices, inputs): (Vec<_>, Vec<_>) = values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_current())
+        .map(|(index, value)| Incoming::metadata(value).map(|input| (index, input)))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    for (index, unchanged) in indices
+        .into_iter()
+        .zip(unchanged::check_page(database, &inputs, revision).await?)
+    {
+        result[index] = unchanged;
+    }
+    Ok(result)
+}
 pub(in crate::marketplace) async fn catalog_observe(
     database: &Database,
     value: &SecurityObservation,
@@ -396,17 +423,30 @@ fn validate(
     Ok(())
 }
 pub async fn require_current(database: &Database, value: &MetadataObservation) -> Result<()> {
+    require_current_at(database, value, None).await
+}
+
+pub(in crate::marketplace) async fn require_current_at(
+    database: &Database,
+    value: &MetadataObservation,
+    expected_revision: Option<u64>,
+) -> Result<()> {
     if !value.is_current() {
         return Err(Rejection::Expired.into());
     }
     let id = &value.descriptor().release.payload.extension_id;
     let root = value.descriptor().publisher.payload.root_key;
     let row=sqlx::query("SELECT p.state_json AS p_json,p.state_bytes AS p_bytes,p.state_sha256 AS p_hash, \
-        e.state_json AS e_json,e.state_bytes AS e_bytes,e.state_sha256 AS e_hash,b.blocked \
+        e.state_json AS e_json,e.state_bytes AS e_bytes,e.state_sha256 AS e_hash,b.blocked,b.revision \
         FROM marketplace_extension_security e JOIN marketplace_publisher_security p ON p.root_key=e.root_key \
         JOIN marketplace_security_budget b ON b.singleton=1 WHERE e.extension_id=$1 AND e.root_key=$2")
         .bind(id.as_str()).bind(root.to_string()).fetch_optional(&database.pool).await?
         .context("marketplace security authority is missing")?;
+    if let Some(expected) = expected_revision
+        && row.try_get::<i64, _>("revision")? != expected as i64
+    {
+        bail!("marketplace catalog security revision is out of sync");
+    }
     check_current_row(&row, value)
 }
 

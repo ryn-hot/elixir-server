@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 async fn revision(db: &Database) -> Result<u64> {
     Ok(sqlx::query_scalar::<_, i64>(
@@ -6,6 +7,85 @@ async fn revision(db: &Database) -> Result<u64> {
     )
     .fetch_one(&db.pool)
     .await? as u64)
+}
+
+#[tokio::test]
+async fn warm_page_compares_every_merge_in_order_without_writing() -> Result<()> {
+    let (_directory, db) = database().await?;
+    let (values, _owners) = current_batch::full_page(&db).await?;
+    let current = revision(&db).await?;
+    let mut references = values.iter().rev().collect::<Vec<_>>();
+    sqlx::query("CREATE TRIGGER forbid_warm_page_write BEFORE UPDATE ON marketplace_security_budget BEGIN SELECT RAISE(FAIL,'unexpected warm page write'); END")
+        .execute(&db.pool).await?;
+    assert_eq!(
+        warm_no_change_page(&db, &references, current).await?,
+        vec![true; 20]
+    );
+    let (base, policy) = fixture()?;
+    let (unknown, _unknown_owner) = MetadataObservation::fixture_for_verified_descriptor(
+        current_batch::renamed(&base, "warm-unknown")?,
+        &policy,
+    )?;
+    let mut changed = references[7].descriptor().clone();
+    changed.revocations.push(SignedRecord::sign(
+        Revocation {
+            root_key: changed.publisher.payload.root_key,
+            extension_id: changed.release.payload.extension_id.clone(),
+            release_ids: vec![Digest::of(b"newly withdrawn alternate release")],
+            release_keys: vec![],
+            reason: "withdrawn".into(),
+        },
+        None,
+        &key(1),
+    )?);
+    let (changed, changed_owner) =
+        MetadataObservation::fixture_for_verified_descriptor(changed, &policy)?;
+    references[7] = &changed;
+    references[18] = &unknown;
+    let mut expected = vec![true; 20];
+    expected[7] = false;
+    expected[18] = false;
+    assert_eq!(
+        warm_no_change_page(&db, &references, current).await?,
+        expected
+    );
+    assert!(
+        warm_no_change_page(&db, &references, current - 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        warm_no_change_page(&db, &[references[0], references[0]], current)
+            .await
+            .is_err()
+    );
+    assert!(
+        warm_no_change_page(&db, &vec![references[0]; 21], current)
+            .await
+            .is_err()
+    );
+    assert!(warm_no_change_page(&db, &[], current).await?.is_empty());
+    assert_eq!(revision(&db).await?, current);
+    // A later admitted restriction changes the revision; the old snapshot
+    // cannot substitute for the fresh per-row currentness check.
+    sqlx::query("DROP TRIGGER forbid_warm_page_write")
+        .execute(&db.pool)
+        .await?;
+    let delta = catalog_admit(&db, &changed, current).await?;
+    assert_eq!(delta.revision(), current + 1);
+    assert!(delta.into_batch().is_some());
+    assert!(
+        require_current_at(&db, &values[0], Some(current))
+            .await
+            .is_err()
+    );
+    require_current_at(&db, &changed, Some(current + 1)).await?;
+    changed_owner(false);
+    assert_eq!(
+        warm_no_change_page(&db, &[&changed], current + 1).await?,
+        vec![false]
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -191,6 +271,12 @@ async fn warm_read_fails_closed_on_budget_row_loss_and_integrity_corruption() ->
             catalog_admit(&db, &metadata, current).await.is_err(),
             "{mutation}"
         );
+        assert!(
+            warm_no_change_page(&db, &[&metadata], current)
+                .await
+                .is_err(),
+            "batch must also fail closed: {mutation}"
+        );
     }
     Ok(())
 }
@@ -225,6 +311,11 @@ async fn warm_postgres_admission_reads_under_shared_lock_and_new_heads_still_com
     let current = catalog_admit(&db, &metadata, revision(&db).await?)
         .await?
         .revision();
+    let (second, _second_owner) = MetadataObservation::fixture_for_verified_descriptor(
+        current_batch::renamed(&descriptor, "warm-postgres-second")?,
+        &policy,
+    )?;
+    let current = catalog_admit(&db, &second, current).await?.revision();
     let mut locked = db.pool.begin().await?;
     sqlx::query("SELECT revision FROM marketplace_security_budget WHERE singleton=1 FOR SHARE")
         .fetch_one(&mut *locked)
@@ -239,6 +330,14 @@ async fn warm_postgres_admission_reads_under_shared_lock_and_new_heads_still_com
     .context("warm admission attempted a conflicting write")??;
     assert_eq!(mutation.revision(), current);
     assert!(mutation.into_batch().is_none());
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            warm_no_change_page(&db, &[&second, &metadata], current)
+        )
+        .await??,
+        vec![true, true]
+    );
     require_current(&db, &metadata).await?;
     locked.rollback().await?;
     descriptor.head.payload.sequence += 1;

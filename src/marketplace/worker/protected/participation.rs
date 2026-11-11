@@ -14,6 +14,8 @@ mod retirement;
 pub use catalog_progress::CatalogSnapshot;
 pub(in crate::marketplace) use retirement::Confirmed as Retirement;
 mod security_mirror;
+mod warm_search;
+pub(in crate::marketplace) use warm_search::WarmSearchAdmission;
 #[cfg(test)]
 pub(in crate::marketplace) mod tests;
 

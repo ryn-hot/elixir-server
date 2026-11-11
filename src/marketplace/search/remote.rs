@@ -1,6 +1,7 @@
 //! Bounded, owner-local discovery pagination. Nothing here authenticates a
 //! descriptor, a popularity hint or source availability. The caller must admit
 //! every emitted candidate through the native/durable/source pipeline.
+use super::super::worker::WarmSearchAdmission;
 use super::*;
 use elixir_marketplace::{
     catalog::SearchResult, worker_control::WorkerControlOutcome, worker_network::PeerKey,
@@ -311,6 +312,7 @@ pub(super) struct Session {
     emitted: BTreeMap<Digest, usize>,
     admitted: BTreeMap<Digest, usize>,
     source_warmed: BTreeSet<Digest>,
+    warm_admissions: BTreeMap<Digest, WarmSearchAdmission>,
     discovery_progress: DiscoveryProgress,
     remote_only: bool,
 }
@@ -333,6 +335,7 @@ impl Default for Session {
             emitted: BTreeMap::new(),
             admitted: BTreeMap::new(),
             source_warmed: BTreeSet::new(),
+            warm_admissions: BTreeMap::new(),
             discovery_progress: DiscoveryProgress::default(),
             remote_only: false,
         }
@@ -405,6 +408,21 @@ impl Session {
             .is_some_and(|source| {
                 source.enabled && !source.rejected && matches!(source.location, Location::Local)
             })
+    }
+    pub(super) fn set_warm_admissions(
+        &mut self,
+        admissions: BTreeMap<Digest, WarmSearchAdmission>,
+    ) {
+        self.warm_admissions = admissions;
+    }
+    pub(super) fn take_warm_admission(
+        &mut self,
+        descriptor: Digest,
+    ) -> Option<WarmSearchAdmission> {
+        if !self.local_pending(descriptor) {
+            return None;
+        }
+        self.warm_admissions.remove(&descriptor)
     }
     pub(super) fn evidence_origins(&self, descriptor: Digest) -> Vec<EvidenceOrigin> {
         let mut origins: Vec<_> = self
@@ -488,12 +506,14 @@ impl Session {
         self.emitted.clear();
         self.admitted.clear();
         self.source_warmed.clear();
+        self.warm_admissions.clear();
     }
     pub(super) fn admission_result(
         &mut self,
         descriptor: Digest,
         feedback: AdmissionFeedback,
     ) -> Result<()> {
+        self.warm_admissions.remove(&descriptor);
         let origin = self
             .emitted
             .remove(&descriptor)

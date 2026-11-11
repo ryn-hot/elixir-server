@@ -273,7 +273,57 @@ struct Live {
     discovery_progress: remote::DiscoveryProgress,
 }
 impl Live {
-    async fn warm_sources(&self, batch: &[CandidateDescriptor], interest: &Interest) -> Result<()> {
+    async fn prefetch_then_verify(
+        &self,
+        descriptor: &CandidateDescriptor,
+        descriptor_id: Digest,
+        interest: &Interest,
+        local_pending: bool,
+    ) -> Result<MetadataObservation> {
+        // Do not spend the once-per-page source attempt before metadata warming
+        // succeeds. A resource/protection deferral retries the same candidate.
+        let sources =
+            remote::prefetch_after_metadata(&self.session, descriptor, |batch| async move {
+                self.client.warm_metadata(&batch).await
+            })
+            .await?;
+        #[cfg(test)]
+        let trace_prefetch = !sources.is_empty();
+        #[cfg(test)]
+        if trace_prefetch {
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"search_prefetch_group", "source_rows":sources.len()})
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"search_metadata_prefetch_finished", "success":true})
+            );
+        }
+        let source_warm = self.warm_sources(&sources, interest, local_pending).await;
+        #[cfg(test)]
+        if trace_prefetch {
+            eprintln!(
+                "{}",
+                serde_json::json!({"stage":"search_source_prefetch_finished", "success":source_warm.is_ok()})
+            );
+        }
+        source_warm?;
+        let warm = self.session.lock().await.take_warm_admission(descriptor_id);
+        if let Some(warm) = warm
+            && let Some(metadata) = self.client.use_warm_search_admission(warm).await?
+        {
+            return Ok(metadata);
+        }
+        self.client.verify_metadata(descriptor).await
+    }
+
+    async fn warm_sources(
+        &self,
+        batch: &[CandidateDescriptor],
+        interest: &Interest,
+        local_pending: bool,
+    ) -> Result<()> {
         let Some(first) = batch.first() else {
             return Ok(());
         };
@@ -284,6 +334,12 @@ impl Live {
             serde_json::json!({"stage":"search_source_prefetch_needed", "rows":batch.len(), "needed":needed})
         );
         if !needed {
+            if local_pending && batch.len() > 1 && interest.active() {
+                let admissions = self.client.warm_local_search_admissions(batch).await?;
+                if interest.active() {
+                    self.session.lock().await.set_warm_admissions(admissions);
+                }
+            }
             return Ok(());
         }
         let mut checked = Vec::new();
@@ -400,47 +456,25 @@ impl Backend for Live {
         descriptor: CandidateDescriptor,
         interest: &Interest,
     ) -> Result<Arc<Verified>> {
-        // The source page is already bounded and owned by this exact query.
-        // Warm native metadata only; normal per-candidate durable/source checks
-        // and source-failure feedback still run before displaying any card.
-        // Keep the once-only source group separate from metadata's exact-positive
-        // cache. A source attempt must not suppress metadata repair after a
-        // transient prefetch failure; a warm first descriptor already returns
-        // immediately inside warm_metadata without another native job.
-        // Do not spend the once-per-page source attempt before metadata warming
-        // succeeds. A resource/protection deferral retries this SAME candidate;
-        // consuming the marker first silently degrades it to per-row helpers.
-        let sources =
-            remote::prefetch_after_metadata(&self.session, &descriptor, |batch| async move {
-                self.client.warm_metadata(&batch).await
-            })
-            .await?;
-        #[cfg(test)]
-        let trace_prefetch = !sources.is_empty();
-        #[cfg(test)]
-        if trace_prefetch {
-            eprintln!(
-                "{}",
-                serde_json::json!({"stage":"search_prefetch_group", "source_rows":sources.len()})
-            );
-        }
-        #[cfg(test)]
-        if trace_prefetch {
-            eprintln!(
-                "{}",
-                serde_json::json!({"stage":"search_metadata_prefetch_finished", "success":true})
-            );
-        }
-        let source_warm = self.warm_sources(&sources, interest).await;
-        #[cfg(test)]
-        if trace_prefetch {
-            eprintln!(
-                "{}",
-                serde_json::json!({"stage":"search_source_prefetch_finished", "success":source_warm.is_ok()})
-            );
-        }
-        source_warm?;
-        let metadata = self.client.verify_metadata(&descriptor).await?;
+        let descriptor_id = Digest::of(canonical::to_vec(&descriptor)?);
+        let (local_pending, warm) = {
+            let mut session = self.session.lock().await;
+            (
+                session.local_pending(descriptor_id),
+                session.take_warm_admission(descriptor_id),
+            )
+        };
+        let metadata = match warm {
+            Some(warm) => self.client.use_warm_search_admission(warm).await?,
+            None => None,
+        };
+        let metadata = match metadata {
+            Some(metadata) => metadata,
+            None => {
+                self.prefetch_then_verify(&descriptor, descriptor_id, interest, local_pending)
+                    .await?
+            }
+        };
         let release = Digest::of(canonical::to_vec(&metadata.descriptor().release.payload)?);
         if metadata.descriptor().head.payload.stable_release_id != release {
             bail!("default search requires the stable head");
@@ -451,11 +485,6 @@ impl Backend for Live {
         // Remote/unknown hints must pass the same veto AFTER source-admitted
         // retention: their newly committed head may already fence the OLD
         // cache entry. Reading that predecessor first would block its update.
-        let local_pending = self
-            .session
-            .lock()
-            .await
-            .local_pending(Digest::of(canonical::to_vec(&descriptor)?));
         let mut failures = selection::SourceFailures::default();
         for location in 0..metadata.descriptor().release.payload.source.locations.len() {
             if !interest.active() {
