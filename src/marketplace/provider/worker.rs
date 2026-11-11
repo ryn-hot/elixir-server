@@ -178,12 +178,15 @@ impl Owner {
                 // a data lease or replenishing credit. Join both original
                 // private frames even if one fails; do not poison the other by
                 // dropping its physical exchange at a select boundary.
-                let (live, paused) = tokio::join!(
+                let (interface_present, paused) = tokio::join!(
                     provider.inspect(),
                     guard.request(elixir_marketplace::guard_control::GuardCommand::Pause)
                 );
-                ensure!(live?, "provider disappeared during worker startup");
                 paused.context("closed worker-startup guard keepalive")?;
+                ensure!(
+                    interface_present.context("provider worker-startup keepalive unavailable")?,
+                    "provider tunnel interface unavailable during worker startup"
+                );
             }
         };
         tokio::pin!(keepalive);

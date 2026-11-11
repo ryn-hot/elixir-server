@@ -723,21 +723,32 @@ impl ProtectedWorker {
             {
                 bail!("protected worker image protocols are unsupported");
             }
-            let worker = match &health {
+            let (worker, readiness_debit) = match &health {
                 #[cfg(unix)]
                 Health::Provider(sample) => {
-                    WorkerProcess::start_provider(
+                    let request = cancel
+                        .as_ref()
+                        .context("original provider startup task missing")?;
+                    if request.is_cancelled() {
+                        bail!("provider worker cancelled before applying startup credit");
+                    }
+                    health.require_current(&guard, config.probe_policy)?;
+                    // Switch from the small bootstrap probe debit before the
+                    // potentially slow native worker start. Credit atomically
+                    // closes the data lease; it only keeps the original metered
+                    // provider transport available while marketplace data is paused.
+                    guard.apply_credit(runtime.as_ref(), debit).await?;
+                    let worker = WorkerProcess::start_provider(
                         runtime.as_ref(),
                         &mut guard,
                         &config.controller_directory,
                         &config.image,
                         &config.issuer_keys,
                         sample.as_ref().context("provider health missing")?,
-                        cancel
-                            .as_ref()
-                            .context("original provider startup task missing")?,
+                        request,
                     )
-                    .await?
+                    .await?;
+                    (worker, None)
                 }
                 Health::Wireguard { monitor, .. } => {
                     let lease = match held_lease.take() {
@@ -764,7 +775,10 @@ impl ProtectedWorker {
                         monitor,
                         config.probe_policy,
                     )?;
-                    WorkerProcess::start_profile(runtime.as_ref(), Arc::new(lease), profile).await?
+                    let worker =
+                        WorkerProcess::start_profile(runtime.as_ref(), Arc::new(lease), profile)
+                            .await?;
+                    (worker, Some(debit))
                 }
             };
             let ready = async {
@@ -775,7 +789,9 @@ impl ProtectedWorker {
                     bail!("provider worker cancelled before protected readiness");
                 }
                 health.require_current(&guard, config.probe_policy)?;
-                guard.apply_credit(runtime.as_ref(), debit).await?;
+                if let Some(debit) = readiness_debit {
+                    guard.apply_credit(runtime.as_ref(), debit).await?;
+                }
                 health
                     .refresh(
                         runtime.as_ref(),
