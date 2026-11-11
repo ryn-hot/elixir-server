@@ -153,33 +153,26 @@ async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -
     };
     let mut cache = ReceiptCache::default();
     cache.insert(&value)?;
-    let id = Digest::of(value.descriptor.to_bytes()?);
+    let input = CheckedDescriptor::new(&value.descriptor)?;
     assert!(
         cache
-            .get(
-                id,
-                Digest::of(b"different issuer policy"),
-                &value.descriptor
-            )
+            .get(&input, Digest::of(b"different issuer policy"))
             .is_none()
     );
     tokio::time::advance(Duration::from_secs(299)).await;
-    let read = cache.get(id, policy, &value.descriptor).unwrap();
+    let read = cache.get(&input, policy).unwrap();
     assert_eq!(read.observed, value.observed);
     assert_eq!(read.observed_utc, value.observed_utc);
     assert!(read.valid_for() <= Duration::from_secs(1));
     assert!(
         cache
-            .get_with_validity(id, policy, Duration::from_secs(60), &value.descriptor)
+            .get_with_validity(&input, policy, Duration::from_secs(60))
             .is_none(),
         "long transfers need a new native check, not a re-timestamped receipt"
     );
-    assert_eq!(
-        cache.get(id, policy, &value.descriptor).unwrap().observed,
-        value.observed
-    );
+    assert_eq!(cache.get(&input, policy).unwrap().observed, value.observed);
     tokio::time::advance(Duration::from_secs(2)).await;
-    assert!(cache.get(id, policy, &value.descriptor).is_none());
+    assert!(cache.get(&input, policy).is_none());
     assert_eq!(cache.entries.len(), 0);
     value.observed = Instant::now();
     // Synthetic changed bodies exercise cache accounting only, not signature
@@ -196,11 +189,10 @@ async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -
     }
     assert_eq!(cache.entries.len(), 10_000);
     let old = value.descriptor.clone();
-    let old_id = Digest::of(old.to_bytes()?);
     value.descriptor.release.payload.description = "replacement for the same extension".into();
     cache.insert(&value)?;
     assert_eq!(cache.entries.len(), 10_000);
-    assert!(cache.get(old_id, policy, &old).is_none());
+    assert!(cache.get(&CheckedDescriptor::new(&old)?, policy).is_none());
     // Large bodies do not remain in this cache. Only the exact hash and fixed
     // receipt fields are retained, with independent original TTL/owner checks.
     assert!(
@@ -218,22 +210,31 @@ async fn metadata_cache_preserves_origin_time_policy_scope_and_bounded_state() -
         value.descriptor.release.payload.description = format!("synthetic page item {i}");
         let bytes = value.descriptor.to_bytes()?;
         wire += bytes.len();
-        page.push((Digest::of(bytes), value.descriptor.clone()));
+        page.push(value.descriptor.clone());
         cache.insert(&value)?;
     }
     assert!(wire < MAX_CONTROL_FRAME_BYTES);
-    for (id, descriptor) in &page {
-        assert!(cache.get(*id, policy, descriptor).is_some());
+    for descriptor in &page {
+        let input = CheckedDescriptor::new(descriptor)?;
+        assert!(cache.get(&input, policy).is_some());
         let mut changed = descriptor.clone();
         changed.release.payload.description.push('!');
+        let changed_input = CheckedDescriptor::new(&changed)?;
+        assert_ne!(input.id(), changed_input.id());
         assert!(
-            cache.get(*id, policy, &changed).is_none(),
-            "a supplied body cannot borrow a different verified hash"
+            cache.get(&changed_input, policy).is_none(),
+            "a changed body cannot reuse a receipt for the same extension"
         );
+        changed.gate_evidence.pop();
+        assert!(CheckedDescriptor::new(&changed).is_err());
     }
     drop(owner);
-    for (id, descriptor) in page {
-        assert!(cache.get(id, policy, &descriptor).is_none());
+    for descriptor in page {
+        assert!(
+            cache
+                .get(&CheckedDescriptor::new(&descriptor)?, policy)
+                .is_none()
+        );
     }
     assert_eq!(cache.entries.len(), 0);
     Ok(())

@@ -84,13 +84,10 @@ impl Client {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("metadata receipt cache is unavailable"))?;
             for (index, descriptor) in descriptors.iter().enumerate() {
-                let Ok(encoded) = descriptor.to_bytes() else {
+                let Ok(input) = CheckedDescriptor::new(descriptor) else {
                     continue;
                 };
-                if cache
-                    .get(Digest::of(&encoded), policy, descriptor)
-                    .is_some()
-                {
+                if cache.get(&input, policy).is_some() {
                     if index == 0 {
                         #[cfg(test)]
                         eprintln!(
@@ -101,10 +98,10 @@ impl Client {
                     } // no O(page²) work on warm browse
                     continue;
                 }
-                if size + encoded.len() + 1 > MAX_CONTROL_FRAME_BYTES {
+                if size + input.bytes().len() + 1 > MAX_CONTROL_FRAME_BYTES {
                     break;
                 }
-                size += encoded.len() + 1;
+                size += input.bytes().len() + 1;
                 selected.push(descriptor.clone());
             }
         }

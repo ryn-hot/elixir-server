@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 
 const MAX_REPLY: usize = 4096;
 mod batch;
+mod input;
 use super::receipt_fifo::ReceiptFifo;
 #[cfg(test)]
 use super::receipt_fifo::{MAX_BYTES as MAX_CACHE_BYTES, MAX_ENTRIES as MAX_CACHE_ENTRIES};
+use input::CheckedDescriptor;
 
 #[derive(Default)]
 pub(super) struct ReceiptCache {
@@ -72,18 +74,17 @@ impl ReceiptCache {
     }
     fn get(
         &mut self,
-        id: Digest,
+        input: &CheckedDescriptor<'_>,
         policy: Digest,
-        descriptor: &CandidateDescriptor,
     ) -> Option<MetadataObservation> {
         // The body is supplied again, not retained 10,000 times. An exact hash
         // match to a private-native receipt is required before reconstitution.
-        if Digest::of(descriptor.to_bytes().ok()?) != id {
-            return None;
-        }
+        // The input owns the digest of this exact borrowed body, not an
+        // independently supplied key that would need a second encoding.
+        let descriptor = input.descriptor();
         let key = Digest::of(descriptor.release.payload.extension_id.as_str().as_bytes());
         let entry = self.entries.get(&key)?;
-        if entry.issuer_policy != policy || entry.descriptor_id != id {
+        if entry.issuer_policy != policy || entry.descriptor_id != input.id() {
             return None;
         }
         let value = MetadataObservation {
@@ -102,12 +103,11 @@ impl ReceiptCache {
     }
     fn get_with_validity(
         &mut self,
-        id: Digest,
+        input: &CheckedDescriptor<'_>,
         policy: Digest,
         minimum: Duration,
-        descriptor: &CandidateDescriptor,
     ) -> Option<MetadataObservation> {
-        self.get(id, policy, descriptor)
+        self.get(input, policy)
             .filter(|value| value.valid_for() >= minimum)
     }
     fn insert(&mut self, value: &MetadataObservation) -> Result<()> {
@@ -398,13 +398,13 @@ impl Client {
     ) -> Result<Option<MetadataObservation>> {
         self.0.cache_admit()?;
         let policy = IssuerPolicy::new(self.0.binding.issuer_keys.iter().copied())?.fingerprint();
-        let id = Digest::of(descriptor.to_bytes()?);
+        let input = CheckedDescriptor::new(descriptor)?;
         Ok(self
             .0
             .metadata_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("metadata receipt cache unavailable"))?
-            .get(id, policy, descriptor))
+            .get(&input, policy))
     }
     pub(in crate::marketplace::worker::protected) async fn verify_metadata(
         &self,
@@ -443,14 +443,14 @@ impl Client {
         if !self.0.binding.metadata_verifier {
             bail!("independent metadata verification is unavailable");
         }
-        let encoded = descriptor.to_bytes()?;
+        let input = CheckedDescriptor::new(descriptor)?;
         let policy = IssuerPolicy::new(self.0.binding.issuer_keys.iter().copied())?.fingerprint();
         if let Some(value) = self
             .0
             .metadata_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("metadata receipt cache is unavailable"))?
-            .get_with_validity(Digest::of(&encoded), policy, minimum, descriptor)
+            .get_with_validity(&input, policy, minimum)
         {
             return Ok(value);
         }
@@ -458,7 +458,7 @@ impl Client {
         // Share the source job's single slot: two helper classes must not each
         // consume the same reserved worker headroom concurrently. No job queue.
         let permit = admission::try_slot(&self.0, work, "metadata/source slot is busy")?;
-        let descriptor = CandidateDescriptor::parse(&encoded)?;
+        let descriptor = CandidateDescriptor::parse(input.bytes())?;
         let (id, bytes) = descriptor_request(&descriptor)?;
         let owner = self.0.clone();
         let (mut completion, response) = oneshot::channel();
