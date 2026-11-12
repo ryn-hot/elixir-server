@@ -20,6 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 mod pilot;
+mod radicle_mirror;
 mod source;
 
 fn now() -> Result<u64> {
