@@ -754,7 +754,12 @@ async fn catalog_workflow(run: CatalogRun) -> Result<()> {
     // tasks are confirmed retired. TempDir's implicit drop ignores a failure
     // to remove files inside an intentionally read-only source capsule.
     for (index, actor) in actors.iter_mut().enumerate() {
-        if let Err(error) = actor.rig.root.close_completed_catalog() {
+        let archives = if timing && index == CONSUMER {
+            CatalogArchives::Absent
+        } else {
+            CatalogArchives::Required
+        };
+        if let Err(error) = actor.rig.root.close_completed_catalog(archives) {
             cleanup.push(format!("participant {}: {error:#}", index + 1));
         }
     }

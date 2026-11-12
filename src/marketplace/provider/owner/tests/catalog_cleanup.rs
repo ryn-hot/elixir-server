@@ -6,16 +6,31 @@ use std::{
     path::Path,
 };
 
+fn owned_directory(path: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0,
+        "catalog fixture archive is not an owned directory"
+    );
+    Ok(metadata)
+}
+
+pub(super) fn confirm_no_archives(root: &Path) -> Result<()> {
+    owned_directory(root)?;
+    owned_directory(&root.join("marketplace"))?;
+    let worker = root.join("marketplace/worker");
+    owned_directory(&worker)?;
+    match fs::symlink_metadata(worker.join("source-archives")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => anyhow::bail!("catalog-only fixture unexpectedly retained an archive path"),
+    }
+}
+
 pub(super) fn unseal_completed_archives(root: &Path) -> Result<()> {
     let owner = unsafe { libc::geteuid() };
-    let owned_directory = |path: &Path| -> Result<_> {
-        let metadata = fs::symlink_metadata(path)?;
-        ensure!(
-            metadata.is_dir() && metadata.uid() == owner && metadata.mode() & 0o022 == 0,
-            "catalog fixture archive is not an owned directory"
-        );
-        Ok(metadata)
-    };
     owned_directory(root)?;
     let mut releases = root.to_owned();
     for component in ["marketplace", "worker", "source-archives", "releases"] {
@@ -155,6 +170,22 @@ mod tests {
         let original = fs::metadata(foreign.path())?.mode();
         assert!(unseal_completed_archives(root.path()).is_err());
         assert_eq!(fs::metadata(foreign.path())?.mode(), original);
+        Ok(())
+    }
+
+    #[test]
+    fn browse_only_cleanup_requires_a_owned_worker_and_an_absent_archive_path() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let worker = root.path().join("marketplace/worker");
+        assert!(confirm_no_archives(root.path()).is_err());
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&worker)?;
+        confirm_no_archives(root.path())?;
+        assert!(unseal_completed_archives(root.path()).is_err());
+        std::os::unix::fs::symlink(worker.join("missing"), worker.join("source-archives"))?;
+        assert!(confirm_no_archives(root.path()).is_err());
         Ok(())
     }
 }

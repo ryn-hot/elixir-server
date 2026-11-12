@@ -14,6 +14,11 @@ use tokio::time::{Duration, timeout};
 mod catalog_cleanup;
 mod guard;
 
+enum CatalogArchives {
+    Required,
+    Absent,
+}
+
 /// Preserve recovery evidence on failed/uncertain native tests. Never erase a
 /// CREATE fence merely because a fixture scope is unwinding.
 struct PreservedRoot(
@@ -98,12 +103,16 @@ impl PreservedRoot {
         });
         self.2.get() || identity || fenced
     }
-    fn close_completed_catalog(&mut self) -> Result<()> {
+    fn close_completed_catalog(&mut self, archives: CatalogArchives) -> Result<()> {
         ensure!(
             self.1.get() && !self.must_preserve(),
             "catalog fixture still requires recovery"
         );
-        if let Err(error) = catalog_cleanup::unseal_completed_archives(self.path()) {
+        let checked = match archives {
+            CatalogArchives::Required => catalog_cleanup::unseal_completed_archives(self.path()),
+            CatalogArchives::Absent => catalog_cleanup::confirm_no_archives(self.path()),
+        };
+        if let Err(error) = checked {
             self.preserve();
             return Err(error.context("catalog fixture sealed archive cleanup"));
         }
@@ -126,15 +135,24 @@ impl Drop for PreservedRoot {
 #[test]
 fn catalog_cleanup_requires_completion_and_refuses_recovery_fences() -> Result<()> {
     let mut root = PreservedRoot::new()?;
-    assert!(root.close_completed_catalog().is_err());
+    assert!(
+        root.close_completed_catalog(CatalogArchives::Absent)
+            .is_err()
+    );
     let worker = root.path().join("marketplace/worker");
     std::fs::create_dir_all(&worker)?;
     let fence = worker.join(FENCE);
     std::fs::write(&fence, b"synthetic unresolved fixture")?;
     root.complete();
-    assert!(root.close_completed_catalog().is_err());
+    assert!(
+        root.close_completed_catalog(CatalogArchives::Absent)
+            .is_err()
+    );
     assert!(fence.is_file());
     std::fs::remove_file(fence)?;
+    let path = root.path().to_owned();
+    root.close_completed_catalog(CatalogArchives::Absent)?;
+    assert!(!path.exists());
     Ok(())
 }
 
