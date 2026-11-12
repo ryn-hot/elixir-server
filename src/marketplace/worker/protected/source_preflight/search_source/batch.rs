@@ -1,7 +1,7 @@
 //! Search-only positive cache warming. Same owned slot/native UID/watchdog,
 //! <=20 authenticated recipes, <=256KiB frames, no install-fact cache writes.
 use super::*;
-use elixir_marketplace::{canonical, source_preflight::SourceAccess};
+use elixir_marketplace::{canonical, records::RepositoryKind, source_preflight::SourceAccess};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -156,7 +156,12 @@ fn select(owner: &Owner, metadata: Vec<MetadataObservation>) -> Result<Vec<Input
         if !extensions.insert(key) || cache.get(key, id).is_some() {
             continue;
         }
-        for location in 0..release.source.locations.len() {
+        for (location, source) in release.source.locations.iter().enumerate() {
+            // This helper only warms HTTPS forge rows. Radicle is verified
+            // separately; a missing seed must not abort another row or mirror.
+            if matches!(source.kind, RepositoryKind::Radicle) {
+                continue;
+            }
             let request = SourcePreflightRequest::for_release(
                 release,
                 location,
@@ -376,6 +381,14 @@ mod tests {
         index: usize,
         bad_manifest: bool,
     ) -> Result<(MetadataObservation, Box<dyn Fn(bool)>, Vec<u8>)> {
+        metadata_with(index, bad_manifest, |_| {})
+    }
+
+    fn metadata_with(
+        index: usize,
+        bad_manifest: bool,
+        edit: impl FnOnce(&mut Release),
+    ) -> Result<(MetadataObservation, Box<dyn Fn(bool)>, Vec<u8>)> {
         let (mut d, _, policy) = super::super::super::evidence::tests::fixture()?;
         let id = ExtensionId::new(
             &d.publisher.payload.root_key,
@@ -386,6 +399,7 @@ mod tests {
             &json!({"id":if bad_manifest{"wrong".to_owned()}else{id.to_string()},"name":d.release.payload.display_name,"kind":d.release.payload.kind,"version":d.release.payload.version}),
         )?;
         d.release.payload.manifest_sha256 = Digest::of(&manifest);
+        edit(&mut d.release.payload);
         let key = SigningKey::from_bytes(&[2; 32]);
         d.release = SignedRecord::sign(
             d.release.payload.clone(),
@@ -414,6 +428,33 @@ mod tests {
         }
         let (metadata, owner) = MetadataObservation::fixture_for_verified_descriptor(d, &policy)?;
         Ok((metadata, Box::new(owner), manifest))
+    }
+
+    #[tokio::test]
+    async fn a_seedless_radicle_hint_does_not_block_forge_prefetch() -> Result<()> {
+        use elixir_marketplace::records::SourceLocation;
+
+        let fixture = super::super::super::tests::fixture()?;
+        let radicle = SourceLocation {
+            kind: RepositoryKind::Radicle,
+            repository_identity: "rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5".into(),
+            url: None,
+        };
+        let (only, _only, _) =
+            metadata_with(0, false, |r| r.source.locations = vec![radicle.clone()])?;
+        let (mixed, _mixed, _) =
+            metadata_with(1, false, |r| r.source.locations.insert(0, radicle))?;
+        let (forge, _forge, _) = metadata(2, false)?;
+        let rows = select(&fixture.owner, vec![only, mixed, forge])?;
+        assert_eq!(
+            rows.iter().map(|row| row.location).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row.request.plan.access, SourceAccess::Https { .. }))
+        );
+        Ok(())
     }
     fn row(input: &Input, manifest: &[u8]) -> Result<Value> {
         let SourceAccess::Https {
