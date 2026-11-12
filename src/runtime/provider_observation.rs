@@ -52,9 +52,15 @@ pub(crate) fn socket(stats: &str, sockets: &str) -> Result<SocketObservation> {
     ensure!(stats.len() <= 65536, "provider stats bounds");
     let stats: Stats =
         serde_json::from_str(stats).map_err(|_| anyhow::anyhow!("invalid provider stats"))?;
+    // The vendor's 2026.8 client reports the same UDP transport as
+    // "HTTPS via UDP". Recognize only these two exact labels; the connected
+    // service-owned UDP socket and the namespace checks remain mandatory.
     ensure!(
         stats.warp_is_on
-            && stats.protocol == "MASQUE (HTTP/3)"
+            && matches!(
+                stats.protocol.as_str(),
+                "MASQUE (HTTP/3)" | "MASQUE (HTTPS via UDP)"
+            )
             && stats.v4_endpoint.is_ipv4()
             && stats.v6_endpoint.is_ipv6(),
         "provider tunnel is not active MASQUE over HTTP/3"
@@ -218,6 +224,8 @@ mod tests {
         for bad in [
             STATS.replace("MASQUE", "WireGuard"),
             STATS.replace("HTTP/3", "HTTP/2"),
+            STATS.replace("HTTP/3", "HTTP/3 with HTTP/2 fallback"),
+            STATS.replace("HTTP/3", "HTTPS via TCP"),
             STATS.replace("true", "false"),
             STATS.replace("162.159.198.2", "162.159.198.3"),
             STATS.replace("162.159.198.2", "127.0.0.1"),
@@ -246,6 +254,17 @@ mod tests {
             SOCKET
         );
         assert_eq!(socket(STATS, &unrelated).unwrap().endpoint, good.endpoint);
+    }
+    #[test]
+    fn vendor_udp_label_still_requires_active_tunnel_and_matching_udp_socket() {
+        let stats = STATS.replace("HTTP/3", "HTTPS via UDP");
+        let modern = socket(&stats, SOCKET).unwrap();
+        let previous = socket(STATS, SOCKET).unwrap();
+        assert_eq!(modern.endpoint, previous.endpoint);
+        assert_eq!(modern.pid, previous.pid);
+        assert!(socket(&stats, "").is_err());
+        assert!(socket(&stats, &SOCKET.replace("198.2", "198.3")).is_err());
+        assert!(socket(&stats.replace("true", "false"), SOCKET).is_err());
     }
     #[test]
     fn addresses_and_protected_trace_are_bounded_and_reject_duplicates_or_downgrades() {
