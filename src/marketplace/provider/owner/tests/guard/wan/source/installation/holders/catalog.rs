@@ -10,6 +10,7 @@ use elixir_marketplace::{
 mod desktop;
 mod freshness;
 mod lifecycle;
+mod offsite;
 mod sdk;
 
 fn descriptor(source: &SourceFixture, weight: u8) -> Result<CandidateDescriptor> {
@@ -626,9 +627,12 @@ async fn catalog_workflow(run: CatalogRun) -> Result<()> {
             .await?;
         ensure!(count == 0, "consumer did not start empty");
         if let Some(executable) = desktop.as_deref() {
+            let sdk = sdk.as_ref().context("desktop qualification requires the actual publisher SDK")?;
             desktop::install_and_update(
-                executable, &actors[0], &actors[CONSUMER], holders[0], &sources, &descriptors[1],
-                sdk.as_ref().context("desktop qualification requires the actual publisher SDK")?,
+                executable, &actors[CONSUMER], &sources, async {
+                    publish_and_seed(&actors[0], &sources[1], Some(holders[0]), Some(sdk)).await?;
+                    offer(&actors[0], &descriptors[1]).await
+                },
             ).await?;
             return Ok(());
         }

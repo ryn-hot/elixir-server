@@ -88,12 +88,9 @@ async fn wait_for_update(directory: &Path) -> Result<()> {
 
 pub(super) async fn install_and_update(
     executable: &Path,
-    publisher: &Participant,
     consumer: &Participant,
-    holder: Uuid,
     sources: &[SourceFixture],
-    update: &CandidateDescriptor,
-    sdk: &sdk::PublisherSdk,
+    offer_update: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id=$1")
         .bind(
@@ -161,8 +158,7 @@ pub(super) async fn install_and_update(
             wait_for_update(&artifacts).await?;
             let instance = activation(consumer, sources[0].matched.release_id).await?;
             // No v2 offer before independent verification of actual v1 activation.
-            publish_and_seed(publisher, &sources[1], Some(holder), Some(sdk)).await?;
-            offer(publisher, update).await?;
+            offer_update.await?;
             write_private(&artifacts, "catalog-update-ready.json",
                 br#"{"schema_version":1,"fixture_only":true,"version_index":1}"#)?;
             Ok::<_, anyhow::Error>(instance)
