@@ -1,5 +1,7 @@
 //! Owner-requested, bounded discovery admission. No provider enrollment,
 //! global coverage assertion, unverified peer score, install or public hosting.
+#[cfg(test)]
+use super::search_timing::cold_setup::{self, Checkpoint};
 use super::worker::{
     EvidenceObservation, MetadataObservation, ParticipationClient, ParticipationPhase,
     PublicSourceObservation, SearchSourceObservation,
@@ -509,13 +511,16 @@ impl Backend for Live {
             if !interest.active() {
                 bail!("marketplace search is no longer requested");
             }
-            if let Some(source) = failures.record(
-                remote::while_interested(
-                    interest,
-                    self.client.preflight_search_metadata(&metadata, location),
-                )
-                .await,
-            ) {
+            #[cfg(test)]
+            cold_setup::record(Checkpoint::SourceStarted);
+            let source_result = remote::while_interested(
+                interest,
+                self.client.preflight_search_metadata(&metadata, location),
+            )
+            .await;
+            #[cfg(test)]
+            cold_setup::record(Checkpoint::SourceFinished(source_result.is_ok()));
+            if let Some(source) = failures.record(source_result) {
                 let value = Arc::new(Verified::new(metadata, source)?);
                 if !local_pending {
                     if !interest.active() {
@@ -1248,6 +1253,19 @@ async fn process(
     request: &SearchRequest,
     backend: Arc<dyn Backend>,
 ) -> Result<()> {
+    let work = process_page(inner, interest, request, backend);
+    #[cfg(test)]
+    if request.prepare_catalog {
+        return cold_setup::observe(interest.id, work).await;
+    }
+    work.await
+}
+async fn process_page(
+    inner: &Arc<Inner>,
+    interest: &Interest,
+    request: &SearchRequest,
+    backend: Arc<dyn Backend>,
+) -> Result<()> {
     if !interest.active() {
         bail!("search interest expired");
     }
@@ -1326,6 +1344,8 @@ async fn process(
                 .admission_result(identity, AdmissionFeedback::from_result(&result))
                 .await?;
             attempts += 1;
+            #[cfg(test)]
+            let mut card_inserted = false;
             if let Ok(mut slot) = inner.slot.lock()
                 && let Some(query) = slot.query.as_mut().filter(|query| query.id == interest.id)
             {
@@ -1337,9 +1357,17 @@ async fn process(
                             &old.metadata.descriptor().release.payload.extension_id != id
                         });
                         query.values.push(value);
+                        #[cfg(test)]
+                        {
+                            card_inserted = true;
+                        }
                     }
                     Err(_) => query.omitted += 1,
                 }
+            }
+            #[cfg(test)]
+            if card_inserted {
+                cold_setup::record(Checkpoint::FirstAdmitted);
             }
         }
         let admitted = inner

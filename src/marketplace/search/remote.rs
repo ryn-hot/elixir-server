@@ -732,6 +732,10 @@ impl Session {
                 }
                 self.emitted.insert(identity, index);
                 output_bytes += bytes.len() + 1;
+                #[cfg(test)]
+                if matches!(self.sources[index].location, Location::Peer(_)) {
+                    cold_setup::record(Checkpoint::FirstRemoteHint);
+                }
                 results.push(candidate);
             }
             if results.len() == emission_limit.min(query.limit)
@@ -787,6 +791,8 @@ impl Session {
             }
             self.discovered = true;
             let waiting = self.discovery_progress.begin();
+            #[cfg(test)]
+            cold_setup::record(Checkpoint::DiscoveryStarted);
             let mut peers = tokio::select! {
                 result=transport.peers(interest)=>result.context("marketplace peer discovery failed")?,
                 _=inactive(interest)=>bail!("search interest expired"),
@@ -797,6 +803,8 @@ impl Session {
             }
             peers.sort();
             peers.dedup();
+            #[cfg(test)]
+            cold_setup::record(Checkpoint::DiscoveryFinished(peers.len().min(MAX_PEERS)));
             // Do not privilege fixed roster order on every new query.
             let nonce = Uuid::new_v4();
             peers.sort_by_key(|peer| {

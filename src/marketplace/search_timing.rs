@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 use uuid::Uuid;
+pub(super) mod cold_setup;
 
 const MAX_EVENTS: usize = 512;
 const MAX_EVENT_BYTES: usize = 2048;
@@ -146,7 +147,7 @@ pub(super) fn emit(event: Event) {
     };
     write_event(&mut std::io::stderr().lock(), &event);
 }
-fn write_event(output: &mut impl Write, event: &Event) {
+fn write_event(output: &mut impl Write, event: &impl Serialize) {
     if let Ok(encoded) = serde_json::to_string(event) {
         if encoded.len() <= MAX_EVENT_BYTES {
             // A closed diagnostic stream must not unwind an owned RPC or

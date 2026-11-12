@@ -139,8 +139,11 @@ fn verified_card<'a>(view: &'a Value, source: &SourceFixture) -> Result<&'a Valu
     Ok(&rows[0])
 }
 
-async fn setup_card(actor: &Participant, source: &SourceFixture) -> Result<Uuid> {
+async fn setup_card(actor: &Participant, source: &SourceFixture, timing: bool) -> Result<Uuid> {
     let began = tokio::time::Instant::now();
+    if timing {
+        eprintln!("{}", json!({"stage":"cold_setup_http_start"}));
+    }
     let request = setup_request();
     let started = http(
         actor.app()?,
@@ -167,7 +170,8 @@ async fn setup_card(actor: &Participant, source: &SourceFixture) -> Result<Uuid>
                 && progress["scope"] == "current_local_catalog"
                 && progress["metadata_only"] == true
                 && progress["network_complete"] == false
-                && (preparing || matches!(progress_phase, Some("complete" | "limited" | "unavailable")))
+                && (preparing
+                    || matches!(progress_phase, Some("complete" | "limited" | "unavailable")))
                 && progress["local_pass_complete"] == json!(progress_phase == Some("complete")),
             "invalid setup progress: {progress}"
         );
@@ -193,6 +197,13 @@ async fn setup_card(actor: &Participant, source: &SourceFixture) -> Result<Uuid>
                 json!({"stage":"cross_peer_verified_setup_page",
                 "elapsed_ms":began.elapsed().as_millis(),"simulated_support_only":true})
             );
+            if timing {
+                eprintln!(
+                    "{}",
+                    json!({"stage":"cold_setup_http_first_card",
+                    "query_id":id,"elapsed_ms":began.elapsed().as_millis()})
+                );
+            }
             return Ok(id);
         }
         ensure!(
@@ -464,19 +475,33 @@ fn approved_versioned_sources_and_test_support_match_before_enrollment() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "two explicitly approved remaining identities; real protected peer catalog/source/install/update; TEST support only"]
 async fn independent_catalog_selected_card_install_and_manual_update() -> Result<()> {
-    catalog_workflow(false, false).await
+    catalog_workflow(CatalogRun::Selected).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "standing-approved two free identities, synthetic sources; normal automatic scheduler/logout, owner opt-out and actual guard failure"]
 async fn independent_catalog_automatic_update_opt_out_and_protection_loss() -> Result<()> {
-    catalog_workflow(true, false).await
+    catalog_workflow(CatalogRun::Automatic).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "two standing-approved free identities; real publisher SDK and independently protected consumer; already-approved synthetic sources only"]
 async fn independent_catalog_sdk_publish_install_and_update() -> Result<()> {
-    catalog_workflow(false, true).await
+    catalog_workflow(CatalogRun::SdkFull).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "standing-approved two free identities; protected first-page timing with approved synthetic source only"]
+async fn independent_catalog_sdk_cold_setup_timing() -> Result<()> {
+    catalog_workflow(CatalogRun::SdkFirstPage).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CatalogRun {
+    Selected,
+    Automatic,
+    SdkFull,
+    SdkFirstPage,
 }
 
 async fn publish_and_seed(
@@ -489,17 +514,31 @@ async fn publish_and_seed(
         return sdk.install_and_seed(actor, source, existing).await;
     }
     let instance = install_with_updates(
-        actor.app()?, actor.state()?, actor.token()?, source, existing, true, false,
-    ).await?;
+        actor.app()?,
+        actor.state()?,
+        actor.token()?,
+        source,
+        existing,
+        true,
+        false,
+    )
+    .await?;
     actor.seeding(instance, source, true).await?;
     Ok(instance)
 }
 
-async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
+async fn catalog_workflow(run: CatalogRun) -> Result<()> {
     consent()?; // No input access or enrollment before explicit consent.
     ensure!(
         std::env::var("ELIXIR_MARKETPLACE_REMAINING_TWO_IDENTITY_LIVE_TEST").as_deref() == Ok("1"),
         "explicit remaining two-identity allowance required before enrollment"
+    );
+    let lifecycle = run == CatalogRun::Automatic;
+    let timing = run == CatalogRun::SdkFirstPage;
+    let use_sdk = timing || run == CatalogRun::SdkFull;
+    ensure!(
+        !timing || std::env::var("ELIXIR_MARKETPLACE_COLD_SETUP_TIMING").as_deref() == Ok("1"),
+        "explicit cold setup observation required before enrollment"
     );
     const CONSUMER: usize = 1;
     let sources = configured_fixtures()?;
@@ -531,6 +570,13 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
                 == Some("0"),
         "ordinary pinned worker required before enrollment"
     );
+    ensure!(
+        !timing
+            || labels
+                .get("elixir.marketplace.worker.private_discovery_trace")
+                .is_some_and(|v| v == "1"),
+        "private worker discovery observation required before enrollment"
+    );
     let topic = Digest::of(Uuid::new_v4().as_bytes());
     let mut allocation = crate::marketplace::application::fixture_allocation();
     allocation.source.cpu_millicores = 200;
@@ -557,6 +603,9 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
                 let instance = publish_and_seed(&actors[n], &sources[0], None, sdk.as_ref()).await?;
                 holders.push(instance);
                 offer(&actors[n], &descriptors[0]).await?;
+                if timing {
+                    eprintln!("{}", json!({"stage":"cold_setup_catalog_offer_accepted"}));
+                }
             }
         }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_extension_grants")
@@ -577,11 +626,18 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
             // Let the ordinary worker discover the publisher; no known-peer
             // configuration or forced refresh before setup begins. Reuse
             // this very receipt for installation, as the desktop does.
-            setup_card(&actors[CONSUMER], &sources[0]).await?
+            setup_card(&actors[CONSUMER], &sources[0], timing).await?
         } else {
             discover_pair(&actors).await?;
             card(&actors[CONSUMER], &sources[0], 10, None).await?
         };
+        if timing {
+            // Do not install or publish v2 merely to measure this first page.
+            actors[CONSUMER].roles(false, 3).await?;
+            eprintln!("{}", json!({"stage":"cold_setup_first_page_only_verified",
+                "verified_cards":1,"consumer_installs":0,"production_enabled":false}));
+            return Ok(());
+        }
         let installed = install_card_with_policy(&actors[CONSUMER], &sources[0], query, None, lifecycle).await?;
         if lifecycle && std::env::var("ELIXIR_MARKETPLACE_FULL_LIFECYCLE_CAPTURE").as_deref() == Ok("1") {
             // Observation window BEFORE publishing the already-approved next
@@ -702,11 +758,22 @@ async fn catalog_workflow(lifecycle: bool, use_sdk: bool) -> Result<()> {
             cleanup.push(format!("participant {}: {error:#}", index + 1));
         }
     }
-    ensure!(cleanup.is_empty(), "local catalog fixture cleanup failures: {cleanup:?}");
-    eprintln!(
-        "{}",
-        json!({"stage":"cross_peer_catalog_test_complete","same_identities_revoked":2,
-        "excludes":"holder failover, real billing, metered foreground-only freshness, GitLab/Radicle, complete packet privacy matrix, playback, scale and release approval"})
+    ensure!(
+        cleanup.is_empty(),
+        "local catalog fixture cleanup failures: {cleanup:?}"
     );
+    if timing {
+        eprintln!(
+            "{}",
+            json!({"stage":"cold_setup_first_page_only_complete",
+            "same_identities_revoked":2})
+        );
+    } else {
+        eprintln!(
+            "{}",
+            json!({"stage":"cross_peer_catalog_test_complete","same_identities_revoked":2,
+            "excludes":"holder failover, real billing, metered foreground-only freshness, GitLab/Radicle, complete packet privacy matrix, playback, scale and release approval"})
+        );
+    }
     Ok(())
 }
