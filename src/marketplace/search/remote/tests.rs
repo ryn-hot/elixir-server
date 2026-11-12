@@ -84,6 +84,43 @@ fn peer(n: usize) -> PeerKey {
     PeerKey::try_from(format!("{n:064x}")).unwrap()
 }
 #[tokio::test]
+async fn setup_recovery_reads_local_only_but_explicit_continuation_can_discover() -> Result<()> {
+    let (_inner, interest, mut request) = context(20);
+    request.prepare_catalog = true;
+    let mut transport = Mock::new();
+    transport
+        .pages
+        .insert("local".into(), vec![vec![candidate(0)]]);
+    transport.catalog(1, vec![vec![candidate(1)]]);
+    let mut session = Session::for_setup_recovery(DiscoveryProgress::default());
+    let local = session.read(&transport, &request, &interest).await?;
+    assert_eq!(local.results.len(), 1);
+    assert_eq!(
+        local.results[0].descriptor.release.payload.display_name,
+        "Remote 0"
+    );
+    assert!(!session.discovered);
+    assert!(!local.network_complete);
+    assert!(
+        transport
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(name, _)| name == "local")
+    );
+    request.prepare_catalog = false;
+    request.cursor = Some(local.next_cursor.context("explicit continuation lost")?);
+    let next = session.read(&transport, &request, &interest).await?;
+    assert_eq!(next.results.len(), 1);
+    assert_eq!(
+        next.results[0].descriptor.release.payload.display_name,
+        "Remote 1"
+    );
+    assert!(session.discovered);
+    Ok(())
+}
+#[tokio::test]
 async fn update_lookup_queries_peers_even_when_the_local_catalog_has_a_usable_card() -> Result<()> {
     let (_inner, interest, mut request) = context(1);
     let old = candidate(1);

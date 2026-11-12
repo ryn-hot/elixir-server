@@ -179,7 +179,12 @@ trait Backend: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    async fn populate(&self, _interest: &Interest, _deadline: Instant) -> Result<()> {
+    async fn populate(
+        &self,
+        _interest: &Interest,
+        _deadline: Instant,
+        _early: &mut catalog::EarlyBrowse<'_>,
+    ) -> Result<()> {
         Ok(())
     }
     async fn inventory(
@@ -205,9 +210,8 @@ trait Backend: Send + Sync {
         self.admit(descriptor, interest).await.map(|_| ())
     }
     async fn page(&self, request: &SearchRequest, interest: &Interest) -> Result<SearchPage>;
-    // An initially empty page may be retried once after bounded population.
     // Never reuse a consumed continuation or restart a nonempty displayed page.
-    async fn reset_browse(&self) -> Result<()> {
+    async fn reset_browse(&self, _scope: catalog::BrowseScope) -> Result<()> {
         Ok(())
     }
     async fn more(
@@ -389,8 +393,13 @@ impl Backend for Live {
     async fn warm_metadata(&self, descriptors: &[CandidateDescriptor], _: &Interest) -> Result<()> {
         self.client.warm_metadata(descriptors).await
     }
-    async fn populate(&self, interest: &Interest, deadline: Instant) -> Result<()> {
-        catalog::populate(&self.client, interest, deadline).await
+    async fn populate(
+        &self,
+        interest: &Interest,
+        deadline: Instant,
+        early: &mut catalog::EarlyBrowse<'_>,
+    ) -> Result<()> {
+        catalog::populate(&self.client, interest, deadline, early).await
     }
     async fn inventory(
         &self,
@@ -431,9 +440,15 @@ impl Backend for Live {
             .page(&self.client, request, interest)
             .await
     }
-    async fn reset_browse(&self) -> Result<()> {
-        *self.session.lock().await =
-            remote::Session::with_progress(self.discovery_progress.clone());
+    async fn reset_browse(&self, scope: catalog::BrowseScope) -> Result<()> {
+        *self.session.lock().await = match scope {
+            catalog::BrowseScope::EarlyLocal => {
+                remote::Session::for_setup_recovery(self.discovery_progress.clone())
+            }
+            catalog::BrowseScope::Ordinary => {
+                remote::Session::with_progress(self.discovery_progress.clone())
+            }
+        };
         Ok(())
     }
     async fn more(
@@ -1185,59 +1200,15 @@ async fn run(inner: Arc<Inner>) {
             let _ = enrich(&inner, &interest, backend.as_ref()).await;
         }
         if let Some(until) = prepare_until {
-            let prepared = catalog::prepare(&inner, &interest, backend.as_ref(), until).await;
+            let mut early = catalog::EarlyBrowse::new(&inner, &interest, &request, &backend, until);
+            let prepared =
+                catalog::prepare(&inner, &interest, backend.as_ref(), until, &mut early).await;
             if let Err(error) = &prepared {
                 crate::marketplace::lifecycle::trace_failure("catalog_preparation", error);
                 catalog::failed(&inner, &interest);
             }
-            // An empty bootstrap browse cannot open setup. If population
-            // succeeded, obtain a new independently checked page once, rather
-            // than waiting for the owner to guess when to retry. Nonempty
-            // pages/cursors remain stable; warming is not display authority.
-            let recheck_allowed = prepared.is_ok() && interest.active();
-            let retry = prepared.is_ok()
-                && inner.slot.lock().ok().is_some_and(|mut slot| {
-                    let Some(query) = slot.query.as_mut().filter(|q| q.id == id) else {
-                        return false;
-                    };
-                    let Some(progress) = query.preparation.as_mut() else {
-                        return false;
-                    };
-                    // Never expose Ready + Complete + empty in between the
-                    // warming pass and its eligible first-page recheck: the
-                    // desktop treats that combination as terminal.
-                    progress.phase = catalog::Phase::Complete;
-                    progress.local_pass_complete = true;
-                    if !recheck_allowed || !query.values.is_empty() {
-                        return false;
-                    }
-                    query.phase = SearchPhase::Checking;
-                    query.total = 0;
-                    query.checked = 0;
-                    query.omitted = 0;
-                    query.next_cursor = None;
-                    true
-                });
-            if retry {
-                let refreshed = match backend.reset_browse().await {
-                    Ok(()) => process(&inner, &interest, &request, backend.clone()).await,
-                    Err(error) => Err(error),
-                }
-                .inspect_err(|error| {
-                    crate::marketplace::lifecycle::trace_failure("catalog_browse_refresh", error)
-                });
-                if let Ok(mut slot) = inner.slot.lock()
-                    && let Some(query) = slot.query.as_mut().filter(|q| q.id == id)
-                {
-                    query.phase = if refreshed.is_ok() {
-                        SearchPhase::Ready
-                    } else {
-                        SearchPhase::Unavailable
-                    };
-                }
-                if refreshed.is_ok() && interest.active() {
-                    let _ = enrich(&inner, &interest, backend.as_ref()).await;
-                }
+            if prepared.is_ok() && early.complete().await && interest.active() {
+                let _ = enrich(&inner, &interest, backend.as_ref()).await;
             }
             if let Ok(mut slot) = inner.slot.lock()
                 && let Some(query) = slot.query.as_mut().filter(|q| q.id == id)

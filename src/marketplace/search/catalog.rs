@@ -98,15 +98,147 @@ async fn ready(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum BrowseScope {
+    EarlyLocal,
+    Ordinary,
+}
+
+fn begin_recheck(query: &mut Query) {
+    query.phase = SearchPhase::Checking;
+    query.total = 0;
+    query.checked = 0;
+    query.omitted = 0;
+    query.next_cursor = None;
+}
+
+/// One local-only browse when the first recovery data lands. It runs in the
+/// original query task and uses the normal admission and view fences. If this
+/// yields nothing, the existing final browse remains available once.
+pub(super) struct EarlyBrowse<'a> {
+    inner: &'a Arc<Inner>,
+    interest: &'a Interest,
+    request: &'a SearchRequest,
+    backend: &'a Arc<dyn Backend>,
+    until: Instant,
+    tried: bool,
+    published: bool,
+}
+impl<'a> EarlyBrowse<'a> {
+    pub(super) fn new(
+        inner: &'a Arc<Inner>,
+        interest: &'a Interest,
+        request: &'a SearchRequest,
+        backend: &'a Arc<dyn Backend>,
+        until: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            interest,
+            request,
+            backend,
+            until,
+            tried: false,
+            published: false,
+        }
+    }
+    async fn recover(&mut self) {
+        if std::mem::replace(&mut self.tried, true)
+            || Instant::now() >= self.until
+            || !self.interest.active()
+        {
+            return;
+        }
+        let started = self.inner.slot.lock().ok().is_some_and(|mut slot| {
+            let Some(query) = slot.query.as_mut().filter(|query| {
+                query.id == self.interest.id
+                    && query.phase == SearchPhase::Ready
+                    && query.values.is_empty()
+            }) else {
+                return false;
+            };
+            begin_recheck(query);
+            true
+        });
+        if !started {
+            return;
+        }
+        self.published = self.check(BrowseScope::EarlyLocal).await;
+    }
+    pub(super) async fn complete(&self) -> bool {
+        let active = self.interest.active();
+        let retry = self.inner.slot.lock().ok().is_some_and(|mut slot| {
+            let Some(query) = slot.query.as_mut().filter(|q| q.id == self.interest.id) else {
+                return false;
+            };
+            let Some(progress) = query.preparation.as_mut() else {
+                return false;
+            };
+            // Never expose Ready + Complete + empty before a scheduled final
+            // recheck. The desktop would treat that combination as terminal.
+            progress.phase = Phase::Complete;
+            progress.local_pass_complete = true;
+            if !active || !query.values.is_empty() {
+                return false;
+            }
+            begin_recheck(query);
+            true
+        });
+        if retry {
+            self.check(BrowseScope::Ordinary).await
+        } else {
+            self.published
+        }
+    }
+    async fn check(&self, scope: BrowseScope) -> bool {
+        let result = match self.backend.reset_browse(scope).await {
+            Ok(()) => {
+                process(
+                    self.inner,
+                    self.interest,
+                    self.request,
+                    self.backend.clone(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+        .inspect_err(|error| {
+            crate::marketplace::lifecycle::trace_failure("catalog_browse_refresh", error)
+        });
+        let early = matches!(scope, BrowseScope::EarlyLocal);
+        if let Ok(mut slot) = self.inner.slot.lock()
+            && let Some(query) = slot.query.as_mut().filter(|q| q.id == self.interest.id)
+        {
+            // An unsuccessful early browse is not terminal while preparation
+            // can still find data. Don't publish its omissions or cursor as
+            // a finished empty result; discard partial observations on error.
+            if early && (result.is_err() || query.values.is_empty()) {
+                query.values.clear();
+                begin_recheck(query);
+            }
+            query.phase = if early || result.is_ok() {
+                SearchPhase::Ready
+            } else {
+                SearchPhase::Unavailable
+            };
+            return result.is_ok() && !query.values.is_empty();
+        }
+        false
+    }
+}
+
 pub(super) async fn prepare(
     inner: &Arc<Inner>,
     interest: &Interest,
     backend: &dyn Backend,
     until: Instant,
+    early: &mut EarlyBrowse<'_>,
 ) -> Result<()> {
     ready(inner, interest, backend, until).await?;
     update(inner, interest, |p| p.phase = Phase::Discovering)?;
-    backend.populate(interest, until).await?;
+    backend.populate(interest, until, early).await?;
     let (mut after, mut rows, mut pages, mut bytes) = (None, 0usize, 0usize, 0usize);
     loop {
         ready(inner, interest, backend, until).await?;
@@ -200,6 +332,9 @@ pub(super) async fn prepare(
                         p.omitted += 1;
                     }
                 })?;
+                if result.is_ok() {
+                    early.recover().await;
+                }
                 tokio::task::yield_now().await;
                 break;
             }
@@ -219,6 +354,7 @@ pub(super) async fn populate(
     client: &ParticipationClient,
     interest: &Interest,
     deadline: Instant,
+    early: &mut EarlyBrowse<'_>,
 ) -> Result<()> {
     use elixir_marketplace::worker_control::CatalogJobPhase;
     let inner = interest
@@ -259,6 +395,9 @@ pub(super) async fn populate(
             pages += 1;
             let count = state.admitted + state.unchanged + state.rejected;
             update(&inner, interest, |p| p.received += count)?;
+            if state.admitted > 0 {
+                early.recover().await;
+            }
             if state.phase != CatalogJobPhase::Progress {
                 break;
             }

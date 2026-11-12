@@ -320,6 +320,7 @@ pub(super) struct Session {
     warm_admissions: BTreeMap<Digest, WarmSearchAdmission>,
     discovery_progress: DiscoveryProgress,
     remote_only: bool,
+    setup_recovery: bool,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -343,6 +344,7 @@ impl Default for Session {
             warm_admissions: BTreeMap::new(),
             discovery_progress: DiscoveryProgress::default(),
             remote_only: false,
+            setup_recovery: false,
         }
     }
 }
@@ -351,6 +353,12 @@ impl Session {
         Self {
             discovery_progress,
             ..Self::default()
+        }
+    }
+    pub(super) fn for_setup_recovery(discovery_progress: DiscoveryProgress) -> Self {
+        Self {
+            setup_recovery: true,
+            ..Self::with_progress(discovery_progress)
         }
     }
     // Automatic checks must ask peers for the installed identity's current
@@ -384,6 +392,11 @@ impl Session {
         descriptor: &CandidateDescriptor,
     ) -> Vec<CandidateDescriptor> {
         let mut batch = vec![descriptor.clone()];
+        if self.setup_recovery && self.admitted.is_empty() {
+            // A fresh first row should not wait on prefetch for the rest of a
+            // newly populated page. Verify it on the ordinary single-row path.
+            return batch;
+        }
         let Some(source) = canonical::to_vec(descriptor)
             .ok()
             .map(Digest::of)
@@ -768,7 +781,10 @@ impl Session {
             if activated {
                 continue;
             }
-            if self.discovered || !results.is_empty() {
+            if self.discovered
+                || !results.is_empty()
+                || (self.setup_recovery && request.prepare_catalog)
+            {
                 break;
             }
             // The requested local page has finished, not the peer lookup or

@@ -19,6 +19,8 @@ struct Fixture {
     resume: Notify,
     broken: u8,
     empty_until_prepared: bool,
+    fail_early_admit: bool,
+    hold_after_warmed: Option<usize>,
     hold_reset: bool,
     resets: AtomicUsize,
     browses: AtomicUsize,
@@ -44,6 +46,8 @@ impl Fixture {
             resume: Notify::new(),
             broken,
             empty_until_prepared: false,
+            fail_early_admit: false,
+            hold_after_warmed: None,
             hold_reset: false,
             resets: AtomicUsize::new(0),
             browses: AtomicUsize::new(0),
@@ -57,7 +61,7 @@ impl Fixture {
 }
 #[async_trait]
 impl Backend for Fixture {
-    async fn populate(&self, _: &Interest, _: Instant) -> Result<()> {
+    async fn populate(&self, _: &Interest, _: Instant, _: &mut EarlyBrowse<'_>) -> Result<()> {
         if self.fail_population {
             bail!("synthetic population failure");
         }
@@ -129,7 +133,9 @@ impl Backend for Fixture {
             self.started.notify_one();
             return Err(ParticipationClient::fixture_queue_busy());
         }
-        if self.hold.swap(false, Ordering::SeqCst) {
+        if self.hold.swap(false, Ordering::SeqCst)
+            || self.hold_after_warmed == Some(self.warmed.load(Ordering::SeqCst))
+        {
             self.started.notify_one();
             self.resume.notified().await;
         }
@@ -144,18 +150,21 @@ impl Backend for Fixture {
         }
         Ok(page)
     }
-    async fn reset_browse(&self) -> Result<()> {
+    async fn reset_browse(&self, scope: BrowseScope) -> Result<()> {
         self.resets.fetch_add(1, Ordering::SeqCst);
         if self.hold_reset {
             self.started.notify_one();
             self.resume.notified().await;
         }
-        if self.fail_reset {
+        if self.fail_reset && matches!(scope, BrowseScope::Ordinary) {
             bail!("synthetic browse refresh failure");
         }
         Ok(())
     }
     async fn admit(&self, d: CandidateDescriptor, i: &Interest) -> Result<Arc<Verified>> {
+        if self.fail_early_admit && self.browses.load(Ordering::SeqCst) == 2 {
+            bail!("synthetic first recovery source failure");
+        }
         self.checks.admit(d, i).await
     }
     async fn current(&self, v: &Verified) -> Result<()> {
@@ -193,6 +202,7 @@ async fn failed_empty_browse_refresh_never_promotes_background_rows_or_restarts_
 -> Result<()> {
     let mut fixture = Fixture::new(20, 0)?;
     fixture.empty_until_prepared = true;
+    fixture.fail_early_admit = true;
     fixture.fail_reset = true;
     let backend = Arc::new(fixture);
     let service = SearchService::default();
@@ -204,8 +214,8 @@ async fn failed_empty_browse_refresh_never_promotes_background_rows_or_restarts_
     assert!(view.preparation.as_ref().unwrap().local_pass_complete);
     assert!(!String::from_utf8(serde_json::to_vec(&view)?)?.contains("synthetic browse"));
     assert_eq!(backend.warmed.load(Ordering::SeqCst), 20);
-    assert_eq!(backend.resets.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.browses.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.resets.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.browses.load(Ordering::SeqCst), 2);
     service.request_stop();
     service.join().await?;
     Ok(())
@@ -420,11 +430,12 @@ async fn ten_thousand_rows_are_a_pass_ceiling_not_an_unbounded_retained_history(
 }
 
 #[tokio::test]
-async fn an_empty_bootstrap_rechecks_once_after_population_without_promoting_warmed_rows()
+async fn an_empty_bootstrap_rechecks_the_first_warmed_row_without_promoting_warmed_rows()
 -> Result<()> {
     let mut fixture = Fixture::new(20, 0)?;
     fixture.empty_until_prepared = true;
     fixture.hold_reset = true;
+    fixture.hold_after_warmed = Some(1);
     fixture.hold.store(true, Ordering::SeqCst);
     let backend = Arc::new(fixture);
     let service = SearchService::default();
@@ -438,7 +449,16 @@ async fn an_empty_bootstrap_rechecks_once_after_population_without_promoting_war
     let rechecking = service.view(id).await?;
     assert!(rechecking.results.is_empty());
     assert_eq!(rechecking.phase, SearchPhase::Checking);
-    assert!(rechecking.preparation.unwrap().local_pass_complete);
+    assert!(!rechecking.preparation.unwrap().local_pass_complete);
+    assert_eq!(backend.warmed.load(Ordering::SeqCst), 1);
+    backend.resume.notify_one();
+    timeout(Duration::from_secs(3), backend.started.notified()).await?;
+    let first = service.view(id).await?;
+    assert_eq!(first.phase, SearchPhase::Ready);
+    assert_eq!(first.results.len(), 1);
+    assert_eq!(first.checked, 1);
+    assert!(!first.preparation.unwrap().local_pass_complete);
+    assert_eq!(backend.warmed.load(Ordering::SeqCst), 1);
     backend.resume.notify_one();
     let view = prepared(&service, id).await?;
     service.join().await?;
@@ -461,6 +481,34 @@ async fn an_empty_bootstrap_rechecks_once_after_population_without_promoting_war
             .preparation_until
             .is_none()
     );
+    service.request_stop();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_missed_early_card_keeps_the_single_final_browse_after_preparation() -> Result<()> {
+    let mut fixture = Fixture::new(3, 0)?;
+    fixture.empty_until_prepared = true;
+    fixture.fail_early_admit = true;
+    fixture.hold_after_warmed = Some(1);
+    let backend = Arc::new(fixture);
+    let service = SearchService::default();
+    let id = service.start_with(backend.clone(), initial())?;
+    timeout(Duration::from_secs(3), backend.started.notified()).await?;
+    let pending = service.view(id).await?;
+    assert_eq!(pending.phase, SearchPhase::Ready);
+    assert!(pending.results.is_empty() && pending.next_cursor.is_none());
+    assert_eq!((pending.checked, pending.omitted), (0, 0));
+    assert!(!pending.preparation.unwrap().local_pass_complete);
+    backend.resume.notify_one();
+    service.join().await?;
+    let view = service.view(id).await?;
+    assert_eq!(view.phase, SearchPhase::Ready);
+    assert_eq!(view.results.len(), 1);
+    assert!(view.preparation.unwrap().local_pass_complete);
+    assert_eq!(backend.resets.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.browses.load(Ordering::SeqCst), 3);
+    assert_eq!(backend.warmed.load(Ordering::SeqCst), 3);
     service.request_stop();
     Ok(())
 }

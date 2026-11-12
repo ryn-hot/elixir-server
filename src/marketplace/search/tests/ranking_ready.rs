@@ -45,7 +45,12 @@ impl Backend for Later {
     fn preparation_ready(&self) -> Result<bool> {
         Ok(self.available.load(Ordering::SeqCst))
     }
-    async fn populate(&self, _: &Interest, _: Instant) -> Result<()> {
+    async fn populate(
+        &self,
+        _: &Interest,
+        _: Instant,
+        _: &mut catalog::EarlyBrowse<'_>,
+    ) -> Result<()> {
         self.populated.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
