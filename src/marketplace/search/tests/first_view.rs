@@ -41,9 +41,14 @@ async fn first_interactive_view_wait_is_bounded_and_cannot_be_claimed_twice() ->
     assert_eq!(second.phase, SearchPhase::Checking);
     assert_eq!(began.elapsed(), Duration::ZERO);
     tokio::time::advance(FIRST_VIEW_WAIT).await;
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    let during_tail = service.interactive_view(id).await?;
+    assert_eq!(during_tail.phase, SearchPhase::Checking);
+    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT);
+    tokio::time::advance(FIRST_EMPTY_LOCAL_TAIL).await;
     let partial = first.await?;
     assert_eq!(partial.phase, SearchPhase::Checking);
-    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT);
+    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT + FIRST_EMPTY_LOCAL_TAIL);
     service.request_stop();
     backend.resume.notify_one();
     service.join().await
@@ -59,6 +64,8 @@ async fn replacement_wakes_waiter_and_setup_still_returns_immediately() -> Resul
     let began = Instant::now();
     let mut first = pin!(service.interactive_view(old_id));
     assert!(futures_util::poll!(first.as_mut()).is_pending());
+    tokio::time::advance(FIRST_VIEW_WAIT).await;
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
     let mut setup = request("");
     setup.prepare_catalog = true;
     let new_id = service.start_with(Arc::new(Fake::new(vec![])), setup)?;
@@ -67,7 +74,7 @@ async fn replacement_wakes_waiter_and_setup_still_returns_immediately() -> Resul
     assert_eq!(view.query_id, new_id);
     assert_eq!(view.phase, SearchPhase::Checking);
     assert!(view.preparation.is_some());
-    assert_eq!(began.elapsed(), Duration::ZERO);
+    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT);
     service.request_stop();
     backend.resume.notify_one();
     service.join().await
@@ -79,6 +86,49 @@ fn two_card_page() -> Result<(Arc<Fake>, SearchRequest)> {
     let mut query = request("example");
     query.query.limit = 2;
     Ok((backend, query))
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_local_tail_wakes_on_the_first_checked_card() -> Result<()> {
+    let service = SearchService::default();
+    let (backend, query) = two_card_page()?;
+    backend.hold_first.store(true, Ordering::SeqCst);
+    let id = service.start_with(backend.clone(), query)?;
+    backend.started.notified().await;
+    let began = Instant::now();
+    let mut first = pin!(service.interactive_view(id));
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    tokio::time::advance(FIRST_VIEW_WAIT).await;
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    backend.resume.notify_one();
+    backend.started.notified().await;
+    let view = first.await?;
+    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT);
+    assert_eq!(view.phase, SearchPhase::Checking);
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(backend.current_calls.load(Ordering::SeqCst), 1);
+    service.request_stop();
+    backend.resume.notify_one();
+    service.join().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_first_wait_does_not_extend_once_peer_lookup_started() -> Result<()> {
+    let service = SearchService::default();
+    let backend = Arc::new(Fake::new(vec![]));
+    backend.hold_first.store(true, Ordering::SeqCst);
+    let id = service.start_with(backend.clone(), request("example"))?;
+    backend.started.notified().await;
+    let began = Instant::now();
+    let mut first = pin!(service.interactive_view(id));
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    backend.peer_lookup_started.store(true, Ordering::SeqCst);
+    tokio::time::advance(FIRST_VIEW_WAIT).await;
+    assert!(first.await?.results.is_empty());
+    assert_eq!(began.elapsed(), FIRST_VIEW_WAIT);
+    service.request_stop();
+    backend.resume.notify_one();
+    service.join().await
 }
 
 #[tokio::test(start_paused = true)]

@@ -665,17 +665,32 @@ impl Backend for Live {
 // Replacing or stopping the query drops its sender, which wakes the old read.
 enum FirstView {
     Unclaimed,
-    Waiting(oneshot::Sender<()>),
+    Waiting {
+        sender: oneshot::Sender<()>,
+        wake_on_card: bool,
+    },
     Finished,
 }
 impl FirstView {
     fn finish(&mut self) {
-        if let Self::Waiting(sender) = std::mem::replace(self, Self::Finished) {
+        if let Self::Waiting { sender, .. } = std::mem::replace(self, Self::Finished) {
             let _ = sender.send(());
+        }
+    }
+    fn card_available(&mut self) {
+        if matches!(
+            self,
+            Self::Waiting {
+                wake_on_card: true,
+                ..
+            }
+        ) {
+            self.finish();
         }
     }
 }
 const FIRST_VIEW_WAIT: Duration = Duration::from_millis(100);
+const FIRST_EMPTY_LOCAL_TAIL: Duration = Duration::from_millis(100);
 const FIRST_LOCAL_SETTLE: Duration = Duration::from_millis(25);
 const FIRST_READY_RANK_GRACE: Duration = Duration::from_millis(500);
 
@@ -704,6 +719,25 @@ impl Query {
             && self.total == self.request.query.limit
             && (1..=5).contains(&self.total.saturating_sub(self.checked))
             && self.backend.local_only_so_far()
+    }
+
+    fn extend_empty_first_wait(&mut self) -> Option<Duration> {
+        if self.phase != SearchPhase::Checking
+            || self.backend.searching_peers()
+            || !self.backend.local_only_so_far()
+        {
+            return None;
+        }
+        if self.values.is_empty()
+            && let FirstView::Waiting { wake_on_card, .. } = &mut self.first_view
+        {
+            // There is nothing useful to display yet. Reuse the original
+            // request/oneshot and wake as soon as it can show a checked card.
+            *wake_on_card = true;
+            Some(FIRST_EMPTY_LOCAL_TAIL)
+        } else {
+            self.local_page_almost_ready().then_some(FIRST_LOCAL_SETTLE)
+        }
     }
 }
 #[derive(Default)]
@@ -936,6 +970,7 @@ impl SearchService {
                 || query.request.cursor.is_some()
                 || query.phase != SearchPhase::Checking
                 || query.backend.searching_peers()
+                || !query.backend.local_only_so_far()
             {
                 query.first_view.finish();
                 None
@@ -949,7 +984,10 @@ impl SearchService {
                 };
                 if let Some(duration) = duration {
                     let (sender, receiver) = oneshot::channel();
-                    query.first_view = FirstView::Waiting(sender);
+                    query.first_view = FirstView::Waiting {
+                        sender,
+                        wake_on_card: false,
+                    };
                     Some((receiver, duration))
                 } else {
                     query.first_view.finish();
@@ -958,25 +996,32 @@ impl SearchService {
             }
         };
         if let Some((mut receiver, duration)) = wait {
+            let started = Instant::now();
             #[cfg(test)]
             let wait_started = std::time::Instant::now();
-            let settle_after_empty = timeout(duration, &mut receiver).await.is_err()
+            let extension = if tokio::time::timeout_at(started + duration, &mut receiver)
+                .await
+                .is_err()
                 && duration == FIRST_VIEW_WAIT
-                && self.inner.slot.lock().is_ok_and(|slot| {
+            {
+                self.inner.slot.lock().ok().and_then(|mut slot| {
                     slot.query
-                        .as_ref()
-                        .is_some_and(|query| query.id == id && query.local_page_almost_ready())
-                });
-            if settle_after_empty {
-                // The empty wait may have become a nearly complete local
-                // page. Give the SAME waiter one short settle; stop or query
-                // replacement still closes it immediately.
-                let _ = timeout(FIRST_LOCAL_SETTLE, receiver).await;
+                        .as_mut()
+                        .filter(|query| query.id == id)
+                        .and_then(Query::extend_empty_first_wait)
+                })
+            } else {
+                None
+            };
+            if let Some(extra) = extension {
+                // One absolute deadline for the SAME request. No additional
+                // native call, permit or background task while waiting.
+                let _ = tokio::time::timeout_at(started + duration + extra, receiver).await;
             }
             #[cfg(test)]
             return super::search_timing::interactive_wait(
                 super::search_timing::micros(wait_started),
-                settle_after_empty || duration == FIRST_LOCAL_SETTLE,
+                extension == Some(FIRST_LOCAL_SETTLE) || duration == FIRST_LOCAL_SETTLE,
                 self.view(id),
             )
             .await;
@@ -1363,6 +1408,7 @@ async fn process_page(
                             &old.metadata.descriptor().release.payload.extension_id != id
                         });
                         query.values.push(value);
+                        query.first_view.card_available();
                         #[cfg(test)]
                         {
                             card_inserted = true;
