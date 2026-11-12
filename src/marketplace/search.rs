@@ -755,6 +755,28 @@ struct Interest {
     id: Uuid,
 }
 impl Interest {
+    fn allows_cold_discovery(&self) -> Result<bool> {
+        let inner = self
+            .inner
+            .upgrade()
+            .context("marketplace search owner stopped")?;
+        let slot = inner
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("marketplace search owner unavailable"))?;
+        let query = slot
+            .query
+            .as_ref()
+            .filter(|query| query.id == self.id)
+            .context("marketplace search is no longer requested")?;
+        // The completed setup pass already had its own discovery opportunity.
+        // The final browse may use connected peers, not start another cold wait.
+        Ok(!query
+            .preparation
+            .as_ref()
+            .is_some_and(|p| p.local_pass_complete))
+    }
+
     fn active(&self) -> bool {
         self.inner
             .upgrade()

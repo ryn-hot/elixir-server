@@ -154,6 +154,12 @@ async fn discover_from(
     let present =
         |peers: &Vec<PeerKey>| wanted.map_or(!peers.is_empty(), |key| peers.contains(key));
     if !present(&peers) && interest.active() {
+        // After setup's population pass, the final check can use live sessions
+        // without repeating cold discovery. Exact reconnects retain their
+        // independent deadline and cursor binding.
+        if wanted.is_none() && !interest.allows_cold_discovery()? {
+            return Ok(peers);
+        }
         // This only refreshes the existing bounded protected topic manager.
         // It never dials a caller-provided address or forwards a cursor.
         // Admission to this one refresh has its own fixed queue deadline. A

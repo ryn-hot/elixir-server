@@ -403,6 +403,45 @@ async fn one_discovery_attempt_covers_onion_dial_and_noise_but_still_has_a_fixed
     Ok(())
 }
 #[tokio::test(start_paused = true)]
+async fn completed_setup_checks_connected_peers_without_starting_another_cold_wait() -> Result<()> {
+    let (inner, interest, _) = context(20);
+    {
+        let mut slot = inner.slot.lock().unwrap();
+        let query = slot.query.as_mut().unwrap();
+        query.request.prepare_catalog = true;
+        query.preparation = Some(catalog::Progress::default());
+    }
+    let state = DelayedDiscovery {
+        inner: inner.clone(),
+        born: Instant::now(),
+        after: ParticipationClient::DISCOVERY_WAIT * 2 + Duration::from_secs(1),
+        calls: 0.into(),
+        refreshes: 0.into(),
+    };
+
+    assert!(discover_from(&state, &interest, None).await?.is_empty());
+    assert_eq!(state.born.elapsed(), ParticipationClient::DISCOVERY_WAIT);
+    // Preserve the actual background recovery opportunity. Only the final
+    // presentation recheck after this pass should skip another empty wait.
+    assert!(discover_from(&state, &interest, None).await?.is_empty());
+    {
+        let mut slot = inner.slot.lock().unwrap();
+        let progress = slot.query.as_mut().unwrap().preparation.as_mut().unwrap();
+        progress.phase = catalog::Phase::Complete;
+        progress.local_pass_complete = true;
+    }
+    assert!(discover_from(&state, &interest, None).await?.is_empty());
+    assert_eq!(
+        state.born.elapsed(),
+        ParticipationClient::DISCOVERY_WAIT * 2
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(discover_from(&state, &interest, None).await?, vec![peer(1)]);
+    assert_eq!(state.refreshes.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_alternative_identity_never_completes_a_specific_peers_reconnect() -> Result<()> {
     let (inner, interest, _) = context(20);
     let state = DelayedDiscovery {
