@@ -7,6 +7,7 @@ struct Later {
     hold: AtomicBool,
     available: AtomicBool,
     invalid_origins: AtomicBool,
+    local_only: bool,
     started: Notify,
     resume: Notify,
     calls: AtomicUsize,
@@ -21,6 +22,7 @@ impl Later {
             hold: AtomicBool::new(true),
             available: AtomicBool::new(true),
             invalid_origins: AtomicBool::new(false),
+            local_only: false,
             started: Notify::new(),
             resume: Notify::new(),
             calls: AtomicUsize::new(0),
@@ -30,6 +32,9 @@ impl Later {
 }
 #[async_trait]
 impl Backend for Later {
+    fn local_only_so_far(&self) -> bool {
+        self.local_only
+    }
     async fn page(&self, r: &SearchRequest, i: &Interest) -> Result<SearchPage> {
         self.checks.page(r, i).await
     }
@@ -74,6 +79,42 @@ impl Backend for Later {
         }
         self.checks.evidence(v, s, i).await
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_rank_waits_for_the_first_checked_local_view_or_one_fixed_grace() -> Result<()> {
+    for poll in [false, true] {
+        let mut later = Later::new()?;
+        later.local_only = true;
+        let backend = Arc::new(later);
+        let service = SearchService::default();
+        let id = service.start_with(backend.clone(), request("example"))?;
+        while !service
+            .inner
+            .slot
+            .lock()
+            .unwrap()
+            .query
+            .as_ref()
+            .is_some_and(|query| query.phase == SearchPhase::Ready)
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        if poll {
+            let page = service.view(id).await?;
+            assert_eq!(page.phase, SearchPhase::Ready);
+            assert_eq!(page.results.len(), 2);
+        } else {
+            tokio::time::advance(FIRST_READY_RANK_GRACE).await;
+        }
+        timeout(Duration::from_millis(25), backend.started.notified()).await?;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        backend.resume.notify_one();
+        service.join().await?;
+        service.request_stop();
+    }
+    Ok(())
 }
 async fn held(service: &SearchService, backend: &Arc<Later>, prepare: bool) -> Result<Uuid> {
     let mut r = request("example");

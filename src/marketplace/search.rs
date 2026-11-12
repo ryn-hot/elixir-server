@@ -677,6 +677,7 @@ impl FirstView {
 }
 const FIRST_VIEW_WAIT: Duration = Duration::from_millis(100);
 const FIRST_LOCAL_SETTLE: Duration = Duration::from_millis(25);
+const FIRST_READY_RANK_GRACE: Duration = Duration::from_millis(500);
 
 struct Query {
     id: Uuid,
@@ -692,6 +693,7 @@ struct Query {
     preparation: Option<catalog::Progress>,
     preparation_until: Option<Instant>,
     first_view: FirstView,
+    rank_after_view: Option<oneshot::Sender<()>>,
 }
 impl Query {
     fn local_page_almost_ready(&self) -> bool {
@@ -853,6 +855,7 @@ impl SearchService {
             preparation,
             preparation_until: None,
             first_view: FirstView::Unclaimed,
+            rank_after_view: None,
         });
         if !slot.running {
             // At most one active task and one replaceable latest query. Old
@@ -1083,14 +1086,14 @@ impl SearchService {
         {
             // Recheck generation after awaits; an older request must never
             // paint a newer query or keep its interest alive.
-            let slot = self
+            let mut slot = self
                 .inner
                 .slot
                 .lock()
                 .map_err(|_| anyhow::anyhow!("search owner unavailable"))?;
             let query = slot
                 .query
-                .as_ref()
+                .as_mut()
                 .filter(|query| query.id == id)
                 .context("search query was replaced or stopped")?;
             // The page may finish while its final security checks await IPC.
@@ -1110,6 +1113,13 @@ impl SearchService {
                 omitted = query.omitted;
                 next_cursor = query.next_cursor.clone();
                 preparation = query.preparation.clone();
+                if phase == SearchPhase::Ready
+                    && !invalidated
+                    && !cards.is_empty()
+                    && let Some(waiter) = query.rank_after_view.take()
+                {
+                    let _ = waiter.send(());
+                }
             }
         }
         let view = SearchView {
@@ -1175,6 +1185,7 @@ async fn run(inner: Arc<Inner>) {
             .inspect_err(|error| crate::marketplace::lifecycle::trace_failure("search", error));
         let still_requested = interest.active();
         let mut prepare_until = None;
+        let mut first_ready = None;
         if let Ok(mut slot) = inner.slot.lock()
             && let Some(query) = slot.query.as_mut().filter(|query| query.id == id)
         {
@@ -1184,6 +1195,20 @@ async fn run(inner: Arc<Inner>) {
                 SearchPhase::Unavailable
             };
             query.first_view.finish();
+            if result.is_ok()
+                && still_requested
+                && !request.prepare_catalog
+                && request.cursor.is_none()
+                && !query.values.is_empty()
+                && backend.local_only_so_far()
+            {
+                // Let the first full local view use the single native pipe
+                // before optional evidence fetches. The page itself is Ready
+                // already; absence of a view delays only optional work briefly.
+                let (send, receive) = oneshot::channel();
+                query.rank_after_view = Some(send);
+                first_ready = Some(receive);
+            }
             if result.is_ok() && request.prepare_catalog && still_requested {
                 // Explicit setup work may continue behind other application
                 // screens. Its fixed deadline is never extended by HTTP polls.
@@ -1197,7 +1222,17 @@ async fn run(inner: Arc<Inner>) {
             // The independently checked page is already ready. Additional
             // popularity evidence is optional, never another visibility gate.
             // Same task/interest/slots: no detached work or uncertain job abort.
-            let _ = enrich(&inner, &interest, backend.as_ref()).await;
+            if let Some(receive) = first_ready {
+                let _ = timeout(FIRST_READY_RANK_GRACE, receive).await;
+                if let Ok(mut slot) = inner.slot.lock()
+                    && let Some(query) = slot.query.as_mut().filter(|query| query.id == id)
+                {
+                    query.rank_after_view = None;
+                }
+            }
+            if interest.active() {
+                let _ = enrich(&inner, &interest, backend.as_ref()).await;
+            }
         }
         if let Some(until) = prepare_until {
             let mut early = catalog::EarlyBrowse::new(&inner, &interest, &request, &backend, until);

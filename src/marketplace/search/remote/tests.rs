@@ -44,6 +44,7 @@ fn context(limit: usize) -> (Arc<Inner>, Interest, SearchRequest) {
         preparation: None,
         preparation_until: None,
         first_view: FirstView::Unclaimed,
+        rank_after_view: None,
     });
     let interest = Interest {
         inner: Arc::downgrade(&inner),
