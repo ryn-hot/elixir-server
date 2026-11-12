@@ -336,4 +336,4 @@ pub(crate) fn installation_routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::authenticated_fixture;
+pub(crate) use tests::{authenticated_first_run_fixture, authenticated_fixture};

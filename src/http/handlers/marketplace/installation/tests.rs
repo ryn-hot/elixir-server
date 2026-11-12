@@ -93,6 +93,25 @@ pub(crate) async fn authenticated_fixture(
     root: &FsPath,
     url: &str,
 ) -> Result<(AppState, Router, CurrentPrincipal, String)> {
+    authenticated_fixture_with_preferences(database, root, url, true).await
+}
+
+// Actual signup/login with a pristine marketplace, so the desktop itself
+// must save first-run contribution preferences and native provider consent.
+pub(crate) async fn authenticated_first_run_fixture(
+    database: Database,
+    root: &FsPath,
+    url: &str,
+) -> Result<(AppState, Router, CurrentPrincipal, String)> {
+    authenticated_fixture_with_preferences(database, root, url, false).await
+}
+
+async fn authenticated_fixture_with_preferences(
+    database: Database,
+    root: &FsPath,
+    url: &str,
+    seed_preferences: bool,
+) -> Result<(AppState, Router, CurrentPrincipal, String)> {
     let mut settings = crate::http::test_settings_with_db();
     settings.database.url = url.into();
     settings.extensions.storage_root = root.join("extensions").display().to_string();
@@ -135,6 +154,16 @@ pub(crate) async fn authenticated_fixture(
     let principal = CurrentPrincipal::from_request_parts(&mut request, &state)
         .await
         .map_err(|_| anyhow::anyhow!("actual fixture token extraction failed"))?;
+    if !seed_preferences {
+        for table in ["marketplace_preferences", "marketplace_provider_setup"] {
+            let revision: i64 =
+                sqlx::query_scalar(&format!("SELECT revision FROM {table} WHERE singleton=1"))
+                    .fetch_one(&state.db_pool)
+                    .await?;
+            anyhow::ensure!(revision == 0, "first-run fixture is not pristine");
+        }
+        return Ok((state, app, principal, token));
+    }
     let change = crate::marketplace::preferences::Change {
         expected_revision: 0,
         mutation_id: Uuid::new_v4(),

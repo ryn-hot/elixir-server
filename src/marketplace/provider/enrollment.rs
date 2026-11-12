@@ -25,6 +25,47 @@ struct Record {
     consent_version: String,
 }
 
+// In a first-run qualification, only the UI can choose the enrollment ID.
+// After its startup has joined, read the native marker for exact recovery.
+// It cannot create an intent, prove a retained account or allow registration.
+#[cfg(test)]
+pub(super) fn fixture_recovery_scope(
+    directory: &std::path::Path,
+    deployment: Digest,
+    image: Digest,
+) -> Result<Option<Scope>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(directory.join(NAME))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("reading first-run enrollment marker"),
+    };
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0
+            && meta.len() <= MAX_BYTES as u64,
+        "first-run enrollment marker must be private, unshared and bounded"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    let record: Record = canonical::decode(&bytes, MAX_BYTES)?;
+    record.scope.validate()?;
+    ensure!(
+        record.schema_version == 1
+            && record.scope.deployment == deployment
+            && record.image == image
+            && record.consent_version == CONSENT_VERSION,
+        "first-run enrollment marker is from another owner context"
+    );
+    Ok(Some(record.scope))
+}
+
 pub(super) fn intent(
     lease: &ControllerLease,
     scope: Scope,
@@ -128,6 +169,28 @@ mod tests {
             "restart cannot reset enrollment"
         );
         assert!(intent(&lease, scope(), image, true)?);
+        Ok(())
+    }
+    #[test]
+    fn first_run_recovery_reads_only_the_original_native_marker() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().canonicalize()?.join("owner");
+        let lease = ControllerLease::acquire(&directory)?;
+        let image = Digest::of(b"image");
+        assert!(fixture_recovery_scope(&directory, scope().deployment, image)?.is_none());
+        assert!(!intent(&lease, scope(), image, false)?);
+        drop(lease);
+        assert_eq!(
+            fixture_recovery_scope(&directory, scope().deployment, image)?,
+            Some(scope())
+        );
+        assert!(
+            fixture_recovery_scope(&directory, Digest::of(b"other deployment"), image).is_err()
+        );
+        assert!(
+            fixture_recovery_scope(&directory, scope().deployment, Digest::of(b"other image"))
+                .is_err()
+        );
         Ok(())
     }
     #[test]

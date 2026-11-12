@@ -29,7 +29,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 mod installation;
 #[cfg(all(test, unix))]
-pub(crate) use installation::authenticated_fixture as installation_http_fixture;
+pub(crate) use installation::{
+    authenticated_first_run_fixture as installation_http_first_run_fixture,
+    authenticated_fixture as installation_http_fixture,
+};
 #[cfg(unix)]
 pub(crate) use installation::{
     installation_read_routes, installation_routes, private_response, targets,

@@ -7,6 +7,7 @@ use elixir_marketplace::{
     evidence::IssuerPolicy,
     records::{SignatureCache, SignedRecord},
 };
+mod desktop;
 mod freshness;
 mod lifecycle;
 mod sdk;
@@ -502,6 +503,13 @@ enum CatalogRun {
     Automatic,
     SdkFull,
     SdkFirstPage,
+    SdkDesktop,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "two standing-approved free identities, normal desktop first run, approved synthetic source only"]
+async fn independent_catalog_sdk_desktop_first_run_and_update() -> Result<()> {
+    catalog_workflow(CatalogRun::SdkDesktop).await
 }
 
 async fn publish_and_seed(
@@ -535,7 +543,10 @@ async fn catalog_workflow(run: CatalogRun) -> Result<()> {
     );
     let lifecycle = run == CatalogRun::Automatic;
     let timing = run == CatalogRun::SdkFirstPage;
-    let use_sdk = timing || run == CatalogRun::SdkFull;
+    let desktop = (run == CatalogRun::SdkDesktop)
+        .then(desktop::executable)
+        .transpose()?;
+    let use_sdk = timing || run == CatalogRun::SdkFull || desktop.is_some();
     ensure!(
         !timing || std::env::var("ELIXIR_MARKETPLACE_COLD_SETUP_TIMING").as_deref() == Ok("1"),
         "explicit cold setup observation required before enrollment"
@@ -596,6 +607,8 @@ async fn catalog_workflow(run: CatalogRun) -> Result<()> {
                 // Upload/review does not need an active serving role. The
                 // original SDK seeding step below still requires that role.
                 actors[n].start_application(&guard, &worker, topic, true, &allocation).await?;
+            } else if n == CONSUMER && desktop.is_some() {
+                actors[n].start_customer(&guard, &worker, topic, &allocation).await?;
             } else {
                 actors[n].start(&guard, &worker, topic, n == 0, &allocation).await?;
             }
@@ -612,6 +625,13 @@ async fn catalog_workflow(run: CatalogRun) -> Result<()> {
             .fetch_one(&actors[CONSUMER].rig.database.pool)
             .await?;
         ensure!(count == 0, "consumer did not start empty");
+        if let Some(executable) = desktop.as_deref() {
+            desktop::install_and_update(
+                executable, &actors[0], &actors[CONSUMER], holders[0], &sources, &descriptors[1],
+                sdk.as_ref().context("desktop qualification requires the actual publisher SDK")?,
+            ).await?;
+            return Ok(());
+        }
         // Allow ordinary catalog refresh without permitting serving. Metered
         // mode intentionally disables this background work; foreground-only
         // metered freshness is a separate qualification case.

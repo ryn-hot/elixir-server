@@ -548,10 +548,8 @@ async fn install_with_updates(
         upload_source.then_some(fixture),
     )
     .await?;
-    let instance = activate_direct_review(
-        app, state, token, id, &review, existing, automatic_updates,
-    )
-    .await?;
+    let instance =
+        activate_direct_review(app, state, token, id, &review, existing, automatic_updates).await?;
     eprintln!(
         "{}",
         json!({"stage":"actual_public_source_http_activation","version":publication.release.payload.version,
@@ -862,16 +860,30 @@ fn write_network_profile_with_network(
     worker: &str,
     network: elixir_marketplace::worker_network::NetworkConfig,
 ) -> Result<PathBuf> {
+    write_network_profile_with_provider(rig, guard, worker, network, false)
+}
+
+fn write_network_profile_with_provider(
+    rig: &Rig,
+    guard: &str,
+    worker: &str,
+    network: elixir_marketplace::worker_network::NetworkConfig,
+    first_run: bool,
+) -> Result<PathBuf> {
     let issuer = PublicKey::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[3; 32])
             .verifying_key()
             .to_bytes(),
     )?;
-    let value = json!({"schema_version":1,"guard_image":guard,"worker_image":worker,
-        "issuer_keys":[issuer],"network":network,
-        "provider":{"type":"native_warp","image":rig.image,
+    let provider = if first_run {
+        json!({"type":"native_warp_setup","image":rig.image})
+    } else {
+        json!({"type":"native_warp","image":rig.image,
             "consent_version":elixir_marketplace::warp_provider::CONSENT_VERSION,
-            "enrollment":rig.scope.enrollment}});
+            "enrollment":rig.scope.enrollment})
+    };
+    let value = json!({"schema_version":1,"guard_image":guard,"worker_image":worker,
+        "issuer_keys":[issuer],"network":network,"provider":provider});
     let path = rig.root.path().canonicalize()?.join("network-startup.json");
     let mut file = OpenOptions::new()
         .write(true)

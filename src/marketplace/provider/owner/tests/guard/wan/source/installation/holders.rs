@@ -27,6 +27,7 @@ struct Participant {
     shutdown: CancellationToken,
     startup: Option<JoinHandle<Result<()>>>,
     installed_startup: Option<JoinHandle<Result<()>>>,
+    customer_first_run: bool,
 }
 impl Participant {
     async fn new(runtime: Arc<dyn RuntimeManager>, image: &str) -> Result<Self> {
@@ -39,6 +40,7 @@ impl Participant {
             shutdown: CancellationToken::new(),
             startup: None,
             installed_startup: None,
+            customer_first_run: false,
         })
     }
     fn state(&self) -> Result<&AppState> {
@@ -62,7 +64,8 @@ impl Participant {
         seed: bool,
         allocation: &Allocation,
     ) -> Result<()> {
-        self.start_application(guard, worker, topic, seed, allocation).await?;
+        self.start_application(guard, worker, topic, seed, allocation)
+            .await?;
         self.roles(seed, 2).await?;
         eprintln!(
             "{}",
@@ -79,37 +82,8 @@ impl Participant {
         seed: bool,
         allocation: &Allocation,
     ) -> Result<()> {
-        let root = self.rig.root.path().canonicalize()?;
-        let url = format!("sqlite://{}", root.join("wan.sqlite").display());
-        let (mut state, _, principal, token) =
-            crate::http::handlers::marketplace::installation_http_fixture(
-                self.rig.database.clone(),
-                &root,
-                &url,
-            )
+        self.prepare_application(guard, worker, topic, allocation, false)
             .await?;
-        write_profile(&root, worker, allocation)?;
-        let mut settings = state.settings.as_ref().clone();
-        settings.marketplace.startup_file = Some(write_network_profile_with_network(
-            &self.rig,
-            guard,
-            worker,
-            // Startup may configure only consumer roles. Actual saved owner
-            // disclosure/metering and live host policy decide contribution.
-            config(topic, false)?,
-        )?);
-        settings.marketplace.installed_startup_file = Some(root.join("installed-startup.json"));
-        settings.marketplace.installation_management = true;
-        state.settings = Arc::new(settings);
-        self.rig.secrets = state.secrets.clone();
-        self.app = Some(crate::http::router(state.clone()));
-        self.token = Some(token);
-        self.principal = Some(principal);
-        self.state = Some(state);
-        // Parse the closed trusted profile before a settings mutation or any
-        // enrollment. Invalid static roles must not become an HTTP readback
-        // failure after the preference transaction has already committed.
-        crate::marketplace::startup::customer_provider_configuration(self.state()?).await?;
         let preference = Preferences {
             contribution: if seed {
                 ContributionMode::On
@@ -131,26 +105,8 @@ impl Participant {
                 && saved["settings"]["preferences"] == json!(preference),
             "owner contribution choice was not saved"
         );
-        self.rig.application = Some(self.state()?.marketplace.clone());
         self.rig.enrollment_started = true;
-        self.startup = Some(
-            crate::marketplace::startup::spawn_configured(self.state()?, self.shutdown.clone())
-                .context("original configured startup missing")?,
-        );
-        // Match main: networking does not start retained-extension restoration,
-        // installed sharing or automatic updates. The separate startup owns
-        // those services. Join its original task before racing an installation
-        // against the empty-database restoration barrier.
-        self.installed_startup = Some(
-            crate::marketplace::installed_startup::spawn_configured(
-                self.state()?,
-                self.shutdown.clone(),
-            )
-            .context("original installed startup missing")?,
-        );
-        let installed = self.installed_startup.as_mut().unwrap().await;
-        self.installed_startup = None;
-        installed.context("original installed startup join")??;
+        self.spawn_application().await?;
         let until = tokio::time::Instant::now() + Duration::from_secs(600);
         loop {
             if self.state()?.marketplace.installation_review_available() {
@@ -169,13 +125,101 @@ impl Participant {
         source_ready(&self.client()?).await?;
         Ok(())
     }
+
+    async fn start_customer(
+        &mut self,
+        guard: &str,
+        worker: &str,
+        topic: Digest,
+        allocation: &Allocation,
+    ) -> Result<()> {
+        self.prepare_application(guard, worker, topic, allocation, true)
+            .await?;
+        self.customer_first_run = true;
+        // Do not wait for protection: only the first-run desktop may enable it.
+        self.spawn_application().await
+    }
+
+    async fn prepare_application(
+        &mut self,
+        guard: &str,
+        worker: &str,
+        topic: Digest,
+        allocation: &Allocation,
+        first_run: bool,
+    ) -> Result<()> {
+        let root = self.rig.root.path().canonicalize()?;
+        let url = format!("sqlite://{}", root.join("wan.sqlite").display());
+        use crate::http::handlers::marketplace::{
+            installation_http_first_run_fixture, installation_http_fixture,
+        };
+        let (mut state, _, principal, token) = if first_run {
+            installation_http_first_run_fixture(self.rig.database.clone(), &root, &url).await?
+        } else {
+            installation_http_fixture(self.rig.database.clone(), &root, &url).await?
+        };
+        write_profile(&root, worker, allocation)?;
+        let mut settings = state.settings.as_ref().clone();
+        settings.marketplace.startup_file = Some(write_network_profile_with_provider(
+            &self.rig,
+            guard,
+            worker,
+            // Startup may configure only consumer roles. Actual saved owner
+            // disclosure/metering and live host policy decide contribution.
+            config(topic, false)?,
+            first_run,
+        )?);
+        settings.marketplace.installed_startup_file = Some(root.join("installed-startup.json"));
+        settings.marketplace.installation_management = true;
+        state.settings = Arc::new(settings);
+        self.rig.secrets = state.secrets.clone();
+        self.app = Some(crate::http::router(state.clone()));
+        self.token = Some(token);
+        self.principal = Some(principal);
+        self.state = Some(state);
+        // Parse the closed trusted profile before a settings mutation or any
+        // enrollment. Invalid static roles must not become an HTTP readback
+        // failure after the preference transaction has already committed.
+        ensure!(
+            crate::marketplace::startup::customer_provider_configuration(self.state()?)
+                .await?
+                .is_some()
+                == first_run,
+            "participant startup profile does not match the qualification case"
+        );
+        Ok(())
+    }
+
+    async fn spawn_application(&mut self) -> Result<()> {
+        self.rig.application = Some(self.state()?.marketplace.clone());
+        self.startup = Some(
+            crate::marketplace::startup::spawn_configured(self.state()?, self.shutdown.clone())
+                .context("original configured startup missing")?,
+        );
+        // Match main: networking does not start retained-extension restoration,
+        // installed sharing or automatic updates. The separate startup owns
+        // those services. Join its original task before racing an installation
+        // against the empty-database restoration barrier.
+        self.installed_startup = Some(
+            crate::marketplace::installed_startup::spawn_configured(
+                self.state()?,
+                self.shutdown.clone(),
+            )
+            .context("original installed startup missing")?,
+        );
+        let installed = self.installed_startup.as_mut().unwrap().await;
+        self.installed_startup = None;
+        installed.context("original installed startup join")??;
+        Ok(())
+    }
     async fn roles(&self, seed: bool, revision: i64) -> Result<()> {
         use crate::marketplace::service::RuntimePhase;
         let marketplace = &self.state()?.marketplace;
         // A recovered contributor earns ten healthy minutes. Allow one full
         // replacement window in the test, without shortening product policy
         // or resetting the deadline on each recovery. Consumers do not wait.
-        let until = tokio::time::Instant::now() + Duration::from_secs(if seed { 1200 } else { 180 });
+        let until =
+            tokio::time::Instant::now() + Duration::from_secs(if seed { 1200 } else { 180 });
         let mut report = tokio::time::Instant::now();
         loop {
             // Read the current owner, not a clone of the first generation.
@@ -186,7 +230,9 @@ impl Participant {
                 && state.is_some_and(|state| {
                     state.phase == ParticipationPhase::Running
                         && state.preferences_revision == Some(revision)
-                        && state.applied_roles.is_some_and(|r| r.consumer && r.catalog == seed && !r.routing)
+                        && state
+                            .applied_roles
+                            .is_some_and(|r| r.consumer && r.catalog == seed && !r.routing)
                 })
             {
                 return Ok(());
@@ -239,7 +285,10 @@ impl Participant {
         let stopped = self.stop().await;
         // Always attempt SAME-identity recovery/revocation, even after a failed
         // operation or stop. Never replace an uncertain enrollment with a new one.
-        let retired = self.rig.close().await;
+        let retired = match self.bind_customer_enrollment() {
+            Ok(()) => self.rig.close().await,
+            Err(error) => Err(error),
+        };
         if let Err(error) = &retired {
             eprintln!("Original holder identity retirement failed: {error:#}");
         }
@@ -258,6 +307,29 @@ impl Participant {
                 Err(first.context(format!("same-identity cleanup also failed: {cleanup:#}")))
             }
         }
+    }
+    fn bind_customer_enrollment(&mut self) -> Result<()> {
+        if !self.customer_first_run {
+            return Ok(());
+        }
+        use crate::marketplace::provider::{FENCE, NEXT, enrollment::fixture_recovery_scope};
+        if let Some(scope) = fixture_recovery_scope(
+            &self.rig.directory,
+            self.rig.scope.deployment,
+            self.rig.image.parse()?,
+        )? {
+            self.rig.scope = scope;
+            self.rig.enrollment_started = true;
+        } else {
+            for name in [FENCE, NEXT, "provider-state.v1", "provider-state.next"] {
+                ensure!(
+                    matches!(std::fs::symlink_metadata(self.rig.directory.join(name)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                    "uncertain first-run enrollment; preserve original owner evidence"
+                );
+            }
+        }
+        Ok(())
     }
     async fn seeding(&self, instance: Uuid, source: &SourceFixture, enable: bool) -> Result<()> {
         let extension = &source.publication.release.payload.extension_id;
@@ -296,9 +368,9 @@ impl Participant {
         loop {
             let runtime = marketplace.snapshot();
             if runtime.phase == crate::marketplace::service::RuntimePhase::Running
-                && runtime.participation.is_some_and(|state|
+                && runtime.participation.is_some_and(|state| {
                     state.phase == ParticipationPhase::Running && state.package_sharing_active
-                )
+                })
             {
                 break;
             }

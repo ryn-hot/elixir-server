@@ -40,6 +40,15 @@ fn exact_script(path: &Path, digest: &str) -> Result<String> {
 enum IrisRun {
     Route(String),
     Publish { script: String, fixture: PathBuf },
+    Read,
+}
+
+#[tokio::test]
+#[ignore = "one standing-approved free temporary identity; read only, same synthetic repository, no publication"]
+async fn existing_iris_mirror_readback_uses_a_fresh_protected_worker() -> Result<()> {
+    run("IRIS_MIRROR_READ", IrisRun::Read).await?;
+    eprintln!("{{\"stage\":\"iris_public_read_retired\",\"same_original_identity_revoked\":true}}");
+    Ok(())
 }
 
 #[tokio::test]
@@ -107,13 +116,15 @@ async fn run(consent: &str, run: IrisRun) -> Result<()> {
         rig.open(&guard, &image).await?;
         let worker = rig.worker()?;
         ready(worker).await?;
-        let status = worker
-            .start_network(config(Digest::of(uuid::Uuid::new_v4().as_bytes()), false)?)
-            .await?;
-        ensure!(
-            status.active && !status.catalog && !status.routing && !status.adaptive,
-            "only consumer networking may run"
-        );
+        if !matches!(&run, IrisRun::Read) {
+            let status = worker
+                .start_network(config(Digest::of(uuid::Uuid::new_v4().as_bytes()), false)?)
+                .await?;
+            ensure!(
+                status.active && !status.catalog && !status.routing && !status.adaptive,
+                "only consumer networking may run"
+            );
+        }
         let id = &worker.handle().id;
         ensure!(
             crate::runtime::packet_network::immutable_id(id),
@@ -142,6 +153,27 @@ async fn run(consent: &str, run: IrisRun) -> Result<()> {
         );
         ready(worker).await?;
         match &run {
+            IrisRun::Read => {
+                let result = timeout(
+                    Duration::from_secs(25),
+                    tokio::process::Command::new("docker")
+                        .args(["exec", "--user=10004:10004", id, "/usr/local/bin/node",
+                            "--input-type=module", "-e", include_str!("radicle_mirror_read.mjs")])
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await
+                .context("protected Iris readback deadline")??;
+                ensure!(result.status.success() && result.stderr.is_empty()
+                    && result.stdout.len() <= 4096, "protected Iris readback command failed");
+                let evidence: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+                ensure!(
+                    evidence["stage"] == "iris_protected_public_read"
+                        && evidence["hosts"].as_array().is_some_and(|rows| rows.len() == 2),
+                    "fixed Iris readback report missing"
+                );
+                eprintln!("{evidence}");
+            }
             IrisRun::Route(script) => {
                 let result = timeout(
                     Duration::from_secs(125),
