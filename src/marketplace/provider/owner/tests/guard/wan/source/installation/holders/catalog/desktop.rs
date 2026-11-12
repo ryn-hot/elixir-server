@@ -5,8 +5,6 @@ use crate::marketplace::application::Phase;
 use std::{os::unix::fs::PermissionsExt, process::Stdio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const EXECUTABLE_SHA: &str =
-    "sha256:facdf4e860e46540d41ec0165c4fe301628585ab9e15b17653c803c2f03b4804";
 const MAX_LOG: usize = 64 * 1024;
 
 pub(super) fn executable() -> Result<PathBuf> {
@@ -19,8 +17,10 @@ pub(super) fn executable() -> Result<PathBuf> {
         path.is_absolute(),
         "absolute desktop test executable required"
     );
+    let expected: Digest =
+        std::env::var("ELIXIR_MARKETPLACE_DESKTOP_EXECUTABLE_SHA256")?.parse()?;
     ensure!(
-        Digest::of(&bounded(&path, 64 * 1024 * 1024)?).to_string() == EXECUTABLE_SHA,
+        Digest::of(&bounded(&path, 64 * 1024 * 1024)?) == expected,
         "desktop executable does not match the reviewed first-run build"
     );
     Ok(path)
