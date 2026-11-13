@@ -24,12 +24,68 @@ use std::{
 mod cold_page;
 mod installation;
 
+/// Owner-approved synthetic test sources. Each signed release names exactly one
+/// of these locations, and its two snapshots must be that set's exact commits.
+struct ApprovedSource {
+    kind: RepositoryKind,
+    repository: &'static str,
+    url: &'static str,
+    snapshots: [(&'static str, &'static str, u64); 2],
+}
 const REPOSITORY: &str = "github.com/ryn-hot/elixir-marketplace-test-extension";
 const URL: &str = "https://github.com/ryn-hot/elixir-marketplace-test-extension";
-const SNAPSHOTS: [(&str, &str, u64); 2] = [
+const ORIGINAL_SAMPLE: [(&str, &str, u64); 2] = [
     ("1.0.0", "8a3dcef4e9f3efbe88f569437c9f1fa28d6435fd", 0),
     ("1.1.0", "842277ac588189eccf1c78deac2de665b4942024", 1),
 ];
+// Same synthetic files with only the manifest's publisher-qualified ID changed
+// (owner-approved 2026-11-13; the original sample's publisher key was lost).
+const MIRROR_SAMPLE: [(&str, &str, u64); 2] = [
+    ("1.0.0", "f5d4af8f800856d21986927f16bc9556c0aa6155", 0),
+    ("1.1.0", "25b4a439b29e914547d073100bdd360278818f5d", 1),
+];
+const MIRROR_RID: &str = "rad:z4ETU68oToPNFCtVPLczKzKFv87KY";
+const APPROVED_SOURCES: [ApprovedSource; 4] = [
+    ApprovedSource {
+        kind: RepositoryKind::Github,
+        repository: REPOSITORY,
+        url: URL,
+        snapshots: ORIGINAL_SAMPLE,
+    },
+    ApprovedSource {
+        kind: RepositoryKind::Gitlab,
+        repository: "gitlab.com/wintermute-software-group/elixir-marketplace-test-extension",
+        url: "https://gitlab.com/wintermute-software-group/elixir-marketplace-test-extension",
+        snapshots: MIRROR_SAMPLE,
+    },
+    ApprovedSource {
+        kind: RepositoryKind::Radicle,
+        repository: MIRROR_RID,
+        url: "https://iris.radicle.network",
+        snapshots: MIRROR_SAMPLE,
+    },
+    ApprovedSource {
+        kind: RepositoryKind::Radicle,
+        repository: MIRROR_RID,
+        url: "https://rosa.radicle.network",
+        snapshots: MIRROR_SAMPLE,
+    },
+];
+fn approved_source(publication: &PreparedPublication) -> Result<&'static ApprovedSource> {
+    let locations = &publication.release.payload.source.locations;
+    ensure!(
+        locations.len() == 1,
+        "only the owner-approved public test repository may be used"
+    );
+    APPROVED_SOURCES
+        .iter()
+        .find(|approved| {
+            locations[0].kind == approved.kind
+                && locations[0].repository_identity == approved.repository
+                && locations[0].url.as_deref() == Some(approved.url)
+        })
+        .context("only the owner-approved public test repository may be used")
+}
 struct SourceFixture {
     publication: PreparedPublication,
     matched: SourceMatchSummary,
@@ -60,26 +116,28 @@ fn fixtures(root: &Path) -> Result<Vec<SourceFixture>> {
         "explicit absolute public fixture root required"
     );
     let mut fixtures = Vec::new();
-    for (index, (version, commit, sequence)) in SNAPSHOTS.into_iter().enumerate() {
+    let mut selected: Option<&'static ApprovedSource> = None;
+    for index in 0..2 {
         let directory = root.join(format!("release-v{}", index + 1));
         let publication = PreparedPublication::parse(&bounded(
             &directory.join("publication.json"),
             MAX_PUBLICATION_BYTES,
         )?)?;
         let summary = publication.verify(now()?)?;
+        // Both versions must name the SAME single approved location.
+        let approved = approved_source(&publication)?;
+        ensure!(
+            selected.is_none_or(|first| std::ptr::eq(first, approved)),
+            "only the owner-approved public test repository may be used"
+        );
+        selected = Some(approved);
+        let (version, commit, sequence) = approved.snapshots[index];
         let release = &publication.release.payload;
         ensure!(
             release.version == version
                 && release.source.commit == commit
                 && publication.head.payload.sequence == sequence,
             "exact reviewed test snapshot required"
-        );
-        ensure!(
-            release.source.locations.len() == 1
-                && release.source.locations[0].kind == RepositoryKind::Github
-                && release.source.locations[0].repository_identity == REPOSITORY
-                && release.source.locations[0].url.as_deref() == Some(URL),
-            "only the owner-approved public test repository may be used"
         );
         let descriptor = SourceMatchDescriptor {
             schema_version: 1,
