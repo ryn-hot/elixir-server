@@ -693,6 +693,7 @@ mod source_response_tests {
         )))?;
         let descriptor = crate::marketplace::service::SourceProviderDescriptor {
             provider: Uuid::new_v4(),
+            capability: crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY,
             home,
             instance: Uuid::new_v4(),
             extension: serde_json::from_value(

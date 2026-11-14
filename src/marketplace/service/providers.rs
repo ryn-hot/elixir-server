@@ -6,6 +6,7 @@ use crate::{
     marketplace::grant_store::installation::{providers, standing::InstalledBinding},
 };
 pub(crate) use providers::Descriptor as SourceProviderDescriptor;
+pub(crate) use providers::SOURCE_ENDPOINT as SOURCE_PROVIDER_ENDPOINT;
 
 impl MarketplaceService {
     #[cfg(test)]
@@ -15,6 +16,7 @@ impl MarketplaceService {
     pub(crate) async fn source_providers(
         &self,
         database: &Database,
+        capability: &'static str,
     ) -> Result<Vec<SourceProviderDescriptor>> {
         let allocation = self
             .installation_allocation
@@ -31,7 +33,7 @@ impl MarketplaceService {
             .try_acquire_owned()
             .context("source provider metadata busy")?;
         let mut providers = Vec::new();
-        for coordinates in providers::candidates(database, None).await? {
+        for coordinates in providers::candidates(database, capability, None).await? {
             match InstalledBinding::load_provider(
                 database,
                 &coordinates,
@@ -51,6 +53,7 @@ impl MarketplaceService {
     pub(crate) async fn source_provider(
         &self,
         database: &Database,
+        capability: &'static str,
         id: uuid::Uuid,
     ) -> Result<Option<SourceProviderDescriptor>> {
         let allocation = self
@@ -67,7 +70,7 @@ impl MarketplaceService {
             .clone()
             .try_acquire_owned()
             .context("source provider metadata busy")?;
-        let candidates = providers::candidates(database, Some(id)).await?;
+        let candidates = providers::candidates(database, capability, Some(id)).await?;
         let Some(coordinates) = candidates.first() else {
             return Ok(None);
         };

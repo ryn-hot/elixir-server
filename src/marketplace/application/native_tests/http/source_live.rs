@@ -60,7 +60,7 @@ pub(super) async fn qualify(
     );
     let descriptor = state
         .marketplace
-        .source_provider(database, snapshot.provider_id)
+        .source_provider(database, crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY, snapshot.provider_id)
         .await?
         .context("registered source provider")?;
     assert_eq!(descriptor.home, home);

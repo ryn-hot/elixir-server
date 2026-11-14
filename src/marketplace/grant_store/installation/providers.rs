@@ -2,15 +2,28 @@
 //! constructed from these rows. Calls independently require the held controller.
 use super::*;
 use crate::extensions::manifest::{LIVE_CATALOG_PROVIDER_CAPABILITY, ManifestProviderScope};
+pub(crate) use crate::extensions::manifest::ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY;
 use elixir_marketplace::records::RuntimeProfile;
 use serde_json::{Value, json};
 
 pub(crate) const SOURCE_ENDPOINT: &str = "{\"type\":\"source-js-v1\"}";
+/// Capabilities a verified source-js generation may serve through the held
+/// controller. Each keeps its own consumer contract; none implies another.
+pub(crate) const SOURCE_PROVIDER_CAPABILITIES: [&str; 2] = [
+    LIVE_CATALOG_PROVIDER_CAPABILITY,
+    ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+];
+fn source_capability(capability: &str) -> Option<&'static str> {
+    SOURCE_PROVIDER_CAPABILITIES
+        .into_iter()
+        .find(|known| *known == capability)
+}
 const MAX_PROVIDERS: i64 = 4096;
 
 #[derive(Clone)]
 pub(crate) struct Descriptor {
     pub provider: Uuid,
+    pub capability: &'static str,
     pub home: Uuid,
     pub extension: ExtensionId,
     pub instance: Uuid,
@@ -33,10 +46,12 @@ pub(in crate::marketplace) struct Coordinates {
     pub extension: ExtensionId,
     pub instance: Uuid,
 }
-fn provider_id(instance: Uuid, slot: &str) -> Result<Uuid> {
+// The capability is part of the identity, so existing Live provider IDs are
+// unchanged and one slot can never alias across consumer contracts.
+fn provider_id(instance: Uuid, slot: &str, capability: &str) -> Result<Uuid> {
     let digest = Digest::of(canonical::to_vec(
         &json!({"domain":"elixir-marketplace/source-live-provider/v1",
-        "instance":instance,"slot":slot,"capability":LIVE_CATALOG_PROVIDER_CAPABILITY}),
+        "instance":instance,"slot":slot,"capability":capability}),
     )?);
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
@@ -57,9 +72,9 @@ pub(super) async fn register(
     let mut declarations = Vec::new();
     let mut charged = 0usize;
     for provide in &manifest.provides {
-        if provide.capability != LIVE_CATALOG_PROVIDER_CAPABILITY {
+        let Some(capability) = source_capability(&provide.capability) else {
             continue;
-        }
+        };
         if facts.release().payload().runtime_profile != RuntimeProfile::SourceJs {
             continue;
         }
@@ -68,7 +83,7 @@ pub(super) async fn register(
             .as_ref()
             .is_none_or(|e| e.r#type != "source-js-v1")
         {
-            bail!("installed live provider has no source transport");
+            bail!("installed source provider has no source transport");
         }
         let scope = serde_json::to_string(
             provide
@@ -87,20 +102,21 @@ pub(super) async fn register(
             bail!("source providers exceed their existing operational metadata reservation");
         }
         declarations.push((
-            provider_id(owner, &provide.slot)?,
+            provider_id(owner, &provide.slot, capability)?,
+            capability,
             provide,
             scope,
             implementation,
         ));
     }
-    let existing:Vec<(String,String)>=sqlx::query_as("SELECT provider_id,slot_id FROM providers WHERE instance_id=$1 AND capability=$2 AND endpoint_json=$3 ORDER BY provider_id")
-        .bind(owner.to_string()).bind(LIVE_CATALOG_PROVIDER_CAPABILITY).bind(SOURCE_ENDPOINT).fetch_all(&mut **tx).await?;
-    for (id, slot) in existing {
+    let existing:Vec<(String,String,String)>=sqlx::query_as("SELECT provider_id,slot_id,SUBSTR(capability,1,129) FROM providers WHERE instance_id=$1 AND capability IN ($2,$3) AND endpoint_json=$4 ORDER BY provider_id")
+        .bind(owner.to_string()).bind(SOURCE_PROVIDER_CAPABILITIES[0]).bind(SOURCE_PROVIDER_CAPABILITIES[1]).bind(SOURCE_ENDPOINT).fetch_all(&mut **tx).await?;
+    for (id, slot, capability) in existing {
         let id: Uuid = id.parse()?;
-        if id != provider_id(owner, &slot)? {
+        if id != provider_id(owner, &slot, &capability)? {
             bail!("source provider identity changed; no implicit repair");
         }
-        if !declarations.iter().any(|(next, _, _, _)| *next == id) {
+        if !declarations.iter().any(|(next, _, _, _, _)| *next == id) {
             let dependants:i64=sqlx::query_scalar("SELECT COUNT(*) FROM bindings WHERE consumer_provider_id=$1 OR target_provider_id=$1")
                 .bind(id.to_string()).fetch_one(&mut **tx).await?;
             if dependants != 0 {
@@ -110,9 +126,9 @@ pub(super) async fn register(
                 .bind(id.to_string()).bind(owner.to_string()).bind(SOURCE_ENDPOINT).execute(&mut **tx).await?;
         }
     }
-    for (id, provide, scope, implementation) in declarations {
+    for (id, capability, provide, scope, implementation) in declarations {
         let changed=sqlx::query("INSERT INTO providers(provider_id,instance_id,capability,slot_id,cardinality,implementation,scope_json,endpoint_json,health_state) VALUES($1,$2,$3,$4,'many',$5,$6,$7,'unknown') ON CONFLICT(provider_id) DO UPDATE SET implementation=excluded.implementation,scope_json=excluded.scope_json,health_state='unknown',last_healthcheck_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE providers.instance_id=excluded.instance_id AND providers.capability=excluded.capability AND providers.slot_id=excluded.slot_id AND providers.endpoint_json=excluded.endpoint_json")
-            .bind(id.to_string()).bind(owner.to_string()).bind(LIVE_CATALOG_PROVIDER_CAPABILITY).bind(&provide.slot)
+            .bind(id.to_string()).bind(owner.to_string()).bind(capability).bind(&provide.slot)
             .bind(implementation).bind(scope).bind(SOURCE_ENDPOINT).execute(&mut **tx).await?.rows_affected();
         if changed != 1 {
             bail!("source provider row is foreign; no adoption");
@@ -123,8 +139,12 @@ pub(super) async fn register(
 
 pub(in crate::marketplace) async fn candidates(
     database: &Database,
+    capability: &'static str,
     id: Option<Uuid>,
 ) -> Result<Vec<Coordinates>> {
+    if source_capability(capability).is_none() {
+        bail!("not a source provider capability");
+    }
     let mut query = String::from(
         "SELECT p.provider_id,SUBSTR(g.home_id,1,37),SUBSTR(i.extension_id,1,129),p.instance_id FROM providers p JOIN extension_instances i ON i.instance_id=p.instance_id JOIN extensions e ON e.extension_id=i.extension_id JOIN marketplace_extension_grants g ON g.extension_id=i.extension_id WHERE p.capability=$1 AND p.endpoint_json=$2 AND i.enabled=TRUE AND e.enabled=TRUE AND g.enabled=TRUE AND i.extension_id LIKE 'elx:%'",
     );
@@ -133,7 +153,7 @@ pub(in crate::marketplace) async fn candidates(
     }
     query.push_str(" ORDER BY p.provider_id LIMIT 4097");
     let mut query = sqlx::query_as::<_, (String, String, String, String)>(&query)
-        .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
+        .bind(capability)
         .bind(SOURCE_ENDPOINT);
     if let Some(id) = id {
         query = query.bind(id.to_string());
@@ -171,26 +191,37 @@ pub(super) async fn describe(
     }
     let (manifest, review) = capsule.source.review(facts.release())?;
     let sql = super::super::sdk::locked(
-        "SELECT SUBSTR(slot_id,1,129) AS slot_id,SUBSTR(implementation,1,129) AS implementation,SUBSTR(scope_json,1,65537) AS scope_json,cardinality FROM providers WHERE provider_id=$1 AND instance_id=$2 AND capability=$3 AND endpoint_json=$4",
+        "SELECT SUBSTR(slot_id,1,129) AS slot_id,SUBSTR(implementation,1,129) AS implementation,SUBSTR(scope_json,1,65537) AS scope_json,cardinality,SUBSTR(capability,1,129) AS capability FROM providers WHERE provider_id=$1 AND instance_id=$2 AND capability IN ($3,$4) AND endpoint_json=$5",
         driver,
         super::super::sdk::RowLock::Shared,
     );
-    let (slot, implementation, scope, cardinality): (String, String, String, String) =
-        sqlx::query_as(&sql)
-            .bind(provider.to_string())
-            .bind(instance.to_string())
-            .bind(LIVE_CATALOG_PROVIDER_CAPABILITY)
-            .bind(SOURCE_ENDPOINT)
-            .fetch_optional(&mut **tx)
-            .await?
-            .context("source provider no longer registered")?;
-    if provider != provider_id(instance, &slot)? || cardinality != "many" || scope.len() > 65536 {
+    let (slot, implementation, scope, cardinality, capability): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(&sql)
+        .bind(provider.to_string())
+        .bind(instance.to_string())
+        .bind(SOURCE_PROVIDER_CAPABILITIES[0])
+        .bind(SOURCE_PROVIDER_CAPABILITIES[1])
+        .bind(SOURCE_ENDPOINT)
+        .fetch_optional(&mut **tx)
+        .await?
+        .context("source provider no longer registered")?;
+    let capability =
+        source_capability(&capability).context("source provider capability is invalid")?;
+    if provider != provider_id(instance, &slot, capability)?
+        || cardinality != "many"
+        || scope.len() > 65536
+    {
         bail!("source provider metadata is invalid");
     }
     let declaration = manifest
         .provides
         .iter()
-        .find(|p| p.capability == LIVE_CATALOG_PROVIDER_CAPABILITY && p.slot == slot)
+        .find(|p| p.capability == capability && p.slot == slot)
         .context("source provider is not in the active signed manifest")?;
     if declaration.implementation.as_deref() != Some(&implementation)
         || declaration
@@ -233,6 +264,7 @@ pub(super) async fn describe(
     )?);
     Ok(Descriptor {
         provider,
+        capability,
         home,
         extension: extension.clone(),
         instance,

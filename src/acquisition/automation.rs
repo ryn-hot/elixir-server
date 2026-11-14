@@ -1355,7 +1355,12 @@ async fn search_and_submit_group(
             )
             .await?
         } else {
-            search_candidates_with_store(&state.db_pool, request).await?
+            search_candidates_with_store(
+                &state.db_pool,
+                request,
+                Some(&crate::http::handlers::acquisition_sources::MarketplaceSources::from_state(state)),
+            )
+            .await?
         };
         process_candidate_search_response_for_group(
             state,
@@ -1401,7 +1406,12 @@ async fn search_extension_suite_candidates_for_group(
     } else {
         group.targets.clone()
     };
-    let mut response = search_candidate_suite_with_store(&state.db_pool, request.clone()).await?;
+    let mut response = search_candidate_suite_with_store(
+        &state.db_pool,
+        request.clone(),
+        Some(&crate::http::handlers::acquisition_sources::MarketplaceSources::from_state(state)),
+    )
+    .await?;
     let stream_request =
         stream_candidate_search_request_for_group(subscription, target, &grouped_targets, &request);
     match search_stream_candidate_suite_with_store(&state.db_pool, stream_request).await {

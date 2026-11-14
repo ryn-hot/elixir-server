@@ -24,7 +24,7 @@ mod providers;
 #[cfg(unix)]
 pub(crate) use super::application::InstalledCall;
 #[cfg(unix)]
-pub(crate) use providers::SourceProviderDescriptor;
+pub(crate) use providers::{SOURCE_PROVIDER_ENDPOINT, SourceProviderDescriptor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

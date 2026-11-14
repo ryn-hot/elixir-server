@@ -259,7 +259,13 @@ impl LiveProviderDirectory {
         }
         #[cfg(unix)]
         if let Some((database, marketplace)) = &self.source {
-            let source = marketplace.source_providers(database).await.map_err(|_| {
+            let source = marketplace
+                .source_providers(
+                    database,
+                    crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY,
+                )
+                .await
+                .map_err(|_| {
                 ProviderDirectoryError::new(ProviderDirectoryErrorCode::StoreUnavailable)
             })?;
             for descriptor in source {
@@ -282,7 +288,11 @@ impl LiveProviderDirectory {
         #[cfg(unix)]
         if let Some((database, marketplace)) = &self.source {
             if let Some(descriptor) = marketplace
-                .source_provider(database, provider_id)
+                .source_provider(
+                    database,
+                    crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY,
+                    provider_id,
+                )
                 .await
                 .map_err(|_| ProviderDirectoryError::new(ProviderDirectoryErrorCode::NotReady))?
             {

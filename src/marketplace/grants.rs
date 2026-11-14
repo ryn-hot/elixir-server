@@ -236,13 +236,34 @@ pub(super) fn build_review(
         bail!("configured local SDK endpoints require the source-js runtime");
     }
     for provide in &manifest.provides {
-        if provide.capability == crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY {
-            let source = provide
-                .endpoint
-                .as_ref()
-                .is_some_and(|endpoint| endpoint.r#type == "source-js-v1");
-            if source != (profile == RuntimeProfile::SourceJs) {
-                bail!("live provider transport must match its verified runtime profile");
+        let source = provide
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.r#type == "source-js-v1");
+        if provide.capability == crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY
+            && source != (profile == RuntimeProfile::SourceJs)
+        {
+            bail!("live provider transport must match its verified runtime profile");
+        }
+        // A source-js candidate provider is served only by the held controller;
+        // it has no HTTP endpoint, healthcheck or container networking.
+        if provide.capability
+            == crate::extensions::manifest::ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY
+            && profile == RuntimeProfile::SourceJs
+        {
+            let endpoint = provide.endpoint.as_ref();
+            if !source
+                || provide.healthcheck.is_some()
+                || manifest.networking.is_some()
+                || endpoint.is_some_and(|e| {
+                    e.base_url.is_some()
+                        || e.scheme.is_some()
+                        || e.host.is_some()
+                        || e.port.is_some()
+                        || e.base_path.is_some()
+                })
+            {
+                bail!("source-js candidate providers require only the source-js-v1 transport");
             }
         }
     }

@@ -617,7 +617,7 @@ async fn provider(
         diagnostics::LiveRedactor,
         provider::LiveProviderClient,
     };
-    let descriptors = state.marketplace.source_providers(database).await?;
+    let descriptors = state.marketplace.source_providers(database, crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY).await?;
     ensure!(
         descriptors.len() == 1
             && descriptors[0].instance == instance
@@ -1206,7 +1206,7 @@ async fn approved_public_source_offline_restart_child() -> Result<()> {
             state.marketplace.client().is_err(),
             "offline restoration acquired marketplace networking"
         );
-        let descriptors = state.marketplace.source_providers(&database).await?;
+        let descriptors = state.marketplace.source_providers(&database, crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY).await?;
         ensure!(
             descriptors.len() == 1 && descriptors[0].version == "1.1.0",
             "persisted updated provider missing"

@@ -13,6 +13,7 @@ mod cache_tamper;
 mod compiled;
 pub(in crate::marketplace) use cache_tamper::mutate as mutate_cached_fixture_bytes;
 mod restart;
+mod source_candidate;
 mod source_live;
 
 async fn call(
@@ -408,6 +409,7 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
             "ordinary invoke must not rerun migration, and an old consumer cannot stop the next same-controller native call");
         again.cancel().await?;drop(again);
         source_live::qualify(&db,&state,principal.home_id,principal.user_id,owner).await?;
+        source_candidate::qualify(&state,owner).await?;
         require_idle_byte_workspace(runtime.as_ref(),&lane,true).await?;
         cache_tamper::qualify(&state,&db,runtime.as_ref(),(&lane,&image),principal.home_id,owner,&release.payload().extension_id).await?;
         assert_eq!(call(&app,&token,"GET","/api/v1/marketplace/installations/current",None).await?["operation"]["operation_id"],json!(next_id),

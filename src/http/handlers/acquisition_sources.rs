@@ -389,6 +389,53 @@ struct CandidateProviderSelection {
     provider: Provider,
     extension: Extension,
     instance: ExtensionInstance,
+    /// Set only for a verified marketplace source module. It is invoked through
+    /// the held installed-source controller, never an HTTP endpoint.
+    source: Option<MarketplaceSourceTarget>,
+}
+
+/// Handle for verified marketplace source modules (source-js-v1). Routing data
+/// only: every call is re-authorized by the installed-source controller.
+#[derive(Clone)]
+pub(crate) struct MarketplaceSources {
+    database: crate::db::Database,
+    marketplace: crate::marketplace::service::MarketplaceService,
+}
+
+impl MarketplaceSources {
+    pub(crate) fn from_state(state: &AppState) -> Self {
+        Self {
+            database: crate::db::Database {
+                driver: state.db_driver,
+                pool: state.db_pool.clone(),
+            },
+            marketplace: state.marketplace.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MarketplaceSourceTarget {
+    sources: MarketplaceSources,
+    descriptor: crate::marketplace::service::SourceProviderDescriptor,
+}
+
+impl std::fmt::Debug for MarketplaceSourceTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MarketplaceSourceTarget")
+            .field("provider", &self.descriptor.provider)
+            .field("instance", &self.descriptor.instance)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceSourceReply {
+    schema_version: u32,
+    status: u16,
+    body: Value,
 }
 
 pub(crate) fn is_extension_suite_source_provider_capability(capability: &str) -> bool {
@@ -402,9 +449,11 @@ pub async fn list_candidate_providers(
     Query(query): Query<CandidateProvidersQuery>,
 ) -> ApiResult<Json<CandidateProvidersResponse>> {
     let store = ExtensionStore::new(&state.db_pool);
-    let providers = available_candidate_providers(&store, query.media_type.as_deref())
-        .await
-        .map_err(ApiError::from)?;
+    let sources = MarketplaceSources::from_state(&state);
+    let providers =
+        available_candidate_providers(&store, query.media_type.as_deref(), Some(&sources))
+            .await
+            .map_err(ApiError::from)?;
     Ok(Json(CandidateProvidersResponse {
         providers: providers.into_iter().map(|item| item.summary).collect(),
     }))
@@ -417,7 +466,8 @@ pub async fn search_candidates(
 ) -> ApiResult<Json<CandidateSearchResponse>> {
     validate_candidate_search_request(&request)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let response = search_candidates_with_store(&state.db_pool, request)
+    let sources = MarketplaceSources::from_state(&state);
+    let response = search_candidates_with_store(&state.db_pool, request, Some(&sources))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(response))
@@ -426,11 +476,17 @@ pub async fn search_candidates(
 pub(crate) async fn search_candidates_with_store(
     pool: &sqlx::AnyPool,
     request: CandidateSearchRequest,
+    sources: Option<&MarketplaceSources>,
 ) -> Result<CandidateSearchResponse> {
     let request = normalize_candidate_search_request(request)?;
     let store = ExtensionStore::new(pool);
-    let provider =
-        select_candidate_provider(&store, request.provider_id, Some(&request.media_type)).await?;
+    let provider = select_candidate_provider(
+        &store,
+        request.provider_id,
+        Some(&request.media_type),
+        sources,
+    )
+    .await?;
     let route_options =
         candidate_route_options(pool, &store, &provider.extension.extension_id).await?;
     let upstream = invoke_candidate_provider(&store, &provider, &request).await?;
@@ -440,10 +496,12 @@ pub(crate) async fn search_candidates_with_store(
 pub(crate) async fn search_candidate_suite_with_store(
     pool: &sqlx::AnyPool,
     request: CandidateSearchRequest,
+    sources: Option<&MarketplaceSources>,
 ) -> Result<CandidateSearchResponse> {
     let request = normalize_candidate_search_request(request)?;
     let store = ExtensionStore::new(pool);
-    let providers = available_candidate_providers(&store, Some(&request.media_type)).await?;
+    let providers =
+        available_candidate_providers(&store, Some(&request.media_type), sources).await?;
     search_candidate_suite_with_providers(pool, request, providers, None).await
 }
 
@@ -467,7 +525,8 @@ pub(crate) async fn search_candidates_with_store_at_base_url(
     let request = normalize_candidate_search_request(request)?;
     let store = ExtensionStore::new(pool);
     let provider =
-        select_candidate_provider(&store, request.provider_id, Some(&request.media_type)).await?;
+        select_candidate_provider(&store, request.provider_id, Some(&request.media_type), None)
+            .await?;
     let route_options =
         candidate_route_options(pool, &store, &provider.extension.extension_id).await?;
     let upstream =
@@ -483,7 +542,7 @@ pub(crate) async fn search_candidate_suite_with_store_at_base_urls(
 ) -> Result<CandidateSearchResponse> {
     let request = normalize_candidate_search_request(request)?;
     let store = ExtensionStore::new(pool);
-    let providers = available_candidate_providers(&store, Some(&request.media_type)).await?;
+    let providers = available_candidate_providers(&store, Some(&request.media_type), None).await?;
     search_candidate_suite_with_providers(pool, request, providers, Some(base_urls)).await
 }
 
@@ -3104,11 +3163,13 @@ fn json_size_bytes(value: &Value) -> Result<usize> {
 async fn available_candidate_providers(
     store: &ExtensionStore<'_>,
     media_type: Option<&str>,
+    sources: Option<&MarketplaceSources>,
 ) -> Result<Vec<CandidateProviderSelection>> {
     available_source_providers_for_capability(
         store,
         media_type,
         ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+        sources,
     )
     .await
 }
@@ -3121,6 +3182,7 @@ async fn available_stream_candidate_providers(
         store,
         media_type,
         ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY,
+        None,
     )
     .await
 }
@@ -3129,15 +3191,53 @@ async fn available_source_providers_for_capability(
     store: &ExtensionStore<'_>,
     media_type: Option<&str>,
     capability: &str,
+    sources: Option<&MarketplaceSources>,
 ) -> Result<Vec<CandidateProviderSelection>> {
+    // One bounded metadata read for all verified marketplace candidate modules.
+    // Rows whose installed binding does not load are simply not offered.
+    let mut marketplace = std::collections::HashMap::new();
+    if let Some(sources) = sources
+        && capability == ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY
+    {
+        match sources
+            .marketplace
+            .source_providers(
+                &sources.database,
+                crate::extensions::manifest::ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+            )
+            .await
+        {
+            Ok(descriptors) => {
+                for descriptor in descriptors {
+                    marketplace.insert(descriptor.provider, descriptor);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "marketplace candidate providers unavailable");
+            }
+        }
+    }
+    let source_endpoint: Value =
+        serde_json::from_str(crate::marketplace::service::SOURCE_PROVIDER_ENDPOINT)?;
     let mut providers = Vec::new();
     for detail in store.list_provider_details().await? {
         if detail.provider.capability != capability {
             continue;
         }
-        if detail.provider.health_state != ProviderHealthState::Healthy {
-            continue;
-        }
+        let source = if detail.provider.endpoint_json.as_ref() == Some(&source_endpoint) {
+            let Some(descriptor) = marketplace.remove(&detail.provider.provider_id) else {
+                continue;
+            };
+            Some(MarketplaceSourceTarget {
+                sources: sources.expect("marketplace descriptors require sources").clone(),
+                descriptor,
+            })
+        } else {
+            if detail.provider.health_state != ProviderHealthState::Healthy {
+                continue;
+            }
+            None
+        };
         let Some(extension) = store.get_extension(&detail.extension_id).await? else {
             continue;
         };
@@ -3179,6 +3279,7 @@ async fn available_source_providers_for_capability(
             provider: detail.provider,
             extension,
             instance,
+            source,
         });
     }
     providers.sort_by_key(|item| {
@@ -3195,8 +3296,9 @@ async fn select_candidate_provider(
     store: &ExtensionStore<'_>,
     provider_id: Option<Uuid>,
     media_type: Option<&str>,
+    sources: Option<&MarketplaceSources>,
 ) -> Result<CandidateProviderSelection> {
-    let providers = available_candidate_providers(store, media_type).await?;
+    let providers = available_candidate_providers(store, media_type, sources).await?;
     if let Some(provider_id) = provider_id {
         return providers
             .into_iter()
@@ -3214,6 +3316,9 @@ async fn invoke_candidate_provider(
     selected: &CandidateProviderSelection,
     request: &CandidateSearchRequest,
 ) -> Result<CandidateProviderUpstreamResponse> {
+    if let Some(target) = &selected.source {
+        return invoke_marketplace_candidate_provider(target, request).await;
+    }
     let endpoint_json = selected
         .provider
         .endpoint_json
@@ -3225,6 +3330,67 @@ async fn invoke_candidate_provider(
         resolve_control_provider_transport_base_url(selected.instance.instance_id, &endpoint)
             .await?;
     invoke_candidate_provider_at_base_url(store, &base_url, selected, request).await
+}
+
+/// Verified source-js module: the same v1 invocation envelope, carried as
+/// `{capability, operation: "search", request}` to the held controller.
+#[cfg(unix)]
+async fn invoke_marketplace_candidate_provider(
+    target: &MarketplaceSourceTarget,
+    request: &CandidateSearchRequest,
+) -> Result<CandidateProviderUpstreamResponse> {
+    let descriptor = &target.descriptor;
+    let invocation = CandidateProviderInvocation {
+        schema_version: CANDIDATE_PROVIDER_SCHEMA_VERSION,
+        request,
+        provider: CandidateProviderInvocationContext {
+            provider_id: descriptor.provider,
+            extension_id: descriptor.extension.as_str(),
+            instance_id: descriptor.instance,
+            implementation: Some(&descriptor.implementation),
+            config: Some(descriptor.config.clone()),
+        },
+    };
+    let arguments = elixir_marketplace::source_execution::RuntimeJson::from_value(json!({
+        "schema_version": 1,
+        "capability": ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
+        "operation": "search",
+        "request": serde_json::to_value(&invocation)?,
+    }))
+    .context("marketplace candidate request exceeds runtime bounds")?;
+    let marketplace = &target.sources.marketplace;
+    let value = tokio::time::timeout(
+        Duration::from_secs(CANDIDATE_PROVIDER_TIMEOUT_SECONDS),
+        async {
+            let turn = marketplace.source_provider_turn().await?;
+            let mut call = marketplace.begin_source_provider_call(descriptor, arguments, turn)?;
+            call.finish().await
+        },
+    )
+    .await
+    .context("marketplace candidate provider timed out")??;
+    let reply: MarketplaceSourceReply = serde_json::from_str(value.as_str())
+        .context("marketplace candidate provider reply shape")?;
+    if reply.schema_version != 1 {
+        bail!("marketplace candidate provider reply schema is unsupported");
+    }
+    if reply.status != 200 {
+        let detail = reply.body.to_string();
+        let detail: String = detail.chars().take(512).collect();
+        bail!(
+            "marketplace candidate provider returned {}: {detail}",
+            reply.status
+        );
+    }
+    serde_json::from_value(reply.body).context("parsing marketplace candidate provider response")
+}
+
+#[cfg(not(unix))]
+async fn invoke_marketplace_candidate_provider(
+    _target: &MarketplaceSourceTarget,
+    _request: &CandidateSearchRequest,
+) -> Result<CandidateProviderUpstreamResponse> {
+    bail!("marketplace source modules require the unix source runtime")
 }
 
 async fn invoke_candidate_provider_at_base_url(
@@ -7722,11 +7888,11 @@ mod tests {
             limit: Some(10),
         };
         let selected_for_series =
-            select_candidate_provider(&store, request.provider_id, Some("series")).await?;
+            select_candidate_provider(&store, request.provider_id, Some("series"), None).await?;
         assert_eq!(selected_for_series.summary.provider_id, provider_id);
 
         let selected =
-            select_candidate_provider(&store, request.provider_id, Some("movie")).await?;
+            select_candidate_provider(&store, request.provider_id, Some("movie"), None).await?;
         let route_options = candidate_route_options(&database.pool, &store, extension_id).await?;
         let upstream = invoke_candidate_provider_at_base_url(
             &store,
@@ -7903,7 +8069,7 @@ mod tests {
             limit: Some(10),
         };
         let selected =
-            select_candidate_provider(&store, request.provider_id, Some("movie")).await?;
+            select_candidate_provider(&store, request.provider_id, Some("movie"), None).await?;
         invoke_candidate_provider_at_base_url(
             &store,
             &format!("http://127.0.0.1:{}/candidate-provider", addr.port()),

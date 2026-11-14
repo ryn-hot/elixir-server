@@ -95,7 +95,7 @@ async fn native_offline_restart_child() -> Result<()> {
             state.marketplace.client().is_err(),
             "retained execution must not need a network participation client"
         );
-        let descriptors = state.marketplace.source_providers(&db).await?;
+        let descriptors = state.marketplace.source_providers(&db, crate::extensions::manifest::LIVE_CATALOG_PROVIDER_CAPABILITY).await?;
         assert_eq!(descriptors.len(), 1);
         let source = &descriptors[0];
         let mut call = state.marketplace.begin_installed_call(

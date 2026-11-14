@@ -11,6 +11,7 @@ use crate::extensions::managed_paths::{
 };
 
 pub const LIVE_CATALOG_PROVIDER_CAPABILITY: &str = "live.catalog_provider";
+pub const ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY: &str = "acquisition.candidate_provider";
 pub const LIVE_CATALOG_PROVIDER_CONTRACT_VERSION: u32 = 1;
 pub const LIVE_CATALOG_READ_PERMISSION: &str = "live.catalog.read";
 pub const LIVE_STREAM_RESOLVE_PERMISSION: &str = "live.stream.resolve";
