@@ -1,8 +1,8 @@
 id: elixir.blueprints.arr_stack
-version: 2.0.4
+version: 2.1.0
 kind: blueprint
 name: "Arr Stack"
-description: "Sonarr + Radarr + Prowlarr + Bazarr + FlareSolverr + Byparr + qBittorrent + NZBGet stack with explicit phased execution."
+description: "Sonarr + Radarr + Prowlarr + qBittorrent + NZBGet stack with public indexers and explicit phased execution."
 publisher:
   name: "Elixir"
   key_id: "ed25519:DK6TdfETFxJk61DW/CXhzzq5TRFi4I98XD5FXGpSmNg="
@@ -13,15 +13,11 @@ execution:
     - elixir.modules.sonarr
     - elixir.modules.radarr
     - elixir.modules.prowlarr
-    - elixir.modules.bazarr
-    - elixir.modules.flaresolverr
-    - elixir.modules.byparr
     - elixir.modules.qbittorrent
     - elixir.modules.nzbget
     - elixir.connectors.prowlarr_public_indexers
     - elixir.connectors.prowlarr_sonarr_app
     - elixir.connectors.prowlarr_radarr_app
-    - elixir.connectors.prowlarr_antibot_proxies
     - elixir.connectors.sonarr_defaults
     - elixir.connectors.sonarr_quality_policy
     - elixir.connectors.radarr_defaults
@@ -42,15 +38,6 @@ execution:
     - id: prowlarr
       extension_id: elixir.modules.prowlarr
       name: default
-    - id: bazarr
-      extension_id: elixir.modules.bazarr
-      name: default
-    - id: flaresolverr
-      extension_id: elixir.modules.flaresolverr
-      name: default
-    - id: byparr
-      extension_id: elixir.modules.byparr
-      name: default
     - id: qbittorrent
       extension_id: elixir.modules.qbittorrent
       name: default
@@ -64,8 +51,6 @@ execution:
       owner: elixir.connectors.prowlarr_sonarr_app
     - domain: prowlarr.apps.radarr
       owner: elixir.connectors.prowlarr_radarr_app
-    - domain: prowlarr.proxies.antibot
-      owner: elixir.connectors.prowlarr_antibot_proxies
     - domain: sonarr.defaults
       owner: elixir.connectors.sonarr_defaults
     - domain: sonarr.quality_policy.default
@@ -97,12 +82,6 @@ execution:
         - type: ensure_package_installed
           extension_id: elixir.modules.prowlarr
         - type: ensure_package_installed
-          extension_id: elixir.modules.bazarr
-        - type: ensure_package_installed
-          extension_id: elixir.modules.flaresolverr
-        - type: ensure_package_installed
-          extension_id: elixir.modules.byparr
-        - type: ensure_package_installed
           extension_id: elixir.modules.qbittorrent
         - type: ensure_package_installed
           extension_id: elixir.modules.nzbget
@@ -112,8 +91,6 @@ execution:
           extension_id: elixir.connectors.prowlarr_sonarr_app
         - type: ensure_package_installed
           extension_id: elixir.connectors.prowlarr_radarr_app
-        - type: ensure_package_installed
-          extension_id: elixir.connectors.prowlarr_antibot_proxies
         - type: ensure_package_installed
           extension_id: elixir.connectors.sonarr_defaults
         - type: ensure_package_installed
@@ -144,12 +121,6 @@ execution:
         - type: ensure_instance_installed
           instance: prowlarr
         - type: ensure_instance_installed
-          instance: bazarr
-        - type: ensure_instance_installed
-          instance: flaresolverr
-        - type: ensure_instance_installed
-          instance: byparr
-        - type: ensure_instance_installed
           instance: qbittorrent
         - type: ensure_instance_installed
           instance: nzbget
@@ -163,12 +134,6 @@ execution:
         - type: ensure_runtime_running
           instance: prowlarr
         - type: ensure_runtime_running
-          instance: bazarr
-        - type: ensure_runtime_running
-          instance: flaresolverr
-        - type: ensure_runtime_running
-          instance: byparr
-        - type: ensure_runtime_running
           instance: qbittorrent
         - type: ensure_runtime_running
           instance: nzbget
@@ -181,12 +146,6 @@ execution:
           instance: radarr
         - type: create_or_update_providers
           instance: prowlarr
-        - type: create_or_update_providers
-          instance: bazarr
-        - type: create_or_update_providers
-          instance: flaresolverr
-        - type: create_or_update_providers
-          instance: byparr
         - type: create_or_update_providers
           instance: qbittorrent
         - type: create_or_update_providers
@@ -208,21 +167,6 @@ execution:
           instance: prowlarr
           capability: indexer.registry
           slot: default
-          timeout_seconds: 120
-        - type: transport_gate
-          instance: bazarr
-          capability: subtitles.manager
-          slot: default
-          timeout_seconds: 120
-        - type: transport_gate
-          instance: flaresolverr
-          capability: indexer.proxy
-          slot: flaresolverr
-          timeout_seconds: 120
-        - type: transport_gate
-          instance: byparr
-          capability: indexer.proxy
-          slot: byparr
           timeout_seconds: 120
         - type: transport_gate
           instance: qbittorrent
@@ -281,21 +225,6 @@ execution:
           slot: default
           timeout_seconds: 120
         - type: health_gate
-          instance: bazarr
-          capability: subtitles.manager
-          slot: default
-          timeout_seconds: 120
-        - type: health_gate
-          instance: flaresolverr
-          capability: indexer.proxy
-          slot: flaresolverr
-          timeout_seconds: 120
-        - type: health_gate
-          instance: byparr
-          capability: indexer.proxy
-          slot: byparr
-          timeout_seconds: 120
-        - type: health_gate
           instance: qbittorrent
           capability: downloader.torrent
           slot: default
@@ -308,12 +237,6 @@ execution:
     - id: apply_wiring
       barrier: true
       steps:
-        - type: apply_connector
-          connector_id: elixir.connectors.prowlarr_antibot_proxies
-          target_instance: prowlarr
-          target_capability: indexer.registry
-          target_slot: default
-          ownership_domains: [prowlarr.proxies.antibot]
         - type: apply_connector
           connector_id: elixir.connectors.prowlarr_public_indexers
           target_instance: prowlarr

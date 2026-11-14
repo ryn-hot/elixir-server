@@ -4,36 +4,36 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use argon2::{
-    Argon2,
     password_hash::{PasswordHasher, SaltString},
+    Argon2,
 };
 use axum::{
-    Json, Router,
     body::{self, Body},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, Request, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
+    Json, Router,
 };
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
-use rand::{RngCore, rngs::OsRng};
-use serde_json::{Value, json};
+use rand::{rngs::OsRng, RngCore};
+use serde_json::{json, Value};
 use sqlx::Row;
-use tempfile::{TempDir, tempdir};
+use tempfile::{tempdir, TempDir};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 use uuid::Uuid;
-use zip::{ZipWriter, write::FileOptions};
+use zip::{write::FileOptions, ZipWriter};
 
 use crate::{
     artwork::ArtworkService,
@@ -43,26 +43,26 @@ use crate::{
         PlaybackRemotePolicyOverride, RunEnvironment, SecretsConfig, ServerConfig, Settings,
         TelemetryConfig,
     },
-    db::Database,
     db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, MediaType, OrchestratorRunStatus,
         ProviderHealthState, ProviderReadinessPhase, SecretScope, SlotCardinality,
     },
-    extensions::ExtensionManager,
-    extensions::ExternalIds,
-    extensions::FileDescriptor,
-    extensions::MediaFileCandidate,
-    extensions::MediaIdentity,
+    db::Database,
     extensions::package::compute_sha256,
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedLibraryProvenance,
         NewManagedMediaTombstone, NewMediaOwnership, NewOrchestratorRun, NewProvider, NewSecret,
     },
+    extensions::ExtensionManager,
+    extensions::ExternalIds,
+    extensions::FileDescriptor,
+    extensions::MediaFileCandidate,
+    extensions::MediaIdentity,
     http::router,
-    library::LinkerService,
     library::normalize_override_key,
     library::run_full_scan,
+    library::LinkerService,
     metadata::MetadataService,
     orchestrator::model::ProviderEndpoint,
     orchestrator::plan_validation::missing_required_secrets_for_plan,
@@ -1192,23 +1192,19 @@ async fn extension_control_surface_renders_generic_manifest_contract_sections() 
         .get("fields")
         .and_then(Value::as_array)
         .expect("managed fields");
-    assert!(
-        managed_fields
-            .iter()
-            .any(
-                |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
-                    && field.get("value").and_then(Value::as_i64) == Some(30)
-            )
-    );
-    assert!(
-        managed_fields
-            .iter()
-            .any(
-                |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
-                    && field.get("secret").and_then(Value::as_bool) == Some(true)
-                    && field.get("value").and_then(Value::as_str) == Some("saved")
-            )
-    );
+    assert!(managed_fields
+        .iter()
+        .any(
+            |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
+                && field.get("value").and_then(Value::as_i64) == Some(30)
+        ));
+    assert!(managed_fields
+        .iter()
+        .any(
+            |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
+                && field.get("secret").and_then(Value::as_bool) == Some(true)
+                && field.get("value").and_then(Value::as_str) == Some("saved")
+        ));
 
     let native_only = control_surface_section(&payload, "nativeOnly");
     assert_eq!(
@@ -1229,13 +1225,11 @@ async fn extension_control_surface_renders_generic_manifest_contract_sections() 
             .and_then(Value::as_str),
         Some("observed")
     );
-    assert!(
-        runtime_bridge
-            .get("notices")
-            .and_then(Value::as_array)
-            .map(|notices| !notices.is_empty())
-            .unwrap_or(false)
-    );
+    assert!(runtime_bridge
+        .get("notices")
+        .and_then(Value::as_array)
+        .map(|notices| !notices.is_empty())
+        .unwrap_or(false));
 
     Ok(())
 }
@@ -1270,22 +1264,18 @@ async fn extension_control_surface_updates_generic_manifest_owned_settings() -> 
         .get("fields")
         .and_then(Value::as_array)
         .expect("managed fields");
-    assert!(
-        managed_fields
-            .iter()
-            .any(
-                |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
-                    && field.get("value").and_then(Value::as_i64) == Some(45)
-            )
-    );
-    assert!(
-        managed_fields
-            .iter()
-            .any(
-                |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
-                    && field.get("value").and_then(Value::as_str) == Some("saved")
-            )
-    );
+    assert!(managed_fields
+        .iter()
+        .any(
+            |field| field.get("id").and_then(Value::as_str) == Some("refreshInterval")
+                && field.get("value").and_then(Value::as_i64) == Some(45)
+        ));
+    assert!(managed_fields
+        .iter()
+        .any(
+            |field| field.get("id").and_then(Value::as_str) == Some("apiKey")
+                && field.get("value").and_then(Value::as_str) == Some("saved")
+        ));
 
     let seeded_section = control_surface_section(&payload, "ownedSettingsSeeded");
     assert_eq!(
@@ -1412,25 +1402,21 @@ async fn debrid_control_surface_redacts_tokens_and_lists_all_services() -> Resul
         premiumize_entity.get("subtitle").and_then(Value::as_str),
         Some("Not configured")
     );
-    assert!(
-        premiumize_entity
-            .get("actions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|action| action.get("label").and_then(Value::as_str) == Some("Add account"))
-    );
-    assert!(
-        premiumize_entity
-            .get("actions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|action| {
-                action.get("openUrl").and_then(Value::as_str)
-                    == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
-            })
-    );
+    assert!(premiumize_entity
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|action| action.get("label").and_then(Value::as_str) == Some("Add account")));
+    assert!(premiumize_entity
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|action| {
+            action.get("openUrl").and_then(Value::as_str)
+                == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
+        }));
     Ok(())
 }
 
@@ -1635,13 +1621,11 @@ async fn debrid_control_action_switches_active_service_and_provider_registration
     assert_eq!(response.status(), StatusCode::OK);
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
-    assert!(
-        payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("TorBox account 'torbox-user' is reachable")
-    );
+    assert!(payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("TorBox account 'torbox-user' is reachable"));
 
     let instance = store
         .get_instance(instance_id)
@@ -1739,13 +1723,11 @@ async fn debrid_control_action_switches_to_all_debrid_with_account_validation() 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
-    assert!(
-        payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("AllDebrid account 'alldebrid-user' is reachable")
-    );
+    assert!(payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("AllDebrid account 'alldebrid-user' is reachable"));
 
     let instance = store
         .get_instance(instance_id)
@@ -1860,13 +1842,11 @@ async fn debrid_control_action_switches_to_premiumize_and_preserves_tokens() -> 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body::to_bytes(response.into_body(), 1_048_576).await?;
     let payload: Value = serde_json::from_slice(&body)?;
-    assert!(
-        payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("Premiumize account 'pm-customer-123' is reachable")
-    );
+    assert!(payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("Premiumize account 'pm-customer-123' is reachable"));
 
     let instance = store
         .get_instance(instance_id)
@@ -1946,17 +1926,15 @@ async fn debrid_control_action_switches_to_premiumize_and_preserves_tokens() -> 
         premiumize.get("subtitle").and_then(Value::as_str),
         Some("Active")
     );
-    assert!(
-        premiumize
-            .get("actions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|action| {
-                action.get("openUrl").and_then(Value::as_str)
-                    == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
-            })
-    );
+    assert!(premiumize
+        .get("actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|action| {
+            action.get("openUrl").and_then(Value::as_str)
+                == Some(crate::debrid::DebridServiceKind::Premiumize.docs_url())
+        }));
 
     let _ = premiumize_shutdown.send(());
     Ok(())
@@ -2347,12 +2325,10 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
         .await?;
     assert_eq!(delete_response.status(), StatusCode::FORBIDDEN);
 
-    assert!(
-        store
-            .get_extension(crate::debrid::DEBRID_EXTENSION_ID)
-            .await?
-            .is_some()
-    );
+    assert!(store
+        .get_extension(crate::debrid::DEBRID_EXTENSION_ID)
+        .await?
+        .is_some());
     assert!(store.get_instance(instance_id).await?.is_some());
     assert!(store.get_provider(provider_id).await?.is_some());
     assert!(store.get_instance(source_instance_id).await?.is_some());
@@ -2395,8 +2371,8 @@ async fn debrid_uninstall_and_instance_delete_are_blocked_without_cleanup() -> R
 }
 
 #[tokio::test]
-async fn extension_control_surface_does_not_route_generic_manifest_by_extension_id_substring()
--> Result<()> {
+async fn extension_control_surface_does_not_route_generic_manifest_by_extension_id_substring(
+) -> Result<()> {
     let extension_id = "elixir.modules.sonarr_helper";
     let (app, _state, _instance_id) =
         setup_generic_control_surface_extension_with_id(extension_id).await?;
@@ -2417,21 +2393,15 @@ async fn extension_control_surface_does_not_route_generic_manifest_by_extension_
         .and_then(Value::as_array)
         .expect("control surface sections");
 
-    assert!(
-        sections
-            .iter()
-            .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsSeeded"))
-    );
-    assert!(
-        sections.iter().any(
-            |section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsManaged")
-        )
-    );
-    assert!(
-        !sections
-            .iter()
-            .any(|section| section.get("id").and_then(Value::as_str) == Some("defaults"))
-    );
+    assert!(sections
+        .iter()
+        .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsSeeded")));
+    assert!(sections
+        .iter()
+        .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsManaged")));
+    assert!(!sections
+        .iter()
+        .any(|section| section.get("id").and_then(Value::as_str) == Some("defaults")));
     assert!(!sections.iter().any(|section| {
         section.get("id").and_then(Value::as_str) == Some("downloadClientPreference")
     }));
@@ -2682,8 +2652,8 @@ struct MockRadarrAddState {
     created_movies: Arc<Mutex<Vec<Value>>>,
 }
 
-async fn start_mock_radarr_server()
--> Result<(String, SocketAddr, MockRadarrAddState, oneshot::Sender<()>)> {
+async fn start_mock_radarr_server(
+) -> Result<(String, SocketAddr, MockRadarrAddState, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
@@ -2904,8 +2874,8 @@ struct MockArrControlState {
     download_client_updates: Arc<Mutex<Vec<Value>>>,
 }
 
-async fn start_mock_sonarr_control_server()
--> Result<(String, SocketAddr, MockArrControlState, oneshot::Sender<()>)> {
+async fn start_mock_sonarr_control_server(
+) -> Result<(String, SocketAddr, MockArrControlState, oneshot::Sender<()>)> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let addr = listener.local_addr()?;
     let host = discover_test_host_ip()?;
@@ -3316,8 +3286,8 @@ async fn setup_download_broker_test_app() -> Result<(Router, sqlx::AnyPool, Stri
 }
 
 #[tokio::test]
-async fn marketplace_search_routes_require_current_owner_auth_and_never_bootstrap_networking()
--> Result<()> {
+async fn marketplace_search_routes_require_current_owner_auth_and_never_bootstrap_networking(
+) -> Result<()> {
     let directory = tempdir()?;
     let mut settings = test_settings_with_db();
     settings.database.url = format!(
@@ -3806,11 +3776,9 @@ async fn health_and_settings_endpoints_work() -> Result<()> {
         Some("inactive")
     );
     assert!(anime_inference.get("backend").is_some_and(Value::is_null));
-    assert!(
-        anime_inference
-            .get("profileFingerprint")
-            .is_some_and(Value::is_null)
-    );
+    assert!(anime_inference
+        .get("profileFingerprint")
+        .is_some_and(Value::is_null));
 
     let settings_response = app
         .clone()
@@ -4035,13 +4003,11 @@ async fn health_endpoint_reports_degraded_docker_runtime_state() -> Result<()> {
         runtime.get("code").and_then(Value::as_str),
         Some("docker_runtime_unavailable")
     );
-    assert!(
-        runtime
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("Docker daemon is unavailable")
-    );
+    assert!(runtime
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("Docker daemon is unavailable"));
     assert_eq!(
         runtime.get("state").and_then(Value::as_str),
         Some("degraded")
@@ -4796,17 +4762,15 @@ async fn download_broker_debrid_route_blocks_unhealthy_active_service() -> Resul
         route.get("blocker").and_then(Value::as_str),
         Some("Active debrid service is unavailable")
     );
-    assert!(
-        route
-            .get("candidates")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|candidate| {
-                candidate.get("implementation").and_then(Value::as_str) == Some("torbox")
-                    && candidate.get("healthState").and_then(Value::as_str) == Some("unhealthy")
-            })
-    );
+    assert!(route
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
+            candidate.get("implementation").and_then(Value::as_str) == Some("torbox")
+                && candidate.get("healthState").and_then(Value::as_str) == Some("unhealthy")
+        }));
 
     let submit_response = app
         .clone()
@@ -6023,12 +5987,10 @@ async fn downloader_profile_reports_default_profile_and_telemetry() -> Result<()
         downloaders[0].get("syncState").and_then(Value::as_str),
         Some("up_to_date")
     );
-    assert!(
-        downloaders[0]
-            .get("telemetryError")
-            .map(Value::is_null)
-            .unwrap_or(true)
-    );
+    assert!(downloaders[0]
+        .get("telemetryError")
+        .map(Value::is_null)
+        .unwrap_or(true));
     assert_eq!(
         downloaders[0]
             .get("lastSuccessfulSampleAt")
@@ -7274,8 +7236,8 @@ async fn extension_status_summary_includes_optional_addons_for_blueprints() -> R
 }
 
 #[tokio::test]
-async fn extension_status_summary_marks_public_indexer_connector_attention_when_downstream_missing()
--> Result<()> {
+async fn extension_status_summary_marks_public_indexer_connector_attention_when_downstream_missing(
+) -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -12505,8 +12467,8 @@ async fn media_segment_candidate_routes_activate_and_disable_segments() -> Resul
 }
 
 #[tokio::test]
-async fn false_positive_detector_segment_disable_is_support_only_and_removes_skip_metadata()
--> Result<()> {
+async fn false_positive_detector_segment_disable_is_support_only_and_removes_skip_metadata(
+) -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "detector-false-positive-secret-key".to_string();
     settings.media_interactions.support_api_enabled = true;
@@ -15478,12 +15440,10 @@ async fn direct_stream_supports_range() -> Result<()> {
         )
         .await?;
     assert_eq!(if_range_mismatch_resp.status(), StatusCode::OK);
-    assert!(
-        if_range_mismatch_resp
-            .headers()
-            .get("content-range")
-            .is_none()
-    );
+    assert!(if_range_mismatch_resp
+        .headers()
+        .get("content-range")
+        .is_none());
     let if_range_mismatch_bytes =
         body::to_bytes(if_range_mismatch_resp.into_body(), 1_048_576).await?;
     assert_eq!(&if_range_mismatch_bytes[..], file_bytes);
@@ -15598,8 +15558,8 @@ async fn direct_stream_supports_range() -> Result<()> {
 }
 
 #[tokio::test]
-async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_policy_bypass()
--> Result<()> {
+async fn phase22_direct_routes_reject_cross_user_revoked_expired_and_share_policy_bypass(
+) -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "phase22-direct-route-security".to_string();
     settings.playback.stream_token_ttl_seconds = 60;
@@ -16506,21 +16466,19 @@ async fn phase23_simulated_six_hour_hls_direct_stream_soak_reads_segments_until_
         )
         .await?;
     assert_eq!(end_resp.status(), StatusCode::OK);
-    assert!(
-        fixture
-            .state
-            .transcodes
-            .snapshot(session_id)
-            .await
-            .is_none()
-    );
+    assert!(fixture
+        .state
+        .transcodes
+        .snapshot(session_id)
+        .await
+        .is_none());
     assert!(tokio::fs::metadata(temp.path()).await.is_err());
     Ok(())
 }
 
 #[tokio::test]
-async fn phase23_simulated_six_hour_video_transcode_loop_soak_reads_segments_until_end()
--> Result<()> {
+async fn phase23_simulated_six_hour_video_transcode_loop_soak_reads_segments_until_end(
+) -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "phase23-video-soak".to_string();
     settings.playback.session_ttl_seconds = 6 * 60 * 60 + 300;
@@ -16621,14 +16579,12 @@ async fn phase23_simulated_six_hour_video_transcode_loop_soak_reads_segments_unt
         )
         .await?;
     assert_eq!(end_resp.status(), StatusCode::OK);
-    assert!(
-        fixture
-            .state
-            .transcodes
-            .snapshot(session_id)
-            .await
-            .is_none()
-    );
+    assert!(fixture
+        .state
+        .transcodes
+        .snapshot(session_id)
+        .await
+        .is_none());
     assert!(tokio::fs::metadata(temp.path()).await.is_err());
     Ok(())
 }
@@ -16844,8 +16800,8 @@ async fn phase23_concurrent_load_rejects_video_over_capacity_before_job_start() 
 }
 
 #[tokio::test]
-async fn phase23_capacity_edges_reject_per_user_temp_and_startup_before_session_insert()
--> Result<()> {
+async fn phase23_capacity_edges_reject_per_user_temp_and_startup_before_session_insert(
+) -> Result<()> {
     let mut per_user_settings = test_settings_with_db();
     per_user_settings.auth.access_token_secret = "phase23-per-user".to_string();
     per_user_settings.playback.max_sessions_per_user = Some(1);
@@ -19568,6 +19524,128 @@ runtime:
     Ok(())
 }
 
+// The shipped Arr stack must one-click install from the bundled packages alone:
+// no registry, signed packages only, and every blueprint package resolvable.
+#[tokio::test]
+async fn bundled_arr_stack_blueprint_installs_every_package_without_a_registry() -> Result<()> {
+    let temp = tempdir()?;
+    let bundled_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/bundled");
+    let mut settings = test_settings_with_db();
+    settings.environment = RunEnvironment::Production;
+    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
+    settings.extensions.allow_unsigned = false;
+    settings.extensions.allow_directory_install = false;
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+
+    let post = |uri: &str, payload: Value| {
+        Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+    };
+    let install = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/extensions/install",
+            json!({ "packagePath": bundled_dir.join("arr-stack-blueprint.elx").to_string_lossy() }),
+        )?)
+        .await?;
+    let status = install.status();
+    let payload: Value =
+        serde_json::from_slice(&body::to_bytes(install.into_body(), 1_048_576).await?)?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "blueprint install failed: {payload}"
+    );
+
+    let apply = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/extensions/blueprints/apply",
+            json!({ "blueprint_id": "elixir.blueprints.arr_stack" }),
+        )?)
+        .await?;
+    let status = apply.status();
+    let plan: Value = serde_json::from_slice(&body::to_bytes(apply.into_body(), 4_194_304).await?)?;
+    assert_eq!(status, StatusCode::OK, "blueprint apply failed: {plan}");
+    assert!(
+        plan["blocked_stage"].is_null(),
+        "plan blocked: {}",
+        plan["blocked_stage"]
+    );
+    assert_eq!(
+        plan["conflicts"].as_array().map(Vec::len),
+        Some(0),
+        "conflicts: {}",
+        plan["conflicts"]
+    );
+
+    let store = ExtensionStore::new(&db_pool);
+    let blueprint = store
+        .get_extension("elixir.blueprints.arr_stack")
+        .await?
+        .expect("blueprint installed");
+    let manifest: crate::extensions::manifest::ExtensionManifest =
+        serde_json::from_value(blueprint.manifest_json)?;
+    let packages = &manifest
+        .execution
+        .as_ref()
+        .expect("execution blueprint")
+        .packages;
+    assert_eq!(packages.len(), 18);
+    for extension_id in packages {
+        let installed = store.get_extension(extension_id).await?;
+        assert!(
+            installed.is_some_and(|value| value.enabled),
+            "{extension_id} not installed"
+        );
+    }
+    for deferred in [
+        "elixir.modules.bazarr",
+        "elixir.modules.byparr",
+        "elixir.modules.flaresolverr",
+    ] {
+        assert!(
+            store.get_extension(deferred).await?.is_none(),
+            "{deferred} is deferred"
+        );
+    }
+    let addon = &manifest.optional_addons[0].extension_id;
+    let catalog = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/catalog").body(Body::empty())?)
+        .await?;
+    let catalog: Value =
+        serde_json::from_slice(&body::to_bytes(catalog.into_body(), 4_194_304).await?)?;
+    assert!(
+        catalog["available"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["id"] == addon.as_str())),
+        "optional add-on {addon} is not bundled"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn extensions_install_auto_provisions_default_instance_for_zero_config_module() -> Result<()>
 {
@@ -19644,8 +19722,8 @@ networking:
 }
 
 #[tokio::test]
-async fn extensions_allows_bundled_elx_install_without_signature_when_manifest_declares_key()
--> Result<()> {
+async fn extensions_allows_bundled_elx_install_without_signature_when_manifest_declares_key(
+) -> Result<()> {
     let temp = tempdir()?;
     let bundled_dir = temp.path().join("bundled");
     std::fs::create_dir_all(&bundled_dir)?;
@@ -22172,12 +22250,10 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     let status_reason: Option<String> = row.try_get("status_reason").ok();
     assert_eq!(owner_type, "extension");
     assert_eq!(status, "succeeded");
-    assert!(
-        status_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Sonarr removed")
-    );
+    assert!(status_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Sonarr removed"));
 
     Ok(())
 }
@@ -24003,8 +24079,8 @@ async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<
 }
 
 #[tokio::test]
-async fn extension_control_surface_uses_cached_sonarr_download_client_inventory_when_live_load_fails()
--> Result<()> {
+async fn extension_control_surface_uses_cached_sonarr_download_client_inventory_when_live_load_fails(
+) -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -24464,8 +24540,8 @@ async fn extension_status_summary_restores_persisted_nzbget_provider_inventory()
 }
 
 #[tokio::test]
-async fn extension_control_surface_drops_stale_nzbget_provider_inventory_without_credentials()
--> Result<()> {
+async fn extension_control_surface_drops_stale_nzbget_provider_inventory_without_credentials(
+) -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -24559,8 +24635,8 @@ async fn extension_control_surface_drops_stale_nzbget_provider_inventory_without
 }
 
 #[tokio::test]
-async fn extension_control_surface_ignores_stale_live_nzbget_inventory_absent_from_persisted_state()
--> Result<()> {
+async fn extension_control_surface_ignores_stale_live_nzbget_inventory_absent_from_persisted_state(
+) -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -24656,8 +24732,8 @@ async fn extension_control_surface_ignores_stale_live_nzbget_inventory_absent_fr
 }
 
 #[tokio::test]
-async fn extension_control_surface_ignores_sample_live_nzbget_inventory_without_persisted_state()
--> Result<()> {
+async fn extension_control_surface_ignores_sample_live_nzbget_inventory_without_persisted_state(
+) -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
     database.run_migrations().await?;
@@ -26088,40 +26164,28 @@ async fn extensions_uninstall_blueprint_cascades_dependencies() -> Result<()> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert!(
-        deleted
-            .iter()
-            .any(|item| item.as_str() == Some("elixir.blueprints.arr_stack"))
-    );
-    assert!(
-        deleted
-            .iter()
-            .any(|item| item.as_str() == Some("elixir.connectors.sonarr_defaults"))
-    );
-    assert!(
-        deleted
-            .iter()
-            .any(|item| item.as_str() == Some("elixir.modules.sonarr"))
-    );
+    assert!(deleted
+        .iter()
+        .any(|item| item.as_str() == Some("elixir.blueprints.arr_stack")));
+    assert!(deleted
+        .iter()
+        .any(|item| item.as_str() == Some("elixir.connectors.sonarr_defaults")));
+    assert!(deleted
+        .iter()
+        .any(|item| item.as_str() == Some("elixir.modules.sonarr")));
 
-    assert!(
-        store
-            .get_extension("elixir.blueprints.arr_stack")
-            .await?
-            .is_none()
-    );
-    assert!(
-        store
-            .get_extension("elixir.connectors.sonarr_defaults")
-            .await?
-            .is_none()
-    );
-    assert!(
-        store
-            .get_extension("elixir.modules.sonarr")
-            .await?
-            .is_none()
-    );
+    assert!(store
+        .get_extension("elixir.blueprints.arr_stack")
+        .await?
+        .is_none());
+    assert!(store
+        .get_extension("elixir.connectors.sonarr_defaults")
+        .await?
+        .is_none());
+    assert!(store
+        .get_extension("elixir.modules.sonarr")
+        .await?
+        .is_none());
 
     let desired = store.list_desired_blueprints(None).await?;
     assert!(
