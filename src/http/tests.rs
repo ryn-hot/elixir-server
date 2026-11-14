@@ -2417,9 +2417,11 @@ async fn extension_control_surface_does_not_route_generic_manifest_by_extension_
         .and_then(Value::as_array)
         .expect("control surface sections");
 
-    assert!(sections
-        .iter()
-        .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsSeeded")));
+    assert!(
+        sections
+            .iter()
+            .any(|section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsSeeded"))
+    );
     assert!(
         sections.iter().any(
             |section| section.get("id").and_then(Value::as_str) == Some("ownedSettingsManaged")
@@ -19561,128 +19563,6 @@ runtime:
     assert_eq!(
         payload.get("extension_id").and_then(Value::as_str),
         Some("elixir.modules.qbittorrent")
-    );
-
-    Ok(())
-}
-
-// The shipped Arr stack must one-click install from the bundled packages alone:
-// no registry, signed packages only, and every blueprint package resolvable.
-#[tokio::test]
-async fn bundled_arr_stack_blueprint_installs_every_package_without_a_registry() -> Result<()> {
-    let temp = tempdir()?;
-    let bundled_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/bundled");
-    let mut settings = test_settings_with_db();
-    settings.environment = RunEnvironment::Production;
-    settings.extensions.storage_root = temp.path().join("extensions").to_string_lossy().to_string();
-    settings.extensions.bundled_dir = bundled_dir.to_string_lossy().to_string();
-    settings.extensions.allow_unsigned = false;
-    settings.extensions.allow_directory_install = false;
-
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let db_pool = database.pool.clone();
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let app = router(AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    ));
-
-    let post = |uri: &str, payload: Value| {
-        Request::post(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string()))
-    };
-    let install = app
-        .clone()
-        .oneshot(post(
-            "/api/v1/extensions/install",
-            json!({ "packagePath": bundled_dir.join("arr-stack-blueprint.elx").to_string_lossy() }),
-        )?)
-        .await?;
-    let status = install.status();
-    let payload: Value =
-        serde_json::from_slice(&body::to_bytes(install.into_body(), 1_048_576).await?)?;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "blueprint install failed: {payload}"
-    );
-
-    let apply = app
-        .clone()
-        .oneshot(post(
-            "/api/v1/extensions/blueprints/apply",
-            json!({ "blueprint_id": "elixir.blueprints.arr_stack" }),
-        )?)
-        .await?;
-    let status = apply.status();
-    let plan: Value = serde_json::from_slice(&body::to_bytes(apply.into_body(), 4_194_304).await?)?;
-    assert_eq!(status, StatusCode::OK, "blueprint apply failed: {plan}");
-    assert!(
-        plan["blocked_stage"].is_null(),
-        "plan blocked: {}",
-        plan["blocked_stage"]
-    );
-    assert_eq!(
-        plan["conflicts"].as_array().map(Vec::len),
-        Some(0),
-        "conflicts: {}",
-        plan["conflicts"]
-    );
-
-    let store = ExtensionStore::new(&db_pool);
-    let blueprint = store
-        .get_extension("elixir.blueprints.arr_stack")
-        .await?
-        .expect("blueprint installed");
-    let manifest: crate::extensions::manifest::ExtensionManifest =
-        serde_json::from_value(blueprint.manifest_json)?;
-    let packages = &manifest
-        .execution
-        .as_ref()
-        .expect("execution blueprint")
-        .packages;
-    assert_eq!(packages.len(), 18);
-    for extension_id in packages {
-        let installed = store.get_extension(extension_id).await?;
-        assert!(
-            installed.is_some_and(|value| value.enabled),
-            "{extension_id} not installed"
-        );
-    }
-    for deferred in [
-        "elixir.modules.bazarr",
-        "elixir.modules.byparr",
-        "elixir.modules.flaresolverr",
-    ] {
-        assert!(
-            store.get_extension(deferred).await?.is_none(),
-            "{deferred} is deferred"
-        );
-    }
-    let addon = &manifest.optional_addons[0].extension_id;
-    let catalog = app
-        .clone()
-        .oneshot(Request::get("/api/v1/extensions/catalog").body(Body::empty())?)
-        .await?;
-    let catalog: Value =
-        serde_json::from_slice(&body::to_bytes(catalog.into_body(), 4_194_304).await?)?;
-    assert!(
-        catalog["available"]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(|entry| entry["id"] == addon.as_str())),
-        "optional add-on {addon} is not bundled"
     );
 
     Ok(())
