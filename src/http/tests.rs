@@ -19560,7 +19560,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     let linkers = LinkerService::new(settings.classifier.clone())?;
     let artwork = test_artwork_service(&settings)?;
     let secrets = SecretsManager::from_settings(&settings)?;
-    let app = router(AppState::new(
+    let state = AppState::new(
         settings,
         database,
         auth_service,
@@ -19569,7 +19569,8 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         linkers,
         artwork,
         secrets,
-    ));
+    );
+    let app = router(state.clone());
     let send = |request: Request<Body>| {
         let app = app.clone();
         async move {
@@ -19625,14 +19626,23 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     let docker = crate::runtime::docker::DockerRuntimeManager::new(None);
     let summary = stack::reconcile(&db_pool, &docker).await?;
     eprintln!("stack reconcile: {summary:?}");
-    assert_eq!(
-        (
-            summary.members_written,
-            summary.images_ready,
-            summary.setups_offered
-        ),
-        (18, 3, 1)
-    );
+    // The server's own loop may reconcile the stack first, so check the
+    // resulting rows rather than which pass wrote them.
+    assert_eq!(summary.images_ready, 3);
+    let members = store
+        .list_extensions()
+        .await?
+        .into_iter()
+        .filter(|row| row.enabled && stack::is_stack_member_id(&row.extension_id))
+        .count();
+    assert_eq!(members, 18, "materialized stack members");
+    let setups = store
+        .list_desired_blueprints(None)
+        .await?
+        .into_iter()
+        .filter(|entry| stack::is_stack_member_id(&entry.blueprint_extension_id))
+        .count();
+    assert_eq!(setups, 1, "one Finish setup offer");
     assert_eq!(
         stack::reconcile(&db_pool, &docker).await?.members_written,
         0,
@@ -19669,6 +19679,91 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         "background reconcile finished after {:?}",
         started.elapsed()
     );
+
+    // First boot, as `main.rs` does it before anyone can press "Finish
+    // setup": create the built-in downloaders' default instances, start them,
+    // register their providers and apply the downloader profiles (which set
+    // NZBGet's managed folders).
+    {
+        use crate::orchestrator::executor::ExecutorAction;
+        use crate::orchestrator::naming::build_aliases;
+        use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
+        let mut actions = Vec::new();
+        for extension_id in ["elixir.modules.qbittorrent", "elixir.modules.nzbget"] {
+            let extension = store
+                .get_extension(extension_id)
+                .await?
+                .context("downloader installed")?;
+            let manifest: crate::extensions::manifest::ExtensionManifest =
+                serde_json::from_value(extension.manifest_json)?;
+            let instance = match store.list_instances(Some(extension_id)).await?.pop() {
+                Some(instance) => instance,
+                None => {
+                    let instance_id = uuid::Uuid::new_v4();
+                    store
+                        .create_instance(&crate::extensions::store::NewExtensionInstance {
+                            instance_id,
+                            extension_id: extension_id.to_string(),
+                            instance_name: "default".to_string(),
+                            config_json: None,
+                            enabled: true,
+                        })
+                        .await?;
+                    store
+                        .get_instance(instance_id)
+                        .await?
+                        .context("created instance")?
+                }
+            };
+            let runtime = manifest.runtime.clone().context("downloader runtime")?;
+            let (aliases, primary_alias) = build_aliases(
+                extension_id,
+                &instance.instance_name,
+                instance.instance_id,
+                runtime.service_name.clone(),
+            );
+            actions.push(ExecutorAction::EnsureRuntimeRunning {
+                instance_id: instance.instance_id,
+                extension_id: extension_id.to_string(),
+                instance_name: instance.instance_name.clone(),
+                runtime,
+                networking: manifest.networking.clone(),
+                aliases,
+            });
+            for provide in &manifest.provides {
+                let provider_id =
+                    stable_provider_id(instance.instance_id, &provide.capability, &provide.slot);
+                actions.push(ExecutorAction::CreateOrUpdateProvider {
+                    provider_id,
+                    instance_id: instance.instance_id,
+                    capability: provide.capability.clone(),
+                    slot_id: provide.slot.clone(),
+                    cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
+                    implementation: provide.implementation.clone(),
+                    scope_json: provide.scope.as_ref().map(serde_json::to_value).transpose()?,
+                    endpoint: build_provider_endpoint(
+                        provide,
+                        &manifest.networking,
+                        &primary_alias,
+                    )?,
+                });
+                actions.push(ExecutorAction::TransportGate {
+                    provider_id,
+                    timeout_seconds: 120,
+                });
+                actions.push(ExecutorAction::BootstrapGate {
+                    provider_id,
+                    timeout_seconds: 120,
+                });
+            }
+        }
+        state.orchestrator.apply_actions(actions).await?;
+        state
+            .orchestrator
+            .apply_builtin_downloader_profiles_now()
+            .await?;
+        eprintln!("first boot finished after {:?}", started.elapsed());
+    }
     let setup = stack::derived_id("elx:test/arr-stack", "setup");
     let (status, plan) = send(post(
         "/api/v1/extensions/blueprints/apply".into(),

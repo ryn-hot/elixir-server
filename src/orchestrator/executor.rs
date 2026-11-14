@@ -413,6 +413,86 @@ impl<'a> Executor<'a> {
     ) -> Result<bool> {
         let endpoint =
             resolve_provider_storage_endpoint(provider.instance_id, declared_endpoint).await?;
+        self.store_provider_endpoint(provider, endpoint).await
+    }
+
+    /// Loads a provider, first re-reading a host-published port from Docker.
+    ///
+    /// When the server runs outside Docker, a provider's endpoint is stored as
+    /// the container's published host port. Those ports are ephemeral: any
+    /// stop/start of the container (a config write, a network rehome) hands
+    /// out a new one, so a stored `elixir_host` port can be stale by the time
+    /// a later setup step uses it. Container-network endpoints are resolved at
+    /// use and are returned unchanged.
+    async fn load_provider(&self, provider_id: Uuid) -> Result<Option<Provider>> {
+        let Some(provider) = self.store.get_provider(provider_id).await? else {
+            return Ok(None);
+        };
+        match self.refresh_host_published_endpoint(&provider).await {
+            Ok(true) => {
+                tracing::info!(
+                    provider_id = %provider.provider_id,
+                    instance_id = %provider.instance_id,
+                    "refreshed host-published provider endpoint after a container restart"
+                );
+                self.store.get_provider(provider_id).await
+            }
+            Ok(false) => Ok(Some(provider)),
+            Err(err) => {
+                tracing::debug!(
+                    "could not refresh host-published endpoint for provider {}: {}",
+                    provider.provider_id,
+                    err
+                );
+                Ok(Some(provider))
+            }
+        }
+    }
+
+    async fn refresh_host_published_endpoint(&self, provider: &Provider) -> Result<bool> {
+        let Some(stored) = provider.endpoint_json.as_ref() else {
+            return Ok(false);
+        };
+        let stored: ProviderEndpoint =
+            serde_json::from_value(stored.clone()).context("parsing provider endpoint")?;
+        if stored.network.as_deref() != Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK) {
+            return Ok(false);
+        }
+        let Some(instance) = self.store.get_instance(provider.instance_id).await? else {
+            return Ok(false);
+        };
+        let Some(extension) = self.store.get_extension(&instance.extension_id).await? else {
+            return Ok(false);
+        };
+        let manifest: ExtensionManifest = serde_json::from_value(extension.manifest_json)
+            .context("parsing provider extension manifest")?;
+        let Some(declared) =
+            declared_provider_endpoint(&instance.extension_id, &manifest, &instance, provider)?
+        else {
+            return Ok(false);
+        };
+        if !endpoint_uses_container_network(&declared) {
+            return Ok(false);
+        }
+        let Some(host_port) =
+            lookup_docker_published_port(provider.instance_id, declared.port).await?
+        else {
+            return Ok(false);
+        };
+        if host_port == stored.port {
+            return Ok(false);
+        }
+        let endpoint = provider_endpoint_from_transport_base_url(&driver_transport_base_url(
+            &declared, host_port,
+        ))?;
+        self.store_provider_endpoint(provider, endpoint).await
+    }
+
+    async fn store_provider_endpoint(
+        &self,
+        provider: &Provider,
+        endpoint: ProviderEndpoint,
+    ) -> Result<bool> {
         let endpoint_json =
             serde_json::to_value(endpoint).context("serializing provider runtime endpoint")?;
         if provider.endpoint_json.as_ref() == Some(&endpoint_json) {
@@ -448,6 +528,14 @@ impl<'a> Executor<'a> {
                 continue;
             }
 
+            self.transport_gate(provider.provider_id, 60).await?;
+            self.bootstrap_gate(provider.provider_id, 60).await?;
+
+            // The gates may have refreshed a host-published port.
+            let provider = self
+                .load_provider(provider.provider_id)
+                .await?
+                .ok_or_else(|| anyhow!("provider {} not found", provider.provider_id))?;
             let endpoint_json = provider
                 .endpoint_json
                 .as_ref()
@@ -456,9 +544,6 @@ impl<'a> Executor<'a> {
             let endpoint: ProviderEndpoint =
                 serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
             endpoint.validate()?;
-
-            self.transport_gate(provider.provider_id, 60).await?;
-            self.bootstrap_gate(provider.provider_id, 60).await?;
 
             let instance = self
                 .store
@@ -1656,8 +1741,7 @@ impl<'a> Executor<'a> {
         provider_id: Uuid,
     ) -> Result<(Provider, crate::db::models::ExtensionInstance)> {
         let provider = self
-            .store
-            .get_provider(provider_id)
+            .load_provider(provider_id)
             .await?
             .ok_or_else(|| anyhow!("provider {} not found", provider_id))?;
         let instance = self
@@ -2181,8 +2265,7 @@ impl<'a> Executor<'a> {
         patch: serde_json::Value,
     ) -> Result<Option<String>> {
         let provider = self
-            .store
-            .get_provider(target_provider_id)
+            .load_provider(target_provider_id)
             .await?
             .ok_or_else(|| {
                 anyhow!(
@@ -2376,8 +2459,7 @@ impl<'a> Executor<'a> {
         provider_id: Uuid,
     ) -> std::result::Result<(), ReadinessCheckError> {
         let provider = self
-            .store
-            .get_provider(provider_id)
+            .load_provider(provider_id)
             .await
             .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
             .ok_or_else(|| {
@@ -2442,8 +2524,7 @@ impl<'a> Executor<'a> {
         provider_id: Uuid,
     ) -> std::result::Result<(), ReadinessCheckError> {
         let provider = self
-            .store
-            .get_provider(provider_id)
+            .load_provider(provider_id)
             .await
             .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
             .ok_or_else(|| {
@@ -2504,8 +2585,7 @@ impl<'a> Executor<'a> {
         provider_id: Uuid,
     ) -> std::result::Result<(), ReadinessCheckError> {
         let provider = self
-            .store
-            .get_provider(provider_id)
+            .load_provider(provider_id)
             .await
             .map_err(|err| ReadinessCheckError::new(ProviderReadinessPhase::Unknown, err))?
             .ok_or_else(|| {
@@ -3050,6 +3130,11 @@ pub(crate) async fn build_driver_ctx_for_provider(
     let endpoint: ProviderEndpoint =
         serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
     endpoint.validate()?;
+    // Drivers call the provider through `transport_base_url`; `endpoint` is
+    // its network identity, which some hand to peers (Prowlarr's own URL for
+    // its apps). A host-published endpoint is only the server's loopback
+    // view, so drivers get the container-network identity instead.
+    let identity = peer_facing_endpoint(store, provider, instance, &endpoint).await?;
 
     let mut secrets = HashMap::new();
     if provider.capability == "media.manager.tv"
@@ -3103,7 +3188,7 @@ pub(crate) async fn build_driver_ctx_for_provider(
         provider.provider_id,
         provider.instance_id,
         provider.capability.clone(),
-        endpoint,
+        identity,
         Some(transport_base_url),
         provider.implementation.clone(),
         instance.config_json.clone(),
@@ -3612,7 +3697,7 @@ async fn resolve_indexer_apps(
             )
             .await?;
             let api_key = resolve_sonarr_api_key(store, secrets, runtime, &target.instance).await?;
-            app.url = target.endpoint.canonical_url()?;
+            app.url = target.peer_endpoint.canonical_url()?;
             app.api_key = Some(api_key);
         } else if is_radarr_app(&app.implementation) {
             let target = resolve_radarr_target_for_app(store, host_hint.as_deref()).await?;
@@ -3631,7 +3716,7 @@ async fn resolve_indexer_apps(
             )
             .await?;
             let api_key = resolve_radarr_api_key(store, secrets, runtime, &target.instance).await?;
-            app.url = target.endpoint.canonical_url()?;
+            app.url = target.peer_endpoint.canonical_url()?;
             app.api_key = Some(api_key);
         }
     }
@@ -3673,7 +3758,7 @@ async fn resolve_downloader_credentials(
                 "download client registration",
             )
             .await?;
-            downloader.url = target.endpoint.canonical_url()?;
+            downloader.url = target.peer_endpoint.canonical_url()?;
             if downloader_has_credentials(downloader) {
                 continue;
             }
@@ -3698,7 +3783,7 @@ async fn resolve_downloader_credentials(
                 "download client registration",
             )
             .await?;
-            downloader.url = target.endpoint.canonical_url()?;
+            downloader.url = target.peer_endpoint.canonical_url()?;
             if downloader_has_credentials(downloader) {
                 continue;
             }
@@ -3716,6 +3801,8 @@ struct ManagedProviderTarget {
     provider: Provider,
     instance: crate::db::models::ExtensionInstance,
     endpoint: ProviderEndpoint,
+    /// How another managed container reaches this provider.
+    peer_endpoint: ProviderEndpoint,
     aliases: Vec<String>,
 }
 
@@ -3959,10 +4046,13 @@ async fn list_managed_provider_targets(
                 )
             })?;
         let aliases = provider_host_aliases(store, &detail, &instance, &endpoint).await?;
+        let peer_endpoint =
+            peer_facing_endpoint(store, &detail.provider, &instance, &endpoint).await?;
         candidates.push(ManagedProviderTarget {
             provider: detail.provider,
             instance,
             endpoint,
+            peer_endpoint,
             aliases,
         });
     }
@@ -4058,6 +4148,34 @@ async fn ensure_provider_driver_ready(
         "{dependency_name} provider {provider_id} is not driver-ready yet; deferring {action_name}: readiness is {}",
         phase.as_str()
     )))
+}
+
+/// The endpoint another managed container uses to reach a provider.
+///
+/// When the server runs outside Docker it stores a host-published endpoint
+/// (`elixir_host`, a loopback port), which only the server process can use.
+/// A URL handed to a peer container (Prowlarr's app list, an Arr download
+/// client) needs the declared container-network endpoint instead.
+async fn peer_facing_endpoint(
+    store: &ExtensionStore<'_>,
+    provider: &Provider,
+    instance: &crate::db::models::ExtensionInstance,
+    endpoint: &ProviderEndpoint,
+) -> Result<ProviderEndpoint> {
+    if endpoint.network.as_deref() != Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK) {
+        return Ok(endpoint.clone());
+    }
+    let Some(extension) = store.get_extension(&instance.extension_id).await? else {
+        return Ok(endpoint.clone());
+    };
+    let manifest: ExtensionManifest = serde_json::from_value(extension.manifest_json)
+        .context("parsing provider extension manifest")?;
+    let declared =
+        declared_provider_endpoint(&instance.extension_id, &manifest, instance, provider)?;
+    match declared {
+        Some(declared) if endpoint_uses_container_network(&declared) => Ok(declared),
+        _ => Ok(endpoint.clone()),
+    }
 }
 
 async fn provider_host_aliases(
@@ -4550,6 +4668,35 @@ async fn resolve_driver_transport_base_url(
     }
 
     Ok(None)
+}
+
+/// The endpoint a provider's manifest declares, before host resolution.
+pub(crate) fn declared_provider_endpoint(
+    extension_id: &str,
+    manifest: &ExtensionManifest,
+    instance: &crate::db::models::ExtensionInstance,
+    provider: &Provider,
+) -> Result<Option<ProviderEndpoint>> {
+    let Some(provide) = manifest.provides.iter().find(|provide| {
+        provide.capability == provider.capability && provide.slot == provider.slot_id
+    }) else {
+        return Ok(None);
+    };
+    let (_, primary_alias) = build_aliases(
+        extension_id,
+        &instance.instance_name,
+        instance.instance_id,
+        manifest
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.service_name.clone()),
+    );
+    crate::orchestrator::planner::build_provider_endpoint(
+        provide,
+        &manifest.networking,
+        &primary_alias,
+    )
+    .map(Some)
 }
 
 async fn resolve_provider_storage_endpoint(

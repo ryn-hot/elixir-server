@@ -1074,22 +1074,15 @@ impl<'a> Reconciler<'a> {
             manifests.insert(extension.extension_id.clone(), manifest.clone());
             manifest
         };
-        let Some(provide) = manifest.provides.iter().find(|provide| {
-            provide.capability == provider.capability && provide.slot == provider.slot_id
-        }) else {
+        let Some(declared_endpoint) = crate::orchestrator::executor::declared_provider_endpoint(
+            &extension.extension_id,
+            &manifest,
+            instance,
+            provider,
+        )?
+        else {
             return Ok(None);
         };
-        let (_, primary_alias) = build_aliases(
-            &extension.extension_id,
-            &instance.instance_name,
-            instance.instance_id,
-            manifest
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.service_name.clone()),
-        );
-        let declared_endpoint =
-            build_provider_endpoint(provide, &manifest.networking, &primary_alias)?;
         executor
             .refresh_provider_runtime_endpoint(provider, declared_endpoint)
             .await

@@ -311,6 +311,12 @@ pub(crate) async fn reconcile(
 ) -> Result<StackReconcile> {
     use crate::db::models::ExtensionTrustLevel;
     use crate::extensions::store::{ExtensionStore, NewDesiredBlueprint, NewExtension};
+    // `reconcile_once` runs from the loop, install handlers and the updater.
+    // Overlapping passes would race on member rows and could offer the same
+    // "Finish setup" twice, so one pass runs at a time.
+    static PASS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    let _pass = PASS.lock().await;
     let store = ExtensionStore::new(pool);
     let extensions = store.list_extensions().await?;
     let mut summary = StackReconcile::default();

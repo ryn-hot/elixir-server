@@ -583,7 +583,7 @@ impl QbittorrentClient {
         if self.host_header.is_none() {
             return Ok(());
         }
-        let container_port = self.endpoint_root.port_or_known_default().unwrap_or(80);
+        let container_port = qbittorrent_container_port(&self.endpoint_root);
         let Some(container_name) =
             find_qbittorrent_container_name_for_instance(instance_id).await?
         else {
@@ -1381,14 +1381,28 @@ fn host_header_for_transport(endpoint: &Url, transport: &Url) -> Option<String> 
     Some(format!("{endpoint_host}:{endpoint_port}"))
 }
 
-fn qbittorrent_host_header(username: &str, endpoint: &Url, transport: &Url) -> Option<String> {
-    host_header_for_transport(endpoint, transport).or_else(|| {
-        let host = transport.host_str()?;
-        let loopback = host.eq_ignore_ascii_case("localhost")
+/// The container port behind a provider endpoint. A loopback endpoint is a
+/// host-published port, which Docker reassigns whenever the container
+/// restarts, so the container-side WebUI port is the stable one to look up.
+fn qbittorrent_container_port(endpoint: &Url) -> u16 {
+    if url_host_is_loopback(endpoint) {
+        return QBITTORRENT_WEBUI_CONTAINER_PORT;
+    }
+    endpoint.port_or_known_default().unwrap_or(80)
+}
+
+fn url_host_is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
             || host == "127.0.0.1"
             || host == "::1"
-            || host == "[::1]";
-        (username.starts_with(QBITTORRENT_AUTOGEN_PREFIX) && loopback)
+            || host == "[::1]"
+    })
+}
+
+fn qbittorrent_host_header(username: &str, endpoint: &Url, transport: &Url) -> Option<String> {
+    host_header_for_transport(endpoint, transport).or_else(|| {
+        (username.starts_with(QBITTORRENT_AUTOGEN_PREFIX) && url_host_is_loopback(transport))
             .then(|| format!("localhost:{QBITTORRENT_WEBUI_CONTAINER_PORT}"))
     })
 }
@@ -1670,6 +1684,17 @@ WebUI\\ServerDomains=*
             Some("localhost:8080")
         );
         assert_eq!(qbittorrent_host_header("admin", &endpoint, &endpoint), None);
+        Ok(())
+    }
+
+    #[test]
+    fn host_published_endpoints_look_up_the_container_webui_port() -> Result<()> {
+        let published = Url::parse("http://127.0.0.1:55008/")?;
+        assert_eq!(qbittorrent_container_port(&published), 8080);
+        let service = Url::parse("http://svc-elixir-modules-qbittorrent-default:8080/")?;
+        assert_eq!(qbittorrent_container_port(&service), 8080);
+        let custom = Url::parse("http://svc-qbit:9090/")?;
+        assert_eq!(qbittorrent_container_port(&custom), 9090);
         Ok(())
     }
 
