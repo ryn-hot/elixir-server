@@ -1731,6 +1731,15 @@ impl OrchestratorService {
 
     pub async fn reconcile_once(&self, config: &ReconcileConfig) -> Result<()> {
         self.ensure_runtime_ready().await?;
+        // Marketplace container stacks first, so their members exist below. A
+        // stack failure is reported but never blocks other extensions.
+        match crate::marketplace::stack::reconcile(&self.pool, self.runtime.as_ref()).await {
+            Ok(summary) if summary != Default::default() => {
+                tracing::info!(?summary, "reconciled marketplace container stacks")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("marketplace container stack reconcile failed: {error:#}"),
+        }
         self.reconcile_once_with_probe(config, self.probe.as_ref(), self.runtime.as_ref())
             .await
     }

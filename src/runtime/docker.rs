@@ -792,6 +792,19 @@ impl DockerRuntimeManager {
         Ok(version.to_string())
     }
 
+    /// Makes an image pinned as `registry/name@sha256:<digest>` present and
+    /// returns its local ID. Docker resolves a digest reference only against
+    /// content with exactly that digest, so a pull cannot substitute another.
+    pub(crate) async fn ensure_pinned_image(&self, reference: &str) -> Result<String> {
+        elixir_marketplace::upstream_image::check_image_reference(reference)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if let Ok(id) = self.local_image_id(reference).await {
+            return Ok(id);
+        }
+        self.pull_image(reference).await?;
+        self.local_image_id(reference).await
+    }
+
     pub async fn pull_image(&self, image: &str) -> Result<()> {
         self.run_capture(&["pull".to_string(), image.to_string()])
             .await?;

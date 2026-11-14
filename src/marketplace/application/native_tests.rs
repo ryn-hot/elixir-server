@@ -125,6 +125,33 @@ async fn sdk_fixture_profile_with_cpu(
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }
+/// The signed fixture with the real Arr Stack `stack` section, its
+/// permissions and no services of its own (its readiness module is SOURCE).
+async fn sdk_stack_fixture() -> Result<serde_json::Value> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sdk = root.join("../extensions/sdk/marketplace/test/fixture.mjs");
+    let arr: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(
+        root.join("../extensions/marketplace-sources/arr-stack/manifest.yaml"),
+    )?)?;
+    let stack =
+        serde_json::json!({"stack": arr["stack"], "permissions": arr["permissions"]}).to_string();
+    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const arr=JSON.parse(process.argv[3]);const f=createFixture({operational:true,mediaTags:['movies'],sourceBytes:Buffer.from(process.argv[2]),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576};m.permissions=arr.permissions;m.provides=[];m.stack=arr.stack;}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
+    let output = timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new("node")
+            .args(["--input-type=module", "-e", script])
+            .arg(sdk)
+            .arg(SOURCE)
+            .arg(stack)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() || output.stdout.len() > 8 * 1024 * 1024 {
+        bail!("stack SDK fixture generation failed")
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
 fn descriptor(value: &serde_json::Value) -> Result<(CandidateDescriptor, IssuerPolicy)> {
     let mut descriptor = CandidateDescriptor::parse(&serde_json::to_vec(
         &serde_json::json!({"schema_version":1,"publisher":value["publisher"],"release":value["release"],"head":value["head"],"revocations":[],"gate_evidence":value["evidence"]["pairs"]}),
@@ -474,6 +501,11 @@ async fn native_owned_application_installs_and_invokes_without_reconstructing_or
     run(None, false).await
 }
 #[tokio::test]
+#[ignore = "explicit offline actual direct container-stack acceptance/source/archive/review/staging/setup/readiness/commit; synthetic signature/public-source/protection receipts"]
+async fn native_direct_application_installs_a_container_stack() -> Result<()> {
+    run_with_withdrawal(None, false, true, false, false, true).await
+}
+#[tokio::test]
 #[ignore = "explicit offline actual zero-paid direct owner acceptance/source/archive/staging/setup/native activation/invocation; synthetic signature/public-source/protection receipts"]
 async fn native_direct_application_installs_and_invokes_without_paid_discovery_proofs() -> Result<()>
 {
@@ -488,7 +520,7 @@ async fn native_sdk_upload_installs_and_invokes_without_peer_blob_downloads() ->
 #[ignore = "explicit pinned worker and actual mid-input source-owner withdrawal/cleanup; synthetic public-source/protection observations"]
 async fn native_source_owner_withdrawal_stops_incomplete_input_and_retires_its_original_job()
 -> Result<()> {
-    run_with_withdrawal(None, false, true, true, true).await
+    run_with_withdrawal(None, false, true, true, true, false).await
 }
 #[tokio::test]
 #[ignore = "explicit NEW empty loopback PostgreSQL and whole actual owned application install/invocation; no public-network qualification"]
@@ -532,7 +564,7 @@ async fn run_input(
     direct: bool,
     upload: bool,
 ) -> Result<()> {
-    run_with_withdrawal(postgres, lose_ack, direct, upload, false).await
+    run_with_withdrawal(postgres, lose_ack, direct, upload, false, false).await
 }
 async fn run_with_withdrawal(
     postgres: Option<&str>,
@@ -540,6 +572,7 @@ async fn run_with_withdrawal(
     direct: bool,
     upload: bool,
     withdraw: bool,
+    stack: bool,
 ) -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
@@ -553,7 +586,11 @@ async fn run_with_withdrawal(
     let lane = directory.join("foreground");
     let files = directory.join("source");
     std::fs::create_dir(&files)?;
-    let value = sdk_fixture().await?;
+    let value = if stack {
+        sdk_stack_fixture().await?
+    } else {
+        sdk_fixture().await?
+    };
     let (release, package, proof) =
         crate::marketplace::quarantine::tests::decode_fixture(value.clone())?;
     for (name, bytes) in [("package.blob", &package), ("proof.blob", &proof)] {
@@ -727,6 +764,19 @@ async fn run_with_withdrawal(
                 assert!(record["active"].is_object());
                 assert!(record["active"]["authority"].get("gate_evidence").is_none());
                 assert_eq!(service.view(id)?.initial_request.direct_reference,Some(reference));
+                if stack {
+                    // The activated row carries the verified stack; its members
+                    // convert exactly as the orchestrator will run them.
+                    let (enabled,manifest):(i64,String)=sqlx::query_as("SELECT CAST(CASE WHEN enabled THEN 1 ELSE 0 END AS BIGINT),manifest_json FROM extensions WHERE extension_id=$1")
+                        .bind(release.payload().extension_id.as_str()).fetch_one(&db.pool).await?;
+                    assert_eq!(enabled,1,"the stack's own row is active");
+                    let manifest:crate::extensions::manifest::ExtensionManifest=serde_json::from_str(&manifest)?;
+                    let stack_section=manifest.stack.as_ref().context("activated stack")?;
+                    let members=crate::marketplace::stack::materialize(release.payload().extension_id.as_str(),&manifest.version,stack_section)?;
+                    assert_eq!(members.len(),18);
+                    eprintln!("container stack passed actual preparation/archive/grant review (3 containers)/staging/setup/readiness/commit; 18 members materialize");
+                    return Ok(());
+                }
                 eprintln!("zero-paid direct source passed actual preparation/archive/grant/staging/setup/native migration/readiness/commit/invocation and lost commit ACK recovery; no discovery or auto-sharing proof");
                 return Ok(());
             }

@@ -735,6 +735,9 @@ impl<'a> Executor<'a> {
             sysctls: HashMap::new(),
             security: container_security_options(&runtime.security),
         };
+        if crate::marketplace::stack::is_stack_member_id(&extension_id) {
+            apply_stack_sandbox(&mut spec);
+        }
 
         let resolved_egress = self
             .resolve_default_download_egress(&extension_id, runtime.egress.clone())
@@ -5984,16 +5987,41 @@ pub(crate) fn describe_volume_mount_identity(volume: &VolumeMount) -> String {
     )
 }
 
+/// Marketplace stack members (crate::marketplace::stack) run under Elixir's
+/// fixed sandbox, never their publisher's settings: only the capabilities the
+/// upstream images' start-up needs to switch users, no new privileges, memory
+/// and process caps, and web ports on this computer only (opened through
+/// Elixir's proxy). Legacy containers are unaffected.
+fn apply_stack_sandbox(spec: &mut ContainerSpec) {
+    const STACK_CAPABILITIES: [&str; 5] = ["CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER"];
+    spec.cap_drop = vec!["ALL".to_string()];
+    spec.cap_add = STACK_CAPABILITIES
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect();
+    spec.devices.clear();
+    spec.sysctls.clear();
+    spec.network_mode = None;
+    spec.security.no_new_privileges = true;
+    spec.security.memory_limit_mb = Some(1024);
+    spec.security.pids_limit = Some(512);
+    for port in &mut spec.ports {
+        port.host_port = Some(0);
+        port.host_ip = Some("127.0.0.1".to_string());
+    }
+}
+
 fn extension_uses_managed_config_volume(extension_id: &str) -> bool {
-    matches!(
-        extension_id,
-        "elixir.modules.sonarr"
-            | "elixir.modules.radarr"
-            | "elixir.modules.prowlarr"
-            | "elixir.modules.bazarr"
-            | "elixir.modules.nzbget"
-            | "elixir.modules.qbittorrent"
-    )
+    crate::marketplace::stack::is_stack_member_id(extension_id)
+        || matches!(
+            extension_id,
+            "elixir.modules.sonarr"
+                | "elixir.modules.radarr"
+                | "elixir.modules.prowlarr"
+                | "elixir.modules.bazarr"
+                | "elixir.modules.nzbget"
+                | "elixir.modules.qbittorrent"
+        )
 }
 
 fn extension_requires_runtime_volume(extension_id: &str) -> bool {

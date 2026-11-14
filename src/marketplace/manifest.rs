@@ -205,6 +205,20 @@ pub(super) fn check_document(
             bail!("unknown or repeated public extension permission");
         }
     }
+    // A source module may declare a container stack (crate::marketplace::stack):
+    // upstream images pinned by digest that the orchestrator runs for it.
+    if let Some(stack) = &manifest.stack {
+        if release.runtime_profile != RuntimeProfile::SourceJs
+            || !manifest.provides.is_empty()
+            || !manifest.actions.is_empty()
+            || manifest.execution.is_some()
+        {
+            bail!("only a source module without its own services declares a container stack");
+        }
+        elixir_marketplace::upstream_image::check_stack(document.value())
+            .map_err(|error| anyhow::anyhow!("invalid container stack: {error}"))?;
+        crate::marketplace::stack::check_members(stack, &manifest.permissions)?;
+    }
     let selection = match release.runtime_profile {
         RuntimeProfile::Declarative => {
             if release.kind == ExtensionKind::Module

@@ -19490,6 +19490,332 @@ runtime:
     Ok(())
 }
 
+// Live, opt-in: the Arr Stack's one-click setup from an activated
+// marketplace stack row, on real Docker. Run with
+// ELIXIR_LIVE_STACK_ROOT=<folder Docker can mount> cargo test --lib
+// live_arr_stack_one_click -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "live Docker Arr Stack test; set ELIXIR_LIVE_STACK_ROOT to run"]
+async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Result<()> {
+    use crate::extensions::store::{ExtensionStore, NewExtension};
+    use crate::marketplace::stack;
+    let Ok(root) = std::env::var("ELIXIR_LIVE_STACK_ROOT") else {
+        return Ok(());
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("arr-stack-")
+        .tempdir_in(&root)?;
+    let storage = temp.path().join("data/extensions");
+    let media = temp.path().join("media");
+    for dir in [
+        storage.clone(),
+        temp.path().join("data/downloads"),
+        media.join("tv"),
+        media.join("movies"),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+    let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/bundled");
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../extensions/marketplace-sources/arr-stack/manifest.yaml");
+    let mut settings = test_settings_with_db();
+    settings.extensions.storage_root = storage.to_string_lossy().to_string();
+    settings.library.local_root = media.to_string_lossy().to_string();
+    settings.extensions.bundled_dir = bundled.to_string_lossy().to_string();
+    settings.extensions.allow_directory_install = true;
+    let deployment = crate::runtime::RuntimePaths::from_roots(
+        &settings.extensions.storage_root,
+        &settings.library.local_root,
+    )
+    .deployment_id();
+
+    // Remove everything this deployment created, even when the test fails.
+    struct Cleanup(String, std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let docker = |args: &[&str]| std::process::Command::new("docker").args(args).output();
+            if let Ok(out) = docker(&[
+                "ps",
+                "-aq",
+                "--filter",
+                &format!("label=elixir.deployment_id={}", self.0),
+            ]) {
+                for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                    let _ = docker(&["rm", "-f", id]);
+                }
+            }
+            for volume in self.1.lock().map(|v| v.clone()).unwrap_or_default() {
+                let _ = docker(&["volume", "rm", "-f", &volume]);
+            }
+        }
+    }
+    let volumes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _cleanup = Cleanup(deployment, volumes.clone());
+
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets,
+    ));
+    let send = |request: Request<Body>| {
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await?;
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&body::to_bytes(response.into_body(), 16 << 20).await?)
+                    .unwrap_or(Value::Null);
+            anyhow::Ok((status, body))
+        }
+    };
+    let post = |uri: String, payload: Value| {
+        Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+    };
+
+    // The built-in downloaders, as the server bootstraps them.
+    for package in ["qbittorrent-module.elx", "nzbget-module"] {
+        let (status, body) = send(post(
+            "/api/v1/extensions/install".into(),
+            json!({ "packagePath": bundled.join(package).to_string_lossy() }),
+        )?)
+        .await?;
+        assert_eq!(status, StatusCode::OK, "install {package}: {body}");
+    }
+
+    // The stack row exactly as marketplace activation leaves it.
+    let mut raw: Value = serde_yaml::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+    raw["id"] = json!("elx:test/arr-stack");
+    if let Some(runtime) = raw["runtime"].as_object_mut() {
+        runtime.remove("profile");
+        runtime.remove("entrypoint");
+    }
+    let manifest: crate::extensions::manifest::ExtensionManifest =
+        serde_json::from_value(raw.clone())?;
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&NewExtension {
+            extension_id: manifest.id.clone(),
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            kind: manifest.kind,
+            publisher_name: Some("Test publisher".into()),
+            signing_key_id: None,
+            trust_level: ExtensionTrustLevel::Community,
+            manifest_json: raw,
+            package_hash: None,
+            enabled: true,
+        })
+        .await?;
+
+    let docker = crate::runtime::docker::DockerRuntimeManager::new(None);
+    let summary = stack::reconcile(&db_pool, &docker).await?;
+    eprintln!("stack reconcile: {summary:?}");
+    assert_eq!(
+        (
+            summary.members_written,
+            summary.images_ready,
+            summary.setups_offered
+        ),
+        (18, 3, 1)
+    );
+    assert_eq!(
+        stack::reconcile(&db_pool, &docker).await?.members_written,
+        0,
+        "reconcile is idempotent"
+    );
+
+    // Installing the downloaders started a background reconcile; let it
+    // release the orchestrator lock, as a person pressing "Finish setup" would.
+    let started = std::time::Instant::now();
+    loop {
+        if store
+            .acquire_lock(
+                crate::orchestrator::lock::APPLY_LOCK_NAME,
+                "arr-stack-live-test",
+                std::time::Duration::from_secs(1),
+            )
+            .await?
+        {
+            store
+                .release_lock(
+                    crate::orchestrator::lock::APPLY_LOCK_NAME,
+                    "arr-stack-live-test",
+                )
+                .await?;
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(900),
+            "reconcile never released the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    eprintln!(
+        "background reconcile finished after {:?}",
+        started.elapsed()
+    );
+    let setup = stack::derived_id("elx:test/arr-stack", "setup");
+    let (status, plan) = send(post(
+        "/api/v1/extensions/blueprints/apply".into(),
+        json!({ "blueprint_id": setup }),
+    )?)
+    .await?;
+    assert_eq!(status, StatusCode::OK, "apply: {plan}");
+    let plan_id = plan["plan_id"].as_str().context("plan id")?.to_owned();
+    let started = std::time::Instant::now();
+    let (status, run) = send(post(
+        format!("/api/v1/extensions/plan/{plan_id}/confirm"),
+        json!({}),
+    )?)
+    .await?;
+    for instance in store.list_instances(None).await? {
+        volumes
+            .lock()
+            .unwrap()
+            .push(format!("elixir_cfg_{}", instance.instance_id.simple()));
+    }
+    eprintln!(
+        "one-click setup: {status} in {:?}: {run}",
+        started.elapsed()
+    );
+    if status != StatusCode::OK || run["status"] != "completed" {
+        let (_, detail) =
+            send(Request::get(format!("/api/v1/extensions/runs/{plan_id}")).body(Body::empty())?)
+                .await?;
+        for step in detail["steps"].as_array().into_iter().flatten() {
+            if step["status"] != "completed" {
+                eprintln!(
+                    "step {}: {}",
+                    step["status"],
+                    step.to_string().chars().take(600).collect::<String>()
+                );
+            }
+        }
+        let docker = |args: &[&str]| std::process::Command::new("docker").args(args).output();
+        let label = format!("label=elixir.deployment_id={}", _cleanup.0);
+        let ps = docker(&[
+            "ps",
+            "-a",
+            "--filter",
+            &label,
+            "--format",
+            "{{.Names}} {{.Image}} {{.Status}} {{.Label \"elixir.extension_id\"}}",
+        ])?;
+        eprintln!("containers:\n{}", String::from_utf8_lossy(&ps.stdout));
+        for provider in store.list_providers(None).await.unwrap_or_default() {
+            eprintln!(
+                "provider {} {} {:?}: {}",
+                provider.provider_id,
+                provider.capability,
+                provider.implementation,
+                provider
+                    .endpoint_json
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            );
+        }
+        let ids = docker(&["ps", "-aq", "--filter", &label])?;
+        for id in String::from_utf8_lossy(&ids.stdout).split_whitespace() {
+            let net = docker(&[
+                "inspect",
+                "--format",
+                "{{.Name}} {{json .NetworkSettings.Networks}} {{json .HostConfig.NetworkMode}} {{json .NetworkSettings.Ports}}",
+                id,
+            ])?;
+            eprintln!(
+                "net {}",
+                String::from_utf8_lossy(&net.stdout)
+                    .chars()
+                    .take(900)
+                    .collect::<String>()
+            );
+        }
+        for name in String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+        {
+            let logs = docker(&["logs", "--tail", "12", name])?;
+            eprintln!(
+                "--- {name}\n{}{}",
+                String::from_utf8_lossy(&logs.stdout),
+                String::from_utf8_lossy(&logs.stderr)
+            );
+        }
+    }
+    assert_eq!(status, StatusCode::OK, "confirm: {run}");
+    assert_eq!(run["status"], "completed", "run: {run}");
+
+    // Every stack container runs under the stack sandbox.
+    for member in ["sonarr", "radarr", "prowlarr"] {
+        let id = stack::derived_id("elx:test/arr-stack", member);
+        let out = std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-q",
+                "--filter",
+                &format!("label=elixir.extension_id={id}"),
+            ])
+            .output()?;
+        let container = String::from_utf8(out.stdout)?.trim().to_owned();
+        assert!(!container.is_empty(), "{member} is not running");
+        let inspect = std::process::Command::new("docker")
+            .args(["inspect", "--format", "{{json .HostConfig}}", &container])
+            .output()?;
+        let host: Value = serde_json::from_slice(&inspect.stdout)?;
+        eprintln!(
+            "{member}: CapDrop={} CapAdd={} SecurityOpt={} Memory={} Pids={} Ports={}",
+            host["CapDrop"],
+            host["CapAdd"],
+            host["SecurityOpt"],
+            host["Memory"],
+            host["PidsLimit"],
+            host["PortBindings"]
+        );
+        assert_eq!(host["CapDrop"], json!(["ALL"]), "{member}");
+        assert_eq!(host["CapAdd"].as_array().map(Vec::len), Some(5), "{member}");
+        assert!(
+            host["SecurityOpt"]
+                .to_string()
+                .contains("no-new-privileges"),
+            "{member}"
+        );
+        assert_eq!(host["Memory"], json!(1024 * 1024 * 1024), "{member}");
+        assert!(!host["Privileged"].as_bool().unwrap_or(true), "{member}");
+        for bindings in host["PortBindings"]
+            .as_object()
+            .into_iter()
+            .flat_map(|ports| ports.values())
+        {
+            for binding in bindings.as_array().into_iter().flatten() {
+                assert_eq!(
+                    binding["HostIp"], "127.0.0.1",
+                    "{member} publishes beyond this computer"
+                );
+            }
+        }
+        assert!(
+            !host["Binds"].to_string().contains("docker.sock"),
+            "{member}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn extensions_allows_unsigned_bundled_elx_install_in_production() -> Result<()> {
     let temp = tempdir()?;

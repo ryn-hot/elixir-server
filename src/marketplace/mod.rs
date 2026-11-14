@@ -45,6 +45,7 @@ mod search_timing;
 pub mod security_state;
 mod selected_source;
 pub mod service;
+pub(crate) mod stack;
 #[cfg(unix)]
 mod sharing;
 pub mod startup;

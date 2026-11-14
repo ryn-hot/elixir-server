@@ -10839,6 +10839,7 @@ mod tests {
                 networking: None,
                 control_surface: None,
                 owner_release: None,
+                stack: None,
             },
             summary: ExtensionStatusSummaryItem {
                 extension_id: "elixir.modules.sonarr".to_string(),

@@ -1969,6 +1969,11 @@ async fn install_extension_internal_with_policy(
 
     let permission_policy = PermissionPolicy::new();
     permission_policy.enforce(trust_level, &manifest.permissions, &manifest.id)?;
+    // Stacks and their derived members come only from verified marketplace
+    // releases (crate::marketplace::stack), never from local packages.
+    if manifest.stack.is_some() || crate::marketplace::stack::is_stack_member_id(&manifest.id) {
+        anyhow::bail!("marketplace stacks install only through the verified marketplace");
+    }
 
     let new_version = Version::parse(&manifest.version)
         .map_err(|_| anyhow::anyhow!("extension version is not valid semver"))?;
@@ -5924,6 +5929,7 @@ fn parse_extension_control_manifest(extension: &Extension) -> ExtensionManifest 
                 networking: None,
                 control_surface: None,
                 owner_release: None,
+                stack: None,
             }
         }
     }
@@ -8697,6 +8703,7 @@ mod extension_ui_proxy_tests {
                 networking: None,
                 control_surface: None,
                 owner_release: None,
+                stack: None,
             };
             ExtensionControlContext {
                 extension: Extension {

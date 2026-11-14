@@ -74,6 +74,21 @@ pub struct ExtensionManifest {
     pub control_surface: Option<ManifestControlSurface>,
     #[serde(default)]
     pub owner_release: Option<ManifestOwnerRelease>,
+    /// Container stack declared by a marketplace source module. Only marketplace
+    /// installation materializes it; legacy installs refuse stack manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<ManifestStack>,
+}
+
+/// Container modules, connector data and setup steps of one marketplace stack
+/// (see `crate::marketplace::stack`). Member IDs are local names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestStack {
+    pub modules: Vec<ExtensionManifest>,
+    #[serde(default)]
+    pub connectors: Vec<ExtensionManifest>,
+    pub blueprint: Box<ExtensionManifest>,
 }
 
 impl ExtensionManifest {
@@ -110,7 +125,8 @@ impl ExtensionManifest {
 
         match self.kind {
             ExtensionKind::Module => {
-                if self.provides.is_empty() {
+                // A stack's own module provides nothing; its members do.
+                if self.provides.is_empty() && self.stack.is_none() {
                     bail!("module manifests must declare at least one provided capability");
                 }
                 if self.runtime.is_none() {

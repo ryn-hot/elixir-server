@@ -125,6 +125,7 @@ impl GrantScope {
             (RuntimeProfile::SourceJs | RuntimeProfile::Reproducible, Some(resources)) => {
                 resources.validate()?
             }
+
             _ => bail!("public grant runtime profile mismatch"),
         }
         Ok(())
@@ -186,6 +187,21 @@ pub struct GrantReview {
     release_id: Digest,
     manifest_sha256: Digest,
     scope: GrantScope,
+    /// The containers a stack declares, shown to the owner. Absent for every
+    /// extension without a stack, so their review IDs are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stack: Option<Vec<StackContainerReview>>,
+}
+
+/// One stack container as the owner approves it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StackContainerReview {
+    pub member: String,
+    pub name: String,
+    pub image: String,
+    pub folders: Vec<String>,
+    pub web_port: Option<u16>,
 }
 impl GrantReview {
     pub fn review_id(&self) -> Result<Digest> {
@@ -198,8 +214,15 @@ impl GrantReview {
     pub fn scope(&self) -> &GrantScope {
         &self.scope
     }
+    pub fn stack(&self) -> Option<&[StackContainerReview]> {
+        self.stack.as_deref()
+    }
     pub(super) fn validate(&self) -> Result<()> {
-        self.scope.validate()
+        self.scope.validate()?;
+        if self.stack.is_some() && self.scope.runtime_profile != RuntimeProfile::SourceJs {
+            bail!("only source modules declare a container stack");
+        }
+        Ok(())
     }
 }
 impl ManifestCheckedQuarantine {
@@ -322,7 +345,7 @@ pub(super) fn build_review(
     // Presentation and source/artifact content hashes are not access grants.
     let build_boundaries: Vec<_> = artifacts.iter().map(|a| json!({"architecture":a.architecture,
         "builder_image_digest":a.builder_image_digest,"command":a.command,"environment":a.environment})).collect();
-    let authority_contract = Digest::of(canonical::to_vec(&json!({
+    let mut contract = json!({
         "provides":manifest.provides,"requires":manifest.requires,"conflicts":manifest.conflicts,
         "kind":manifest.kind,
         "targets":manifest.targets,"actions":manifest.actions,"execution":manifest.execution,
@@ -330,7 +353,18 @@ pub(super) fn build_review(
         "preferences":manifest.preferences,"bindings":manifest.bindings,"policies":manifest.policies,
         "networking":manifest.networking,"control_surface":manifest.control_surface,"owner_release":manifest.owner_release,
         "build_boundaries":build_boundaries
-    }))?);
+    });
+    // Images, folders, connectors and setup steps are all authority-bearing.
+    // The key is added only for stacks, so other contracts keep their digest.
+    let stack = match &manifest.stack {
+        Some(stack) if profile == RuntimeProfile::SourceJs => {
+            contract["stack"] = serde_json::to_value(stack)?;
+            Some(stack_review(stack))
+        }
+        Some(_) => bail!("only source modules declare a container stack"),
+        None => None,
+    };
+    let authority_contract = Digest::of(canonical::to_vec(&contract)?);
     let scope = GrantScope {
         policy_version: POLICY_VERSION,
         extension_id: manifest.id.parse()?,
@@ -344,9 +378,30 @@ pub(super) fn build_review(
         release_id,
         manifest_sha256,
         scope,
+        stack,
     };
     review.validate()?;
     Ok(review)
+}
+
+fn stack_review(stack: &crate::extensions::manifest::ManifestStack) -> Vec<StackContainerReview> {
+    stack
+        .modules
+        .iter()
+        .map(|module| {
+            let runtime = module.runtime.as_ref();
+            StackContainerReview {
+                member: module.id.clone(),
+                name: module.name.clone(),
+                image: runtime.and_then(|r| r.image.clone()).unwrap_or_default(),
+                folders: runtime.map(|r| r.volumes.clone()).unwrap_or_default(),
+                web_port: module
+                    .networking
+                    .as_ref()
+                    .map(|networking| networking.service_port.container_port),
+            }
+        })
+        .collect()
 }
 
 fn sorted_unique(values: &[String]) -> bool {
@@ -432,7 +487,7 @@ mod tests {
         let manifest: ExtensionManifest = serde_json::from_value(
             json!({"id":golden["extension_id"],"version":"1.0.0","kind":"module","name":"Grant Fixture",
             "permissions":["runtime.manage_containers","network.egress"],
-            "provides":[{"capability":"acquisition.candidate_provider","slot":"default","cardinality":"many","implementation":"fixture","scope":{"media_types":["movies"],"actions":["search"]}}],
+            "provides":[{"capability":"acquisition.candidate_provider","slot":"default","cardinality":"many","implementation":"fixture","scope":{"media_types":["movies"],"actions":["search"]},"endpoint":{"type":"source-js-v1"}}],
             "runtime":{"type":"container","env":[{"name":"API_KEY","from_secret":"instance:source_api","optional":true}]}}),
         )?;
         manifest.validate()?;
