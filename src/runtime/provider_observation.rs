@@ -23,11 +23,20 @@ impl ProviderTransport {
         expected.sort();
         let mut actual = self.tunnel_addresses.clone();
         actual.sort();
+        // Name WHICH part moved (closed field names only, never addresses), so
+        // a fail-closed transport change is diagnosable from the default log.
+        let changed: Vec<&str> = [
+            (self.namespace_inode != namespace, "namespace"),
+            (actual != expected, "tunnel_addresses"),
+            (policy.endpoints != [self.endpoint.clone()], "endpoint"),
+        ]
+        .into_iter()
+        .filter_map(|(differs, field)| differs.then_some(field))
+        .collect();
         ensure!(
-            self.namespace_inode == namespace
-                && actual == expected
-                && policy.endpoints == [self.endpoint.clone()],
-            "provider transport changed"
+            changed.is_empty(),
+            "provider transport changed ({})",
+            changed.join(",")
         );
         Ok(())
     }

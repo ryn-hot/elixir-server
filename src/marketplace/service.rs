@@ -912,7 +912,17 @@ impl<W: Owned> Managed<W> {
             || slot.closing
             || !matches!(slot.phase, RuntimePhase::Failed | RuntimePhase::Stopped)
         {
-            bail!("cancelled startup slot is not exclusively vacant and stopping");
+            // Closed state only (no identity, path or error payload), so a
+            // cancellation race is diagnosable from the default log.
+            bail!(
+                "cancelled startup slot is not exclusively vacant and stopping \
+                 (phase={:?} stop_requested={} owner={} client={} closing={})",
+                slot.phase,
+                slot.stop_requested,
+                slot.owner.is_some(),
+                slot.client.is_some(),
+                slot.closing
+            );
         }
         slot.phase = RuntimePhase::Stopped;
         Ok(())
