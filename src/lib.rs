@@ -10,6 +10,7 @@ pub mod download_broker;
 pub mod drivers;
 pub mod extensions;
 pub mod http;
+pub mod legacy_arr;
 pub mod library;
 pub mod live;
 mod live_egress_common;

@@ -2299,13 +2299,20 @@ impl<'a> Executor<'a> {
                 )
             })?;
 
-        let driver = self.drivers.get(&provider.capability).ok_or_else(|| {
-            anyhow!(
-                "no driver registered for capability '{}' (connector {})",
-                provider.capability,
-                connector_extension_id
-            )
-        })?;
+        // A marketplace stack's own member is set up by its stack's code, never
+        // by the server's drivers.
+        let stack_setup =
+            super::stack_setup::for_member(&instance.extension_id, &provider.capability)?;
+        let driver = match stack_setup {
+            Some(_) => None,
+            None => Some(self.drivers.get(&provider.capability).ok_or_else(|| {
+                anyhow!(
+                    "no driver registered for capability '{}' (connector {})",
+                    provider.capability,
+                    connector_extension_id
+                )
+            })?),
+        };
 
         let mut patch = DriverPatch::from_manifest(&provider.capability, patch)
             .context("parsing driver patch")?;
@@ -2313,21 +2320,31 @@ impl<'a> Executor<'a> {
 
         resolve_indexer_credentials(&self.store, self.secrets, provider.instance_id, &mut patch)
             .await?;
-        resolve_indexer_apps(
-            &self.store,
-            self.secrets,
-            self.runtime,
-            self.probe,
-            &mut patch,
-        )
-        .await?;
+        if stack_setup.is_some() {
+            resolve_stack_indexer_apps(
+                &self.store,
+                self.secrets,
+                self.probe,
+                &instance,
+                &mut patch,
+            )
+            .await?;
+        } else {
+            resolve_indexer_apps(
+                &self.store,
+                self.secrets,
+                self.runtime,
+                self.probe,
+                &mut patch,
+            )
+            .await?;
+        }
         resolve_downloader_credentials(&self.store, self.secrets, self.probe, &mut patch).await?;
 
-        // A marketplace stack's own member: its code checks and applies the
-        // resolved patch under the same drift policy.
-        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
-            let implementation = provider.implementation.clone().unwrap_or_default();
-            let semantics = driver.patch_semantics(&patch);
+        // The stack's code checks and applies the resolved patch under the same
+        // drift policy.
+        if let Some(setup) = stack_setup {
+            let semantics = super::stack_setup::patch_semantics(&patch);
             let patch = patch.to_json()?;
             // Its network identity as its peers reach it (a host-published
             // endpoint is only the server's loopback view), as drivers get it.
@@ -2335,12 +2352,7 @@ impl<'a> Executor<'a> {
                 .await?
                 .canonical_url()?;
             let evaluation = setup
-                .evaluate_patch(
-                    &instance.extension_id,
-                    &implementation,
-                    patch.clone(),
-                    &provider_url,
-                )
+                .evaluate_patch(patch.clone(), &provider_url)
                 .await
                 .context("evaluating driver patch drift")?;
             match evaluation.status {
@@ -2360,9 +2372,7 @@ impl<'a> Executor<'a> {
                 }
                 DriftStatus::Drifted | DriftStatus::Unknown => {}
             }
-            let result = setup
-                .apply_patch(&instance.extension_id, &implementation, patch, &provider_url)
-                .await?;
+            let result = setup.apply_patch(patch, &provider_url).await?;
             if result.status == ApplyStatus::Deferred {
                 let detail = result
                     .message
@@ -2383,6 +2393,7 @@ impl<'a> Executor<'a> {
             }
             return Ok(result.message);
         }
+        let driver = driver.context("no driver for this provider")?;
 
         let ctx = build_driver_ctx_for_provider(
             &self.store,
@@ -2718,11 +2729,11 @@ impl<'a> Executor<'a> {
         // A marketplace stack's own member: its code names the files it needs
         // from its /config, reads its API key from them and finishes its
         // first-start setup (web login from Elixir); Elixir stores the key.
-        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
+        if let Some(setup) =
+            super::stack_setup::for_member(&instance.extension_id, &provider.capability)?
+        {
             let implementation = provider.implementation.clone().unwrap_or_default();
-            let names = setup
-                .bootstrap_files(&instance.extension_id, &implementation)
-                .await?;
+            let names = setup.bootstrap_files().await?;
             let mut files = std::collections::BTreeMap::new();
             for name in names {
                 if !super::stack_setup::valid_bootstrap_file(&name) {
@@ -2745,11 +2756,10 @@ impl<'a> Executor<'a> {
             let login =
                 ensure_arr_ui_credentials(&self.store, self.secrets, provider.instance_id).await?;
             let key = setup
-                .bootstrap(&instance.extension_id, &implementation, files, login)
+                .bootstrap(files, login)
                 .await?
                 .ok_or_else(|| anyhow!("{implementation} configuration not ready"))?;
-            upsert_instance_api_key(&self.store, self.secrets, provider.instance_id, &key)
-                .await?;
+            upsert_instance_api_key(&self.store, self.secrets, provider.instance_id, &key).await?;
             self.record_provider_readiness(
                 provider.provider_id,
                 ProviderReadinessPhase::BootstrapReady,
@@ -2885,11 +2895,10 @@ impl<'a> Executor<'a> {
             ensure_candidate_provider_runtime_ready(provider).await?;
             return Ok(());
         }
-        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
-            let implementation = provider.implementation.clone().unwrap_or_default();
-            setup
-                .read_state(&instance.extension_id, &implementation)
-                .await?;
+        if let Some(setup) =
+            super::stack_setup::for_member(&instance.extension_id, &provider.capability)?
+        {
+            setup.read_state().await?;
             return Ok(());
         }
         let Some(driver) = self.drivers.get(&provider.capability) else {
@@ -3090,6 +3099,7 @@ impl<'a> Executor<'a> {
         endpoint: &ProviderEndpoint,
         config_paths: &[&str],
     ) -> Result<()> {
+        crate::legacy_arr::mark("executor: Arr web login normalization");
         let Some(base_url) = resolve_driver_transport_base_url(instance_id, endpoint).await? else {
             return Ok(());
         };
@@ -3199,6 +3209,7 @@ async fn resolve_sonarr_api_key(
     runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
+    crate::legacy_arr::mark("executor: Sonarr API key");
     let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
     if let Some(key) = config.api_key {
         upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
@@ -3313,6 +3324,7 @@ async fn resolve_radarr_api_key(
     runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
+    crate::legacy_arr::mark("executor: Radarr API key");
     let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
     if let Some(key) = config.api_key {
         upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
@@ -3405,6 +3417,7 @@ async fn resolve_prowlarr_api_key(
     runtime: &dyn RuntimeManager,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<String> {
+    crate::legacy_arr::mark("executor: Prowlarr API key");
     let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
     if let Some(key) = config.api_key {
         upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
@@ -3803,6 +3816,7 @@ async fn resolve_indexer_apps(
         DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps { apps }) => apps,
         _ => return Ok(()),
     };
+    crate::legacy_arr::mark("executor: Prowlarr app links by app name");
     for app in apps {
         if app
             .api_key
@@ -3851,6 +3865,99 @@ async fn resolve_indexer_apps(
             app.url = target.peer_endpoint.canonical_url()?;
             app.api_key = Some(api_key);
         }
+    }
+    Ok(())
+}
+
+/// Fills in the address and API key of each application a marketplace stack's
+/// indexer list registers, from that stack's own media-manager members: the
+/// member the app's URL names (`http://<member>.stack:<port>`), else the one
+/// whose address it names, else the only one. The key is the one the member's
+/// first start stored. No application name is involved.
+async fn resolve_stack_indexer_apps(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    probe: &dyn ProbeRunner,
+    instance: &crate::db::models::ExtensionInstance,
+    patch: &mut DriverPatch,
+) -> Result<()> {
+    use crate::marketplace::stack::split_member_id;
+    let apps = match patch {
+        DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps { apps }) => apps,
+        _ => return Ok(()),
+    };
+    let has_key = |key: &Option<String>| key.as_ref().is_some_and(|value| !value.trim().is_empty());
+    if apps.iter().all(|app| has_key(&app.api_key)) {
+        return Ok(());
+    }
+    let (stack, _) = split_member_id(&instance.extension_id)
+        .ok_or_else(|| anyhow!("{} is not a stack member", instance.extension_id))?;
+    let mut candidates = Vec::new();
+    for detail in store.list_provider_details().await? {
+        if super::stack_setup::interface_for(&detail.provider.capability) != Some("media.manager") {
+            continue;
+        }
+        let Some((other, member)) = split_member_id(&detail.extension_id) else {
+            continue;
+        };
+        if other != stack {
+            continue;
+        }
+        let Some(endpoint_json) = detail.provider.endpoint_json.clone() else {
+            continue;
+        };
+        let endpoint: ProviderEndpoint =
+            serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+        let member_instance = store
+            .get_instance(detail.provider.instance_id)
+            .await?
+            .ok_or_else(|| anyhow!("stack member {member} has no instance"))?;
+        let aliases = provider_host_aliases(store, &detail, &member_instance, &endpoint).await?;
+        let peer_endpoint =
+            peer_facing_endpoint(store, &detail.provider, &member_instance, &endpoint).await?;
+        candidates.push((
+            member.to_owned(),
+            ManagedProviderTarget {
+                provider: detail.provider,
+                instance: member_instance,
+                endpoint,
+                peer_endpoint,
+                aliases,
+            },
+        ));
+    }
+    for app in apps.iter_mut().filter(|app| !has_key(&app.api_key)) {
+        let host = url_host(&app.url).unwrap_or_default();
+        let (member, target) = candidates
+            .iter()
+            .find(|(member, _)| host.eq_ignore_ascii_case(&format!("{member}.stack")))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(_, target)| provider_host_matches_alias(&host, &target.aliases))
+            })
+            .or_else(|| (candidates.len() == 1).then(|| &candidates[0]))
+            .ok_or_else(|| anyhow!("no member of this stack answers the app link {}", app.url))?;
+        let action = "application registration";
+        ensure_dependency_provider_ready(store, target, member, action).await?;
+        ensure_dependency_provider_reachable(probe, target, member, action).await?;
+        let api_key = store
+            .get_secret(
+                SecretScope::Instance,
+                Some(target.instance.instance_id),
+                "api_key",
+            )
+            .await?
+            .map(|secret| secrets.decrypt(&secret.value_encrypted))
+            .transpose()?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                deferred_dependency_error(format!(
+                    "{member} has no API key yet; deferring {action}"
+                ))
+            })?;
+        app.url = target.peer_endpoint.canonical_url()?;
+        app.api_key = Some(api_key);
     }
     Ok(())
 }
@@ -4702,6 +4809,7 @@ async fn read_arr_api_key(
     instance_id: Uuid,
     config_dir: Option<&str>,
 ) -> Result<Option<String>> {
+    crate::legacy_arr::mark("executor: config.xml API key reader");
     let Some(content) = read_config_text(
         runtime,
         instance_id,

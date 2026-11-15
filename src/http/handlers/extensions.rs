@@ -3902,13 +3902,14 @@ async fn cleanup_extension_downstream_state(
     };
     #[cfg(unix)]
     if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
-        state,
         &instance.extension_id,
-        target_provider.implementation.as_deref(),
-    )
-    .await?
-    {
-        let names: Vec<String> = cleanup.proxies.iter().map(|proxy| proxy.name.clone()).collect();
+        &target_provider.capability,
+    )? {
+        let names: Vec<String> = cleanup
+            .proxies
+            .iter()
+            .map(|proxy| proxy.name.clone())
+            .collect();
         let tags: Vec<String> = cleanup
             .proxies
             .iter()
@@ -3916,7 +3917,10 @@ async fn cleanup_extension_downstream_state(
             .collect();
         if !names.is_empty() || !tags.is_empty() {
             indexers
-                .call::<serde_json::Value>("remove_proxies", json!({ "names": names, "tags": tags }))
+                .call::<serde_json::Value>(
+                    "remove_proxies",
+                    json!({ "names": names, "tags": tags }),
+                )
                 .await?;
         }
         return Ok(());
@@ -4211,12 +4215,9 @@ async fn list_prowlarr_indexer_names(
     };
     #[cfg(unix)]
     if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
-        state,
         &instance.extension_id,
-        provider.implementation.as_deref(),
-    )
-    .await?
-    {
+        &provider.capability,
+    )? {
         return indexers.names("indexer_names").await;
     }
     let api_key =
@@ -4249,12 +4250,9 @@ pub(crate) async fn list_prowlarr_indexer_proxy_names(
     };
     #[cfg(unix)]
     if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
-        state,
         &instance.extension_id,
-        provider.implementation.as_deref(),
-    )
-    .await?
-    {
+        &provider.capability,
+    )? {
         return indexers.names("indexer_proxy_names").await;
     }
     let api_key =
@@ -5451,11 +5449,9 @@ async fn build_extension_control_prowlarr_indexers_section(
 
     #[cfg(unix)]
     let extension = super::discovery::manager::ExtensionIndexerList::for_member(
-        state,
         &context.extension.extension_id,
-        provider.implementation.as_deref(),
-    )
-    .await?;
+        &provider.capability,
+    )?;
     #[cfg(not(unix))]
     let extension: Option<()> = None;
     let value = match extension {
@@ -6317,21 +6313,19 @@ struct ExtensionDownloadClient {
     category: Option<String>,
 }
 
-/// The stack module behind a selected Sonarr/Radarr member, if any.
+/// The stack module behind a selected media-manager member, if any.
 #[cfg(unix)]
 async fn control_extension_manager(
-    state: &AppState,
+    _state: &AppState,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Option<super::discovery::manager::ExtensionManager>> {
     let Some(provider) = context.selected_provider.as_ref() else {
         return Ok(None);
     };
     super::discovery::manager::ExtensionManager::for_member(
-        state,
         &context.extension.extension_id,
-        provider.implementation.as_deref(),
+        &provider.capability,
     )
-    .await
 }
 
 /// The status metrics of a marketplace stack's Prowlarr member.
@@ -6352,7 +6346,10 @@ async fn extension_prowlarr_snapshot(
             ExtensionControlMetric {
                 id: "version".to_string(),
                 label: "Service version".to_string(),
-                value: status.version.clone().unwrap_or_else(|| "Unknown".to_string()),
+                value: status
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
             },
             ExtensionControlMetric {
                 id: "indexerCount".to_string(),
@@ -6391,7 +6388,10 @@ async fn extension_control_snapshot(
         ExtensionControlMetric {
             id: "version".to_string(),
             label: "Service version".to_string(),
-            value: status.version.clone().unwrap_or_else(|| "Unknown".to_string()),
+            value: status
+                .version
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string()),
         },
         ExtensionControlMetric {
             id: id.to_string(),
@@ -8012,6 +8012,28 @@ async fn build_extension_control_open_service_ui_action(
     context: &ExtensionControlContext,
 ) -> Option<ExtensionControlAction> {
     let provider = context.selected_provider.as_ref()?;
+    // A marketplace stack member's page is named after the member.
+    if crate::marketplace::stack::is_stack_member_id(&context.extension.extension_id) {
+        let instance = context.selected_instance.as_ref()?;
+        let name = context.extension.name.trim();
+        return Some(ExtensionControlAction {
+            id: "open_service_ui".to_string(),
+            label: format!("Open {name} UI"),
+            description: format!("Open {name}'s own web page for settings Elixir does not manage."),
+            kind: "secondary".to_string(),
+            params: None,
+            confirm_text: None,
+            navigate_extension_id: None,
+            navigate_view: None,
+            open_url: Some(format!(
+                "/api/v1/extensions/instances/{}/ui/start",
+                instance.instance_id
+            )),
+            required_fields: Vec::new(),
+            secret_keys: Vec::new(),
+            secret_scope_instance_id: None,
+        });
+    }
     let implementation = provider.implementation.as_deref()?.to_ascii_lowercase();
     let (label, description) = match implementation.as_str() {
         "prowlarr" => (
@@ -8078,13 +8100,28 @@ struct ExtensionUiProxyTarget {
     proxy_prefix: String,
     host_header: Option<String>,
     upstream_auth: ExtensionUiUpstreamAuth,
+    /// A marketplace stack member's page, as its stack's code describes it.
+    #[cfg(unix)]
+    stack_page: Option<super::discovery::manager::StackWebPage>,
 }
 
 enum ExtensionUiUpstreamAuth {
     None,
+    /// One of the member's own stored secrets in the header its code names.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Header {
+        name: String,
+        value: String,
+    },
     ApiKey(String),
-    BasicAuth { username: String, password: String },
-    QbittorrentSession { username: String, password: String },
+    BasicAuth {
+        username: String,
+        password: String,
+    },
+    QbittorrentSession {
+        username: String,
+        password: String,
+    },
 }
 
 async fn resolve_extension_ui_proxy_target(
@@ -8115,6 +8152,38 @@ async fn resolve_extension_ui_proxy_target(
     let implementation_key = implementation.trim().to_ascii_lowercase();
     let canonical_url = endpoint.canonical_url()?;
     let host_header = extension_ui_proxy_host_header(&canonical_url, &base_url);
+
+    // A marketplace stack member: its stack's code says how to sign in to its
+    // page; the server knows no application here.
+    #[cfg(unix)]
+    if let Some(page) =
+        super::discovery::manager::StackWebPage::for_member(&instance.extension_id).await?
+    {
+        let upstream_auth = match page.auth.as_ref() {
+            Some(auth) => {
+                let secret = store
+                    .get_secret(SecretScope::Instance, Some(instance_id), &auth.secret)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("this app's web page sign-in is not set up yet")
+                    })?;
+                ExtensionUiUpstreamAuth::Header {
+                    name: auth.header.clone(),
+                    value: state.secrets.decrypt(&secret.value_encrypted)?,
+                }
+            }
+            None => ExtensionUiUpstreamAuth::None,
+        };
+        return Ok(ExtensionUiProxyTarget {
+            instance_id,
+            endpoint_url: canonical_url,
+            base_url,
+            proxy_prefix: extension_ui_proxy_prefix(instance_id),
+            host_header,
+            upstream_auth,
+            stack_page: Some(page),
+        });
+    }
     let upstream_auth = match implementation_key.as_str() {
         "prowlarr" => ExtensionUiUpstreamAuth::ApiKey(
             resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
@@ -8174,6 +8243,8 @@ async fn resolve_extension_ui_proxy_target(
         proxy_prefix: extension_ui_proxy_prefix(instance_id),
         host_header,
         upstream_auth,
+        #[cfg(unix)]
+        stack_page: None,
     })
 }
 
@@ -8236,7 +8307,26 @@ async fn proxy_extension_ui_impl(
         .map_err(anyhow::Error::from)
         .map_err(ApiError::from)?;
     let normalized_path = path.trim_matches('/');
-    let response_bytes = if content_type.to_ascii_lowercase().contains("text/html") {
+    let is_html = content_type.to_ascii_lowercase().contains("text/html");
+    #[cfg(unix)]
+    let stack_rewrite = target.stack_page.as_ref().map(|page| {
+        if is_html {
+            let html = String::from_utf8_lossy(&body_bytes).into_owned();
+            rewrite_extension_ui_paths(
+                page.rewrite_html(html, &target.proxy_prefix),
+                &target.proxy_prefix,
+            )
+            .into_bytes()
+        } else {
+            page.rewrite_json(normalized_path, &body_bytes, &target.proxy_prefix)
+                .unwrap_or_else(|| body_bytes.to_vec())
+        }
+    });
+    #[cfg(not(unix))]
+    let stack_rewrite: Option<Vec<u8>> = None;
+    let response_bytes = if let Some(bytes) = stack_rewrite {
+        bytes
+    } else if is_html {
         rewrite_extension_ui_html(&body_bytes, &target.proxy_prefix).into_bytes()
     } else if normalized_path.eq_ignore_ascii_case("initialize.json") {
         rewrite_extension_ui_initialize_json(&body_bytes, &target.proxy_prefix).into_bytes()
@@ -8398,6 +8488,13 @@ async fn build_extension_ui_upstream_request(
     }
     match &target.upstream_auth {
         ExtensionUiUpstreamAuth::None => {}
+        ExtensionUiUpstreamAuth::Header { name, value } => {
+            request = request.header(
+                reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
+                    .map_err(anyhow::Error::from)?,
+                ReqwestHeaderValue::from_str(value).map_err(anyhow::Error::from)?,
+            );
+        }
         ExtensionUiUpstreamAuth::ApiKey(api_key) => {
             request = request.header(
                 "X-Api-Key",
@@ -8576,10 +8673,17 @@ fn rewrite_extension_ui_location(location: &str, base_url: &str, proxy_prefix: &
 
 fn rewrite_extension_ui_html(bytes: &[u8], proxy_prefix: &str) -> String {
     let html = String::from_utf8_lossy(bytes).into_owned();
+    rewrite_extension_ui_paths(
+        html.replace("urlBase: ''", &format!("urlBase: '{proxy_prefix}'"))
+            .replace("urlBase:\"\"", &format!("urlBase:\"{proxy_prefix}\"")),
+        proxy_prefix,
+    )
+}
+
+/// Points a proxied page's root-relative links at the proxy's path.
+fn rewrite_extension_ui_paths(html: String, proxy_prefix: &str) -> String {
     let prefix = format!("{proxy_prefix}/");
-    html.replace("urlBase: ''", &format!("urlBase: '{proxy_prefix}'"))
-        .replace("urlBase:\"\"", &format!("urlBase:\"{proxy_prefix}\""))
-        .replace("href=\"/", &format!("href=\"{prefix}"))
+    html.replace("href=\"/", &format!("href=\"{prefix}"))
         .replace("src=\"/", &format!("src=\"{prefix}"))
         .replace("action=\"/", &format!("action=\"{prefix}"))
         .replace("content=\"/", &format!("content=\"{prefix}"))
@@ -8788,6 +8892,8 @@ mod extension_ui_proxy_tests {
                     username: "elixir".to_string(),
                     password: "secret".to_string(),
                 },
+                #[cfg(unix)]
+                stack_page: None,
             };
 
             let request = build_extension_ui_upstream_request(
@@ -8822,6 +8928,8 @@ mod extension_ui_proxy_tests {
                 proxy_prefix: "/api/v1/extensions/instances/test/ui".to_string(),
                 host_header: Some("svc-elixir-modules-qbittorrent-default:8080".to_string()),
                 upstream_auth: ExtensionUiUpstreamAuth::None,
+                #[cfg(unix)]
+                stack_page: None,
             };
             let mut headers = AxumHeaderMap::new();
             headers.insert(
@@ -8900,6 +9008,8 @@ mod extension_ui_proxy_tests {
                 username: "elixir".to_string(),
                 password: "secret".to_string(),
             },
+            #[cfg(unix)]
+            stack_page: None,
         };
 
         let request = build_extension_ui_upstream_request(
@@ -9352,12 +9462,9 @@ pub(crate) async fn remove_managed_library_item_from_manager(
         .ok_or_else(|| anyhow::anyhow!("manager instance is no longer available"))?;
     #[cfg(unix)]
     if let Some(manager) = super::discovery::manager::ExtensionManager::for_member(
-        state,
         &instance.extension_id,
-        provider.implementation.as_deref(),
-    )
-    .await?
-    {
+        &provider.capability,
+    )? {
         #[derive(Deserialize)]
         struct Reply {
             message: String,
@@ -9563,6 +9670,7 @@ pub(crate) async fn resolve_control_api_key(
     instance: &ExtensionInstance,
     candidate_keys: &[&str],
 ) -> anyhow::Result<String> {
+    crate::legacy_arr::mark("control: Arr API key");
     if let Some(value) = instance
         .config_json
         .as_ref()

@@ -40,6 +40,7 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        crate::legacy_arr::mark("Radarr driver: patch_semantics");
         match patch {
             DriverPatch::MediaManagerMovies(
                 MediaManagerMoviesPatch::ApplyQualityPolicyPreset { .. },
@@ -52,6 +53,7 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        crate::legacy_arr::mark("Radarr driver: evaluate_patch");
         let patch = match patch {
             DriverPatch::MediaManagerMovies(patch) => patch,
             _ => bail!("media.manager.movies patch mismatch"),
@@ -101,6 +103,7 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
+        crate::legacy_arr::mark("Radarr driver: read_state");
         Ok(StateSnapshot {
             summary: None,
             activity: None,
@@ -108,6 +111,7 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
+        crate::legacy_arr::mark("Radarr driver: apply_patch");
         let patch = match patch {
             DriverPatch::MediaManagerMovies(patch) => patch,
             other => bail!("media.manager.movies driver received unsupported patch {other:?}"),
@@ -149,6 +153,7 @@ impl CapabilityDriver for MediaManagerMoviesDriver {
     }
 
     async fn add_media(&self, ctx: DriverCtx, request: AddMediaRequest) -> Result<AddMediaResult> {
+        crate::legacy_arr::mark("Radarr driver: add_media");
         let implementation = ctx
             .implementation
             .as_deref()

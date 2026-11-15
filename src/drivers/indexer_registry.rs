@@ -30,6 +30,7 @@ impl CapabilityDriver for IndexerRegistryDriver {
     }
 
     fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        crate::legacy_arr::mark("Prowlarr driver: patch_semantics");
         match patch {
             DriverPatch::IndexerRegistry(_) => {
                 PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite)
@@ -39,6 +40,7 @@ impl CapabilityDriver for IndexerRegistryDriver {
     }
 
     async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        crate::legacy_arr::mark("Prowlarr driver: evaluate_patch");
         let patch = match patch {
             DriverPatch::IndexerRegistry(patch) => patch,
             _ => bail!("indexer.registry patch mismatch"),
@@ -81,6 +83,7 @@ impl CapabilityDriver for IndexerRegistryDriver {
     }
 
     async fn read_state(&self, ctx: DriverCtx) -> Result<StateSnapshot> {
+        crate::legacy_arr::mark("Prowlarr driver: read_state");
         let implementation = ctx
             .implementation
             .as_deref()
@@ -109,6 +112,7 @@ impl CapabilityDriver for IndexerRegistryDriver {
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
+        crate::legacy_arr::mark("Prowlarr driver: apply_patch");
         let patch = match patch {
             DriverPatch::IndexerRegistry(patch) => patch,
             _ => bail!("indexer.registry patch mismatch"),

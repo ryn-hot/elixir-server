@@ -1143,12 +1143,9 @@ impl ExtensionControlProvider for ProwlarrControlAdapter {
         };
         #[cfg(unix)]
         if let Some(indexers) = super::super::discovery::manager::ExtensionIndexerList::for_member(
-            state,
             &context.extension.extension_id,
-            provider.implementation.as_deref(),
-        )
-        .await?
-        {
+            &provider.capability,
+        )? {
             return super::extension_prowlarr_snapshot(&indexers).await;
         }
         let endpoint_json = provider

@@ -112,6 +112,14 @@ pub(crate) fn is_stack_member_id(extension_id: &str) -> bool {
     extension_id.starts_with(STACK_MEMBER_PREFIX)
 }
 
+/// The stack (its derived-ID hash) and local member name of a member ID.
+pub(crate) fn split_member_id(extension_id: &str) -> Option<(&str, &str)> {
+    extension_id
+        .strip_prefix(STACK_MEMBER_PREFIX)?
+        .split_once('.')
+        .filter(|(stack, member)| !stack.is_empty() && !member.is_empty())
+}
+
 fn member_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 32

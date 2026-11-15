@@ -6737,7 +6737,8 @@ async fn resolve_extension_item_state(
             let files: manager::ManagerImportedFiles = manager
                 .call("imported_files", json!({ "itemId": manager_item_id }))
                 .await?;
-            let events = extension_import_events(state, manager.kind, &implementation, intent, files);
+            let events =
+                extension_import_events(state, manager.kind, &implementation, intent, files);
             ingest_managed_import_events(state, store, intent, events).await
         }
         .await;
@@ -7743,10 +7744,6 @@ fn derive_arr_acquisition_state(
     )
 }
 
-
-
-
-
 fn summarize_sonarr_batch_children(
     children: &[FindMediaAcquisitionChildItem],
 ) -> SonarrBatchCounts {
@@ -7816,7 +7813,6 @@ fn format_sonarr_batch_headline(counts: SonarrBatchCounts) -> String {
     }
 }
 
-
 fn build_sonarr_batch_blocker(counts: SonarrBatchCounts) -> Option<FindMediaAcquisitionBlocker> {
     let attention = counts.needs_attention + counts.failed;
     (attention > 0).then(|| FindMediaAcquisitionBlocker {
@@ -7845,8 +7841,6 @@ fn sonarr_series_stats(value: &Value) -> SonarrSeriesStats {
             .unwrap_or(0),
     }
 }
-
-
 
 fn format_transfer_count(count: usize) -> String {
     if count == 1 {
@@ -10849,6 +10843,7 @@ pub(crate) async fn resolve_arr_api_key(
     provider: &ProviderContext,
     implementation: &str,
 ) -> AnyResult<String> {
+    crate::legacy_arr::mark("discovery: Sonarr/Radarr API key");
     if let Some(value) = provider
         .instance_config
         .as_ref()

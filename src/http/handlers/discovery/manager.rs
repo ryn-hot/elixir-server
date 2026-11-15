@@ -102,6 +102,7 @@ impl ManagerClient {
         if let Some(manager) = ExtensionManager::for_provider(state, provider).await? {
             return Ok(Self::Extension(manager));
         }
+        crate::legacy_arr::mark("manager: legacy Sonarr/Radarr client");
         let implementation = provider
             .detail
             .provider
@@ -289,7 +290,8 @@ pub(super) fn derive_manager_acquisition_state(
     }
 
     if has_file && library_matched {
-        let mut evidence = base_acquisition_evidence(true, false, true, queue_entry_count, None, None);
+        let mut evidence =
+            base_acquisition_evidence(true, false, true, queue_entry_count, None, None);
         evidence.push(acquisition_evidence(
             "Elixir linked",
             "Yes",
@@ -314,7 +316,8 @@ pub(super) fn derive_manager_acquisition_state(
     }
 
     if has_file {
-        let mut evidence = base_acquisition_evidence(true, false, true, queue_entry_count, None, None);
+        let mut evidence =
+            base_acquisition_evidence(true, false, true, queue_entry_count, None, None);
         evidence.push(acquisition_evidence("Elixir linked", "No", Some("warning")));
         return AcquisitionItemState {
             phase: AcquisitionPhase::Importing,
@@ -501,52 +504,55 @@ fn derive_queue_entry_state(
         AcquisitionPhase::QueuedInDownloader
     };
 
-    let (headline, detail) = match phase {
-        AcquisitionPhase::Downloading => {
-            if let Some(label) = downloader_label.as_deref() {
-                (
-                    format!("Downloading via {label}."),
-                    Some(status_message.clone().unwrap_or_else(|| {
-                        "Transfer is active in the downloader.".to_string()
-                    })),
-                )
-            } else {
-                (
-                    "Download in progress.".to_string(),
-                    Some(status_message.clone().unwrap_or_else(|| {
-                        "Transfer is active in the downloader.".to_string()
-                    })),
-                )
+    let (headline, detail) =
+        match phase {
+            AcquisitionPhase::Downloading => {
+                if let Some(label) = downloader_label.as_deref() {
+                    (
+                        format!("Downloading via {label}."),
+                        Some(status_message.clone().unwrap_or_else(|| {
+                            "Transfer is active in the downloader.".to_string()
+                        })),
+                    )
+                } else {
+                    (
+                        "Download in progress.".to_string(),
+                        Some(status_message.clone().unwrap_or_else(|| {
+                            "Transfer is active in the downloader.".to_string()
+                        })),
+                    )
+                }
             }
-        }
-        AcquisitionPhase::PostProcessing => (
-            "Download finished.".to_string(),
-            Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
-        ),
-        AcquisitionPhase::Importing => (
-            "Manager is importing the completed download.".to_string(),
-            Some("The downloader finished and the manager is finishing the import.".to_string()),
-        ),
-        _ => {
-            if let Some(label) = downloader_label.as_deref() {
-                (
+            AcquisitionPhase::PostProcessing => (
+                "Download finished.".to_string(),
+                Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
+            ),
+            AcquisitionPhase::Importing => (
+                "Manager is importing the completed download.".to_string(),
+                Some(
+                    "The downloader finished and the manager is finishing the import.".to_string(),
+                ),
+            ),
+            _ => {
+                if let Some(label) = downloader_label.as_deref() {
+                    (
                     format!("Queued with {label}."),
                     Some(status_message.clone().unwrap_or_else(|| {
                         "Manager handed the item to the downloader. Waiting for transfer to start."
                             .to_string()
                     })),
                 )
-            } else {
-                (
+                } else {
+                    (
                     "Waiting in the download queue.".to_string(),
                     Some(status_message.unwrap_or_else(|| {
                         "Manager handed the item to the downloader. Waiting for transfer to start."
                             .to_string()
                     })),
                 )
+                }
             }
-        }
-    };
+        };
 
     AcquisitionItemState {
         phase,
@@ -586,8 +592,12 @@ fn derive_series_batch_state(
         episode_count: item.total_count as usize,
         episode_file_count: item.file_count as usize,
     };
-    let downloader_label = queue_entries.first().and_then(|entry| entry.downloader.clone());
-    let protocol = queue_entries.first().and_then(|entry| entry.protocol.clone());
+    let downloader_label = queue_entries
+        .first()
+        .and_then(|entry| entry.downloader.clone());
+    let protocol = queue_entries
+        .first()
+        .and_then(|entry| entry.protocol.clone());
     let phase = summarize_sonarr_batch_phase(counts);
 
     let mut evidence = base_acquisition_evidence(
@@ -841,7 +851,10 @@ pub(crate) mod legacy {
             title: json_nonempty_string(entry.get("title")),
         }
     }
-    pub(crate) fn queue(implementation: &str, queue_value: Option<&Value>) -> Vec<ManagerQueueEntry> {
+    pub(crate) fn queue(
+        implementation: &str,
+        queue_value: Option<&Value>,
+    ) -> Vec<ManagerQueueEntry> {
         queue_value
             .map(extract_arr_queue_records)
             .unwrap_or_default()
@@ -909,15 +922,277 @@ pub(crate) mod legacy {
     }
 }
 
+impl ManagerItemKind {
+    /// The kind of item a media-manager capability manages. A stack member's
+    /// media search is answered by the same interface (its lookup).
+    pub(crate) fn for_capability(capability: &str) -> Option<Self> {
+        match capability.trim() {
+            "media.manager.tv"
+            | "media.manager.anime"
+            | "media.search.tv"
+            | "media.search.anime" => Some(Self::Series),
+            "media.manager.movies" | "media.search.movies" => Some(Self::Movie),
+            _ => None,
+        }
+    }
+}
+
 /// One member of an installed marketplace stack, answered by the stack's own
-/// code in its long-lived executor.
+/// code (`crate::orchestrator::stack_setup::StackCode`).
 #[cfg(unix)]
 pub(crate) struct StackMemberCall {
-    marketplace: crate::marketplace::service::MarketplaceService,
-    home: Uuid,
-    extension: elixir_marketplace::identity::ExtensionId,
-    instance: Uuid,
+    code: std::sync::Arc<dyn crate::orchestrator::stack_setup::StackCode>,
     member: String,
+}
+
+#[cfg(unix)]
+impl StackMemberCall {
+    /// `None` for any extension that is not a marketplace stack member.
+    fn resolve(member_id: &str) -> AnyResult<Option<Self>> {
+        if !crate::marketplace::stack::is_stack_member_id(member_id) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            code: crate::orchestrator::stack_setup::code()?,
+            member: member_id.to_owned(),
+        }))
+    }
+
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        interface: &str,
+        operation: &str,
+        request: Value,
+    ) -> AnyResult<T> {
+        let body = self
+            .code
+            .call(&self.member, interface, operation, request)
+            .await?;
+        serde_json::from_value(body).context("stack extension reply body")
+    }
+}
+
+/// A stack's media-manager member: the general-purpose media-manager interface.
+#[cfg(unix)]
+pub(crate) struct ExtensionManager {
+    target: StackMemberCall,
+    pub(crate) kind: ManagerItemKind,
+}
+
+#[cfg(unix)]
+impl ExtensionManager {
+    /// `None` for any provider that is not a marketplace stack member.
+    pub(crate) async fn for_provider(
+        _state: &AppState,
+        provider: &ProviderContext,
+    ) -> AnyResult<Option<Self>> {
+        Self::for_member(
+            &provider.detail.extension_id,
+            &provider.detail.provider.capability,
+        )
+    }
+
+    /// `None` for any extension that is not a marketplace stack member. A
+    /// member's provider that is not a media manager is an error, never a
+    /// reason to fall back to the legacy stack's code.
+    pub(crate) fn for_member(member_id: &str, capability: &str) -> AnyResult<Option<Self>> {
+        if !crate::marketplace::stack::is_stack_member_id(member_id) {
+            return Ok(None);
+        }
+        let kind = ManagerItemKind::for_capability(capability).with_context(|| {
+            format!("this stack member's {capability} provider is not a media manager")
+        })?;
+        Ok(StackMemberCall::resolve(member_id)?.map(|target| Self { target, kind }))
+    }
+
+    /// One operation of the general-purpose interface; `kind` is added.
+    pub(crate) async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        mut request: Value,
+    ) -> AnyResult<T> {
+        if let Some(object) = request.as_object_mut() {
+            object.insert("kind".to_string(), serde_json::to_value(self.kind)?);
+        }
+        self.target.call("media.manager", operation, request).await
+    }
+}
+
+/// A stack's indexer-list member: the general-purpose indexer-list interface.
+#[cfg(unix)]
+pub(crate) struct ExtensionIndexerList {
+    target: StackMemberCall,
+}
+
+#[cfg(unix)]
+impl ExtensionIndexerList {
+    /// `None` unless this is a marketplace stack member; a member's provider
+    /// that is not an indexer list is an error.
+    pub(crate) fn for_member(member_id: &str, capability: &str) -> AnyResult<Option<Self>> {
+        if !crate::marketplace::stack::is_stack_member_id(member_id) {
+            return Ok(None);
+        }
+        if crate::orchestrator::stack_setup::interface_for(capability) != Some("indexer.list") {
+            bail!("this stack member's {capability} provider is not an indexer list");
+        }
+        Ok(StackMemberCall::resolve(member_id)?.map(|target| Self { target }))
+    }
+
+    pub(crate) async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+    ) -> AnyResult<T> {
+        self.target.call("indexer.list", operation, request).await
+    }
+
+    pub(crate) async fn names(&self, operation: &str) -> AnyResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Names {
+            names: Vec<String>,
+        }
+        Ok(self.call::<Names>(operation, json!({})).await?.names)
+    }
+}
+
+/// A stack member's web page as its stack's code describes it: how Elixir's
+/// proxy signs in to it and which addresses in its pages and settings file it
+/// rewrites to the proxy's path. `{prefix}` stands for that path.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StackWebPage {
+    #[serde(default)]
+    pub auth: Option<StackWebAuth>,
+    #[serde(default)]
+    pub html_replace: Vec<StackWebReplace>,
+    #[serde(default)]
+    pub json_files: Vec<StackWebJsonFile>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StackWebAuth {
+    /// A request header carrying one of the member's own stored secrets.
+    pub header: String,
+    pub secret: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct StackWebReplace {
+    pub find: String,
+    pub replace: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StackWebJsonFile {
+    /// The file's path under the web page, for example `initialize.json`.
+    pub path: String,
+    /// Top-level fields set to a value (`{prefix}` substituted).
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    /// Top-level path fields that get the proxy's path in front.
+    #[serde(default)]
+    pub prefix: Vec<String>,
+}
+
+#[cfg(unix)]
+impl StackWebPage {
+    /// The web page a stack member's code describes; `None` for any extension
+    /// that is not a marketplace stack member. Every proxied request needs it,
+    /// so a description is kept for a few minutes.
+    pub(crate) async fn for_member(member_id: &str) -> AnyResult<Option<Self>> {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+        type Pages = HashMap<String, (Instant, StackWebPage)>;
+        static PAGES: OnceLock<Mutex<Pages>> = OnceLock::new();
+        const KEEP: Duration = Duration::from_secs(300);
+        let Some(target) = StackMemberCall::resolve(member_id)? else {
+            return Ok(None);
+        };
+        let pages = PAGES.get_or_init(Default::default);
+        let kept = pages.lock().ok().and_then(|pages| {
+            pages
+                .get(member_id)
+                .filter(|(at, _)| at.elapsed() < KEEP)
+                .map(|(_, page)| page.clone())
+        });
+        if let Some(page) = kept {
+            return Ok(Some(page));
+        }
+        let page: Self = target.call("web.page", "describe", json!({})).await?;
+        page.validate()?;
+        if let Ok(mut pages) = pages.lock() {
+            pages.insert(member_id.to_owned(), (Instant::now(), page.clone()));
+        }
+        Ok(Some(page))
+    }
+
+    fn validate(&self) -> AnyResult<()> {
+        if let Some(auth) = &self.auth {
+            let header = auth.header.trim().to_ascii_lowercase();
+            if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err()
+                || matches!(
+                    header.as_str(),
+                    "host" | "cookie" | "connection" | "content-length" | "transfer-encoding"
+                )
+            {
+                bail!("stack web page names an unusable auth header");
+            }
+            if !crate::orchestrator::stack_setup::valid_bootstrap_file(&auth.secret) {
+                bail!("stack web page names an invalid secret");
+            }
+        }
+        if self.html_replace.len() > 16
+            || self.json_files.len() > 4
+            || self.html_replace.iter().any(|rule| rule.find.is_empty())
+        {
+            bail!("stack web page describes too many or empty rewrites");
+        }
+        Ok(())
+    }
+
+    /// Applies the HTML rewrites, then the general ones every proxied page gets.
+    pub(crate) fn rewrite_html(&self, html: String, prefix: &str) -> String {
+        self.html_replace.iter().fold(html, |html, rule| {
+            html.replace(&rule.find, &rule.replace.replace("{prefix}", prefix))
+        })
+    }
+
+    /// Rewrites one described settings file; `None` for any other path.
+    pub(crate) fn rewrite_json(&self, path: &str, bytes: &[u8], prefix: &str) -> Option<Vec<u8>> {
+        let file = self.json_files.iter().find(|file| {
+            file.path
+                .trim_matches('/')
+                .eq_ignore_ascii_case(path.trim_matches('/'))
+        })?;
+        let mut value: Value = serde_json::from_slice(bytes).ok()?;
+        let object = value.as_object_mut()?;
+        for (key, set) in &file.set {
+            object.insert(key.clone(), Value::String(set.replace("{prefix}", prefix)));
+        }
+        for key in &file.prefix {
+            if let Some(path) = object.get(key).and_then(Value::as_str) {
+                if !path.starts_with(prefix) {
+                    let joined = format!("{prefix}/{}", path.trim_start_matches('/'));
+                    object.insert(key.clone(), Value::String(joined));
+                }
+            }
+        }
+        serde_json::to_vec(&value).ok()
+    }
+}
+
+/// The stack code the marketplace serves: each stack's own code in its
+/// long-lived executor.
+#[cfg(unix)]
+pub(crate) struct ServeStackCode {
+    pool: sqlx::AnyPool,
+    marketplace: crate::marketplace::service::MarketplaceService,
 }
 
 #[cfg(unix)]
@@ -930,52 +1205,44 @@ struct ExtensionReply {
 }
 
 #[cfg(unix)]
-impl StackMemberCall {
-    /// `None` for any extension that is not a marketplace stack member.
-    async fn resolve(state: &AppState, member_id: &str) -> AnyResult<Option<Self>> {
-        Self::resolve_with(&state.db_pool, &state.marketplace, member_id).await
+impl ServeStackCode {
+    pub(crate) fn new(
+        pool: sqlx::AnyPool,
+        marketplace: crate::marketplace::service::MarketplaceService,
+    ) -> Self {
+        Self { pool, marketplace }
     }
+}
 
-    async fn resolve_with(
-        pool: &sqlx::AnyPool,
-        marketplace: &crate::marketplace::service::MarketplaceService,
-        member_id: &str,
-    ) -> AnyResult<Option<Self>> {
-        if !crate::marketplace::stack::is_stack_member_id(member_id) {
-            return Ok(None);
-        }
-        let (stack, member) = crate::marketplace::stack::owner_of(pool, member_id)
-            .await?
-            .context("this member's stack extension is not installed or enabled")?;
-        let (home, instance) = crate::marketplace::stack::installed_instance(pool, &stack)
-            .await?
-            .context("this member's stack extension has no enabled installation")?;
-        Ok(Some(Self {
-            marketplace: marketplace.clone(),
-            home,
-            extension: stack.parse().context("stack extension id")?,
-            instance,
-            member,
-        }))
-    }
-
-    async fn call<T: serde::de::DeserializeOwned>(
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl crate::orchestrator::stack_setup::StackCode for ServeStackCode {
+    async fn call(
         &self,
-        capability: &str,
+        member_id: &str,
+        interface: &str,
         operation: &str,
         request: Value,
-    ) -> AnyResult<T> {
+    ) -> AnyResult<Value> {
+        let (stack, member) = crate::marketplace::stack::owner_of(&self.pool, member_id)
+            .await?
+            .context("this member's stack extension is not installed or enabled")?;
+        let (home, instance) = crate::marketplace::stack::installed_instance(&self.pool, &stack)
+            .await?
+            .context("this member's stack extension has no enabled installation")?;
+        let extension: elixir_marketplace::identity::ExtensionId =
+            stack.parse().context("stack extension id")?;
         let arguments = elixir_marketplace::source_execution::RuntimeJson::from_value(json!({
             "schema_version": 1,
-            "capability": capability,
-            "member": self.member,
+            "capability": interface,
+            "member": member,
             "operation": operation,
             "request": request,
         }))
         .context("stack member request exceeds runtime bounds")?;
         let reply = match self
             .marketplace
-            .serve_call(self.home, &self.extension, self.instance, arguments)
+            .serve_call(home, &extension, instance, arguments)
             .await?
         {
             crate::marketplace::service::ServeReply::Result(value) => value,
@@ -997,229 +1264,7 @@ impl StackMemberCall {
                 .unwrap_or_else(|| reply.body.to_string().chars().take(300).collect());
             bail!("stack extension returned {}: {message}", reply.status);
         }
-        serde_json::from_value(reply.body).context("stack extension reply body")
-    }
-}
-
-/// A Sonarr/Radarr member: the general-purpose media-manager interface.
-#[cfg(unix)]
-pub(crate) struct ExtensionManager {
-    target: StackMemberCall,
-    pub(crate) kind: ManagerItemKind,
-}
-
-#[cfg(unix)]
-impl ExtensionManager {
-    /// `None` for any provider that is not a marketplace stack member.
-    pub(crate) async fn for_provider(
-        state: &AppState,
-        provider: &ProviderContext,
-    ) -> AnyResult<Option<Self>> {
-        Self::for_member(
-            state,
-            &provider.detail.extension_id,
-            provider.detail.provider.implementation.as_deref(),
-        )
-        .await
-    }
-
-    /// `None` for any extension that is not a marketplace stack member.
-    pub(crate) async fn for_member(
-        state: &AppState,
-        member_id: &str,
-        implementation: Option<&str>,
-    ) -> AnyResult<Option<Self>> {
-        if !crate::marketplace::stack::is_stack_member_id(member_id) {
-            return Ok(None);
-        }
-        let kind = match implementation
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("sonarr") => ManagerItemKind::Series,
-            Some("radarr") => ManagerItemKind::Movie,
-            other => bail!("unsupported stack media manager {other:?}"),
-        };
-        Ok(StackMemberCall::resolve(state, member_id)
-            .await?
-            .map(|target| Self { target, kind }))
-    }
-
-    /// One operation of the general-purpose interface; `kind` is added.
-    pub(crate) async fn call<T: serde::de::DeserializeOwned>(
-        &self,
-        operation: &str,
-        mut request: Value,
-    ) -> AnyResult<T> {
-        if let Some(object) = request.as_object_mut() {
-            object.insert("kind".to_string(), serde_json::to_value(self.kind)?);
-        }
-        self.target.call("media.manager", operation, request).await
-    }
-}
-
-/// A Prowlarr member: the general-purpose indexer-list interface.
-#[cfg(unix)]
-pub(crate) struct ExtensionIndexerList {
-    target: StackMemberCall,
-}
-
-#[cfg(unix)]
-impl ExtensionIndexerList {
-    /// `None` unless this is a marketplace stack's indexer list.
-    pub(crate) async fn for_member(
-        state: &AppState,
-        member_id: &str,
-        implementation: Option<&str>,
-    ) -> AnyResult<Option<Self>> {
-        if !crate::marketplace::stack::is_stack_member_id(member_id)
-            || implementation.map(|value| value.trim().to_ascii_lowercase()).as_deref()
-                != Some("prowlarr")
-        {
-            return Ok(None);
-        }
-        Ok(StackMemberCall::resolve(state, member_id)
-            .await?
-            .map(|target| Self { target }))
-    }
-
-    pub(crate) async fn call<T: serde::de::DeserializeOwned>(
-        &self,
-        operation: &str,
-        request: Value,
-    ) -> AnyResult<T> {
-        self.target.call("indexer.list", operation, request).await
-    }
-
-    pub(crate) async fn names(&self, operation: &str) -> AnyResult<Vec<String>> {
-        #[derive(Deserialize)]
-        struct Names {
-            names: Vec<String>,
-        }
-        Ok(self.call::<Names>(operation, json!({})).await?.names)
-    }
-}
-
-/// The orchestrator's setup of a marketplace stack's members, answered by the
-/// stack's own code in its long-lived executor.
-#[cfg(unix)]
-pub(crate) struct ServeStackSetup {
-    pool: sqlx::AnyPool,
-    marketplace: crate::marketplace::service::MarketplaceService,
-}
-
-#[cfg(unix)]
-impl ServeStackSetup {
-    pub(crate) fn new(
-        pool: sqlx::AnyPool,
-        marketplace: crate::marketplace::service::MarketplaceService,
-    ) -> Self {
-        Self { pool, marketplace }
-    }
-
-    async fn target(
-        &self,
-        member_id: &str,
-        implementation: &str,
-    ) -> AnyResult<(StackMemberCall, &'static str)> {
-        let capability = match implementation.trim().to_ascii_lowercase().as_str() {
-            "sonarr" | "radarr" => "media.manager",
-            "prowlarr" => "indexer.list",
-            other => bail!("no stack setup interface for {other:?}"),
-        };
-        let target = StackMemberCall::resolve_with(&self.pool, &self.marketplace, member_id)
-            .await?
-            .context("stack member is not served")?;
-        Ok((target, capability))
-    }
-}
-
-#[cfg(unix)]
-#[async_trait::async_trait]
-impl crate::orchestrator::stack_setup::StackMemberSetup for ServeStackSetup {
-    async fn evaluate_patch(
-        &self,
-        member_id: &str,
-        implementation: &str,
-        patch: Value,
-        provider_url: &str,
-    ) -> AnyResult<crate::drivers::DriftEvaluation> {
-        let (target, capability) = self.target(member_id, implementation).await?;
-        let value: Value = target
-            .call(
-                capability,
-                "evaluate_patch",
-                json!({ "patch": patch, "providerUrl": provider_url }),
-            )
-            .await?;
-        crate::orchestrator::stack_setup::drift_from_json(value)
-    }
-    async fn apply_patch(
-        &self,
-        member_id: &str,
-        implementation: &str,
-        patch: Value,
-        provider_url: &str,
-    ) -> AnyResult<crate::drivers::ApplyResult> {
-        let (target, capability) = self.target(member_id, implementation).await?;
-        let value: Value = target
-            .call(
-                capability,
-                "apply_patch",
-                json!({ "patch": patch, "providerUrl": provider_url }),
-            )
-            .await?;
-        crate::orchestrator::stack_setup::apply_from_json(value)
-    }
-    async fn bootstrap_files(&self, member_id: &str, implementation: &str) -> AnyResult<Vec<String>> {
-        #[derive(Deserialize)]
-        struct Reply {
-            files: Vec<String>,
-        }
-        let (target, capability) = self.target(member_id, implementation).await?;
-        Ok(target
-            .call::<Reply>(capability, "bootstrap_files", json!({}))
-            .await?
-            .files)
-    }
-    async fn bootstrap(
-        &self,
-        member_id: &str,
-        implementation: &str,
-        files: std::collections::BTreeMap<String, String>,
-        (username, password): (String, String),
-    ) -> AnyResult<Option<String>> {
-        #[derive(Deserialize)]
-        struct Reply {
-            #[serde(rename = "apiKey", default)]
-            api_key: Option<String>,
-        }
-        let (target, capability) = self.target(member_id, implementation).await?;
-        Ok(target
-            .call::<Reply>(
-                capability,
-                "bootstrap",
-                json!({ "files": files, "login": { "username": username, "password": password } }),
-            )
-            .await?
-            .api_key)
-    }
-    async fn read_state(
-        &self,
-        member_id: &str,
-        implementation: &str,
-    ) -> AnyResult<crate::drivers::StateSnapshot> {
-        #[derive(Deserialize)]
-        struct Reply {
-            #[serde(default)]
-            summary: Option<String>,
-        }
-        let (target, capability) = self.target(member_id, implementation).await?;
-        let reply: Reply = target.call(capability, "read_state", json!({})).await?;
-        Ok(crate::drivers::StateSnapshot {
-            summary: reply.summary,
-            activity: None,
-        })
+        Ok(reply.body)
     }
 }
 
@@ -1316,7 +1361,11 @@ pub(crate) fn lookup_results(
             let poster_url = item.poster_url.or_else(|| {
                 let root = Url::parse(base_url?).ok()?;
                 let path = item.poster_path?;
-                Some(root.join(path.trim().trim_start_matches('/')).ok()?.to_string())
+                Some(
+                    root.join(path.trim().trim_start_matches('/'))
+                        .ok()?
+                        .to_string(),
+                )
             });
             let (r#type, external_ids) = match kind {
                 ManagerItemKind::Series => (
@@ -1385,6 +1434,87 @@ pub(crate) fn add_request(request: &crate::drivers::AddMediaRequest) -> Value {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn interfaces_follow_the_provider_capability() {
+        assert_eq!(
+            ManagerItemKind::for_capability("media.manager.tv"),
+            Some(ManagerItemKind::Series)
+        );
+        assert_eq!(
+            ManagerItemKind::for_capability("media.search.anime"),
+            Some(ManagerItemKind::Series)
+        );
+        assert_eq!(
+            ManagerItemKind::for_capability("media.manager.movies"),
+            Some(ManagerItemKind::Movie)
+        );
+        assert_eq!(ManagerItemKind::for_capability("indexer.registry"), None);
+        // Not a stack member: the caller's own path, whatever the capability.
+        assert!(
+            ExtensionManager::for_member("elixir.modules.sonarr", "media.manager.tv")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ExtensionIndexerList::for_member("elixir.modules.prowlarr", "indexer.registry")
+                .unwrap()
+                .is_none()
+        );
+        // A stack member's provider of another interface is an error, never a
+        // fall-back to the legacy stack's code.
+        assert!(
+            ExtensionManager::for_member("stack.0123abcd.prowlarr", "indexer.registry").is_err()
+        );
+        assert!(
+            ExtensionIndexerList::for_member("stack.0123abcd.sonarr", "media.manager.tv").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stack_web_page_rules_are_checked_and_applied() {
+        let page: StackWebPage = serde_json::from_value(json!({
+            "auth": {"header": "X-Api-Key", "secret": "api_key"},
+            "htmlReplace": [{"find": "urlBase: ''", "replace": "urlBase: '{prefix}'"}],
+            "jsonFiles": [{"path": "initialize.json", "set": {"urlBase": "{prefix}"}, "prefix": ["apiRoot"]}]
+        }))
+        .unwrap();
+        page.validate().unwrap();
+        let prefix = "/api/v1/extensions/instances/x/ui";
+        assert_eq!(
+            page.rewrite_html(
+                "<script>window.App = {urlBase: ''};</script>".into(),
+                prefix
+            ),
+            format!("<script>window.App = {{urlBase: '{prefix}'}};</script>")
+        );
+        let json: Value = serde_json::from_slice(
+            &page
+                .rewrite_json(
+                    "/initialize.json",
+                    br#"{"urlBase":"","apiRoot":"/api/v3","x":1}"#,
+                    prefix,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            json!({"urlBase": prefix, "apiRoot": format!("{prefix}/api/v3"), "x": 1})
+        );
+        assert!(page.rewrite_json("other.json", b"{}", prefix).is_none());
+        for bad in [
+            json!({"auth": {"header": "Cookie", "secret": "api_key"}}),
+            json!({"auth": {"header": "bad header", "secret": "api_key"}}),
+            json!({"auth": {"header": "X-Api-Key", "secret": "../api_key"}}),
+            json!({"htmlReplace": [{"find": "", "replace": "x"}]}),
+        ] {
+            let page: StackWebPage = serde_json::from_value(bad.clone()).unwrap();
+            assert!(page.validate().is_err(), "{bad}");
+        }
+    }
+
     /// The reply the Arr Stack module produced in the real engine for one
     /// series with a downloading episode (QuickJS port harness).
     const STATUS: &str = r#"{"episodes":{"100":{"episode":3,"season":1,"title":"T"}},"item":{"fileCount":2,"hasFiles":true,"totalCount":10},"queue":[{"downloadId":"a","downloader":null,"entryId":null,"episodeId":"100","errorMessage":null,"itemId":"42","protocol":null,"state":"downloading","statusMessage":null,"title":null}]}"#;
@@ -1409,7 +1539,9 @@ mod tests {
         assert_eq!(state.headline, "1 transfer downloading.");
         assert_eq!(
             state.detail.as_deref(),
-            Some("Sonarr is handling this series as release downloads. 2 of 10 episode files are imported so far.")
+            Some(
+                "Sonarr is handling this series as release downloads. 2 of 10 episode files are imported so far."
+            )
         );
         assert_eq!(state.children.len(), 1);
         assert_eq!(state.children[0].subtitle.as_deref(), Some("S01E03 • T"));
@@ -1422,8 +1554,14 @@ mod tests {
         let queue = json!({"records": [{"movieId": 5, "downloadId": "x", "downloadClient": "qBittorrent",
             "protocol": "torrent", "trackedDownloadState": "downloading", "trackedDownloadStatus": "ok", "status": "queued"}]});
         let legacy = derive_arr_acquisition_state(
-            "radarr", "5", &item, Some(&queue), false, None,
-            &AcquisitionDownloaderProgressIndex::default(), None,
+            "radarr",
+            "5",
+            &item,
+            Some(&queue),
+            false,
+            None,
+            &AcquisitionDownloaderProgressIndex::default(),
+            None,
         );
         let extension: ManagerStatusReply = serde_json::from_value(json!({
             "item": {"hasFiles": false, "fileCount": 0, "totalCount": 0},
@@ -1478,6 +1616,9 @@ mod tests {
         );
         let ids = results[0].external_ids.as_ref().unwrap();
         assert_eq!(ids.tvdb_series.as_deref(), Some("280619"));
-        assert_eq!(results[1].poster_url.as_deref(), Some("https://image.example/p.jpg"));
+        assert_eq!(
+            results[1].poster_url.as_deref(),
+            Some("https://image.example/p.jpg")
+        );
     }
 }

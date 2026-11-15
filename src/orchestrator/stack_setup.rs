@@ -1,8 +1,10 @@
-//! Setup of a marketplace stack's own members (for example its media manager)
-//! by the stack's own code. The orchestrator still resolves every address and
-//! credential into the patch, applies the drift policy and records readiness;
-//! the stack's code reads and writes its own application. Nothing here knows a
-//! particular application. See docs/architecture/arr-stack-marketplace-extension.md.
+//! Calls into a marketplace stack's own code for one of its members (for
+//! example its media manager), and the orchestrator's setup of those members
+//! through it. The server picks the general interface from the member
+//! provider's capability, never from the application's name; the orchestrator
+//! still resolves every address and credential into the patch, applies the
+//! drift policy and records readiness, while the stack's code reads and writes
+//! its own application. See docs/architecture/arr-stack-marketplace-extension.md.
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
@@ -10,81 +12,189 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::drivers::{
-    ApplyResult, ApplyStatus, DriftEvaluation, DriftField, DriftStatus, FieldSemantics,
-    StateSnapshot,
+    ApplyResult, ApplyStatus, DriftEvaluation, DriftField, DriftStatus, DriverPatch,
+    FieldSemantics, PatchSemantics, PatchSideEffect, StateSnapshot,
 };
 
+/// Runs one operation of a stack's own code for one of its members and returns
+/// the reply body. In production this is the stack's long-lived executor.
 #[async_trait::async_trait]
-pub trait StackMemberSetup: Send + Sync {
-    /// Drift of one resolved patch (the connector's patch JSON).
-    /// `provider_url` is the member's own address as the other containers
-    /// reach it (for example, where its peers should call it back).
-    async fn evaluate_patch(
+pub trait StackCode: Send + Sync {
+    async fn call(
         &self,
         member_extension_id: &str,
-        implementation: &str,
-        patch: Value,
-        provider_url: &str,
-    ) -> Result<DriftEvaluation>;
-    async fn apply_patch(
-        &self,
-        member_extension_id: &str,
-        implementation: &str,
-        patch: Value,
-        provider_url: &str,
-    ) -> Result<ApplyResult>;
-    /// File names (inside the member's `/config`) its first-start setup reads.
-    async fn bootstrap_files(
-        &self,
-        member_extension_id: &str,
-        implementation: &str,
-    ) -> Result<Vec<String>>;
-    /// First-start setup from those files and Elixir's generated web login.
-    /// Returns the member's API key, or `None` while it is not ready yet.
-    async fn bootstrap(
-        &self,
-        member_extension_id: &str,
-        implementation: &str,
-        files: BTreeMap<String, String>,
-        login: (String, String),
-    ) -> Result<Option<String>>;
-    /// Readiness probe once bootstrapped.
-    async fn read_state(
-        &self,
-        member_extension_id: &str,
-        implementation: &str,
-    ) -> Result<StateSnapshot>;
+        interface: &str,
+        operation: &str,
+        request: Value,
+    ) -> Result<Value>;
 }
 
-static SETUP: RwLock<Option<Arc<dyn StackMemberSetup>>> = RwLock::new(None);
+static CODE: RwLock<Option<Arc<dyn StackCode>>> = RwLock::new(None);
 
 /// Installed at startup once the marketplace can serve stack code.
-pub fn install(setup: Option<Arc<dyn StackMemberSetup>>) {
-    if let Ok(mut slot) = SETUP.write() {
-        *slot = setup;
+pub fn install(code: Option<Arc<dyn StackCode>>) {
+    if let Ok(mut slot) = CODE.write() {
+        *slot = code;
     }
 }
 
-/// Installs the marketplace's long-lived executors as the stack setup.
+/// Installs the marketplace's long-lived executors as the stack code.
 #[cfg(unix)]
 pub fn install_marketplace(state: &crate::state::AppState) {
     install(Some(Arc::new(
-        crate::http::handlers::discovery::manager::ServeStackSetup::new(
+        crate::http::handlers::discovery::manager::ServeStackCode::new(
             state.db_pool.clone(),
             state.marketplace.clone(),
         ),
     )));
 }
 
-/// The installed setup, for a marketplace stack member only.
-pub(crate) fn for_member(extension_id: &str) -> Option<Arc<dyn StackMemberSetup>> {
-    if !crate::marketplace::stack::is_stack_member_id(extension_id) {
-        return None;
+/// The installed stack code. A stack member is never handed to the legacy
+/// stack's code instead, so its absence is an error.
+pub(crate) fn code() -> Result<Arc<dyn StackCode>> {
+    CODE.read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .context("this stack's own code is not available on this server")
+}
+
+/// The general interface a member provider's capability answers.
+pub(crate) fn interface_for(capability: &str) -> Option<&'static str> {
+    match capability.trim() {
+        "media.manager.tv" | "media.manager.anime" | "media.manager.movies" => {
+            Some("media.manager")
+        }
+        "indexer.registry" => Some("indexer.list"),
+        _ => None,
     }
-    SETUP.read().ok().and_then(|slot| slot.clone())
+}
+
+/// How a setup patch to a stack member may be applied: a quality-policy preset
+/// only when the owner asks for it, everything else is safe to reapply. These
+/// are the rules the orchestrator applies to these patch kinds.
+pub(crate) fn patch_semantics(patch: &DriverPatch) -> PatchSemantics {
+    use crate::drivers::{MediaManagerMoviesPatch, MediaManagerTvPatch};
+    match patch {
+        DriverPatch::MediaManagerTv(MediaManagerTvPatch::ApplyQualityPolicyPreset { .. })
+        | DriverPatch::MediaManagerMovies(MediaManagerMoviesPatch::ApplyQualityPolicyPreset {
+            ..
+        }) => PatchSemantics::desired_change_only(PatchSideEffect::LiveApiWrite),
+        _ => PatchSemantics::periodic_safe(PatchSideEffect::LiveApiWrite),
+    }
+}
+
+/// Setup of one stack member's provider by its stack's own code.
+pub(crate) struct MemberSetup {
+    code: Arc<dyn StackCode>,
+    member: String,
+    interface: &'static str,
+}
+
+/// `None` unless this is a marketplace stack member's provider of a general
+/// interface (media manager, indexer list).
+pub(crate) fn for_member(extension_id: &str, capability: &str) -> Result<Option<MemberSetup>> {
+    if !crate::marketplace::stack::is_stack_member_id(extension_id) {
+        return Ok(None);
+    }
+    let Some(interface) = interface_for(capability) else {
+        return Ok(None);
+    };
+    Ok(Some(MemberSetup {
+        code: code()?,
+        member: extension_id.to_owned(),
+        interface,
+    }))
+}
+
+impl MemberSetup {
+    async fn call(&self, operation: &str, request: Value) -> Result<Value> {
+        self.code
+            .call(&self.member, self.interface, operation, request)
+            .await
+    }
+
+    /// Drift of one resolved patch (the connector's patch JSON).
+    /// `provider_url` is the member's own address as the other containers
+    /// reach it (for example, where its peers should call it back).
+    pub(crate) async fn evaluate_patch(
+        &self,
+        patch: Value,
+        provider_url: &str,
+    ) -> Result<DriftEvaluation> {
+        drift_from_json(
+            self.call(
+                "evaluate_patch",
+                json!({ "patch": patch, "providerUrl": provider_url }),
+            )
+            .await?,
+        )
+    }
+
+    pub(crate) async fn apply_patch(
+        &self,
+        patch: Value,
+        provider_url: &str,
+    ) -> Result<ApplyResult> {
+        apply_from_json(
+            self.call(
+                "apply_patch",
+                json!({ "patch": patch, "providerUrl": provider_url }),
+            )
+            .await?,
+        )
+    }
+
+    /// File names (inside the member's `/config`) its first-start setup reads.
+    pub(crate) async fn bootstrap_files(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            files: Vec<String>,
+        }
+        let reply: Reply = serde_json::from_value(self.call("bootstrap_files", json!({})).await?)
+            .context("stack bootstrap_files reply shape")?;
+        Ok(reply.files)
+    }
+
+    /// First-start setup from those files and Elixir's generated web login.
+    /// Returns the member's API key, or `None` while it is not ready yet.
+    pub(crate) async fn bootstrap(
+        &self,
+        files: BTreeMap<String, String>,
+        (username, password): (String, String),
+    ) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(rename = "apiKey", default)]
+            api_key: Option<String>,
+        }
+        let reply: Reply = serde_json::from_value(
+            self.call(
+                "bootstrap",
+                json!({ "files": files, "login": { "username": username, "password": password } }),
+            )
+            .await?,
+        )
+        .context("stack bootstrap reply shape")?;
+        Ok(reply.api_key)
+    }
+
+    /// Readiness probe once bootstrapped.
+    pub(crate) async fn read_state(&self) -> Result<StateSnapshot> {
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(default)]
+            summary: Option<String>,
+        }
+        let reply: Reply = serde_json::from_value(self.call("read_state", json!({})).await?)
+            .context("stack read_state reply shape")?;
+        Ok(StateSnapshot {
+            summary: reply.summary,
+            activity: None,
+        })
+    }
 }
 
 /// A file name a stack may ask for: one plain name inside `/config`.
@@ -167,15 +277,19 @@ pub fn apply_from_json(value: Value) -> Result<ApplyResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn wire_forms_map_to_driver_results() {
-        let drift = drift_from_json(json!({"status": "drifted", "message": "root folders require repair: /tv",
-            "nonComparableFields": [{"name": "apiKey", "semantics": "opaque_secret"}]}))
+        let drift = drift_from_json(
+            json!({"status": "drifted", "message": "root folders require repair: /tv",
+            "nonComparableFields": [{"name": "apiKey", "semantics": "opaque_secret"}]}),
+        )
         .unwrap();
         assert_eq!(drift.status, DriftStatus::Drifted);
-        assert_eq!(drift.non_comparable_fields[0].semantics, FieldSemantics::OpaqueSecret);
+        assert_eq!(
+            drift.non_comparable_fields[0].semantics,
+            FieldSemantics::OpaqueSecret
+        );
         assert!(drift_from_json(json!({"status": "maybe"})).is_err());
         let applied = apply_from_json(json!({"status": "deferred", "message": "later"})).unwrap();
         assert_eq!(applied.status, ApplyStatus::Deferred);
@@ -183,6 +297,43 @@ mod tests {
         for bad in ["", "../x", "a/b", ".env", "x y"] {
             assert!(!valid_bootstrap_file(bad), "{bad}");
         }
-        assert!(for_member("elixir.modules.sonarr").is_none());
+        assert!(
+            for_member("elixir.modules.sonarr", "media.manager.tv")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interfaces_follow_the_capability_not_the_application() {
+        assert_eq!(interface_for("media.manager.tv"), Some("media.manager"));
+        assert_eq!(interface_for("media.manager.movies"), Some("media.manager"));
+        assert_eq!(interface_for("indexer.registry"), Some("indexer.list"));
+        assert_eq!(interface_for("media.search.tv"), None);
+        assert_eq!(interface_for("downloader.torrent"), None);
+    }
+
+    #[test]
+    fn stack_patch_semantics_match_the_orchestrator_rules() {
+        use crate::drivers::PatchApplyPolicy;
+        let preset = DriverPatch::from_manifest(
+            "media.manager.tv",
+            json!({"op": "apply_quality_policy_preset",
+                "policy": {"preset": "modern_codecs", "profile_name": "Elixir Modern Codecs"}}),
+        )
+        .unwrap();
+        let tags = DriverPatch::from_manifest(
+            "media.manager.movies",
+            json!({"op": "set_tags", "tags": ["elixir"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            patch_semantics(&preset).apply_policy,
+            PatchApplyPolicy::DesiredChangeOnly
+        );
+        assert_eq!(
+            patch_semantics(&tags).apply_policy,
+            PatchApplyPolicy::PeriodicSafe
+        );
     }
 }

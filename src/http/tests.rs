@@ -19497,27 +19497,26 @@ runtime:
 /// The live test's stand-in for the long-lived executor: the Arr Stack
 /// module's real code in Node, reaching each member through the member
 /// directory (its address on this computer and stored API key).
-struct NodeStackSetup {
+/// The Arr Stack module's own code, run by Node against the real apps (the
+/// long-lived executor needs Linux): every call a stack member gets from the
+/// server goes through here.
+struct NodeStackCode {
     pool: sqlx::AnyPool,
     secrets: SecretsManager,
     stack: String,
     calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
-impl NodeStackSetup {
-    async fn run(
+#[async_trait::async_trait]
+impl crate::orchestrator::stack_setup::StackCode for NodeStackCode {
+    async fn call(
         &self,
         member_id: &str,
-        implementation: &str,
+        interface: &str,
         operation: &str,
         request: Value,
     ) -> Result<Value> {
         use crate::marketplace::stack::StackMembers;
         let member = member_id.rsplit('.').next().unwrap_or_default().to_owned();
-        let capability = if implementation == "prowlarr" {
-            "indexer.list"
-        } else {
-            "media.manager"
-        };
         let directory = crate::marketplace::stack::MemberDirectory::new(
             self.pool.clone(),
             self.secrets.clone(),
@@ -19531,60 +19530,41 @@ impl NodeStackSetup {
                 );
             }
         }
-        let op = request.get("patch").and_then(|p| p.get("op")).and_then(Value::as_str);
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("{member}:{operation}{}", op.map(|op| format!(":{op}")).unwrap_or_default()));
+        let op = request
+            .get("patch")
+            .and_then(|p| p.get("op"))
+            .and_then(Value::as_str);
+        self.calls.lock().unwrap().push(format!(
+            "{member}:{operation}{}",
+            op.map(|op| format!(":{op}")).unwrap_or_default()
+        ));
         let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../extensions/marketplace-sources/arr-stack");
         let out = tokio::process::Command::new("node")
             .current_dir(&tree)
-            .args(["--import", "./test/live/register.mjs", "test/live/invoke.mjs"])
+            .args([
+                "--import",
+                "./test/live/register.mjs",
+                "test/live/invoke.mjs",
+            ])
             .env("ARR_STACK_LIVE_MEMBERS", serde_json::to_string(&members)?)
             .env(
                 "ARR_STACK_INVOKE",
-                serde_json::to_string(&json!({"schema_version": 1, "capability": capability,
+                serde_json::to_string(&json!({"schema_version": 1, "capability": interface,
                     "member": member, "operation": operation, "request": request}))?,
             )
             .output()
             .await?;
         let reply: Value = serde_json::from_slice(&out.stdout).with_context(|| {
-            format!("{member} {operation}: {}", String::from_utf8_lossy(&out.stderr))
+            format!(
+                "{member} {operation}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
         })?;
         if reply["status"] != 200 {
             anyhow::bail!("{member} {operation} returned {reply}");
         }
         Ok(reply["body"].clone())
-    }
-}
-#[async_trait::async_trait]
-impl crate::orchestrator::stack_setup::StackMemberSetup for NodeStackSetup {
-    async fn evaluate_patch(&self, member: &str, implementation: &str, patch: Value, provider_url: &str)
-        -> Result<crate::drivers::DriftEvaluation> {
-        let body = self.run(member, implementation, "evaluate_patch",
-            json!({"patch": patch, "providerUrl": provider_url})).await?;
-        crate::orchestrator::stack_setup::drift_from_json(body)
-    }
-    async fn apply_patch(&self, member: &str, implementation: &str, patch: Value, provider_url: &str)
-        -> Result<crate::drivers::ApplyResult> {
-        let body = self.run(member, implementation, "apply_patch",
-            json!({"patch": patch, "providerUrl": provider_url})).await?;
-        crate::orchestrator::stack_setup::apply_from_json(body)
-    }
-    async fn bootstrap_files(&self, member: &str, implementation: &str) -> Result<Vec<String>> {
-        let body = self.run(member, implementation, "bootstrap_files", json!({})).await?;
-        Ok(serde_json::from_value(body["files"].clone())?)
-    }
-    async fn bootstrap(&self, member: &str, implementation: &str,
-        files: std::collections::BTreeMap<String, String>, login: (String, String)) -> Result<Option<String>> {
-        let body = self.run(member, implementation, "bootstrap",
-            json!({"files": files, "login": {"username": login.0, "password": login.1}})).await?;
-        Ok(body["apiKey"].as_str().map(str::to_owned))
-    }
-    async fn read_state(&self, member: &str, implementation: &str) -> Result<crate::drivers::StateSnapshot> {
-        let body = self.run(member, implementation, "read_state", json!({})).await?;
-        Ok(crate::drivers::StateSnapshot { summary: body["summary"].as_str().map(str::to_owned), activity: None })
     }
 }
 
@@ -19667,7 +19647,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     // Stage 2, slice 3: the stack's members are set up by the Arr Stack
     // module's own code (first start, every setup patch, readiness).
     let stack_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    crate::orchestrator::stack_setup::install(Some(std::sync::Arc::new(NodeStackSetup {
+    crate::orchestrator::stack_setup::install(Some(std::sync::Arc::new(NodeStackCode {
         pool: db_pool.clone(),
         secrets: state.secrets.as_ref().clone(),
         stack: "elx:test/arr-stack".to_owned(),
@@ -19680,6 +19660,9 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         }
     }
     let _uninstall = Uninstall;
+    // Stage 2, slice 4: nothing of the legacy Arr stack's own code may run for
+    // this stack, from setup to Find Media, the control screens and web pages.
+    crate::legacy_arr::start_recording();
     let app = router(state.clone());
     let send = |request: Request<Body>| {
         let app = app.clone();
@@ -19850,7 +19833,11 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
                     slot_id: provide.slot.clone(),
                     cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
                     implementation: provide.implementation.clone(),
-                    scope_json: provide.scope.as_ref().map(serde_json::to_value).transpose()?,
+                    scope_json: provide
+                        .scope
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()?,
                     endpoint: build_provider_endpoint(
                         provide,
                         &manifest.networking,
@@ -19975,23 +19962,38 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             .await?
             .context("prowlarr resolves")?;
         let schema = reqwest::Client::new()
-            .get(format!("{}/api/v1/indexer/schema", prowlarr.base_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/api/v1/indexer/schema",
+                prowlarr.base_url.trim_end_matches('/')
+            ))
             .header("x-api-key", prowlarr.api_key.clone().unwrap_or_default())
             .send()
             .await?
             .bytes()
             .await?;
         eprintln!("prowlarr indexer/schema reply: {} bytes", schema.len());
-        assert!(schema.len() < 16 * 1024 * 1024 - 4096, "indexer catalog fits one reply");
+        assert!(
+            schema.len() < 16 * 1024 * 1024 - 4096,
+            "indexer catalog fits one reply"
+        );
     }
     for expected in [
-        "sonarr:bootstrap", "radarr:bootstrap", "prowlarr:bootstrap",
-        "sonarr:apply_patch:set_root_folders", "radarr:apply_patch:set_root_folders",
-        "sonarr:apply_patch:set_downloaders", "radarr:apply_patch:set_downloaders",
-        "sonarr:apply_patch:apply_quality_policy_preset", "radarr:apply_patch:apply_quality_policy_preset",
-        "prowlarr:apply_patch:register_indexers", "prowlarr:apply_patch:register_apps",
+        "sonarr:bootstrap",
+        "radarr:bootstrap",
+        "prowlarr:bootstrap",
+        "sonarr:apply_patch:set_root_folders",
+        "radarr:apply_patch:set_root_folders",
+        "sonarr:apply_patch:set_downloaders",
+        "radarr:apply_patch:set_downloaders",
+        "sonarr:apply_patch:apply_quality_policy_preset",
+        "radarr:apply_patch:apply_quality_policy_preset",
+        "prowlarr:apply_patch:register_indexers",
+        "prowlarr:apply_patch:register_apps",
     ] {
-        assert!(calls.iter().any(|call| call == expected), "{expected} went through the module: {calls:?}");
+        assert!(
+            calls.iter().any(|call| call == expected),
+            "{expected} went through the module: {calls:?}"
+        );
     }
 
     // Every stack container runs under the stack sandbox.
@@ -20063,8 +20065,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     // apps, reaching them through the member directory that Elixir's
     // long-lived executor uses (address on this computer plus API key).
     use crate::marketplace::stack::StackMembers;
-    let directory =
-        stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone());
+    let directory = stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone());
     let mut members = serde_json::Map::new();
     for member in ["sonarr", "radarr", "prowlarr"] {
         let endpoint = directory
@@ -20081,7 +20082,11 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         .join("../extensions/marketplace-sources/arr-stack");
     let out = std::process::Command::new("node")
         .current_dir(&tree)
-        .args(["--import", "./test/live/register.mjs", "test/live/check.mjs"])
+        .args([
+            "--import",
+            "./test/live/register.mjs",
+            "test/live/check.mjs",
+        ])
         .env("ARR_STACK_LIVE_MEMBERS", serde_json::to_string(&members)?)
         .output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -20089,6 +20094,146 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     assert!(
         out.status.success() && stdout.contains("LIVE_CHECK_OK"),
         "the Arr Stack module works against the real apps"
+    );
+
+    // The server's own Find Media, control and web-page paths for the stack's
+    // members, through the module against the real apps, as a signed-in user.
+    let (status, tokens) = send(post(
+        "/api/v1/auth/signup".into(),
+        json!({"email": "arr-stack-live@example.test", "password": "fixture-password-only"}),
+    )?)
+    .await?;
+    assert!(status.is_success(), "test account: {tokens}");
+    let bearer = format!(
+        "Bearer {}",
+        tokens["access_token"]
+            .as_str()
+            .context("test account access token")?
+    );
+    let post = |uri: String, payload: Value| {
+        Request::post(uri)
+            .header("authorization", bearer.clone())
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+    };
+    let get = |uri: String| {
+        Request::get(uri)
+            .header("authorization", bearer.clone())
+            .body(Body::empty())
+    };
+    let details = store.list_provider_details().await?;
+    let provider_of = |member: &str, capability: &str| {
+        let id = stack::derived_id("elx:test/arr-stack", member);
+        details
+            .iter()
+            .find(|detail| detail.extension_id == id && detail.provider.capability == capability)
+            .map(|detail| detail.provider.clone())
+            .with_context(|| format!("{member} provides {capability}"))
+    };
+    let search = provider_of("sonarr", "media.search.tv")?;
+    let manager = provider_of("sonarr", "media.manager.tv")?;
+    // Sonarr's own metadata service (SkyHook) sometimes times out; a lookup
+    // that reached Sonarr through the module is retried.
+    let mut attempts = 0;
+    let expanse = loop {
+        attempts += 1;
+        let (status, found) = send(post(
+            "/api/v1/find-media/search".into(),
+            json!({"mediaType": "series", "query": "The Expanse",
+                "providerIds": [search.provider_id.to_string()]}),
+        )?)
+        .await?;
+        assert_eq!(status, StatusCode::OK, "find media search: {found}");
+        if let Some(item) = found["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| {
+                item["externalIds"]["tvdbSeries"] == "280619"
+                    || item["externalIds"]["tvdb"] == "280619"
+            })
+        {
+            break item.clone();
+        }
+        assert!(
+            attempts < 5 && found.to_string().contains("SkyHook"),
+            "find media search found The Expanse: {found}"
+        );
+        eprintln!("find media search: SkyHook failed, retrying");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    };
+    let (status, added) = send(post(
+        "/api/v1/find-media/add".into(),
+        json!({"mediaType": "series", "managerProviderId": manager.provider_id.to_string(),
+            "item": {"title": expanse["title"], "year": expanse["year"],
+                "externalIds": expanse["externalIds"]},
+            "options": {"monitor": false, "search": false}}),
+    )?)
+    .await?;
+    assert_eq!(status, StatusCode::OK, "find media add: {added}");
+    let (status, acquisition) = send(get("/api/v1/find-media/acquisition".into())?).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "find media acquisition: {acquisition}"
+    );
+    eprintln!(
+        "find media acquisition: {}",
+        acquisition
+            .to_string()
+            .chars()
+            .take(800)
+            .collect::<String>()
+    );
+    assert!(
+        acquisition
+            .to_string()
+            .contains(added["intentId"].as_str().unwrap_or("?")),
+        "the added series is tracked: {acquisition}"
+    );
+    for member in ["sonarr", "radarr", "prowlarr"] {
+        let id = stack::derived_id("elx:test/arr-stack", member);
+        let (status, surface) =
+            send(get(format!("/api/v1/extensions/{id}/control-surface"))?).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{member} control surface: {surface}"
+        );
+        let surface = surface.to_string();
+        assert!(
+            surface.contains("open_service_ui"),
+            "{member} offers its web page: {surface}"
+        );
+    }
+    // The web page signs in with the member's key, as the module describes it,
+    // and its settings file points at the proxy's path.
+    let (status, page) = send(get(format!(
+        "/api/v1/extensions/instances/{}/ui/initialize.json",
+        manager.instance_id
+    ))?)
+    .await?;
+    let prefix = format!("/api/v1/extensions/instances/{}/ui", manager.instance_id);
+    assert_eq!(status, StatusCode::OK, "initialize.json: {page}");
+    assert_eq!(page["urlBase"], json!(prefix), "initialize.json: {page}");
+    assert!(
+        page["apiRoot"]
+            .as_str()
+            .is_some_and(|root| root.starts_with(&prefix)),
+        "initialize.json: {page}"
+    );
+    let (status, system) = send(get(format!("{prefix}/api/v3/system/status"))?).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "signed-in API call through the page: {system}"
+    );
+    assert_eq!(system["appName"], "Sonarr", "{system}");
+
+    let ran = crate::legacy_arr::stop_recording();
+    assert!(
+        ran.is_empty(),
+        "the legacy Arr stack's own code ran for this marketplace stack: {ran:?}"
     );
     Ok(())
 }

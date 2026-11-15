@@ -39,6 +39,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     }
 
     fn patch_semantics(&self, patch: &DriverPatch) -> PatchSemantics {
+        crate::legacy_arr::mark("Sonarr driver: patch_semantics");
         match patch {
             DriverPatch::MediaManagerTv(MediaManagerTvPatch::ApplyQualityPolicyPreset {
                 ..
@@ -51,6 +52,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     }
 
     async fn evaluate_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<DriftEvaluation> {
+        crate::legacy_arr::mark("Sonarr driver: evaluate_patch");
         let patch = match patch {
             DriverPatch::MediaManagerTv(patch) => patch,
             _ => bail!("media.manager.tv patch mismatch"),
@@ -144,6 +146,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     }
 
     async fn read_state(&self, _ctx: DriverCtx) -> Result<StateSnapshot> {
+        crate::legacy_arr::mark("Sonarr driver: read_state");
         Ok(StateSnapshot {
             summary: Some("media.manager.tv driver is not implemented".to_string()),
             activity: None,
@@ -151,6 +154,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     }
 
     async fn apply_patch(&self, ctx: DriverCtx, patch: DriverPatch) -> Result<ApplyResult> {
+        crate::legacy_arr::mark("Sonarr driver: apply_patch");
         let patch = match patch {
             DriverPatch::MediaManagerTv(patch) => patch,
             _ => bail!("media.manager.tv patch mismatch"),
@@ -229,6 +233,7 @@ impl CapabilityDriver for MediaManagerTvDriver {
     }
 
     async fn add_media(&self, ctx: DriverCtx, request: AddMediaRequest) -> Result<AddMediaResult> {
+        crate::legacy_arr::mark("Sonarr driver: add_media");
         let implementation = ctx
             .implementation
             .as_deref()

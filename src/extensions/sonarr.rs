@@ -162,6 +162,7 @@ impl FileSource for SonarrSource {
         &self,
         _since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<MediaFileCandidate>> {
+        crate::legacy_arr::mark("library: Sonarr library source");
         let mut candidates = Vec::new();
         let series_list = self.fetch_series().await?;
         let mut seen_paths: HashSet<String> = HashSet::new();
