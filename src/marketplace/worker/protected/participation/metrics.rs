@@ -90,6 +90,28 @@ pub(in crate::marketplace) enum SourceAdmissionDeferred {
         playback: bool,
     },
 }
+impl SourceAdmissionDeferred {
+    /// Waiting only for a stream to finish starting or seeking, with enough
+    /// memory and disk. Such a wait is short, so it is retried sooner.
+    pub(in crate::marketplace) fn playback_only(&self) -> bool {
+        match *self {
+            Self::Measured {
+                memory,
+                memory_needed,
+                disk,
+                disk_needed,
+                pressure,
+                playback,
+            } => playback && !pressure && memory >= memory_needed && disk >= disk_needed,
+            Self::Bootstrap {
+                memory,
+                memory_needed,
+                pressure,
+                playback,
+            } => playback && !pressure && memory >= memory_needed,
+        }
+    }
+}
 #[cfg(test)]
 impl SourceAdmissionDeferred {
     // Scheduling diagnostic only, not a resource/authority capability.

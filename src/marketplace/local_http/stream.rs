@@ -398,9 +398,8 @@ fn safe_failure(error: &anyhow::Error) -> &'static str {
             "native source invocation is no longer current" => "native_scope_closed",
             "native source executor identity is not running" => "native_not_running",
             "native effect inspection deadline" => "native_inspection_timeout",
-            "local SDK HTTP is stopped, disabled, expired or waiting for playback startup/seek" => {
-                "admission_stopped"
-            }
+            "local SDK HTTP is stopped, disabled or expired"
+            | "local SDK HTTP expired waiting for playback startup/seek" => "admission_stopped",
             "local SDK HTTP cancelled" | "local SDK stream cancelled" => "cancelled",
             "configured local endpoint is no longer authorized" => "endpoint_revoked",
             "configured local endpoint changed during its original request" => "endpoint_changed",

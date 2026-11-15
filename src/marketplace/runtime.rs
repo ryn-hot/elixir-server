@@ -26,6 +26,9 @@ const MIB: u64 = 1024 * 1024;
 /// or execution authority. No Default/Deserialize/DerefMut: trusted allocation
 /// must select a finite profile, then pass independent admission and review.
 /// Keep the old plan encoding so unchanged 100m profiles retain their digests.
+/// An installed call may use every CPU on the Docker host while nothing plays.
+pub const MAX_SOURCE_JOB_MILLICORES: u32 = 64_000;
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(transparent)]
 pub struct SourceJobLimits(OrdinaryLimits);
@@ -45,9 +48,9 @@ impl SourceJobLimits {
     pub fn validate(&self) -> Result<()> {
         if !(64 * MIB..=256 * MIB).contains(&self.0.memory_bytes)
             || !self.0.memory_bytes.is_multiple_of(MIB)
-            || !(1..=1000).contains(&self.0.cpu_millicores)
+            || !(1..=MAX_SOURCE_JOB_MILLICORES).contains(&self.0.cpu_millicores)
         {
-            bail!("foreground source job requires 64-256 MiB and at most one CPU core");
+            bail!("foreground source job requires 64-256 MiB and 1-64 CPU cores");
         }
         Ok(())
     }
@@ -857,7 +860,7 @@ mod tests {
             (64 * MIB + 1, 100),
             (257 * MIB, 100),
             (64 * MIB, 0),
-            (64 * MIB, 1001),
+            (64 * MIB, MAX_SOURCE_JOB_MILLICORES + 1),
         ] {
             assert!(SourceJobLimits::new(memory, cpu).is_err());
         }

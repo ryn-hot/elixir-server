@@ -96,6 +96,10 @@ pub trait RuntimeManager: Send + Sync {
     #[cfg(unix)]
     fn marketplace_import_profile(&self)->Option<std::sync::Arc<image_import::Profile>> {None}
     async fn marketplace_daemon_id(&self)->anyhow::Result<String> {anyhow::bail!("runtime lacks local image-import daemon identity")}
+    /// CPUs available to containers on this runtime's host.
+    async fn host_cpus(&self) -> anyhow::Result<u64> {
+        anyhow::bail!("runtime lacks host CPU information")
+    }
     async fn inspect_marketplace_import_image(&self,_image:elixir_marketplace::identity::Digest)->anyhow::Result<Vec<u8>> {anyhow::bail!("runtime lacks actual imported-image inspection")}
     #[cfg(unix)]
     async fn provider_transport(

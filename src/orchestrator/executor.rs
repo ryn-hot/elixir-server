@@ -821,7 +821,7 @@ impl<'a> Executor<'a> {
             security: container_security_options(&runtime.security),
         };
         if crate::marketplace::stack::is_stack_member_id(&extension_id) {
-            apply_stack_sandbox(&mut spec);
+            apply_stack_sandbox(&mut spec, stack_member_memory_mb().await);
         }
 
         let resolved_egress = self
@@ -6139,7 +6139,23 @@ pub(crate) fn describe_volume_mount_identity(volume: &VolumeMount) -> String {
 /// upstream images' start-up needs to switch users, no new privileges, memory
 /// and process caps, and web ports on this computer only (opened through
 /// Elixir's proxy). Legacy containers are unaffected.
-fn apply_stack_sandbox(spec: &mut ContainerSpec) {
+/// Memory ceiling for a stack member: half the Docker host, never below 1 GiB.
+/// A guard against a runaway extension, not a reservation. CPU is not fixed:
+/// [`crate::orchestrator::playback_priority`] caps it only while media plays.
+async fn stack_member_memory_mb() -> u64 {
+    const FLOOR_MB: u64 = 1024;
+    static CEILING: tokio::sync::OnceCell<u64> = tokio::sync::OnceCell::const_new();
+    CEILING
+        .get_or_try_init(|| async {
+            let bytes = crate::orchestrator::playback_priority::docker_host_memory_bytes().await?;
+            anyhow::Ok((bytes / 2 / (1024 * 1024)).max(FLOOR_MB))
+        })
+        .await
+        .copied()
+        .unwrap_or(FLOOR_MB)
+}
+
+fn apply_stack_sandbox(spec: &mut ContainerSpec, memory_mb: u64) {
     const STACK_CAPABILITIES: [&str; 5] = ["CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER"];
     spec.cap_drop = vec!["ALL".to_string()];
     spec.cap_add = STACK_CAPABILITIES
@@ -6150,8 +6166,9 @@ fn apply_stack_sandbox(spec: &mut ContainerSpec) {
     spec.sysctls.clear();
     spec.network_mode = None;
     spec.security.no_new_privileges = true;
-    spec.security.memory_limit_mb = Some(1024);
+    spec.security.memory_limit_mb = Some(memory_mb);
     spec.security.pids_limit = Some(512);
+    spec.security.cpu_quota = None;
     for port in &mut spec.ports {
         port.host_port = Some(0);
         port.host_ip = Some("127.0.0.1".to_string());

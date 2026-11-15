@@ -19889,7 +19889,18 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
                 .contains("no-new-privileges"),
             "{member}"
         );
-        assert_eq!(host["Memory"], json!(1024 * 1024 * 1024), "{member}");
+        // Half the Docker host, never below 1 GiB; no fixed CPU limit.
+        let docker_memory: u64 = String::from_utf8(
+            std::process::Command::new("docker")
+                .args(["info", "--format", "{{.MemTotal}}"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .parse()?;
+        let ceiling = (docker_memory / 2 / (1024 * 1024)).max(1024) * 1024 * 1024;
+        assert_eq!(host["Memory"], json!(ceiling), "{member}");
+        assert_eq!(host["NanoCpus"], json!(0), "{member}");
         assert!(!host["Privileged"].as_bool().unwrap_or(true), "{member}");
         for bindings in host["PortBindings"]
             .as_object()

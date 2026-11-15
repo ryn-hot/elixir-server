@@ -344,6 +344,17 @@ async fn start_post_listener_background_tasks(
     reconcile_config: ReconcileConfig,
     shutdown: CancellationToken,
 ) {
+    // Installed extension containers yield CPU to playback, and only then.
+    let playback_priority = state.transcodes.clone();
+    let playback_priority_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        elixir_server::orchestrator::playback_priority::run(
+            playback_priority,
+            playback_priority_shutdown,
+        )
+        .await;
+    });
+
     let anime_inference = state.anime_inference.clone();
     let anime_inference_shutdown = shutdown.clone();
     tokio::spawn(async move {

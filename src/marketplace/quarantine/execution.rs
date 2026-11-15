@@ -319,8 +319,10 @@ impl SourceQuarantinePlan {
     ) -> Result<()> {
         let plan = self;
         let tmp_bytes = 8.min(plan.limits.memory_bytes / MIB / 16) * MIB;
+        // CPU is scheduled by the server (the whole host, capped while media
+        // plays), so the reviewed CPU figure is the publisher's request, not
+        // a ceiling. Memory and processes stay bounded by the review.
         if plan.limits.memory_bytes > resources.memory_bytes
-            || plan.limits.cpu_millicores > resources.cpu_millicores
             || super::super::runtime::WORKER_PIDS > u64::from(resources.pids)
             || !resources
                 .temporary_mounts

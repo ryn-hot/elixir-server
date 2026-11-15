@@ -508,6 +508,20 @@ impl PlaybackJobManager {
         self.startup_queue_len() > 0 || !self.jobs.is_empty()
     }
 
+    /// Waits, polling, until no stream is starting or seeking, for at most
+    /// `limit`, and says whether it settled. For optional work that should wait
+    /// briefly for playback instead of failing.
+    pub async fn startup_settled(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while self.startup_queue_len() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        true
+    }
+
     pub async fn start(
         &self,
         mut plan: PlaybackJobPlan,

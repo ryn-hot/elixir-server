@@ -12,6 +12,8 @@ pub(in crate::marketplace) struct IndependentAdmission {
     server_memory: tokio::sync::Mutex<Option<ServerMemory>>,
 }
 const SERVER_MEMORY_MAX_AGE: Duration = Duration::from_secs(1);
+/// How long an installed HTTP call waits for a stream to finish starting.
+const PLAYBACK_STARTUP_WAIT: Duration = Duration::from_secs(20);
 
 /// Scheduling data, never a native/grant/VPN capability. One short-lived cache
 /// per owned application context avoids vm_stat at every nested HTTP check.
@@ -73,17 +75,20 @@ impl IndependentAdmission {
         if self.application_bytes == 0 {
             bail!("application HTTP requires its independent resource reservation");
         }
-        if host_cpu_pressure() || self.playback.startup_queue_len() > 0 {
-            bail!("application HTTP yields to current host pressure or playback startup");
+        // An installed call waits for a stream to finish starting or seeking,
+        // and CPU load alone never refuses it: during playback the call runs
+        // under a small CPU limit instead. Low memory still refuses it.
+        if !self.playback.startup_settled(PLAYBACK_STARTUP_WAIT).await {
+            bail!("application HTTP waited too long for playback startup");
         }
         let available = self.application_memory().await?;
-        // Always recheck playback/load after a potentially asynchronous sample.
-        // Neither is cached, and missing/failed memory queries are not reused.
-        if available < self.ordinary.memory_bytes * 2
-            || host_cpu_pressure()
-            || self.playback.startup_queue_len() > 0
-        {
-            bail!("application HTTP yields to current host pressure or playback startup");
+        // Always recheck playback after a potentially asynchronous sample.
+        // Missing/failed memory queries are not reused.
+        if available < self.ordinary.memory_bytes * 2 {
+            bail!("application HTTP yields to low server memory");
+        }
+        if !self.playback.startup_settled(PLAYBACK_STARTUP_WAIT).await {
+            bail!("application HTTP waited too long for playback startup");
         }
         storage_available(&self.storage)?;
         Ok(())
@@ -127,9 +132,11 @@ impl ResourceAdmission for IndependentAdmission {
             .and_then(|n| n.checked_add(self.application_bytes))
             .and_then(|n| n.checked_add(plan.memory_reservation_bytes()))
             .context("bootstrap resource bounds")?;
-        let pressure = host_cpu_pressure();
+        // CPU load alone never holds an installed call back: during playback
+        // the call gets a small CPU limit instead. Stream startup still waits.
+        let pressure = false;
         let playback = self.playback.startup_queue_len() > 0;
-        if memory < memory_needed || pressure || playback {
+        if memory < memory_needed || playback {
             return Err(SourceAdmissionDeferred::Bootstrap {
                 memory,
                 memory_needed,
@@ -151,9 +158,10 @@ impl ResourceAdmission for IndependentAdmission {
             .context("installed admission requires an actual native host observation")?;
         let report = observation.report()?;
         let sample = probe::Snapshot::parse(report).map_err(anyhow::Error::msg)?;
-        let before = cpu::Sample::parse(sample.before).map_err(anyhow::Error::msg)?;
-        let after = cpu::Sample::parse(sample.after).map_err(anyhow::Error::msg)?;
-        let guest_cpu = after.pressured_since(before).map_err(anyhow::Error::msg)?;
+        // The CPU samples are still parsed as part of the observation, but CPU
+        // load does not defer an installed call; memory and I/O pressure do.
+        cpu::Sample::parse(sample.before).map_err(anyhow::Error::msg)?;
+        cpu::Sample::parse(sample.after).map_err(anyhow::Error::msg)?;
         let host = host_available().await?;
         let disk = storage_available(&self.storage)?.min(disk_available(sample.disk)?);
         check_source_headroom(
@@ -167,7 +175,7 @@ impl ResourceAdmission for IndependentAdmission {
             host.min(linux_available(sample.kernel)?)
                 .saturating_sub(self.application_bytes),
             disk,
-            guest_cpu || foreground_memory_io_pressure(sample.kernel)? || host_cpu_pressure(),
+            foreground_memory_io_pressure(sample.kernel)?,
             self.playback.startup_queue_len() > 0,
         )?;
         observation.report()?;

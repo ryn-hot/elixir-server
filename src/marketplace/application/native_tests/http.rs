@@ -238,11 +238,21 @@ async fn foreground_comparison_requires_declared_quota_and_keeps_entrypoint_byte
                 None,
                 &foreground.source,
             )?;
-            assert!(
-                larger.require_execution_resources(resources).is_err(),
-                "trusted allocation cannot exceed the approved manifest quota"
-            );
+            // CPU is scheduled by the server (the whole host, capped while
+            // media plays); the reviewed figure is a request, not a ceiling.
+            larger.require_execution_resources(resources)?;
         }
+        let mut more_memory = budget.clone();
+        more_memory.memory_bytes = resources.memory_bytes + 64 * 1024 * 1024;
+        let more_memory = crate::marketplace::quarantine::SourceQuarantinePlan::for_release(
+            &release,
+            None,
+            &more_memory,
+        )?;
+        assert!(
+            more_memory.require_execution_resources(resources).is_err(),
+            "memory stays bounded by the reviewed manifest"
+        );
     }
     Ok(())
 }

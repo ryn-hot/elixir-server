@@ -56,6 +56,7 @@ pub struct DockerRuntimeManager {
     #[cfg(unix)]
     container_guardian: Option<std::sync::Arc<crate::runtime::container_guardian::Profile>>,
     immutable_image_labels: tokio::sync::Mutex<image_labels::Cache>,
+    host_cpus: tokio::sync::OnceCell<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -261,6 +262,7 @@ impl DockerRuntimeManager {
             #[cfg(unix)]
             container_guardian: None,
             immutable_image_labels: Default::default(),
+            host_cpus: Default::default(),
         }
     }
 
@@ -2928,6 +2930,24 @@ impl RuntimeManager for DockerRuntimeManager {
     #[cfg(unix)]
     fn marketplace_import_profile(&self)->Option<std::sync::Arc<crate::runtime::image_import::Profile>> {self.import_profile.clone()}
     async fn marketplace_daemon_id(&self)->Result<String> {self.image_import_daemon_id().await}
+    async fn host_cpus(&self) -> Result<u64> {
+        self.host_cpus
+            .get_or_try_init(|| async {
+                let args = ["info", "--format", "{{.NCPU}}"].map(String::from);
+                let cpus: u64 = self
+                    .run_stdout_with_timeout(&args, DOCKER_PROBE_COMMAND_TIMEOUT)
+                    .await?
+                    .trim()
+                    .parse()
+                    .context("docker host CPU count")?;
+                if cpus == 0 {
+                    bail!("docker host reports no CPUs");
+                }
+                Ok(cpus)
+            })
+            .await
+            .copied()
+    }
     async fn inspect_marketplace_import_image(&self,image:elixir_marketplace::identity::Digest)->Result<Vec<u8>> {self.image_import_inspect(image).await}
     #[cfg(unix)]
     async fn provider_transport(

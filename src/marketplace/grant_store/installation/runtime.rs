@@ -36,6 +36,8 @@ const STOP_GRACE: Duration = Duration::from_secs(45);
 const CHECK: Duration = Duration::from_millis(500);
 const CLEANUP_RETRY: Duration = Duration::from_secs(10);
 const RESOURCE_RETRY: Duration = Duration::from_secs(10);
+/// A call waiting only for a stream to finish starting checks again sooner.
+const PLAYBACK_RETRY: Duration = Duration::from_secs(1);
 
 /// Trusted server configuration, never a peer/HTTP body. The source lane must
 /// be the SAME global expensive-job lane used by preparation/builds. No new
@@ -54,6 +56,24 @@ pub(in crate::marketplace) struct InstalledRuntime {
     pub image: String,
     pub source_budget: SourceJobBudget,
     pub retention: ArchiveBudget,
+}
+impl InstalledRuntime {
+    /// Each installed call starts its own container, so its CPU is chosen
+    /// here: every CPU on the Docker host while nothing plays, the configured
+    /// smaller budget while a stream starts or plays, so playback wins. If the
+    /// host cannot be asked, the configured budget applies.
+    async fn call_budget(&self) -> SourceJobBudget {
+        let mut budget = self.source_budget.clone();
+        if !self.playback.has_latency_sensitive_work()
+            && let Ok(cpus) = self.runtime.host_cpus().await
+        {
+            let host = u32::try_from(cpus.saturating_mul(1000)).unwrap_or(u32::MAX);
+            budget.cpu_millicores = budget
+                .cpu_millicores
+                .max(host.min(crate::marketplace::runtime::MAX_SOURCE_JOB_MILLICORES));
+        }
+        budget
+    }
 }
 
 /// One owned call, not Clone/Deserialize or an installation ticket. Caller
@@ -417,8 +437,13 @@ async fn resource_pause(
         ?waiting,
         "installed source retaining its owner while awaiting physical headroom"
     );
+    let pause = if waiting.playback_only() {
+        PLAYBACK_RETRY
+    } else {
+        RESOURCE_RETRY
+    };
     guarded(database, binding, stop, expires, async {
-        sleep(RESOURCE_RETRY).await;
+        sleep(pause).await;
         Ok(())
     })
     .await
@@ -688,8 +713,8 @@ async fn load_retained(
     } else {
         bail!("unsupported installed runtime profile");
     };
-    let mut plan =
-        SourceQuarantinePlan::for_release(facts.release(), selected, &configuration.source_budget)?;
+    let budget = configuration.call_budget().await;
+    let mut plan = SourceQuarantinePlan::for_release(facts.release(), selected, &budget)?;
     let resources = binding
         .review()
         .scope()

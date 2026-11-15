@@ -92,14 +92,8 @@ impl Client {
         }
     }
     fn admitted(&self, cancellation: &CancellationToken, expires: Instant) -> Result<()> {
-        if !self.enabled
-            || cancellation.is_cancelled()
-            || Instant::now() >= expires
-            || self.playback.startup_queue_len() > 0
-        {
-            bail!(
-                "local SDK HTTP is stopped, disabled, expired or waiting for playback startup/seek"
-            );
+        if !self.enabled || cancellation.is_cancelled() || Instant::now() >= expires {
+            bail!("local SDK HTTP is stopped, disabled or expired");
         }
         Ok(())
     }
@@ -109,6 +103,14 @@ impl Client {
         cancellation: &CancellationToken,
         expires: Instant,
     ) -> Result<()> {
+        // Wait for a stream to finish starting or seeking rather than fail.
+        let limit = expires.saturating_duration_since(Instant::now());
+        tokio::select! { biased;
+            _ = cancellation.cancelled() => bail!("local SDK HTTP cancelled"),
+            settled = self.playback.startup_settled(limit) => if !settled {
+                bail!("local SDK HTTP expired waiting for playback startup/seek");
+            },
+        }
         self.admitted(cancellation, expires)?;
         tokio::select! { biased;
             _ = cancellation.cancelled() => bail!("local SDK HTTP cancelled"),
