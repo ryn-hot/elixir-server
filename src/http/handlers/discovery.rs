@@ -21,6 +21,8 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+pub(crate) mod manager;
+
 use super::{
     acquisition_sources::{
         ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY,
@@ -6572,6 +6574,22 @@ async fn resolve_acquisition_item_state(
         });
     };
 
+    #[cfg(unix)]
+    if let Some(manager) = manager::ExtensionManager::for_provider(state, provider).await? {
+        return resolve_extension_item_state(
+            state,
+            store,
+            provider,
+            &manager,
+            manager_item_id,
+            (library_matched, library_needs_hydration),
+            recovery_view,
+            downloader_progress,
+            intent,
+        )
+        .await;
+    }
+
     let endpoint_json = provider
         .detail
         .provider
@@ -6676,6 +6694,174 @@ async fn resolve_acquisition_item_state(
         downloader_progress,
         sonarr_episode_index.as_ref(),
     ))
+}
+
+/// A marketplace stack member: one status call to the stack's long-lived
+/// executor, imported files when unlinked, then the general-purpose state.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn resolve_extension_item_state(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    provider: &ProviderContext,
+    manager: &manager::ExtensionManager,
+    manager_item_id: &str,
+    (mut library_matched, library_needs_hydration): (bool, bool),
+    recovery_view: Option<&IntentRecoveryView>,
+    downloader_progress: &AcquisitionDownloaderProgressIndex,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+) -> AnyResult<AcquisitionItemState> {
+    let status: manager::ManagerStatusReply = match manager
+        .call("acquisition_status", json!({ "itemId": manager_item_id }))
+        .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            return Ok(acquisition_attention(
+                "manager_status_unavailable",
+                "Manager status unavailable",
+                format!("Manager status could not be loaded: {err}"),
+                base_acquisition_evidence(true, false, false, 0, None, None),
+            ));
+        }
+    };
+    if (!library_matched || library_needs_hydration) && status.item.has_files {
+        let implementation = provider
+            .detail
+            .provider
+            .implementation
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let linked = async {
+            let files: manager::ManagerImportedFiles = manager
+                .call("imported_files", json!({ "itemId": manager_item_id }))
+                .await?;
+            let events = extension_import_events(state, manager.kind, &implementation, intent, files);
+            ingest_managed_import_events(state, store, intent, events).await
+        }
+        .await;
+        match linked {
+            Ok(true) => library_matched = true,
+            Ok(false) => {}
+            Err(err) => warn!(
+                intent_id = %intent.intent_id,
+                implementation,
+                "failed to process managed import events: {err}"
+            ),
+        }
+    }
+    Ok(manager::derive_manager_acquisition_state(
+        manager::ManagerAcquisitionInput {
+            kind: manager.kind,
+            manager_label: provider.instance_name.as_str(),
+            item_id: manager_item_id,
+            item: &status.item,
+            queue: &status.queue,
+            episodes: status.episodes.as_ref(),
+        },
+        library_matched,
+        recovery_view,
+        downloader_progress,
+    ))
+}
+
+/// Import events from a stack member's general-purpose imported-file list,
+/// built exactly as the server builds them from its own Sonarr/Radarr reads.
+#[cfg(unix)]
+fn extension_import_events(
+    state: &AppState,
+    kind: manager::ManagerItemKind,
+    implementation: &str,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    files: manager::ManagerImportedFiles,
+) -> Vec<NewManagedImportEvent> {
+    let ids = files.external_ids;
+    let (media_type, external_ids) = match kind {
+        manager::ManagerItemKind::Movie => (
+            MediaType::Movie,
+            ExternalIds {
+                imdb: ids.imdb,
+                tmdb: ids.tmdb,
+                tvdb: ids.tvdb.clone(),
+                tvdb_movie: ids.tvdb,
+                ..Default::default()
+            },
+        ),
+        manager::ManagerItemKind::Series => (
+            intent.media_type,
+            ExternalIds {
+                imdb: ids.imdb,
+                tvdb: ids.tvdb.clone(),
+                tvdb_series: ids.tvdb,
+                ..Default::default()
+            },
+        ),
+    };
+    let mut events = Vec::new();
+    for file in files.files {
+        let Some(library_path) = resolve_manager_imported_file_path(
+            &state.settings.library.local_root,
+            &file.manager_path,
+            media_type,
+        ) else {
+            warn!(
+                intent_id = %intent.intent_id,
+                manager_path = %file.manager_path,
+                "imported file path is outside the managed library root"
+            );
+            continue;
+        };
+        let imported = ManagedImportFile {
+            path: library_path,
+            season_number: file.season,
+            episode_number: file.episode,
+            absolute_episode_number: file.absolute_episode,
+            episode_title: file.episode_title,
+            size_bytes: file.size_bytes,
+            container: StdPath::new(&file.manager_path)
+                .extension()
+                .map(|value| value.to_string_lossy().to_string()),
+            video_codec: file.video_codec,
+            audio_codec: file.audio_codec,
+        };
+        let (key, payload) = match kind {
+            manager::ManagerItemKind::Movie => (
+                format!("movie:{}", imported.path.to_ascii_lowercase()),
+                files.raw.clone(),
+            ),
+            manager::ManagerItemKind::Series => (
+                format!(
+                    "episode:{}:s{}e{}",
+                    imported.path.to_ascii_lowercase(),
+                    imported.season_number.unwrap_or_default(),
+                    imported.episode_number.unwrap_or_default()
+                ),
+                json!({
+                    "series": files.raw,
+                    "episode": file.raw.get("episode"),
+                    "episodeFile": file.raw.get("episodeFile"),
+                }),
+            ),
+        };
+        events.push(NewManagedImportEvent {
+            event_key: managed_import_event_key(intent, implementation, &[key]),
+            intent_id: intent.intent_id,
+            media_type,
+            external_ids: Some(merge_external_ids_for_event(
+                intent.external_ids.clone().unwrap_or_default(),
+                external_ids.clone(),
+            )),
+            manager_provider_id: intent.manager_provider_id,
+            manager_item_id: intent.manager_item_id.clone(),
+            manager_label: intent.manager_label.clone(),
+            manager_implementation: Some(implementation.to_string()),
+            imported_files: vec![imported],
+            raw_manager_payload: Some(payload),
+            imported_at: Some(Utc::now()),
+        });
+    }
+    events
 }
 
 async fn managed_library_needs_hydration(
@@ -7277,6 +7463,16 @@ async fn detect_and_ingest_managed_import_events(
     let events =
         detect_managed_import_events(state, intent, implementation, item_value, base_url, api_key)
             .await?;
+    ingest_managed_import_events(state, store, intent, events).await
+}
+
+/// Persists and links detected import events; true when any linked.
+async fn ingest_managed_import_events(
+    state: &AppState,
+    store: &ExtensionStore<'_>,
+    intent: &crate::extensions::store::ManagedIngestIntent,
+    events: Vec<NewManagedImportEvent>,
+) -> AnyResult<bool> {
     let mut linked = false;
 
     for event in events {
@@ -7517,6 +7713,8 @@ async fn detect_sonarr_managed_import_events(
     Ok(events)
 }
 
+/// Legacy Sonarr/Radarr reads, converted to the general-purpose shapes.
+#[allow(clippy::too_many_arguments)]
 fn derive_arr_acquisition_state(
     implementation: &str,
     manager_item_id: &str,
@@ -7527,522 +7725,27 @@ fn derive_arr_acquisition_state(
     downloader_progress: &AcquisitionDownloaderProgressIndex,
     sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
 ) -> AcquisitionItemState {
-    let queue_entries: Vec<Value> = queue_value
-        .map(extract_arr_queue_records)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|entry| queue_entry_matches_manager_item(entry, implementation, manager_item_id))
-        .collect();
-    let queue_entry_count = queue_entries.len();
-
-    let has_file = match implementation {
-        "sonarr" => sonarr_item_has_files(item_value),
-        "radarr" => radarr_item_has_file(item_value),
-        _ => false,
-    };
-
-    if implementation == "sonarr" && !queue_entries.is_empty() {
-        return derive_sonarr_batch_acquisition_state(
-            item_value,
-            &queue_entries,
-            sonarr_episode_index,
-            downloader_progress,
-        );
-    }
-
-    if let Some(entry) = queue_entries.first() {
-        let mut state = derive_arr_queue_entry_state(entry, queue_entry_count, downloader_progress);
-        state.children = vec![build_download_attempt_child(
-            entry,
-            sonarr_episode_index,
-            downloader_progress,
-        )];
-        return state;
-    }
-
-    if acquisition_is_completed(implementation, item_value, library_matched) {
-        return completed_acquisition_state();
-    }
-
-    let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
-    let protocol = queue_entries.first().and_then(queue_entry_protocol);
-
-    if has_file && library_matched {
-        let mut evidence = base_acquisition_evidence(
-            true,
-            !queue_entries.is_empty(),
-            true,
-            queue_entry_count,
-            downloader_label.as_deref(),
-            protocol.as_deref(),
-        );
-        evidence.push(acquisition_evidence(
-            "Elixir linked",
-            "Yes",
-            Some("success"),
-        ));
-        return AcquisitionItemState {
-            phase: AcquisitionPhase::Importing,
-            headline: "Imported files linked in Elixir.".to_string(),
-            detail: Some(
-                "The manager has imported files and Elixir linked them to the managed request. Waiting for remaining monitored media."
-                    .to_string(),
-            ),
-            blocker: None,
-            evidence,
-            actions: Vec::new(),
-            progress_percent: Some(100.0),
-            eta_seconds: None,
-            downloader_label,
-            protocol,
-            children: Vec::new(),
-        };
-    }
-
-    if has_file {
-        let mut evidence = base_acquisition_evidence(
-            true,
-            !queue_entries.is_empty(),
-            true,
-            queue_entry_count,
-            downloader_label.as_deref(),
-            protocol.as_deref(),
-        );
-        evidence.push(acquisition_evidence("Elixir linked", "No", Some("warning")));
-        return AcquisitionItemState {
-            phase: AcquisitionPhase::Importing,
-            headline: "Imported in manager, not linked in Elixir.".to_string(),
-            detail: Some(
-                "The manager reports imported files, but Elixir has not linked the import to the managed request yet.".to_string(),
-            ),
-            blocker: None,
-            evidence,
-            actions: Vec::new(),
-            progress_percent: Some(100.0),
-            eta_seconds: None,
-            downloader_label,
-            protocol,
-            children: Vec::new(),
-        };
-    }
-
-    if acquisition_recovery_is_transitioning(recovery_view) {
-        return AcquisitionItemState {
-            phase: AcquisitionPhase::FindingAnotherRelease,
-            headline: "Finding another release.".to_string(),
-            detail: Some(
-                "Elixir cleared the dead release and is waiting for the manager to provide another one."
-                    .to_string(),
-            ),
-            blocker: None,
-            evidence: base_acquisition_evidence(true, false, false, 0, None, None),
-            actions: Vec::new(),
-            progress_percent: None,
-            eta_seconds: None,
-            downloader_label: None,
-            protocol: None,
-            children: Vec::new(),
-        };
-    }
-
-    AcquisitionItemState {
-        phase: AcquisitionPhase::AcceptedByManager,
-        headline: "Accepted by manager.".to_string(),
-        detail: Some(
-            "The manager accepted the item and is still looking for a valid release. No downloader has accepted it yet."
-                .to_string(),
-        ),
-        blocker: None,
-        evidence: base_acquisition_evidence(true, false, false, 0, None, None),
-        actions: Vec::new(),
-        progress_percent: None,
-        eta_seconds: None,
-        downloader_label: None,
-        protocol: None,
-        children: Vec::new(),
-    }
+    let item = manager::legacy::item_status(implementation, item_value);
+    let queue = manager::legacy::queue(implementation, queue_value);
+    let episodes = sonarr_episode_index.map(manager::legacy::episodes);
+    manager::derive_manager_acquisition_state(
+        manager::ManagerAcquisitionInput {
+            kind: manager::legacy::kind(implementation),
+            manager_label: manager::legacy::label(implementation),
+            item_id: manager_item_id,
+            item: &item,
+            queue: &queue,
+            episodes: episodes.as_ref(),
+        },
+        library_matched,
+        recovery_view,
+        downloader_progress,
+    )
 }
 
-fn derive_arr_queue_entry_state(
-    entry: &Value,
-    queue_entry_count: usize,
-    downloader_progress_index: &AcquisitionDownloaderProgressIndex,
-) -> AcquisitionItemState {
-    let downloader_progress = queue_entry_download_id(entry)
-        .and_then(|download_id| downloader_progress_index.get(&download_id));
-    let progress_percent = downloader_progress.and_then(|item| item.progress_percent);
-    let eta_seconds = downloader_progress.and_then(|item| item.eta_seconds);
-    let downloader_label = queue_entry_downloader_label(entry);
-    let protocol = queue_entry_protocol(entry);
-    let status_message = queue_entry_status_message(entry);
 
-    if let Some(message) = queue_entry_error_message(entry) {
-        return acquisition_attention(
-            "manager_queue_error",
-            "Manager reported a problem",
-            message,
-            base_acquisition_evidence(
-                true,
-                false,
-                false,
-                queue_entry_count,
-                downloader_label.as_deref(),
-                protocol.as_deref(),
-            ),
-        );
-    }
 
-    if let Some(issue) = downloader_progress.and_then(|item| item.issue.clone()) {
-        if issue.code.starts_with("nzbget_release_")
-            || issue.code.starts_with("qbittorrent_release_")
-        {
-            let protected_payload = issue.code == "qbittorrent_release_failed_with_payload";
-            let headline = if protected_payload {
-                "Torrent needs manual recovery."
-            } else {
-                "Dead release detected."
-            };
-            let title = if protected_payload {
-                issue.title.clone()
-            } else {
-                "Dead release detected".to_string()
-            };
-            return AcquisitionItemState {
-                phase: AcquisitionPhase::NeedsAttention,
-                headline: headline.to_string(),
-                detail: Some(issue.detail.clone()),
-                blocker: Some(FindMediaAcquisitionBlocker {
-                    code: issue.code,
-                    title,
-                    detail: issue.detail,
-                    severity: "warning".to_string(),
-                }),
-                evidence: base_acquisition_evidence(
-                    true,
-                    true,
-                    false,
-                    queue_entry_count,
-                    downloader_label.as_deref(),
-                    protocol.as_deref(),
-                ),
-                actions: Vec::new(),
-                progress_percent: None,
-                eta_seconds: None,
-                downloader_label,
-                protocol,
-                children: Vec::new(),
-            };
-        }
 
-        return AcquisitionItemState {
-            phase: AcquisitionPhase::NeedsAttention,
-            headline: issue.title.clone(),
-            detail: Some(issue.detail.clone()),
-            blocker: Some(FindMediaAcquisitionBlocker {
-                code: issue.code,
-                title: issue.title,
-                detail: issue.detail,
-                severity: "warning".to_string(),
-            }),
-            evidence: base_acquisition_evidence(
-                true,
-                true,
-                false,
-                queue_entry_count,
-                downloader_label.as_deref(),
-                protocol.as_deref(),
-            ),
-            actions: Vec::new(),
-            progress_percent,
-            eta_seconds,
-            downloader_label,
-            protocol,
-            children: Vec::new(),
-        };
-    }
-
-    let tracked_state = queue_entry_state(entry);
-    let phase = if tracked_state.contains("import") {
-        AcquisitionPhase::Importing
-    } else if tracked_state.contains("post")
-        || tracked_state.contains("extract")
-        || tracked_state.contains("verif")
-        || progress_percent.map(|value| value >= 99.5).unwrap_or(false)
-    {
-        AcquisitionPhase::PostProcessing
-    } else if tracked_state.contains("download")
-        || progress_percent.map(|value| value > 0.0).unwrap_or(false)
-    {
-        AcquisitionPhase::Downloading
-    } else {
-        AcquisitionPhase::QueuedInDownloader
-    };
-
-    let (headline, detail) =
-        match phase {
-            AcquisitionPhase::Downloading => {
-                if let Some(label) = downloader_label.as_deref() {
-                    (
-                        format!("Downloading via {label}."),
-                        Some(status_message.clone().unwrap_or_else(|| {
-                            "Transfer is active in the downloader.".to_string()
-                        })),
-                    )
-                } else {
-                    (
-                        "Download in progress.".to_string(),
-                        Some(status_message.clone().unwrap_or_else(|| {
-                            "Transfer is active in the downloader.".to_string()
-                        })),
-                    )
-                }
-            }
-            AcquisitionPhase::PostProcessing => (
-                "Download finished.".to_string(),
-                Some("Waiting for verification, extraction, or downloader cleanup.".to_string()),
-            ),
-            AcquisitionPhase::Importing => (
-                "Manager is importing the completed download.".to_string(),
-                Some(
-                    "The downloader finished and the manager is finishing the import.".to_string(),
-                ),
-            ),
-            _ => {
-                if let Some(label) = downloader_label.as_deref() {
-                    (
-                    format!("Queued with {label}."),
-                    Some(status_message.clone().unwrap_or_else(|| {
-                        "Manager handed the item to the downloader. Waiting for transfer to start."
-                            .to_string()
-                    })),
-                )
-                } else {
-                    (
-                    "Waiting in the download queue.".to_string(),
-                    Some(status_message.unwrap_or_else(|| {
-                        "Manager handed the item to the downloader. Waiting for transfer to start."
-                            .to_string()
-                    })),
-                )
-                }
-            }
-        };
-
-    AcquisitionItemState {
-        phase,
-        headline,
-        detail,
-        blocker: None,
-        evidence: base_acquisition_evidence(
-            true,
-            true,
-            false,
-            queue_entry_count,
-            downloader_label.as_deref(),
-            protocol.as_deref(),
-        ),
-        actions: Vec::new(),
-        progress_percent,
-        eta_seconds,
-        downloader_label,
-        protocol,
-        children: Vec::new(),
-    }
-}
-
-fn derive_sonarr_batch_acquisition_state(
-    item_value: &Value,
-    queue_entries: &[Value],
-    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
-    downloader_progress: &AcquisitionDownloaderProgressIndex,
-) -> AcquisitionItemState {
-    let mut children = queue_entries
-        .iter()
-        .map(|entry| build_download_attempt_child(entry, sonarr_episode_index, downloader_progress))
-        .collect::<Vec<_>>();
-    let counts = summarize_sonarr_batch_children(&children);
-    let stats = sonarr_series_stats(item_value);
-    let downloader_label = queue_entries.first().and_then(queue_entry_downloader_label);
-    let protocol = queue_entries.first().and_then(queue_entry_protocol);
-    let phase = summarize_sonarr_batch_phase(counts);
-
-    let mut evidence = base_acquisition_evidence(
-        true,
-        true,
-        false,
-        queue_entries.len(),
-        downloader_label.as_deref(),
-        protocol.as_deref(),
-    );
-    evidence.push(acquisition_evidence(
-        "Transfers queued",
-        counts.queued.to_string(),
-        Some("neutral"),
-    ));
-    if counts.downloading > 0 {
-        evidence.push(acquisition_evidence(
-            "Transfers downloading",
-            counts.downloading.to_string(),
-            Some("success"),
-        ));
-    }
-    if counts.post_processing > 0 {
-        evidence.push(acquisition_evidence(
-            "Transfers post-processing",
-            counts.post_processing.to_string(),
-            Some("neutral"),
-        ));
-    }
-    if counts.importing > 0 {
-        evidence.push(acquisition_evidence(
-            "Transfers importing",
-            counts.importing.to_string(),
-            Some("neutral"),
-        ));
-    }
-    if counts.needs_attention + counts.failed > 0 {
-        evidence.push(acquisition_evidence(
-            "Transfers needing attention",
-            (counts.needs_attention + counts.failed).to_string(),
-            Some("warning"),
-        ));
-    }
-    if stats.episode_count > 0 {
-        evidence.push(acquisition_evidence(
-            "Files imported",
-            format!("{} / {}", stats.episode_file_count, stats.episode_count),
-            Some(if stats.episode_file_count > 0 {
-                "success"
-            } else {
-                "neutral"
-            }),
-        ));
-    } else if stats.episode_file_count > 0 {
-        evidence.push(acquisition_evidence(
-            "Files imported",
-            stats.episode_file_count.to_string(),
-            Some("success"),
-        ));
-    }
-
-    children.sort_by(|left, right| {
-        let left_phase = acquisition_phase_from_str(&left.phase);
-        let right_phase = acquisition_phase_from_str(&right.phase);
-        left_phase
-            .sort_priority()
-            .cmp(&right_phase.sort_priority())
-            .then_with(|| {
-                left.title
-                    .to_ascii_lowercase()
-                    .cmp(&right.title.to_ascii_lowercase())
-            })
-    });
-
-    AcquisitionItemState {
-        phase,
-        headline: format_sonarr_batch_headline(counts),
-        detail: Some(format_sonarr_batch_detail(stats)),
-        blocker: build_sonarr_batch_blocker(counts),
-        evidence,
-        actions: Vec::new(),
-        progress_percent: None,
-        eta_seconds: None,
-        downloader_label,
-        protocol,
-        children,
-    }
-}
-
-fn build_download_attempt_child(
-    entry: &Value,
-    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
-    downloader_progress: &AcquisitionDownloaderProgressIndex,
-) -> FindMediaAcquisitionChildItem {
-    let state = derive_arr_queue_entry_state(entry, 1, downloader_progress);
-    let download_id = queue_entry_download_id(entry);
-    let progress = download_id
-        .as_deref()
-        .and_then(|download_id| downloader_progress.get(download_id));
-    let (title, subtitle) = download_attempt_title(entry, progress, sonarr_episode_index);
-    let id = download_id
-        .clone()
-        .or_else(|| as_id_string(entry.get("episodeId").unwrap_or(&Value::Null)))
-        .or_else(|| as_id_string(entry.get("id").unwrap_or(&Value::Null)))
-        .unwrap_or_else(|| title.clone());
-
-    FindMediaAcquisitionChildItem {
-        id,
-        title,
-        release_id: None,
-        source_provider_id: None,
-        source_provider_label: None,
-        source_suite: None,
-        route_provider_id: None,
-        route_provider_label: None,
-        route_logical_id: None,
-        subtitle,
-        download_id,
-        status: progress
-            .and_then(|item| item.status.clone())
-            .or_else(|| Some(queue_entry_state(entry)).filter(|value| !value.trim().is_empty())),
-        category: progress.and_then(|item| item.category.clone()),
-        phase: state.phase.as_str().to_string(),
-        phase_label: state.phase.label().to_string(),
-        headline: state.headline,
-        detail: state.detail,
-        blocker: state.blocker,
-        progress_percent: state.progress_percent,
-        eta_seconds: state.eta_seconds,
-        downloader_label: state.downloader_label,
-        protocol: state.protocol,
-        size_bytes: progress.and_then(|item| item.size_bytes),
-        downloaded_bytes: progress.and_then(|item| item.downloaded_bytes),
-        remaining_bytes: progress.and_then(|item| item.remaining_bytes),
-        download_rate_bps: progress.and_then(|item| item.download_rate_bps),
-        upload_rate_bps: progress.and_then(|item| item.upload_rate_bps),
-        connected_seeds: progress.and_then(|item| item.connected_seeds),
-        connected_peers: progress.and_then(|item| item.connected_peers),
-        known_seeds: progress.and_then(|item| item.known_seeds),
-        known_peers: progress.and_then(|item| item.known_peers),
-        availability: progress.and_then(|item| item.availability),
-        seen_complete_at: progress.and_then(|item| item.seen_complete_at),
-    }
-}
-
-fn download_attempt_title(
-    entry: &Value,
-    downloader_progress: Option<&AcquisitionDownloaderProgress>,
-    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
-) -> (String, Option<String>) {
-    let release_title = entry
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let title = downloader_progress
-        .and_then(|item| item.release_title.clone())
-        .or(release_title.clone())
-        .unwrap_or_else(|| "Download".to_string());
-
-    let Some(episode_id) = entry.get("episodeId").and_then(Value::as_i64) else {
-        return (title, None);
-    };
-    let Some(episode) = sonarr_episode_index.and_then(|index| index.get(&episode_id)) else {
-        return (title, None);
-    };
-
-    let code = format!(
-        "S{:02}E{:02}",
-        episode.season_number, episode.episode_number
-    );
-    let destination = if episode.title.trim().is_empty() {
-        code
-    } else {
-        format!("{code} • {}", episode.title.trim())
-    };
-    (title, Some(destination))
-}
 
 fn summarize_sonarr_batch_children(
     children: &[FindMediaAcquisitionChildItem],
@@ -8113,21 +7816,6 @@ fn format_sonarr_batch_headline(counts: SonarrBatchCounts) -> String {
     }
 }
 
-fn format_sonarr_batch_detail(stats: SonarrSeriesStats) -> String {
-    if stats.episode_count > 0 {
-        format!(
-            "Sonarr is handling this series as release downloads. {} of {} episode files are imported so far.",
-            stats.episode_file_count, stats.episode_count
-        )
-    } else if stats.episode_file_count > 0 {
-        format!(
-            "Sonarr is handling this series as release downloads. {} episode files are already imported.",
-            stats.episode_file_count
-        )
-    } else {
-        "Sonarr is handling this series as one or more release downloads.".to_string()
-    }
-}
 
 fn build_sonarr_batch_blocker(counts: SonarrBatchCounts) -> Option<FindMediaAcquisitionBlocker> {
     let attention = counts.needs_attention + counts.failed;
@@ -8158,25 +7846,7 @@ fn sonarr_series_stats(value: &Value) -> SonarrSeriesStats {
     }
 }
 
-fn sonarr_series_is_complete(value: &Value) -> bool {
-    let stats = sonarr_series_stats(value);
-    stats.episode_count > 0 && stats.episode_file_count >= stats.episode_count
-}
 
-fn acquisition_is_completed(
-    implementation: &str,
-    item_value: &Value,
-    library_matched: bool,
-) -> bool {
-    if !library_matched {
-        return false;
-    }
-    match implementation {
-        "sonarr" => sonarr_series_is_complete(item_value),
-        "radarr" => true,
-        _ => true,
-    }
-}
 
 fn format_transfer_count(count: usize) -> String {
     if count == 1 {
@@ -10908,6 +10578,31 @@ async fn add_with_manager_provider(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("item.title is required"))?
         .to_string();
+
+    #[cfg(unix)]
+    if let Some(manager) = manager::ExtensionManager::for_provider(state, provider).await? {
+        let effective_options = resolve_find_media_add_options(store, provider, options).await?;
+        let request = AddMediaRequest {
+            media_type,
+            title,
+            year: item.year,
+            external_ids: item.external_ids.clone(),
+            options: DriverAddMediaOptions {
+                monitor: effective_options.monitor.unwrap_or(true),
+                search: effective_options.search.unwrap_or(false),
+                root_folder_path: effective_options.root_folder_path.clone(),
+                quality_profile_id: effective_options.quality_profile_id,
+            },
+        };
+        #[derive(Deserialize)]
+        struct Added {
+            #[serde(rename = "itemId", default)]
+            item_id: Option<String>,
+        }
+        let added: Added = manager.call("add", manager::add_request(&request)).await?;
+        return Ok(added.item_id);
+    }
+
     let ctx = build_manager_driver_ctx(state, store, provider).await?;
 
     debug!(
@@ -11108,6 +10803,30 @@ async fn search_with_provider(
         .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
     let endpoint: ProviderEndpoint =
         serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+
+    #[cfg(unix)]
+    if let Some(manager) = manager::ExtensionManager::for_provider(state, provider).await? {
+        let reply: manager::ManagerLookupReply =
+            manager.call("lookup", json!({ "query": query })).await?;
+        let base_url = if reply
+            .items
+            .iter()
+            .any(|item| item.poster_url.is_none() && item.poster_path.is_some())
+        {
+            resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        return Ok(manager::lookup_results(
+            manager.kind,
+            media_type,
+            base_url.as_deref(),
+            reply,
+        ));
+    }
+
     let base_url =
         resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
             .await?;

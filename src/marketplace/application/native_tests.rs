@@ -29,6 +29,7 @@ use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use tokio::time::{sleep, timeout};
 mod automatic;
 pub(super) mod http;
+mod serve_stack;
 
 const MIB: u64 = 1024 * 1024;
 const SOURCE: &str = "import{state,getSecret}from'@elixir/sdk/v1';export async function invoke(){return{cursor:await state.get('cursor'),key:await getSecret('source_api')}}export async function migrate(){await state.set('cursor',(await state.get('cursor')??0)+1)}export async function checkReady(){return(await state.get('cursor'))===1&&(await getSecret('source_api'))==='credential-private'}";
@@ -133,16 +134,25 @@ async fn sdk_stack_fixture() -> Result<serde_json::Value> {
     let arr: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(
         root.join("../extensions/marketplace-sources/arr-stack/manifest.yaml"),
     )?)?;
-    let stack =
-        serde_json::json!({"stack": arr["stack"], "permissions": arr["permissions"]}).to_string();
-    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const arr=JSON.parse(process.argv[3]);const f=createFixture({operational:true,mediaTags:['movies'],sourceBytes:Buffer.from(process.argv[2]),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576};m.permissions=arr.permissions;m.provides=[];m.stack=arr.stack;}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
+    let stack = serde_json::json!({"stack": arr["stack"], "permissions": arr["permissions"],
+        "memory_limit_mb": arr["runtime"]["security"]["memory_limit_mb"]})
+    .to_string();
+    // The Arr Stack's real module code: its entry as src/provider.mjs, beside
+    // the modules it imports.
+    let source = root.join("../extensions/marketplace-sources/arr-stack/src");
+    let main = std::fs::read_to_string(source.join("main.mjs"))?;
+    let modules = serde_json::to_string(&["arr.mjs", "manager.mjs"].iter().map(|name| {
+        Ok(serde_json::json!({"name": name, "text": std::fs::read_to_string(source.join(name))?}))
+    }).collect::<Result<Vec<_>>>()?)?;
+    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const arr=JSON.parse(process.argv[3]);const modules=JSON.parse(process.argv[4]);const f=createFixture({operational:true,mediaTags:['movies'],sourceBytes:Buffer.from(process.argv[2]),sourceFiles:modules.map(m=>({name:m.name,bytes:Buffer.from(m.text)})),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576,memory_limit_mb:arr.memory_limit_mb};m.permissions=arr.permissions;m.provides=[];m.stack=arr.stack;}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
     let output = timeout(
         Duration::from_secs(15),
         tokio::process::Command::new("node")
             .args(["--input-type=module", "-e", script])
             .arg(sdk)
-            .arg(SOURCE)
+            .arg(main)
             .arg(stack)
+            .arg(modules)
             .kill_on_drop(true)
             .output(),
     )
@@ -774,6 +784,7 @@ async fn run_with_withdrawal(
                     let stack_section=manifest.stack.as_ref().context("activated stack")?;
                     let members=crate::marketplace::stack::materialize(release.payload().extension_id.as_str(),&manifest.version,stack_section)?;
                     assert_eq!(members.len(),18);
+                    serve_stack::qualify(&client,&db,&secrets,principal.home_id,&release.payload().extension_id,owner).await?;
                     eprintln!("container stack passed actual preparation/archive/grant review (3 containers)/staging/setup/readiness/commit; 18 members materialize");
                     return Ok(());
                 }

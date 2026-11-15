@@ -19919,6 +19919,38 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             "{member}"
         );
     }
+
+    // Stage 2: the Arr Stack module's own media-manager code against the real
+    // apps, reaching them through the member directory that Elixir's
+    // long-lived executor uses (address on this computer plus API key).
+    use crate::marketplace::stack::StackMembers;
+    let directory =
+        stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone());
+    let mut members = serde_json::Map::new();
+    for member in ["sonarr", "radarr"] {
+        let endpoint = directory
+            .member("elx:test/arr-stack", member)
+            .await?
+            .with_context(|| format!("{member} resolves through the member directory"))?;
+        assert!(endpoint.api_key.is_some(), "{member} API key is available");
+        members.insert(
+            member.to_owned(),
+            json!({"base_url": endpoint.base_url, "api_key": endpoint.api_key}),
+        );
+    }
+    let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../extensions/marketplace-sources/arr-stack");
+    let out = std::process::Command::new("node")
+        .current_dir(&tree)
+        .args(["--import", "./test/live/register.mjs", "test/live/check.mjs"])
+        .env("ARR_STACK_LIVE_MEMBERS", serde_json::to_string(&members)?)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    eprintln!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success() && stdout.contains("LIVE_CHECK_OK"),
+        "the Arr Stack module works against the real apps"
+    );
     Ok(())
 }
 
