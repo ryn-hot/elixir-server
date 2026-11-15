@@ -108,7 +108,7 @@ async fn sdk_fixture_profile_with_cpu(
     };
     let sdk = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../extensions/sdk/marketplace/test/fixture.mjs");
-    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const live=process.argv[3]==='true';const cpu=process.argv[4];const f=createFixture({operational:true,mediaTags:live?['live']:['movies'],sourceBytes:Buffer.from(process.argv[2]),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576};if(cpu!=='0.1')m.runtime.security.cpu_quota=cpu;if(live){m.permissions=['live.catalog.read','live.stream.resolve','live.artwork.fetch'];m.runtime.security={...m.runtime.security,run_as_non_root:true,read_only_rootfs:true,no_new_privileges:true,drop_capabilities:['ALL'],prohibit_docker_socket:true,prohibit_host_media_mounts:true};m.provides=[{capability:'live.catalog_provider',slot:'default',cardinality:'many',implementation:'source_fixture',contract_version:1,scope:{actions:['catalog','meta','resolve'],live_item_types:['event'],stream_protocols:['hls']},endpoint:{type:'source-js-v1'}},{capability:'acquisition.candidate_provider',slot:'candidates',cardinality:'many',implementation:'source_fixture',scope:{media_types:['movie'],actions:['search']},endpoint:{type:'source-js-v1'}}]}}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
+    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const live=process.argv[3]==='true';const cpu=process.argv[4];const f=createFixture({operational:true,mediaTags:live?['live']:['movies'],sourceBytes:Buffer.from(process.argv[2]),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576};if(cpu!=='0.1')m.runtime.security.cpu_quota=cpu;if(live){m.permissions=['live.catalog.read','live.stream.resolve','live.artwork.fetch'];m.runtime.security={...m.runtime.security,memory_limit_mb:192,run_as_non_root:true,read_only_rootfs:true,no_new_privileges:true,drop_capabilities:['ALL'],prohibit_docker_socket:true,prohibit_host_media_mounts:true};m.provides=[{capability:'live.catalog_provider',slot:'default',cardinality:'many',implementation:'source_fixture',contract_version:1,scope:{actions:['catalog','meta','resolve'],live_item_types:['event'],stream_protocols:['hls']},endpoint:{type:'source-js-v1'}},{capability:'acquisition.candidate_provider',slot:'candidates',cardinality:'many',implementation:'source_fixture',scope:{media_types:['movie'],actions:['search']},endpoint:{type:'source-js-v1'}}]}}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
     let output = timeout(
         Duration::from_secs(15),
         tokio::process::Command::new("node")
@@ -138,21 +138,16 @@ async fn sdk_stack_fixture() -> Result<serde_json::Value> {
         "memory_limit_mb": arr["runtime"]["security"]["memory_limit_mb"]})
     .to_string();
     // The Arr Stack's real module code: its entry as src/provider.mjs, beside
-    // the modules it imports.
+    // the modules it imports (read by Node from the tree: too large for argv).
     let source = root.join("../extensions/marketplace-sources/arr-stack/src");
-    let main = std::fs::read_to_string(source.join("main.mjs"))?;
-    let modules = serde_json::to_string(&["arr.mjs", "manager.mjs"].iter().map(|name| {
-        Ok(serde_json::json!({"name": name, "text": std::fs::read_to_string(source.join(name))?}))
-    }).collect::<Result<Vec<_>>>()?)?;
-    let script = "import{pathToFileURL}from'node:url';const{createFixture}=await import(pathToFileURL(process.argv[1]));const arr=JSON.parse(process.argv[3]);const modules=JSON.parse(process.argv[4]);const f=createFixture({operational:true,mediaTags:['movies'],sourceBytes:Buffer.from(process.argv[2]),sourceFiles:modules.map(m=>({name:m.name,bytes:Buffer.from(m.text)})),transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576,memory_limit_mb:arr.memory_limit_mb};m.permissions=arr.permissions;m.provides=[];m.stack=arr.stack;}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
+    let script = "import{pathToFileURL}from'node:url';import{readFileSync,readdirSync}from'node:fs';import{join}from'node:path';const{createFixture}=await import(pathToFileURL(process.argv[1]));const dir=process.argv[2];const arr=JSON.parse(process.argv[3]);const modules=readdirSync(dir).filter(n=>n.endsWith('.mjs')&&n!=='main.mjs'&&!n.startsWith('.')).sort().map(n=>({name:n,bytes:readFileSync(join(dir,n))}));const f=createFixture({operational:true,mediaTags:['movies'],sourceBytes:readFileSync(join(dir,'main.mjs')),sourceFiles:modules,transformManifest(m){m.runtime.security={sdk_state_limit_bytes:1048576,memory_limit_mb:arr.memory_limit_mb};m.permissions=arr.permissions;m.provides=[];m.stack=arr.stack;}});const{publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}=f;process.stdout.write(JSON.stringify({publisher,release,head,evidence,issuer_key,package_base64,source_proof_base64}));";
     let output = timeout(
         Duration::from_secs(15),
         tokio::process::Command::new("node")
             .args(["--input-type=module", "-e", script])
             .arg(sdk)
-            .arg(main)
+            .arg(&source)
             .arg(stack)
-            .arg(modules)
             .kill_on_drop(true)
             .output(),
     )

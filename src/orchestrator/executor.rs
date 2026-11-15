@@ -2323,6 +2323,67 @@ impl<'a> Executor<'a> {
         .await?;
         resolve_downloader_credentials(&self.store, self.secrets, self.probe, &mut patch).await?;
 
+        // A marketplace stack's own member: its code checks and applies the
+        // resolved patch under the same drift policy.
+        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
+            let implementation = provider.implementation.clone().unwrap_or_default();
+            let semantics = driver.patch_semantics(&patch);
+            let patch = patch.to_json()?;
+            // Its network identity as its peers reach it (a host-published
+            // endpoint is only the server's loopback view), as drivers get it.
+            let provider_url = peer_facing_endpoint(&self.store, &provider, &instance, &endpoint)
+                .await?
+                .canonical_url()?;
+            let evaluation = setup
+                .evaluate_patch(
+                    &instance.extension_id,
+                    &implementation,
+                    patch.clone(),
+                    &provider_url,
+                )
+                .await
+                .context("evaluating driver patch drift")?;
+            match evaluation.status {
+                DriftStatus::InSync => return Ok(None),
+                DriftStatus::Unknown
+                    if semantics.side_effect.is_service_disruptive()
+                        || semantics.apply_policy != PatchApplyPolicy::PeriodicSafe =>
+                {
+                    let detail = evaluation.message.unwrap_or_else(|| {
+                        "driver patch drift could not be safely evaluated".to_string()
+                    });
+                    bail!(
+                        "driver patch requires explicit repair for connector {}: {}",
+                        connector_extension_id,
+                        detail
+                    );
+                }
+                DriftStatus::Drifted | DriftStatus::Unknown => {}
+            }
+            let result = setup
+                .apply_patch(&instance.extension_id, &implementation, patch, &provider_url)
+                .await?;
+            if result.status == ApplyStatus::Deferred {
+                let detail = result
+                    .message
+                    .unwrap_or_else(|| "driver patch deferred".to_string());
+                bail!(
+                    "driver patch deferred for connector {}: {}",
+                    connector_extension_id,
+                    detail
+                );
+            }
+            if let Some(detail) = result.message.as_ref() {
+                tracing::warn!(
+                    connector_extension_id = %connector_extension_id,
+                    provider_id = %provider.provider_id,
+                    detail = %detail,
+                    "driver patch completed with warnings"
+                );
+            }
+            return Ok(result.message);
+        }
+
         let ctx = build_driver_ctx_for_provider(
             &self.store,
             self.secrets,
@@ -2654,6 +2715,49 @@ impl<'a> Executor<'a> {
         instance: &crate::db::models::ExtensionInstance,
         endpoint: &ProviderEndpoint,
     ) -> Result<Option<ProviderReadinessPhase>> {
+        // A marketplace stack's own member: its code names the files it needs
+        // from its /config, reads its API key from them and finishes its
+        // first-start setup (web login from Elixir); Elixir stores the key.
+        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
+            let implementation = provider.implementation.clone().unwrap_or_default();
+            let names = setup
+                .bootstrap_files(&instance.extension_id, &implementation)
+                .await?;
+            let mut files = std::collections::BTreeMap::new();
+            for name in names {
+                if !super::stack_setup::valid_bootstrap_file(&name) {
+                    bail!("stack member asked for an invalid configuration file name");
+                }
+                let content = read_config_text(
+                    self.runtime,
+                    provider.instance_id,
+                    None,
+                    &name,
+                    &format!("/config/{name}"),
+                )
+                .await?
+                .ok_or_else(|| anyhow!("{implementation} {name} not ready"))?;
+                if content.len() > 256 * 1024 {
+                    bail!("{implementation} {name} is too large to read");
+                }
+                files.insert(name, content);
+            }
+            let login =
+                ensure_arr_ui_credentials(&self.store, self.secrets, provider.instance_id).await?;
+            let key = setup
+                .bootstrap(&instance.extension_id, &implementation, files, login)
+                .await?
+                .ok_or_else(|| anyhow!("{implementation} configuration not ready"))?;
+            upsert_instance_api_key(&self.store, self.secrets, provider.instance_id, &key)
+                .await?;
+            self.record_provider_readiness(
+                provider.provider_id,
+                ProviderReadinessPhase::BootstrapReady,
+                None,
+            )
+            .await?;
+            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
+        }
         if provider.capability == "media.manager.tv"
             && provider.implementation.as_deref() == Some("sonarr")
         {
@@ -2779,6 +2883,13 @@ impl<'a> Executor<'a> {
     ) -> Result<()> {
         if provider.capability == ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY {
             ensure_candidate_provider_runtime_ready(provider).await?;
+            return Ok(());
+        }
+        if let Some(setup) = super::stack_setup::for_member(&instance.extension_id) {
+            let implementation = provider.implementation.clone().unwrap_or_default();
+            setup
+                .read_state(&instance.extension_id, &implementation)
+                .await?;
             return Ok(());
         }
         let Some(driver) = self.drivers.get(&provider.capability) else {
@@ -3227,6 +3338,27 @@ async fn resolve_radarr_api_key(
     }
 
     bail!("radarr api key is not available yet");
+}
+
+/// A member's API key under the general `api_key` instance secret.
+async fn upsert_instance_api_key(
+    store: &ExtensionStore<'_>,
+    secrets: &SecretsManager,
+    instance_id: Uuid,
+    api_key: &str,
+) -> Result<()> {
+    let encrypted = secrets.encrypt(api_key)?;
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(instance_id),
+            key: "api_key".to_string(),
+            value_encrypted: encrypted,
+            rotatable: false,
+        })
+        .await?;
+    Ok(())
 }
 
 async fn upsert_sonarr_secret(

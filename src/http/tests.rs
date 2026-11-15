@@ -19494,6 +19494,100 @@ runtime:
 // marketplace stack row, on real Docker. Run with
 // ELIXIR_LIVE_STACK_ROOT=<folder Docker can mount> cargo test --lib
 // live_arr_stack_one_click -- --ignored --nocapture
+/// The live test's stand-in for the long-lived executor: the Arr Stack
+/// module's real code in Node, reaching each member through the member
+/// directory (its address on this computer and stored API key).
+struct NodeStackSetup {
+    pool: sqlx::AnyPool,
+    secrets: SecretsManager,
+    stack: String,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl NodeStackSetup {
+    async fn run(
+        &self,
+        member_id: &str,
+        implementation: &str,
+        operation: &str,
+        request: Value,
+    ) -> Result<Value> {
+        use crate::marketplace::stack::StackMembers;
+        let member = member_id.rsplit('.').next().unwrap_or_default().to_owned();
+        let capability = if implementation == "prowlarr" {
+            "indexer.list"
+        } else {
+            "media.manager"
+        };
+        let directory = crate::marketplace::stack::MemberDirectory::new(
+            self.pool.clone(),
+            self.secrets.clone(),
+        );
+        let mut members = serde_json::Map::new();
+        for name in ["sonarr", "radarr", "prowlarr"] {
+            if let Ok(Some(endpoint)) = directory.member(&self.stack, name).await {
+                members.insert(
+                    name.to_owned(),
+                    json!({"base_url": endpoint.base_url, "api_key": endpoint.api_key}),
+                );
+            }
+        }
+        let op = request.get("patch").and_then(|p| p.get("op")).and_then(Value::as_str);
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{member}:{operation}{}", op.map(|op| format!(":{op}")).unwrap_or_default()));
+        let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extensions/marketplace-sources/arr-stack");
+        let out = tokio::process::Command::new("node")
+            .current_dir(&tree)
+            .args(["--import", "./test/live/register.mjs", "test/live/invoke.mjs"])
+            .env("ARR_STACK_LIVE_MEMBERS", serde_json::to_string(&members)?)
+            .env(
+                "ARR_STACK_INVOKE",
+                serde_json::to_string(&json!({"schema_version": 1, "capability": capability,
+                    "member": member, "operation": operation, "request": request}))?,
+            )
+            .output()
+            .await?;
+        let reply: Value = serde_json::from_slice(&out.stdout).with_context(|| {
+            format!("{member} {operation}: {}", String::from_utf8_lossy(&out.stderr))
+        })?;
+        if reply["status"] != 200 {
+            anyhow::bail!("{member} {operation} returned {reply}");
+        }
+        Ok(reply["body"].clone())
+    }
+}
+#[async_trait::async_trait]
+impl crate::orchestrator::stack_setup::StackMemberSetup for NodeStackSetup {
+    async fn evaluate_patch(&self, member: &str, implementation: &str, patch: Value, provider_url: &str)
+        -> Result<crate::drivers::DriftEvaluation> {
+        let body = self.run(member, implementation, "evaluate_patch",
+            json!({"patch": patch, "providerUrl": provider_url})).await?;
+        crate::orchestrator::stack_setup::drift_from_json(body)
+    }
+    async fn apply_patch(&self, member: &str, implementation: &str, patch: Value, provider_url: &str)
+        -> Result<crate::drivers::ApplyResult> {
+        let body = self.run(member, implementation, "apply_patch",
+            json!({"patch": patch, "providerUrl": provider_url})).await?;
+        crate::orchestrator::stack_setup::apply_from_json(body)
+    }
+    async fn bootstrap_files(&self, member: &str, implementation: &str) -> Result<Vec<String>> {
+        let body = self.run(member, implementation, "bootstrap_files", json!({})).await?;
+        Ok(serde_json::from_value(body["files"].clone())?)
+    }
+    async fn bootstrap(&self, member: &str, implementation: &str,
+        files: std::collections::BTreeMap<String, String>, login: (String, String)) -> Result<Option<String>> {
+        let body = self.run(member, implementation, "bootstrap",
+            json!({"files": files, "login": {"username": login.0, "password": login.1}})).await?;
+        Ok(body["apiKey"].as_str().map(str::to_owned))
+    }
+    async fn read_state(&self, member: &str, implementation: &str) -> Result<crate::drivers::StateSnapshot> {
+        let body = self.run(member, implementation, "read_state", json!({})).await?;
+        Ok(crate::drivers::StateSnapshot { summary: body["summary"].as_str().map(str::to_owned), activity: None })
+    }
+}
+
 #[tokio::test]
 #[ignore = "live Docker Arr Stack test; set ELIXIR_LIVE_STACK_ROOT to run"]
 async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Result<()> {
@@ -19570,6 +19664,22 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         artwork,
         secrets,
     );
+    // Stage 2, slice 3: the stack's members are set up by the Arr Stack
+    // module's own code (first start, every setup patch, readiness).
+    let stack_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    crate::orchestrator::stack_setup::install(Some(std::sync::Arc::new(NodeStackSetup {
+        pool: db_pool.clone(),
+        secrets: state.secrets.as_ref().clone(),
+        stack: "elx:test/arr-stack".to_owned(),
+        calls: stack_calls.clone(),
+    })));
+    struct Uninstall;
+    impl Drop for Uninstall {
+        fn drop(&mut self) {
+            crate::orchestrator::stack_setup::install(None);
+        }
+    }
+    let _uninstall = Uninstall;
     let app = router(state.clone());
     let send = |request: Request<Body>| {
         let app = app.clone();
@@ -19854,6 +19964,35 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     }
     assert_eq!(status, StatusCode::OK, "confirm: {run}");
     assert_eq!(run["status"], "completed", "run: {run}");
+    let calls = stack_calls.lock().unwrap().clone();
+    eprintln!("stack setup through the module: {calls:?}");
+    // The largest reply the module reads during setup: Prowlarr's indexer
+    // catalog. A long-lived call accepts 16 MiB per reply.
+    {
+        use crate::marketplace::stack::StackMembers;
+        let prowlarr = stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone())
+            .member("elx:test/arr-stack", "prowlarr")
+            .await?
+            .context("prowlarr resolves")?;
+        let schema = reqwest::Client::new()
+            .get(format!("{}/api/v1/indexer/schema", prowlarr.base_url.trim_end_matches('/')))
+            .header("x-api-key", prowlarr.api_key.clone().unwrap_or_default())
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        eprintln!("prowlarr indexer/schema reply: {} bytes", schema.len());
+        assert!(schema.len() < 16 * 1024 * 1024 - 4096, "indexer catalog fits one reply");
+    }
+    for expected in [
+        "sonarr:bootstrap", "radarr:bootstrap", "prowlarr:bootstrap",
+        "sonarr:apply_patch:set_root_folders", "radarr:apply_patch:set_root_folders",
+        "sonarr:apply_patch:set_downloaders", "radarr:apply_patch:set_downloaders",
+        "sonarr:apply_patch:apply_quality_policy_preset", "radarr:apply_patch:apply_quality_policy_preset",
+        "prowlarr:apply_patch:register_indexers", "prowlarr:apply_patch:register_apps",
+    ] {
+        assert!(calls.iter().any(|call| call == expected), "{expected} went through the module: {calls:?}");
+    }
 
     // Every stack container runs under the stack sandbox.
     for member in ["sonarr", "radarr", "prowlarr"] {

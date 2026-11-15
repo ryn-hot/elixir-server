@@ -38,10 +38,11 @@ const MEMBER_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(in crate::marketplace) fn serve_limits() -> SourceExecutionLimits {
     SourceExecutionLimits {
         profile: Default::default(),
-        heap_bytes: 48 * MIB,
+        // Prowlarr's indexer catalog alone is about 6 MB and growing.
+        heap_bytes: 64 * MIB,
         timeout_millis: 30_000,
         max_file_bytes: 4 * MIB,
-        json_bytes: 8 * MIB,
+        json_bytes: 16 * MIB,
         pending_jobs: 4096,
         sdk: Some(SourceSdkLimits {
             calls: 256,

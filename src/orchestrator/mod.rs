@@ -8,5 +8,6 @@ pub mod plan_validation;
 pub mod planner;
 pub mod reconcile;
 pub mod service;
+pub mod stack_setup;
 
 pub use service::OrchestratorService;

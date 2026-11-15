@@ -933,17 +933,25 @@ struct ExtensionReply {
 impl StackMemberCall {
     /// `None` for any extension that is not a marketplace stack member.
     async fn resolve(state: &AppState, member_id: &str) -> AnyResult<Option<Self>> {
+        Self::resolve_with(&state.db_pool, &state.marketplace, member_id).await
+    }
+
+    async fn resolve_with(
+        pool: &sqlx::AnyPool,
+        marketplace: &crate::marketplace::service::MarketplaceService,
+        member_id: &str,
+    ) -> AnyResult<Option<Self>> {
         if !crate::marketplace::stack::is_stack_member_id(member_id) {
             return Ok(None);
         }
-        let (stack, member) = crate::marketplace::stack::owner_of(&state.db_pool, member_id)
+        let (stack, member) = crate::marketplace::stack::owner_of(pool, member_id)
             .await?
             .context("this member's stack extension is not installed or enabled")?;
-        let (home, instance) = crate::marketplace::stack::installed_instance(&state.db_pool, &stack)
+        let (home, instance) = crate::marketplace::stack::installed_instance(pool, &stack)
             .await?
             .context("this member's stack extension has no enabled installation")?;
         Ok(Some(Self {
-            marketplace: state.marketplace.clone(),
+            marketplace: marketplace.clone(),
             home,
             extension: stack.parse().context("stack extension id")?,
             instance,
@@ -1089,6 +1097,129 @@ impl ExtensionIndexerList {
             names: Vec<String>,
         }
         Ok(self.call::<Names>(operation, json!({})).await?.names)
+    }
+}
+
+/// The orchestrator's setup of a marketplace stack's members, answered by the
+/// stack's own code in its long-lived executor.
+#[cfg(unix)]
+pub(crate) struct ServeStackSetup {
+    pool: sqlx::AnyPool,
+    marketplace: crate::marketplace::service::MarketplaceService,
+}
+
+#[cfg(unix)]
+impl ServeStackSetup {
+    pub(crate) fn new(
+        pool: sqlx::AnyPool,
+        marketplace: crate::marketplace::service::MarketplaceService,
+    ) -> Self {
+        Self { pool, marketplace }
+    }
+
+    async fn target(
+        &self,
+        member_id: &str,
+        implementation: &str,
+    ) -> AnyResult<(StackMemberCall, &'static str)> {
+        let capability = match implementation.trim().to_ascii_lowercase().as_str() {
+            "sonarr" | "radarr" => "media.manager",
+            "prowlarr" => "indexer.list",
+            other => bail!("no stack setup interface for {other:?}"),
+        };
+        let target = StackMemberCall::resolve_with(&self.pool, &self.marketplace, member_id)
+            .await?
+            .context("stack member is not served")?;
+        Ok((target, capability))
+    }
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl crate::orchestrator::stack_setup::StackMemberSetup for ServeStackSetup {
+    async fn evaluate_patch(
+        &self,
+        member_id: &str,
+        implementation: &str,
+        patch: Value,
+        provider_url: &str,
+    ) -> AnyResult<crate::drivers::DriftEvaluation> {
+        let (target, capability) = self.target(member_id, implementation).await?;
+        let value: Value = target
+            .call(
+                capability,
+                "evaluate_patch",
+                json!({ "patch": patch, "providerUrl": provider_url }),
+            )
+            .await?;
+        crate::orchestrator::stack_setup::drift_from_json(value)
+    }
+    async fn apply_patch(
+        &self,
+        member_id: &str,
+        implementation: &str,
+        patch: Value,
+        provider_url: &str,
+    ) -> AnyResult<crate::drivers::ApplyResult> {
+        let (target, capability) = self.target(member_id, implementation).await?;
+        let value: Value = target
+            .call(
+                capability,
+                "apply_patch",
+                json!({ "patch": patch, "providerUrl": provider_url }),
+            )
+            .await?;
+        crate::orchestrator::stack_setup::apply_from_json(value)
+    }
+    async fn bootstrap_files(&self, member_id: &str, implementation: &str) -> AnyResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            files: Vec<String>,
+        }
+        let (target, capability) = self.target(member_id, implementation).await?;
+        Ok(target
+            .call::<Reply>(capability, "bootstrap_files", json!({}))
+            .await?
+            .files)
+    }
+    async fn bootstrap(
+        &self,
+        member_id: &str,
+        implementation: &str,
+        files: std::collections::BTreeMap<String, String>,
+        (username, password): (String, String),
+    ) -> AnyResult<Option<String>> {
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(rename = "apiKey", default)]
+            api_key: Option<String>,
+        }
+        let (target, capability) = self.target(member_id, implementation).await?;
+        Ok(target
+            .call::<Reply>(
+                capability,
+                "bootstrap",
+                json!({ "files": files, "login": { "username": username, "password": password } }),
+            )
+            .await?
+            .api_key)
+    }
+    async fn read_state(
+        &self,
+        member_id: &str,
+        implementation: &str,
+    ) -> AnyResult<crate::drivers::StateSnapshot> {
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(default)]
+            summary: Option<String>,
+        }
+        let (target, capability) = self.target(member_id, implementation).await?;
+        let reply: Reply = target.call(capability, "read_state", json!({})).await?;
+        Ok(crate::drivers::StateSnapshot {
+            summary: reply.summary,
+            activity: None,
+        })
     }
 }
 

@@ -148,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
         artwork,
         secrets,
     );
+    // A marketplace stack's own members are set up by the stack's code.
+    #[cfg(unix)]
+    elixir_server::orchestrator::stack_setup::install_marketplace(&state);
     if let Err(err) = bootstrap_core_extensions(&state).await {
         tracing::warn!("core extension bootstrap failed: {err}");
     }

@@ -24,6 +24,17 @@ impl DriverPatch {
         }
     }
 
+    /// The patch as its connector JSON (tagged by `op`), resolved fields included.
+    pub fn to_json(&self) -> Result<serde_json::Value> {
+        Ok(match self {
+            DriverPatch::MediaManagerTv(patch) => serde_json::to_value(patch)?,
+            DriverPatch::MediaManagerMovies(patch) => serde_json::to_value(patch)?,
+            DriverPatch::IndexerRegistry(patch) => serde_json::to_value(patch)?,
+            DriverPatch::DownloaderTorrent(patch) => serde_json::to_value(patch)?,
+            DriverPatch::DownloaderNzb(patch) => serde_json::to_value(patch)?,
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             DriverPatch::MediaManagerTv(patch) => patch.validate(),
