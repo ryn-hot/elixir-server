@@ -175,7 +175,7 @@ impl OperationalMetadata {
     ) -> Result<Self> {
         let payload = release.payload();
         let manifest = serde_json::to_string(manifest)?;
-        if manifest.len() > 64 * 1024 {
+        if manifest.len() > crate::marketplace::manifest::MAX_OPERATIONAL_MANIFEST_BYTES {
             bail!("operational manifest exceeds metadata reservation");
         }
         let kind = match payload.kind {
@@ -196,7 +196,7 @@ impl OperationalMetadata {
         })
     }
     pub(super) fn id(&self) -> Result<Digest> {
-        if self.manifest.len() > 64 * 1024 {
+        if self.manifest.len() > crate::marketplace::manifest::MAX_OPERATIONAL_MANIFEST_BYTES {
             bail!("operational manifest exceeds metadata reservation");
         }
         // Some typed manifest fields are HashMaps. Preserve their values but

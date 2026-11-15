@@ -16,6 +16,10 @@ use serde_json::Value;
 use super::quarantine::SourceMatchedQuarantine;
 use crate::{db::models::ExtensionTrustLevel, extensions::manifest::ExtensionManifest};
 
+/// An installed extension's typed manifest, kept in its operational metadata.
+/// Half of an installation's 128 KiB row charge; provider rows use the rest.
+pub(crate) const MAX_OPERATIONAL_MANIFEST_BYTES: usize = 64 * 1024;
+
 /// Requested execution selection only; never a runtime command or permission
 /// grant. The platform chooses pinned runners and enforces their full sandbox.
 #[derive(Debug)]
@@ -292,6 +296,11 @@ pub(super) fn check_document(
             }
         }
     };
+    // Refuse here, before review, a manifest that passes the protocol cap but
+    // whose installed form would not fit its metadata reservation.
+    if serde_json::to_vec(&manifest)?.len() > MAX_OPERATIONAL_MANIFEST_BYTES {
+        bail!("manifest is too large to install");
+    }
     Ok((manifest, selection, requested.into_iter().collect()))
 }
 

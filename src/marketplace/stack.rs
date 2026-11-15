@@ -506,7 +506,11 @@ mod tests {
                 |id| is_stack_member_id(id) || BUILT_IN_STACK_REFERENCES.contains(&id.as_str())
             )
         );
-        assert!(serde_json::to_vec(&manifest)?.len() < 64 * 1024);
+        let installed = serde_json::to_vec(&manifest)?.len();
+        assert!(
+            installed <= crate::marketplace::manifest::MAX_OPERATIONAL_MANIFEST_BYTES,
+            "installed manifest is {installed} bytes"
+        );
         Ok(())
     }
 
