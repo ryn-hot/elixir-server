@@ -3900,6 +3900,27 @@ async fn cleanup_extension_downstream_state(
     let Some(instance) = store.get_instance(target_provider.instance_id).await? else {
         return Ok(());
     };
+    #[cfg(unix)]
+    if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
+        state,
+        &instance.extension_id,
+        target_provider.implementation.as_deref(),
+    )
+    .await?
+    {
+        let names: Vec<String> = cleanup.proxies.iter().map(|proxy| proxy.name.clone()).collect();
+        let tags: Vec<String> = cleanup
+            .proxies
+            .iter()
+            .flat_map(|proxy| proxy.tags.iter().cloned())
+            .collect();
+        if !names.is_empty() || !tags.is_empty() {
+            indexers
+                .call::<serde_json::Value>("remove_proxies", json!({ "names": names, "tags": tags }))
+                .await?;
+        }
+        return Ok(());
+    }
     let api_key =
         resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
     let endpoint_json = target_provider
@@ -4188,6 +4209,16 @@ async fn list_prowlarr_indexer_names(
     let Some(instance) = store.get_instance(provider.instance_id).await? else {
         anyhow::bail!("target provider instance is missing");
     };
+    #[cfg(unix)]
+    if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
+        state,
+        &instance.extension_id,
+        provider.implementation.as_deref(),
+    )
+    .await?
+    {
+        return indexers.names("indexer_names").await;
+    }
     let api_key =
         resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
     let endpoint_json = provider
@@ -4216,6 +4247,16 @@ pub(crate) async fn list_prowlarr_indexer_proxy_names(
     let Some(instance) = store.get_instance(provider.instance_id).await? else {
         anyhow::bail!("target provider instance is missing");
     };
+    #[cfg(unix)]
+    if let Some(indexers) = super::discovery::manager::ExtensionIndexerList::for_member(
+        state,
+        &instance.extension_id,
+        provider.implementation.as_deref(),
+    )
+    .await?
+    {
+        return indexers.names("indexer_proxy_names").await;
+    }
     let api_key =
         resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
     let endpoint_json = provider
@@ -5408,9 +5449,45 @@ async fn build_extension_control_prowlarr_indexers_section(
         return Ok(None);
     }
 
-    let (base_url, api_key) =
-        resolve_extension_control_arr_connection(state, store, context).await?;
-    let value = request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?;
+    #[cfg(unix)]
+    let extension = super::discovery::manager::ExtensionIndexerList::for_member(
+        state,
+        &context.extension.extension_id,
+        provider.implementation.as_deref(),
+    )
+    .await?;
+    #[cfg(not(unix))]
+    let extension: Option<()> = None;
+    let value = match extension {
+        #[cfg(unix)]
+        Some(indexers) => {
+            // The module reports the same fields the server read below.
+            #[derive(Deserialize)]
+            struct Reply {
+                indexers: Vec<serde_json::Value>,
+            }
+            let reply: Reply = indexers.call("indexers", json!({})).await?;
+            serde_json::Value::Array(
+                reply
+                    .indexers
+                    .into_iter()
+                    .map(|item| {
+                        json!({
+                            "name": item.get("name"),
+                            "implementation": item.get("implementation"),
+                            "enable": item.get("enabled"),
+                            "appProfileId": item.get("appProfileId"),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        _ => {
+            let (base_url, api_key) =
+                resolve_extension_control_arr_connection(state, store, context).await?;
+            request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?
+        }
+    };
     let Some(indexers) = value.as_array() else {
         return Ok(None);
     };
@@ -6210,6 +6287,131 @@ struct ArrControlDownloadClient {
     priority: i64,
     enabled: bool,
     raw: serde_json::Value,
+    /// Host/port and category, when the manager reported them with the list
+    /// (a marketplace stack's module does); otherwise read per client.
+    target: Option<ArrDownloadClientTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct ArrDownloadClientTarget {
+    host_port: Option<(String, u16)>,
+    category: Option<String>,
+}
+
+/// A download client as a marketplace stack's module reports it.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionDownloadClient {
+    id: i64,
+    name: String,
+    #[serde(default)]
+    implementation: Option<String>,
+    protocol: String,
+    priority: i64,
+    enabled: bool,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    category: Option<String>,
+}
+
+/// The stack module behind a selected Sonarr/Radarr member, if any.
+#[cfg(unix)]
+async fn control_extension_manager(
+    state: &AppState,
+    context: &ExtensionControlContext,
+) -> anyhow::Result<Option<super::discovery::manager::ExtensionManager>> {
+    let Some(provider) = context.selected_provider.as_ref() else {
+        return Ok(None);
+    };
+    super::discovery::manager::ExtensionManager::for_member(
+        state,
+        &context.extension.extension_id,
+        provider.implementation.as_deref(),
+    )
+    .await
+}
+
+/// The status metrics of a marketplace stack's Prowlarr member.
+#[cfg(unix)]
+async fn extension_prowlarr_snapshot(
+    indexers: &super::discovery::manager::ExtensionIndexerList,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Status {
+        version: Option<String>,
+        indexer_count: usize,
+        app_count: usize,
+    }
+    let status: Status = indexers.call("status", json!({})).await?;
+    Ok(ExtensionControlLiveSnapshot {
+        metrics: vec![
+            ExtensionControlMetric {
+                id: "version".to_string(),
+                label: "Service version".to_string(),
+                value: status.version.clone().unwrap_or_else(|| "Unknown".to_string()),
+            },
+            ExtensionControlMetric {
+                id: "indexerCount".to_string(),
+                label: "Indexers".to_string(),
+                value: status.indexer_count.to_string(),
+            },
+            ExtensionControlMetric {
+                id: "appCount".to_string(),
+                label: "Connected apps".to_string(),
+                value: status.app_count.to_string(),
+            },
+        ],
+        version: status.version,
+    })
+}
+
+/// The status metrics of a marketplace stack's Sonarr/Radarr member.
+#[cfg(unix)]
+async fn extension_control_snapshot(
+    store: &ExtensionStore<'_>,
+    instance: &ExtensionInstance,
+    manager: &super::discovery::manager::ExtensionManager,
+) -> anyhow::Result<ExtensionControlLiveSnapshot> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Status {
+        version: Option<String>,
+        item_count: usize,
+    }
+    let status: Status = manager.call("status", json!({})).await?;
+    let (id, label) = match manager.kind {
+        super::discovery::manager::ManagerItemKind::Series => ("seriesCount", "Series"),
+        super::discovery::manager::ManagerItemKind::Movie => ("movieCount", "Movies"),
+    };
+    let mut metrics = vec![
+        ExtensionControlMetric {
+            id: "version".to_string(),
+            label: "Service version".to_string(),
+            value: status.version.clone().unwrap_or_else(|| "Unknown".to_string()),
+        },
+        ExtensionControlMetric {
+            id: id.to_string(),
+            label: label.to_string(),
+            value: status.item_count.to_string(),
+        },
+    ];
+    if let Some(download_client_count) =
+        cached_arr_control_download_client_count(store, instance.instance_id).await?
+    {
+        metrics.push(ExtensionControlMetric {
+            id: "downloadClientCount".to_string(),
+            label: "Download clients".to_string(),
+            value: download_client_count.to_string(),
+        });
+    }
+    Ok(ExtensionControlLiveSnapshot {
+        version: status.version,
+        metrics,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6568,9 +6770,18 @@ async fn build_arr_managed_invariants_section(
             continue;
         };
 
-        let detail =
-            load_arr_control_download_client_detail(state, store, context, client.id).await?;
-        let live_host_port = extract_arr_download_client_host_port(&detail);
+        let (live_host_port, live_category) = match &client.target {
+            Some(target) => (target.host_port.clone(), target.category.clone()),
+            None => {
+                let detail =
+                    load_arr_control_download_client_detail(state, store, context, client.id)
+                        .await?;
+                (
+                    extract_arr_download_client_host_port(&detail),
+                    extract_arr_download_client_category(&detail),
+                )
+            }
+        };
         match live_host_port {
             Some((host, port))
                 if host_matches_expected_alias(&host, &expected_client.aliases)
@@ -6599,7 +6810,6 @@ async fn build_arr_managed_invariants_section(
             )),
         }
 
-        let live_category = extract_arr_download_client_category(&detail);
         match live_category.as_deref() {
             Some(value) if value.eq_ignore_ascii_case(expected_client.category) => {}
             Some(value) => notices.push(control_notice(
@@ -7326,6 +7536,7 @@ fn arr_download_client_from_cache_entry(
         priority: entry.priority,
         enabled: entry.enabled,
         raw: json!({}),
+        target: None,
     }
 }
 
@@ -7512,6 +7723,7 @@ fn parse_arr_control_download_client(
         priority,
         enabled,
         raw: value.clone(),
+        target: None,
     })
 }
 
@@ -7520,6 +7732,35 @@ async fn load_arr_control_download_clients(
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Vec<ArrControlDownloadClient>> {
+    #[cfg(unix)]
+    if let Some(manager) = control_extension_manager(state, context).await? {
+        #[derive(Deserialize)]
+        struct Reply {
+            clients: Vec<ExtensionDownloadClient>,
+        }
+        let reply: Reply = manager
+            .call("download_clients", json!({ "details": true }))
+            .await?;
+        return reply
+            .clients
+            .into_iter()
+            .map(|client| {
+                Ok(ArrControlDownloadClient {
+                    raw: serde_json::to_value(&client)?,
+                    id: client.id,
+                    name: client.name,
+                    implementation: client.implementation,
+                    protocol: arr_download_client_protocol_from_str(&client.protocol),
+                    priority: client.priority,
+                    enabled: client.enabled,
+                    target: Some(ArrDownloadClientTarget {
+                        host_port: client.host.zip(client.port),
+                        category: client.category,
+                    }),
+                })
+            })
+            .collect();
+    }
     let (base_url, api_key) =
         resolve_extension_control_arr_connection(state, store, context).await?;
     let value = request_control_json(
@@ -7702,8 +7943,6 @@ async fn update_arr_download_client_preference(
     let preference = ArrDownloadClientPreference::from_value(raw_value).ok_or_else(|| {
         anyhow::anyhow!("downloadClientPreference must be one of current, usenet, or torrent")
     })?;
-    let (base_url, api_key) =
-        resolve_extension_control_arr_connection(state, store, context).await?;
     let instance = context
         .selected_instance
         .as_ref()
@@ -7712,7 +7951,27 @@ async fn update_arr_download_client_preference(
     save_cached_arr_control_download_clients(store, instance.instance_id, &clients).await?;
     let updates = plan_arr_download_client_priority_updates(&clients, preference)?;
 
-    for (id, target_priority, _) in &updates {
+    #[cfg(unix)]
+    let extension = control_extension_manager(state, context).await?;
+    #[cfg(not(unix))]
+    let extension: Option<()> = None;
+    #[cfg(unix)]
+    if let Some(manager) = extension.as_ref() {
+        for (id, target_priority, _) in &updates {
+            manager
+                .call::<serde_json::Value>(
+                    "set_download_client_priority",
+                    json!({ "id": id, "priority": target_priority }),
+                )
+                .await?;
+        }
+    }
+    let (base_url, api_key) = if extension.is_none() {
+        resolve_extension_control_arr_connection(state, store, context).await?
+    } else {
+        (String::new(), String::new())
+    };
+    for (id, target_priority, _) in updates.iter().filter(|_| extension.is_none()) {
         let mut detail =
             load_arr_control_download_client_detail(state, store, context, *id).await?;
         set_arr_control_download_client_priority(&mut detail, *target_priority)?;
@@ -9091,6 +9350,26 @@ pub(crate) async fn remove_managed_library_item_from_manager(
         .get_instance(provider.instance_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("manager instance is no longer available"))?;
+    #[cfg(unix)]
+    if let Some(manager) = super::discovery::manager::ExtensionManager::for_member(
+        state,
+        &instance.extension_id,
+        provider.implementation.as_deref(),
+    )
+    .await?
+    {
+        #[derive(Deserialize)]
+        struct Reply {
+            message: String,
+        }
+        let reply: Reply = manager
+            .call(
+                "remove_item",
+                json!({ "itemId": manager_item_id.to_string() }),
+            )
+            .await?;
+        return Ok(reply.message);
+    }
     let endpoint_json = provider
         .endpoint_json
         .clone()

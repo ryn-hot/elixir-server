@@ -76,6 +76,10 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
         let Some(provider) = context.selected_provider.as_ref() else {
             return Ok(ExtensionControlLiveSnapshot::default());
         };
+        #[cfg(unix)]
+        if let Some(manager) = super::control_extension_manager(state, context).await? {
+            return super::extension_control_snapshot(store, instance, &manager).await;
+        }
         let endpoint_json = provider
             .endpoint_json
             .clone()
@@ -198,6 +202,10 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
                 super::run_extension_control_targeted_managed_repair(state, store, context).await
             }
             "search_missing" | "refresh_manager" => {
+                #[cfg(unix)]
+                if let Some(manager) = super::control_extension_manager(state, context).await? {
+                    return extension_command(&manager, action_id, None).await;
+                }
                 let (base_url, api_key) =
                     super::resolve_extension_control_arr_connection(state, store, context).await?;
                 super::execute_extension_control_manager_command(
@@ -224,16 +232,29 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
                     })?
                     .parse::<i64>()
                     .context("parsing manager item id")?;
-                let (base_url, api_key) =
-                    super::resolve_extension_control_arr_connection(state, store, context).await?;
-                let message = super::execute_extension_control_manager_command(
-                    self.implementation,
-                    &base_url,
-                    &api_key,
-                    action_id,
-                    Some(manager_item_id),
-                )
-                .await?;
+                #[cfg(unix)]
+                let extension = super::control_extension_manager(state, context).await?;
+                #[cfg(not(unix))]
+                let extension: Option<()> = None;
+                let message = match extension {
+                    #[cfg(unix)]
+                    Some(manager) => {
+                        extension_command(&manager, action_id, Some(manager_item_id)).await?
+                    }
+                    _ => {
+                        let (base_url, api_key) =
+                            super::resolve_extension_control_arr_connection(state, store, context)
+                                .await?;
+                        super::execute_extension_control_manager_command(
+                            self.implementation,
+                            &base_url,
+                            &api_key,
+                            action_id,
+                            Some(manager_item_id),
+                        )
+                        .await?
+                    }
+                };
                 if action_id == "remove_item" {
                     store
                         .deactivate_managed_ingest_intent(intent.intent_id)
@@ -244,6 +265,34 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
             _ => anyhow::bail!("unsupported control action '{action_id}'"),
         }
     }
+}
+
+/// A manager command answered by a marketplace stack's module; returns its
+/// message. `remove_item` stops managing the item and keeps its files.
+#[cfg(unix)]
+async fn extension_command(
+    manager: &super::super::discovery::manager::ExtensionManager,
+    action_id: &str,
+    item_id: Option<i64>,
+) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        message: String,
+    }
+    let item_id = item_id.map(|id| id.to_string());
+    let reply: Reply = if action_id == "remove_item" {
+        manager
+            .call("remove_item", serde_json::json!({ "itemId": item_id }))
+            .await?
+    } else {
+        manager
+            .call(
+                "command",
+                serde_json::json!({ "command": action_id, "itemId": item_id }),
+            )
+            .await?
+    };
+    Ok(reply.message)
 }
 
 struct DebridControlAdapter;
@@ -1092,6 +1141,16 @@ impl ExtensionControlProvider for ProwlarrControlAdapter {
         let Some(provider) = context.selected_provider.as_ref() else {
             return Ok(ExtensionControlLiveSnapshot::default());
         };
+        #[cfg(unix)]
+        if let Some(indexers) = super::super::discovery::manager::ExtensionIndexerList::for_member(
+            state,
+            &context.extension.extension_id,
+            provider.implementation.as_deref(),
+        )
+        .await?
+        {
+            return super::extension_prowlarr_snapshot(&indexers).await;
+        }
         let endpoint_json = provider
             .endpoint_json
             .clone()

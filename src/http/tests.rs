@@ -19927,7 +19927,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     let directory =
         stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone());
     let mut members = serde_json::Map::new();
-    for member in ["sonarr", "radarr"] {
+    for member in ["sonarr", "radarr", "prowlarr"] {
         let endpoint = directory
             .member("elx:test/arr-stack", member)
             .await?

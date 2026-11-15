@@ -66,6 +66,178 @@ pub(crate) struct ManagerEpisode {
 /// Episodes by the manager's episode ID.
 pub(crate) type ManagerEpisodeIndex = HashMap<String, ManagerEpisode>;
 
+/// One entry of the manager's recent history (grabs, failures, imports).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagerHistoryEntry {
+    pub history_id: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    /// Lowercase, e.g. `grabbed`, `downloadfailed`.
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub download_id: Option<String>,
+}
+
+/// A media manager Find Media and release recovery talk to: an installed
+/// stack's module, or (until Stage 3) the server's own Sonarr/Radarr code.
+pub(crate) enum ManagerClient {
+    Legacy {
+        implementation: String,
+        base_url: String,
+        api_key: String,
+    },
+    #[cfg(unix)]
+    Extension(ExtensionManager),
+}
+
+impl ManagerClient {
+    pub(crate) async fn for_provider(
+        state: &AppState,
+        store: &ExtensionStore<'_>,
+        provider: &ProviderContext,
+    ) -> AnyResult<Self> {
+        #[cfg(unix)]
+        if let Some(manager) = ExtensionManager::for_provider(state, provider).await? {
+            return Ok(Self::Extension(manager));
+        }
+        let implementation = provider
+            .detail
+            .provider
+            .implementation
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let endpoint_json = provider
+            .detail
+            .provider
+            .endpoint_json
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
+        let endpoint: ProviderEndpoint =
+            serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
+        let base_url =
+            resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
+                .await?;
+        let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
+        Ok(Self::Legacy {
+            implementation,
+            base_url,
+            api_key,
+        })
+    }
+
+    /// The first queue page, every item's entries.
+    pub(crate) async fn queue(&self) -> AnyResult<Vec<ManagerQueueEntry>> {
+        match self {
+            Self::Legacy {
+                implementation,
+                base_url,
+                api_key,
+            } => {
+                let value = request_arr_json_with_query(
+                    base_url,
+                    api_key,
+                    &manager_queue_paths(implementation),
+                    &[("page", "1".to_string()), ("pageSize", "250".to_string())],
+                )
+                .await?;
+                Ok(legacy::queue(implementation, Some(&value)))
+            }
+            #[cfg(unix)]
+            Self::Extension(manager) => {
+                #[derive(Deserialize)]
+                struct Reply {
+                    entries: Vec<ManagerQueueEntry>,
+                }
+                Ok(manager.call::<Reply>("queue", json!({})).await?.entries)
+            }
+        }
+    }
+
+    /// The newest 100 history entries.
+    pub(crate) async fn history(&self) -> AnyResult<Vec<ManagerHistoryEntry>> {
+        match self {
+            Self::Legacy {
+                implementation,
+                base_url,
+                api_key,
+            } => {
+                let value = request_arr_json_with_query(
+                    base_url,
+                    api_key,
+                    &["api/v3/history", "api/v4/history"],
+                    &[
+                        ("page", "1".to_string()),
+                        ("pageSize", "100".to_string()),
+                        ("sortDirection", "descending".to_string()),
+                        ("sortKey", "date".to_string()),
+                    ],
+                )
+                .await?;
+                Ok(legacy::history(implementation, &value))
+            }
+            #[cfg(unix)]
+            Self::Extension(manager) => {
+                #[derive(Deserialize)]
+                struct Reply {
+                    entries: Vec<ManagerHistoryEntry>,
+                }
+                Ok(manager.call::<Reply>("history", json!({})).await?.entries)
+            }
+        }
+    }
+
+    /// Marks a grabbed release failed; the manager blocklists it and searches.
+    pub(crate) async fn mark_failed(&self, history_id: &str) -> AnyResult<()> {
+        match self {
+            Self::Legacy {
+                base_url, api_key, ..
+            } => {
+                let v3 = format!("api/v3/history/failed/{history_id}");
+                let v4 = format!("api/v4/history/failed/{history_id}");
+                request_arr_write(
+                    base_url,
+                    api_key,
+                    &[v3.as_str(), v4.as_str()],
+                    ReqwestMethod::POST,
+                    &json!({}),
+                )
+                .await
+            }
+            #[cfg(unix)]
+            Self::Extension(manager) => {
+                manager
+                    .call::<Value>("mark_failed", json!({ "historyId": history_id }))
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Starts a fresh search for one item.
+    pub(crate) async fn search_item(&self, item_id: &str) -> AnyResult<()> {
+        match self {
+            Self::Legacy {
+                implementation,
+                base_url,
+                api_key,
+            } => {
+                let item_id = item_id.parse::<i64>().context("parsing manager item id")?;
+                request_arr_search_item(implementation, base_url, api_key, item_id).await
+            }
+            #[cfg(unix)]
+            Self::Extension(manager) => {
+                manager
+                    .call::<Value>("search_item", json!({ "itemId": item_id }))
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// What Find Media needs to know about one managed item and its downloads.
 pub(crate) struct ManagerAcquisitionInput<'a> {
     pub kind: ManagerItemKind,
@@ -612,7 +784,7 @@ fn download_attempt_title(
 
 /// Legacy Sonarr/Radarr JSON, converted to the general-purpose shapes. Used
 /// only for the server's own Arr code until Stage 3 removes it.
-pub(super) mod legacy {
+pub(crate) mod legacy {
     use super::*;
 
     pub(crate) fn kind(implementation: &str) -> ManagerItemKind {
@@ -677,7 +849,50 @@ pub(super) mod legacy {
             .map(|entry| queue_entry(implementation, entry))
             .collect()
     }
-    pub(crate) fn episodes(index: &HashMap<i64, SonarrEpisodeDescriptor>) -> ManagerEpisodeIndex {
+    /// Arr history records; entries without a numeric id are skipped.
+    pub(crate) fn history(implementation: &str, value: &Value) -> Vec<ManagerHistoryEntry> {
+        let records = if let Some(items) = value.as_array() {
+            items.clone()
+        } else {
+            value
+                .get("records")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        records
+            .iter()
+            .filter_map(|entry| {
+                let history_id = entry.get("id").and_then(Value::as_i64)?.to_string();
+                let item = match implementation {
+                    "sonarr" => entry.get("seriesId"),
+                    "radarr" => entry.get("movieId"),
+                    _ => None,
+                };
+                Some(ManagerHistoryEntry {
+                    history_id,
+                    item_id: item.and_then(|value| {
+                        value
+                            .as_i64()
+                            .map(|id| id.to_string())
+                            .or_else(|| value.as_str().map(|id| id.trim().to_string()))
+                    }),
+                    event_type: entry
+                        .get("eventType")
+                        .and_then(Value::as_str)
+                        .map(|value| value.trim().to_ascii_lowercase())
+                        .unwrap_or_default(),
+                    download_id: entry
+                        .get("downloadId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            })
+            .collect()
+    }
+    pub(in crate::http::handlers::discovery) fn episodes(
+        index: &HashMap<i64, SonarrEpisodeDescriptor>,
+    ) -> ManagerEpisodeIndex {
         index
             .iter()
             .map(|(id, episode)| {
@@ -694,16 +909,15 @@ pub(super) mod legacy {
     }
 }
 
-/// A Sonarr/Radarr member of an installed marketplace stack, answered by the
-/// stack's own code in its long-lived executor.
+/// One member of an installed marketplace stack, answered by the stack's own
+/// code in its long-lived executor.
 #[cfg(unix)]
-pub(crate) struct ExtensionManager {
+pub(crate) struct StackMemberCall {
     marketplace: crate::marketplace::service::MarketplaceService,
     home: Uuid,
     extension: elixir_marketplace::identity::ExtensionId,
     instance: Uuid,
     member: String,
-    pub(crate) kind: ManagerItemKind,
 }
 
 #[cfg(unix)]
@@ -716,27 +930,101 @@ struct ExtensionReply {
 }
 
 #[cfg(unix)]
+impl StackMemberCall {
+    /// `None` for any extension that is not a marketplace stack member.
+    async fn resolve(state: &AppState, member_id: &str) -> AnyResult<Option<Self>> {
+        if !crate::marketplace::stack::is_stack_member_id(member_id) {
+            return Ok(None);
+        }
+        let (stack, member) = crate::marketplace::stack::owner_of(&state.db_pool, member_id)
+            .await?
+            .context("this member's stack extension is not installed or enabled")?;
+        let (home, instance) = crate::marketplace::stack::installed_instance(&state.db_pool, &stack)
+            .await?
+            .context("this member's stack extension has no enabled installation")?;
+        Ok(Some(Self {
+            marketplace: state.marketplace.clone(),
+            home,
+            extension: stack.parse().context("stack extension id")?,
+            instance,
+            member,
+        }))
+    }
+
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        capability: &str,
+        operation: &str,
+        request: Value,
+    ) -> AnyResult<T> {
+        let arguments = elixir_marketplace::source_execution::RuntimeJson::from_value(json!({
+            "schema_version": 1,
+            "capability": capability,
+            "member": self.member,
+            "operation": operation,
+            "request": request,
+        }))
+        .context("stack member request exceeds runtime bounds")?;
+        let reply = match self
+            .marketplace
+            .serve_call(self.home, &self.extension, self.instance, arguments)
+            .await?
+        {
+            crate::marketplace::service::ServeReply::Result(value) => value,
+            crate::marketplace::service::ServeReply::Failed => {
+                bail!("the stack extension failed this request")
+            }
+        };
+        let reply: ExtensionReply =
+            serde_json::from_str(reply.as_str()).context("stack extension reply shape")?;
+        if reply.schema_version != 1 {
+            bail!("stack extension reply schema is unsupported");
+        }
+        if reply.status != 200 {
+            let message = reply
+                .body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| reply.body.to_string().chars().take(300).collect());
+            bail!("stack extension returned {}: {message}", reply.status);
+        }
+        serde_json::from_value(reply.body).context("stack extension reply body")
+    }
+}
+
+/// A Sonarr/Radarr member: the general-purpose media-manager interface.
+#[cfg(unix)]
+pub(crate) struct ExtensionManager {
+    target: StackMemberCall,
+    pub(crate) kind: ManagerItemKind,
+}
+
+#[cfg(unix)]
 impl ExtensionManager {
     /// `None` for any provider that is not a marketplace stack member.
     pub(crate) async fn for_provider(
         state: &AppState,
         provider: &ProviderContext,
     ) -> AnyResult<Option<Self>> {
-        let member_id = provider.detail.extension_id.as_str();
+        Self::for_member(
+            state,
+            &provider.detail.extension_id,
+            provider.detail.provider.implementation.as_deref(),
+        )
+        .await
+    }
+
+    /// `None` for any extension that is not a marketplace stack member.
+    pub(crate) async fn for_member(
+        state: &AppState,
+        member_id: &str,
+        implementation: Option<&str>,
+    ) -> AnyResult<Option<Self>> {
         if !crate::marketplace::stack::is_stack_member_id(member_id) {
             return Ok(None);
         }
-        let (stack, member) = crate::marketplace::stack::owner_of(&state.db_pool, member_id)
-            .await?
-            .context("this manager's stack extension is not installed or enabled")?;
-        let (home, instance) = crate::marketplace::stack::installed_instance(&state.db_pool, &stack)
-            .await?
-            .context("this manager's stack extension has no enabled installation")?;
-        let kind = match provider
-            .detail
-            .provider
-            .implementation
-            .as_deref()
+        let kind = match implementation
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
@@ -744,14 +1032,9 @@ impl ExtensionManager {
             Some("radarr") => ManagerItemKind::Movie,
             other => bail!("unsupported stack media manager {other:?}"),
         };
-        Ok(Some(Self {
-            marketplace: state.marketplace.clone(),
-            home,
-            extension: stack.parse().context("stack extension id")?,
-            instance,
-            member,
-            kind,
-        }))
+        Ok(StackMemberCall::resolve(state, member_id)
+            .await?
+            .map(|target| Self { target, kind }))
     }
 
     /// One operation of the general-purpose interface; `kind` is added.
@@ -763,39 +1046,49 @@ impl ExtensionManager {
         if let Some(object) = request.as_object_mut() {
             object.insert("kind".to_string(), serde_json::to_value(self.kind)?);
         }
-        let arguments = elixir_marketplace::source_execution::RuntimeJson::from_value(json!({
-            "schema_version": 1,
-            "capability": "media.manager",
-            "member": self.member,
-            "operation": operation,
-            "request": request,
-        }))
-        .context("media manager request exceeds runtime bounds")?;
-        let reply = match self
-            .marketplace
-            .serve_call(self.home, &self.extension, self.instance, arguments)
-            .await?
+        self.target.call("media.manager", operation, request).await
+    }
+}
+
+/// A Prowlarr member: the general-purpose indexer-list interface.
+#[cfg(unix)]
+pub(crate) struct ExtensionIndexerList {
+    target: StackMemberCall,
+}
+
+#[cfg(unix)]
+impl ExtensionIndexerList {
+    /// `None` unless this is a marketplace stack's indexer list.
+    pub(crate) async fn for_member(
+        state: &AppState,
+        member_id: &str,
+        implementation: Option<&str>,
+    ) -> AnyResult<Option<Self>> {
+        if !crate::marketplace::stack::is_stack_member_id(member_id)
+            || implementation.map(|value| value.trim().to_ascii_lowercase()).as_deref()
+                != Some("prowlarr")
         {
-            crate::marketplace::service::ServeReply::Result(value) => value,
-            crate::marketplace::service::ServeReply::Failed => {
-                bail!("the media manager extension failed this request")
-            }
-        };
-        let reply: ExtensionReply =
-            serde_json::from_str(reply.as_str()).context("media manager reply shape")?;
-        if reply.schema_version != 1 {
-            bail!("media manager reply schema is unsupported");
+            return Ok(None);
         }
-        if reply.status != 200 {
-            let message = reply
-                .body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| reply.body.to_string().chars().take(300).collect());
-            bail!("media manager returned {}: {message}", reply.status);
+        Ok(StackMemberCall::resolve(state, member_id)
+            .await?
+            .map(|target| Self { target }))
+    }
+
+    pub(crate) async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+    ) -> AnyResult<T> {
+        self.target.call("indexer.list", operation, request).await
+    }
+
+    pub(crate) async fn names(&self, operation: &str) -> AnyResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Names {
+            names: Vec<String>,
         }
-        serde_json::from_value(reply.body).context("media manager reply body")
+        Ok(self.call::<Names>(operation, json!({})).await?.names)
     }
 }
 

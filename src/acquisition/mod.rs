@@ -30,17 +30,13 @@ use crate::{
     extensions::store::{ExtensionStore, ManagedIngestIntent},
     http::handlers::{
         discovery::{
-            ProviderContext, extract_arr_queue_records, load_provider_contexts,
-            manager_queue_paths, queue_entry_download_id, queue_entry_downloader_label,
-            queue_entry_matches_manager_item, remove_nzbget_download_by_download_id,
-            remove_qbittorrent_download_by_download_id, request_arr_json_with_query,
-            request_arr_search_item, request_arr_write, resolve_arr_api_key,
-            resolve_provider_transport_base_url, select_nzbget_provider,
-            select_qbittorrent_provider,
+            ProviderContext, load_provider_contexts,
+            manager::{ManagerClient, ManagerHistoryEntry, ManagerQueueEntry},
+            remove_nzbget_download_by_download_id, remove_qbittorrent_download_by_download_id,
+            select_nzbget_provider, select_qbittorrent_provider,
         },
         extensions::request_instance_service_json,
     },
-    orchestrator::model::ProviderEndpoint,
     runtime::health::DockerRuntimeHealthState,
     state::AppState,
 };
@@ -91,12 +87,12 @@ struct IntentRecoveryState {
 
 #[derive(Debug, Clone)]
 struct ArrHistoryEntry {
-    history_id: i64,
+    history_id: String,
 }
 
 #[derive(Debug, Clone)]
 struct ReleaseRecoveryTarget {
-    history_id: i64,
+    history_id: String,
     download_id: String,
     downloader: ReleaseRecoveryDownloader,
 }
@@ -284,8 +280,8 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
     let nzbget_provider = select_nzbget_provider(&contexts);
     let qbittorrent_provider = select_qbittorrent_provider(&contexts);
 
-    let mut queue_cache = HashMap::<Uuid, Value>::new();
-    let mut history_cache = HashMap::<Uuid, Value>::new();
+    let mut queue_cache = HashMap::<Uuid, Vec<ManagerQueueEntry>>::new();
+    let mut history_cache = HashMap::<Uuid, Vec<ManagerHistoryEntry>>::new();
     let mut nzbget_groups_cache = None::<HashMap<String, NzbgetRecoveryGroup>>;
     let mut qbittorrent_torrents_cache = None::<HashMap<String, QbittorrentRecoveryTorrent>>;
     let mut state_doc = load_recovery_state(&store).await?;
@@ -350,8 +346,7 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
             continue;
         }
 
-        let transport = match resolve_arr_transport(state, &store, provider, &implementation).await
-        {
+        let client = match ManagerClient::for_provider(state, &store, provider).await {
             Ok(value) => value,
             Err(err) => {
                 warn!(
@@ -366,8 +361,7 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
         let target = match find_nzbget_recovery_target(
             state,
             &store,
-            provider,
-            &implementation,
+            &client,
             &intent,
             nzbget_provider,
             &mut queue_cache,
@@ -381,8 +375,7 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
             Ok(None) => match find_qbittorrent_recovery_target(
                 state,
                 &store,
-                provider,
-                &implementation,
+                &client,
                 &intent,
                 qbittorrent_provider,
                 &mut queue_cache,
@@ -419,13 +412,7 @@ async fn run_acquisition_recovery_iteration(state: &AppState) -> AnyResult<()> {
             continue;
         }
 
-        let result = match request_arr_mark_history_failed(
-            &transport.base_url,
-            &transport.api_key,
-            target.history_id,
-        )
-        .await
-        {
+        let result = match client.mark_failed(&target.history_id).await {
             Ok(()) => Ok(cleanup_failed_release_download(
                 state,
                 &store,
@@ -536,9 +523,9 @@ async fn execute_release_recovery(
         .parse::<i64>()
         .context("parsing manager item id")?;
 
-    let transport = resolve_arr_transport(state, store, provider, &implementation).await?;
-    let mut queue_cache = HashMap::<Uuid, Value>::new();
-    let mut history_cache = HashMap::<Uuid, Value>::new();
+    let client = ManagerClient::for_provider(state, store, provider).await?;
+    let mut queue_cache = HashMap::<Uuid, Vec<ManagerQueueEntry>>::new();
+    let mut history_cache = HashMap::<Uuid, Vec<ManagerHistoryEntry>>::new();
     let mut nzbget_groups_cache = None::<HashMap<String, NzbgetRecoveryGroup>>;
     let mut qbittorrent_torrents_cache = None::<HashMap<String, QbittorrentRecoveryTorrent>>;
     let nzbget_provider = select_nzbget_provider(contexts);
@@ -547,8 +534,7 @@ async fn execute_release_recovery(
     if let Some(target) = find_nzbget_recovery_target(
         state,
         store,
-        provider,
-        &implementation,
+        &client,
         intent,
         nzbget_provider,
         &mut queue_cache,
@@ -558,8 +544,7 @@ async fn execute_release_recovery(
     )
     .await?
     {
-        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
-            .await?;
+        client.mark_failed(&target.history_id).await?;
         return Ok(cleanup_failed_release_download(
             state,
             store,
@@ -575,8 +560,7 @@ async fn execute_release_recovery(
     if let Some(target) = find_qbittorrent_recovery_target(
         state,
         store,
-        provider,
-        &implementation,
+        &client,
         intent,
         qbittorrent_provider,
         &mut queue_cache,
@@ -586,8 +570,7 @@ async fn execute_release_recovery(
     )
     .await?
     {
-        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
-            .await?;
+        client.mark_failed(&target.history_id).await?;
         return Ok(cleanup_failed_release_download(
             state,
             store,
@@ -603,8 +586,7 @@ async fn execute_release_recovery(
     if let Some(target) = find_nzbget_recovery_target(
         state,
         store,
-        provider,
-        &implementation,
+        &client,
         intent,
         nzbget_provider,
         &mut queue_cache,
@@ -614,8 +596,7 @@ async fn execute_release_recovery(
     )
     .await?
     {
-        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
-            .await?;
+        client.mark_failed(&target.history_id).await?;
         return Ok(cleanup_failed_release_download(
             state,
             store,
@@ -631,8 +612,7 @@ async fn execute_release_recovery(
     if let Some(target) = find_qbittorrent_recovery_target(
         state,
         store,
-        provider,
-        &implementation,
+        &client,
         intent,
         qbittorrent_provider,
         &mut queue_cache,
@@ -642,8 +622,7 @@ async fn execute_release_recovery(
     )
     .await?
     {
-        request_arr_mark_history_failed(&transport.base_url, &transport.api_key, target.history_id)
-            .await?;
+        client.mark_failed(&target.history_id).await?;
         return Ok(cleanup_failed_release_download(
             state,
             store,
@@ -656,44 +635,30 @@ async fn execute_release_recovery(
         .await);
     }
 
-    let history_value = load_arr_history_page(state, store, provider, &implementation).await?;
-    if let Some(history_entry) = find_latest_history_entry_for_item(
-        &history_value,
-        &implementation,
-        manager_item_id,
-        &["downloadfailed"],
-    ) {
-        request_arr_mark_history_failed(
-            &transport.base_url,
-            &transport.api_key,
-            history_entry.history_id,
-        )
-        .await?;
+    let history = client.history().await?;
+    if let Some(history_entry) =
+        find_latest_history_entry_for_item(&history, manager_item_id, &["downloadfailed"])
+    {
+        client.mark_failed(&history_entry.history_id).await?;
         return Ok(
             "Marked the failed release in the manager and requested another release.".to_string(),
         );
     }
 
-    let queue_value = request_arr_json_with_query(
-        &transport.base_url,
-        &transport.api_key,
-        &manager_queue_paths(&implementation),
-        &[("page", "1".to_string()), ("pageSize", "250".to_string())],
-    )
-    .await
-    .ok();
-    let queue_entry = queue_value
-        .as_ref()
-        .map(extract_arr_queue_records)
+    let queue_entry = client
+        .queue()
+        .await
         .unwrap_or_default()
         .into_iter()
-        .find(|entry| queue_entry_matches_manager_item(entry, &implementation, manager_item_id));
+        .find(|entry| entry.item_id.as_deref() == Some(manager_item_id));
 
     let mut removed_failed_download = false;
     let mut removed_downloader_label = None::<&'static str>;
     if let Some(entry) = queue_entry.as_ref()
-        && let Some(download_id) = queue_entry_download_id(entry)
-        && queue_entry_downloader_label(entry)
+        && let Some(download_id) = entry.download_id.clone()
+        && entry
+            .downloader
+            .as_deref()
             .map(|value| value.to_ascii_lowercase().contains("nzbget"))
             .unwrap_or(false)
         && let Some(nzbget_provider) = nzbget_provider
@@ -703,8 +668,10 @@ async fn execute_release_recovery(
                 .await?;
         removed_downloader_label = Some("NZBGet job");
     } else if let Some(entry) = queue_entry.as_ref()
-        && let Some(download_id) = queue_entry_download_id(entry)
-        && queue_entry_downloader_label(entry)
+        && let Some(download_id) = entry.download_id.clone()
+        && entry
+            .downloader
+            .as_deref()
             .map(|value| value.to_ascii_lowercase().contains("qbittorrent"))
             .unwrap_or(false)
         && let Some(qbittorrent_provider) = qbittorrent_provider
@@ -729,13 +696,8 @@ async fn execute_release_recovery(
         removed_downloader_label = Some("qBittorrent torrent");
     }
 
-    request_arr_search_item(
-        &implementation,
-        &transport.base_url,
-        &transport.api_key,
-        manager_item_id_numeric,
-    )
-    .await?;
+    let _ = manager_item_id_numeric;
+    client.search_item(manager_item_id).await?;
 
     Ok(if removed_failed_download {
         format!(
@@ -838,41 +800,15 @@ async fn cleanup_failed_release_download(
     }
 }
 
-struct ArrTransport {
-    base_url: String,
-    api_key: String,
-}
-
-async fn resolve_arr_transport(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-    implementation: &str,
-) -> AnyResult<ArrTransport> {
-    let endpoint_json = provider
-        .detail
-        .provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint =
-        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let base_url =
-        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-            .await?;
-    let api_key = resolve_arr_api_key(state, store, provider, implementation).await?;
-    Ok(ArrTransport { base_url, api_key })
-}
 
 async fn find_nzbget_recovery_target(
     state: &AppState,
     store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-    implementation: &str,
+    client: &ManagerClient,
     intent: &ManagedIngestIntent,
     nzbget_provider: Option<&ProviderContext>,
-    queue_cache: &mut HashMap<Uuid, Value>,
-    history_cache: &mut HashMap<Uuid, Value>,
+    queue_cache: &mut HashMap<Uuid, Vec<ManagerQueueEntry>>,
+    history_cache: &mut HashMap<Uuid, Vec<ManagerHistoryEntry>>,
     nzbget_groups_cache: &mut Option<HashMap<String, NzbgetRecoveryGroup>>,
     require_dead_nzbget: bool,
 ) -> AnyResult<Option<ReleaseRecoveryTarget>> {
@@ -881,34 +817,28 @@ async fn find_nzbget_recovery_target(
         _ => return Ok(None),
     };
 
-    let transport = resolve_arr_transport(state, store, provider, implementation).await?;
-    let queue_value = match queue_cache.get(&intent.manager_provider_id) {
+    let queue = match queue_cache.get(&intent.manager_provider_id) {
         Some(value) => value.clone(),
         None => {
-            let value =
-                load_arr_queue_page(&transport.base_url, &transport.api_key, implementation)
-                    .await?;
+            let value = client.queue().await?;
             queue_cache.insert(intent.manager_provider_id, value.clone());
             value
         }
     };
 
-    let queue_entry = extract_arr_queue_records(&queue_value)
-        .into_iter()
-        .find(|entry| {
-            queue_entry_matches_manager_item(entry, implementation, manager_item_id)
-                && queue_entry_downloader_label(entry)
-                    .map(|value| value.to_ascii_lowercase().contains("nzbget"))
-                    .unwrap_or(false)
-                && queue_entry_download_id(entry).is_some()
-        });
+    let queue_entry = queue.into_iter().find(|entry| {
+        entry.item_id.as_deref() == Some(manager_item_id)
+            && entry
+                .downloader
+                .as_deref()
+                .map(|value| value.to_ascii_lowercase().contains("nzbget"))
+                .unwrap_or(false)
+            && entry.download_id.is_some()
+    });
     let Some(queue_entry) = queue_entry else {
         return Ok(None);
     };
-    let Some(download_id) = queue_entry_download_id(&queue_entry)
-        .as_deref()
-        .map(normalize_download_id)
-    else {
+    let Some(download_id) = queue_entry.download_id.as_deref().map(normalize_download_id) else {
         return Ok(None);
     };
 
@@ -933,17 +863,16 @@ async fn find_nzbget_recovery_target(
         }
     }
 
-    let history_value = match history_cache.get(&intent.manager_provider_id) {
+    let history = match history_cache.get(&intent.manager_provider_id) {
         Some(value) => value.clone(),
         None => {
-            let value = load_arr_history_page(state, store, provider, implementation).await?;
+            let value = client.history().await?;
             history_cache.insert(intent.manager_provider_id, value.clone());
             value
         }
     };
     let Some(history_entry) = find_latest_history_entry_for_download(
-        &history_value,
-        implementation,
+        &history,
         manager_item_id,
         &download_id,
         &["grabbed", "downloadfailed"],
@@ -961,12 +890,11 @@ async fn find_nzbget_recovery_target(
 async fn find_qbittorrent_recovery_target(
     state: &AppState,
     store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-    implementation: &str,
+    client: &ManagerClient,
     intent: &ManagedIngestIntent,
     qbittorrent_provider: Option<&ProviderContext>,
-    queue_cache: &mut HashMap<Uuid, Value>,
-    history_cache: &mut HashMap<Uuid, Value>,
+    queue_cache: &mut HashMap<Uuid, Vec<ManagerQueueEntry>>,
+    history_cache: &mut HashMap<Uuid, Vec<ManagerHistoryEntry>>,
     qbittorrent_torrents_cache: &mut Option<HashMap<String, QbittorrentRecoveryTorrent>>,
     require_dead_qbittorrent: bool,
 ) -> AnyResult<Option<ReleaseRecoveryTarget>> {
@@ -975,34 +903,28 @@ async fn find_qbittorrent_recovery_target(
         _ => return Ok(None),
     };
 
-    let transport = resolve_arr_transport(state, store, provider, implementation).await?;
-    let queue_value = match queue_cache.get(&intent.manager_provider_id) {
+    let queue = match queue_cache.get(&intent.manager_provider_id) {
         Some(value) => value.clone(),
         None => {
-            let value =
-                load_arr_queue_page(&transport.base_url, &transport.api_key, implementation)
-                    .await?;
+            let value = client.queue().await?;
             queue_cache.insert(intent.manager_provider_id, value.clone());
             value
         }
     };
 
-    let queue_entry = extract_arr_queue_records(&queue_value)
-        .into_iter()
-        .find(|entry| {
-            queue_entry_matches_manager_item(entry, implementation, manager_item_id)
-                && queue_entry_downloader_label(entry)
-                    .map(|value| value.to_ascii_lowercase().contains("qbittorrent"))
-                    .unwrap_or(false)
-                && queue_entry_download_id(entry).is_some()
-        });
+    let queue_entry = queue.into_iter().find(|entry| {
+        entry.item_id.as_deref() == Some(manager_item_id)
+            && entry
+                .downloader
+                .as_deref()
+                .map(|value| value.to_ascii_lowercase().contains("qbittorrent"))
+                .unwrap_or(false)
+            && entry.download_id.is_some()
+    });
     let Some(queue_entry) = queue_entry else {
         return Ok(None);
     };
-    let Some(download_id) = queue_entry_download_id(&queue_entry)
-        .as_deref()
-        .map(normalize_download_id)
-    else {
+    let Some(download_id) = queue_entry.download_id.as_deref().map(normalize_download_id) else {
         return Ok(None);
     };
 
@@ -1033,17 +955,16 @@ async fn find_qbittorrent_recovery_target(
         return Ok(None);
     }
 
-    let history_value = match history_cache.get(&intent.manager_provider_id) {
+    let history = match history_cache.get(&intent.manager_provider_id) {
         Some(value) => value.clone(),
         None => {
-            let value = load_arr_history_page(state, store, provider, implementation).await?;
+            let value = client.history().await?;
             history_cache.insert(intent.manager_provider_id, value.clone());
             value
         }
     };
     let Some(history_entry) = find_latest_history_entry_for_download(
-        &history_value,
-        implementation,
+        &history,
         manager_item_id,
         &download_id,
         &["grabbed", "downloadfailed"],
@@ -1058,40 +979,7 @@ async fn find_qbittorrent_recovery_target(
     }))
 }
 
-async fn load_arr_queue_page(
-    base_url: &str,
-    api_key: &str,
-    implementation: &str,
-) -> AnyResult<Value> {
-    request_arr_json_with_query(
-        base_url,
-        api_key,
-        &manager_queue_paths(implementation),
-        &[("page", "1".to_string()), ("pageSize", "250".to_string())],
-    )
-    .await
-}
 
-async fn load_arr_history_page(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-    implementation: &str,
-) -> AnyResult<Value> {
-    let transport = resolve_arr_transport(state, store, provider, implementation).await?;
-    request_arr_json_with_query(
-        &transport.base_url,
-        &transport.api_key,
-        &["api/v3/history", "api/v4/history"],
-        &[
-            ("page", "1".to_string()),
-            ("pageSize", "100".to_string()),
-            ("sortDirection", "descending".to_string()),
-            ("sortKey", "date".to_string()),
-        ],
-    )
-    .await
-}
 
 async fn load_qbittorrent_torrent_index(
     state: &AppState,
@@ -1439,134 +1327,47 @@ fn combine_size_parts(hi: Option<u64>, lo: Option<u64>) -> Option<u64> {
     }
 }
 
-fn extract_arr_history_records(value: &Value) -> Vec<Value> {
-    if let Some(items) = value.as_array() {
-        return items.clone();
-    }
-    value
-        .get("records")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+
+fn history_entry_matches(
+    entry: &ManagerHistoryEntry,
+    manager_item_id: &str,
+    accepted_events: &[&str],
+) -> bool {
+    entry.item_id.as_deref().map(str::trim) == Some(manager_item_id)
+        && accepted_events
+            .iter()
+            .any(|candidate| entry.event_type == candidate.to_ascii_lowercase())
 }
 
 fn find_latest_history_entry_for_download(
-    history_value: &Value,
-    implementation: &str,
+    history: &[ManagerHistoryEntry],
     manager_item_id: &str,
     download_id: &str,
     accepted_events: &[&str],
 ) -> Option<ArrHistoryEntry> {
     let normalized_download_id = normalize_download_id(download_id);
-    extract_arr_history_records(history_value)
-        .into_iter()
-        .find_map(|entry| {
-            let item_id = match implementation {
-                "sonarr" => entry.get("seriesId"),
-                "radarr" => entry.get("movieId"),
-                _ => None,
-            }?;
-            let matches_item = item_id
-                .as_i64()
-                .map(|value| value.to_string() == manager_item_id)
-                .or_else(|| {
-                    item_id
-                        .as_str()
-                        .map(|value| value.trim() == manager_item_id)
-                })
-                .unwrap_or(false);
-            if !matches_item {
-                return None;
-            }
-
-            let event_type = entry
-                .get("eventType")
-                .and_then(Value::as_str)
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if !accepted_events
-                .iter()
-                .any(|candidate| event_type == candidate.to_ascii_lowercase())
-            {
-                return None;
-            }
-
-            let entry_download_id = entry
-                .get("downloadId")
-                .and_then(Value::as_str)
-                .map(normalize_download_id);
-            if entry_download_id.as_deref() != Some(normalized_download_id.as_str()) {
-                return None;
-            }
-
-            Some(ArrHistoryEntry {
-                history_id: entry.get("id").and_then(Value::as_i64)?,
-            })
+    history.iter().find_map(|entry| {
+        (history_entry_matches(entry, manager_item_id, accepted_events)
+            && entry.download_id.as_deref().map(normalize_download_id).as_deref()
+                == Some(normalized_download_id.as_str()))
+        .then(|| ArrHistoryEntry {
+            history_id: entry.history_id.clone(),
         })
+    })
 }
 
 fn find_latest_history_entry_for_item(
-    history_value: &Value,
-    implementation: &str,
+    history: &[ManagerHistoryEntry],
     manager_item_id: &str,
     accepted_events: &[&str],
 ) -> Option<ArrHistoryEntry> {
-    extract_arr_history_records(history_value)
-        .into_iter()
-        .find_map(|entry| {
-            let item_id = match implementation {
-                "sonarr" => entry.get("seriesId"),
-                "radarr" => entry.get("movieId"),
-                _ => None,
-            }?;
-            let matches_item = item_id
-                .as_i64()
-                .map(|value| value.to_string() == manager_item_id)
-                .or_else(|| {
-                    item_id
-                        .as_str()
-                        .map(|value| value.trim() == manager_item_id)
-                })
-                .unwrap_or(false);
-            if !matches_item {
-                return None;
-            }
-
-            let event_type = entry
-                .get("eventType")
-                .and_then(Value::as_str)
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if !accepted_events
-                .iter()
-                .any(|candidate| event_type == candidate.to_ascii_lowercase())
-            {
-                return None;
-            }
-
-            Some(ArrHistoryEntry {
-                history_id: entry.get("id").and_then(Value::as_i64)?,
-            })
+    history.iter().find_map(|entry| {
+        history_entry_matches(entry, manager_item_id, accepted_events).then(|| ArrHistoryEntry {
+            history_id: entry.history_id.clone(),
         })
+    })
 }
 
-async fn request_arr_mark_history_failed(
-    base_url: &str,
-    api_key: &str,
-    history_id: i64,
-) -> AnyResult<()> {
-    let history_id = history_id.to_string();
-    let v3 = format!("api/v3/history/failed/{history_id}");
-    let v4 = format!("api/v4/history/failed/{history_id}");
-    request_arr_write(
-        base_url,
-        api_key,
-        &[v3.as_str(), v4.as_str()],
-        ReqwestMethod::POST,
-        &json!({}),
-    )
-    .await
-}
 
 async fn load_recovery_state(
     store: &ExtensionStore<'_>,
@@ -1614,16 +1415,16 @@ mod tests {
             ]
         });
 
+        let history = crate::http::handlers::discovery::manager::legacy::history("radarr", &history);
         let entry = find_latest_history_entry_for_download(
             &history,
-            "radarr",
             "6",
             "bbb",
             &["grabbed", "downloadfailed"],
         )
         .expect("matching history entry");
 
-        assert_eq!(entry.history_id, 22);
+        assert_eq!(entry.history_id, "22");
     }
 
     #[test]
