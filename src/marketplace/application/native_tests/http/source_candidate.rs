@@ -46,3 +46,22 @@ pub(super) async fn qualify(state: &crate::state::AppState, instance: Uuid) -> R
     );
     Ok(())
 }
+
+/// Stage 2 latency evidence: back-to-back calls of the same installed module,
+/// each a fresh sandbox, through the real acquisition path.
+pub(super) async fn measure(state: &crate::state::AppState, label: &str, calls: usize) -> Result<()> {
+    let sources = MarketplaceSources::from_state(state);
+    let mut elapsed = Vec::with_capacity(calls);
+    for _ in 0..calls {
+        let request: CandidateSearchRequest = serde_json::from_value(json!({
+            "mediaType": "movie", "title": "Example Movie", "year": 2026,
+            "externalIds": {"imdb": "tt1234567"}, "limit": 5
+        }))?;
+        let started = std::time::Instant::now();
+        let response = search_candidates_with_store(&state.db_pool, request, Some(&sources)).await?;
+        assert_eq!(response.candidates.len(), 1);
+        elapsed.push(started.elapsed().as_millis());
+    }
+    eprintln!("native source call latency {label}: elapsed_ms={elapsed:?}");
+    Ok(())
+}

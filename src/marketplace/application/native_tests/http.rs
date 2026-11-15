@@ -399,7 +399,7 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
         let cancelled=observed(&app,&token,next_id,"cancelled").await?;
         assert_eq!(cancelled["revision"],2);assert_eq!(cancelled["cancellation_request_id"],json!(cancel));
         original.entry(next_id)?.task.lock().await.join().await?;
-        playback.insert_test_job(Uuid::new_v4(),directory.join("steady-playback"),0).await;
+        let steady=Uuid::new_v4();playback.insert_test_job(steady,directory.join("steady-playback"),0).await;
         assert!(playback.has_latency_sensitive_work());
         assert_eq!(playback.startup_queue_len(),0,
             "steady managed playback must not become a foreground source veto");
@@ -420,6 +420,10 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
         again.cancel().await?;drop(again);
         source_live::qualify(&db,&state,principal.home_id,principal.user_id,owner).await?;
         source_candidate::qualify(&state,owner).await?;
+        playback.stop_and_remove(steady).await;assert!(!playback.has_latency_sensitive_work());
+        source_candidate::measure(&state,"idle",5).await?;
+        playback.insert_test_job(steady,directory.join("steady-playback"),0).await;
+        source_candidate::measure(&state,"playback",3).await?;
         require_idle_byte_workspace(runtime.as_ref(),&lane,true).await?;
         cache_tamper::qualify(&state,&db,runtime.as_ref(),(&lane,&image),principal.home_id,owner,&release.payload().extension_id).await?;
         assert_eq!(call(&app,&token,"GET","/api/v1/marketplace/installations/current",None).await?["operation"]["operation_id"],json!(next_id),
