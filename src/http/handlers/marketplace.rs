@@ -32,6 +32,7 @@ mod installation;
 pub(crate) use installation::{
     authenticated_first_run_fixture as installation_http_first_run_fixture,
     authenticated_fixture as installation_http_fixture,
+    authenticated_fixture_with_settings as installation_http_fixture_with_settings,
 };
 #[cfg(unix)]
 pub(crate) use installation::{

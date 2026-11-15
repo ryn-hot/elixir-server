@@ -93,7 +93,17 @@ pub(crate) async fn authenticated_fixture(
     root: &FsPath,
     url: &str,
 ) -> Result<(AppState, Router, CurrentPrincipal, String)> {
-    authenticated_fixture_with_preferences(database, root, url, true).await
+    authenticated_fixture_with_preferences(database, root, url, true, |_| {}).await
+}
+
+/// The same server with further settings (for example where it keeps media).
+pub(crate) async fn authenticated_fixture_with_settings(
+    database: Database,
+    root: &FsPath,
+    url: &str,
+    customize: impl FnOnce(&mut crate::config::Settings),
+) -> Result<(AppState, Router, CurrentPrincipal, String)> {
+    authenticated_fixture_with_preferences(database, root, url, true, customize).await
 }
 
 // Actual signup/login with a pristine marketplace, so the desktop itself
@@ -103,7 +113,7 @@ pub(crate) async fn authenticated_first_run_fixture(
     root: &FsPath,
     url: &str,
 ) -> Result<(AppState, Router, CurrentPrincipal, String)> {
-    authenticated_fixture_with_preferences(database, root, url, false).await
+    authenticated_fixture_with_preferences(database, root, url, false, |_| {}).await
 }
 
 async fn authenticated_fixture_with_preferences(
@@ -111,11 +121,13 @@ async fn authenticated_fixture_with_preferences(
     root: &FsPath,
     url: &str,
     seed_preferences: bool,
+    customize: impl FnOnce(&mut crate::config::Settings),
 ) -> Result<(AppState, Router, CurrentPrincipal, String)> {
     let mut settings = crate::http::test_settings_with_db();
     settings.database.url = url.into();
     settings.extensions.storage_root = root.join("extensions").display().to_string();
     settings.extensions.bundled_dir = root.join("bundled").display().to_string();
+    customize(&mut settings);
     let auth = AuthService::new(settings.auth.clone())?;
     let metadata = crate::metadata::MetadataService::new(settings.metadata.clone())?;
     let linkers = crate::library::LinkerService::new(settings.classifier.clone())?;

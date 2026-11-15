@@ -790,4 +790,6 @@ fn marketplace_data_routes(state: &AppState) -> Router<AppState> {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{test_artwork_service, test_settings_with_db};
+pub(crate) use tests::{
+    LiveArrStack, live_arr_stack_one_click, test_artwork_service, test_settings_with_db,
+};

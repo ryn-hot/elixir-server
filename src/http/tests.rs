@@ -19571,8 +19571,6 @@ impl crate::orchestrator::stack_setup::StackCode for NodeStackCode {
 #[tokio::test]
 #[ignore = "live Docker Arr Stack test; set ELIXIR_LIVE_STACK_ROOT to run"]
 async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Result<()> {
-    use crate::extensions::store::{ExtensionStore, NewExtension};
-    use crate::marketplace::stack;
     let Ok(root) = std::env::var("ELIXIR_LIVE_STACK_ROOT") else {
         return Ok(());
     };
@@ -19660,10 +19658,67 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         }
     }
     let _uninstall = Uninstall;
+    // The stack row exactly as marketplace activation leaves it.
+    let mut raw: Value = serde_yaml::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+    raw["id"] = json!("elx:test/arr-stack");
+    if let Some(runtime) = raw["runtime"].as_object_mut() {
+        runtime.remove("profile");
+        runtime.remove("entrypoint");
+    }
+    live_arr_stack_one_click(LiveArrStack {
+        app: router(state.clone()),
+        state,
+        stack: "elx:test/arr-stack".to_owned(),
+        bundled,
+        deployment: _cleanup.0.clone(),
+        volumes: volumes.clone(),
+        stack_row: Some(raw),
+        node_calls: Some(stack_calls),
+        bearer: None,
+    })
+    .await
+}
+
+/// What a live Arr Stack test runs: a server whose stack code is installed
+/// (Node on the Mac, the long-lived executor on Linux) and the stack's ID.
+pub(crate) struct LiveArrStack {
+    pub state: AppState,
+    pub app: axum::Router,
+    pub stack: String,
+    pub bundled: std::path::PathBuf,
+    /// Labels this server's containers, for diagnostics.
+    pub deployment: String,
+    /// Settings volumes to remove afterwards.
+    pub volumes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Written first unless a marketplace installation wrote it already.
+    pub stack_row: Option<Value>,
+    /// Node's log of calls into the module, and its own check, on the Mac.
+    pub node_calls: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    /// A signed-in user's bearer header; a test user signs up otherwise.
+    pub bearer: Option<String>,
+}
+
+/// One-click setup of the Arr Stack's real apps, then Find Media, the control
+/// screens and the web pages through the server's own routes. Fails if any of
+/// the legacy Arr stack's code runs.
+pub(crate) async fn live_arr_stack_one_click(live: LiveArrStack) -> Result<()> {
+    use crate::extensions::store::{ExtensionStore, NewExtension};
+    use crate::marketplace::stack;
+    let LiveArrStack {
+        state,
+        app,
+        stack: stack_id,
+        bundled,
+        deployment,
+        volumes,
+        stack_row,
+        node_calls,
+        bearer,
+    } = live;
+    let db_pool = state.db_pool.clone();
     // Stage 2, slice 4: nothing of the legacy Arr stack's own code may run for
     // this stack, from setup to Find Media, the control screens and web pages.
     crate::legacy_arr::start_recording();
-    let app = router(state.clone());
     let send = |request: Request<Body>| {
         let app = app.clone();
         async move {
@@ -19681,40 +19736,45 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             .body(Body::from(payload.to_string()))
     };
 
-    // The built-in downloaders, as the server bootstraps them.
+    // The built-in downloaders, installed as main.rs installs them at startup:
+    // without a background reconcile, so first boot below starts each once.
     for package in ["qbittorrent-module.elx", "nzbget-module"] {
-        let (status, body) = send(post(
-            "/api/v1/extensions/install".into(),
-            json!({ "packagePath": bundled.join(package).to_string_lossy() }),
-        )?)
-        .await?;
-        assert_eq!(status, StatusCode::OK, "install {package}: {body}");
+        crate::http::handlers::extensions::install_internal_extension_from_dir(
+            &state,
+            &bundled.join(package),
+            crate::http::handlers::extensions::InstallPolicy {
+                allow_internal_directory_install: true,
+                allow_internal_unsigned: true,
+                allow_downgrade: false,
+                allow_same_version_replace: false,
+                suppress_reconcile: true,
+            },
+        )
+        .await
+        .with_context(|| format!("install {package}"))?;
     }
 
-    // The stack row exactly as marketplace activation leaves it.
-    let mut raw: Value = serde_yaml::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-    raw["id"] = json!("elx:test/arr-stack");
-    if let Some(runtime) = raw["runtime"].as_object_mut() {
-        runtime.remove("profile");
-        runtime.remove("entrypoint");
-    }
-    let manifest: crate::extensions::manifest::ExtensionManifest =
-        serde_json::from_value(raw.clone())?;
     let store = ExtensionStore::new(&db_pool);
-    store
-        .upsert_extension(&NewExtension {
-            extension_id: manifest.id.clone(),
-            name: manifest.name.clone(),
-            version: manifest.version.clone(),
-            kind: manifest.kind,
-            publisher_name: Some("Test publisher".into()),
-            signing_key_id: None,
-            trust_level: ExtensionTrustLevel::Community,
-            manifest_json: raw,
-            package_hash: None,
-            enabled: true,
-        })
-        .await?;
+    // The stack row exactly as marketplace activation leaves it (a marketplace
+    // installation has written it already).
+    if let Some(raw) = stack_row {
+        let manifest: crate::extensions::manifest::ExtensionManifest =
+            serde_json::from_value(raw.clone())?;
+        store
+            .upsert_extension(&NewExtension {
+                extension_id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                kind: manifest.kind,
+                publisher_name: Some("Test publisher".into()),
+                signing_key_id: None,
+                trust_level: ExtensionTrustLevel::Community,
+                manifest_json: raw,
+                package_hash: None,
+                enabled: true,
+            })
+            .await?;
+    }
 
     let docker = crate::runtime::docker::DockerRuntimeManager::new(None);
     let summary = stack::reconcile(&db_pool, &docker).await?;
@@ -19776,92 +19836,49 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     // First boot, as `main.rs` does it before anyone can press "Finish
     // setup": create the built-in downloaders' default instances, start them,
     // register their providers and apply the downloader profiles (which set
-    // NZBGet's managed folders).
-    {
-        use crate::orchestrator::executor::ExecutorAction;
-        use crate::orchestrator::naming::build_aliases;
-        use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
-        let mut actions = Vec::new();
-        for extension_id in ["elixir.modules.qbittorrent", "elixir.modules.nzbget"] {
-            let extension = store
-                .get_extension(extension_id)
-                .await?
-                .context("downloader installed")?;
-            let manifest: crate::extensions::manifest::ExtensionManifest =
-                serde_json::from_value(extension.manifest_json)?;
-            let instance = match store.list_instances(Some(extension_id)).await?.pop() {
-                Some(instance) => instance,
-                None => {
-                    let instance_id = uuid::Uuid::new_v4();
-                    store
-                        .create_instance(&crate::extensions::store::NewExtensionInstance {
-                            instance_id,
-                            extension_id: extension_id.to_string(),
-                            instance_name: "default".to_string(),
-                            config_json: None,
-                            enabled: true,
-                        })
-                        .await?;
-                    store
-                        .get_instance(instance_id)
-                        .await?
-                        .context("created instance")?
+    // NZBGet's managed folders). Like main.rs, it retries until it succeeds.
+    for attempt in 1..=3 {
+        match live_arr_stack_first_boot(&state, &store).await {
+            Ok(()) => break,
+            Err(error) if attempt < 3 => {
+                eprintln!(
+                    "first boot attempt {attempt} failed, retrying as main.rs does: {error:#}"
+                );
+                let label = format!("label=elixir.deployment_id={deployment}");
+                if let Ok(out) = std::process::Command::new("docker")
+                    .args([
+                        "ps",
+                        "-a",
+                        "--filter",
+                        &label,
+                        "--format",
+                        "{{.Names}} {{.Label \"elixir.extension_id\"}}",
+                    ])
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        if line.contains("qbittorrent") || line.contains("nzbget") {
+                            let name = line.split_whitespace().next().unwrap_or_default();
+                            if let Ok(logs) = std::process::Command::new("docker")
+                                .args(["logs", "--tail", "25", name])
+                                .output()
+                            {
+                                eprintln!(
+                                    "--- {line}\n{}{}",
+                                    String::from_utf8_lossy(&logs.stdout),
+                                    String::from_utf8_lossy(&logs.stderr)
+                                );
+                            }
+                        }
+                    }
                 }
-            };
-            let runtime = manifest.runtime.clone().context("downloader runtime")?;
-            let (aliases, primary_alias) = build_aliases(
-                extension_id,
-                &instance.instance_name,
-                instance.instance_id,
-                runtime.service_name.clone(),
-            );
-            actions.push(ExecutorAction::EnsureRuntimeRunning {
-                instance_id: instance.instance_id,
-                extension_id: extension_id.to_string(),
-                instance_name: instance.instance_name.clone(),
-                runtime,
-                networking: manifest.networking.clone(),
-                aliases,
-            });
-            for provide in &manifest.provides {
-                let provider_id =
-                    stable_provider_id(instance.instance_id, &provide.capability, &provide.slot);
-                actions.push(ExecutorAction::CreateOrUpdateProvider {
-                    provider_id,
-                    instance_id: instance.instance_id,
-                    capability: provide.capability.clone(),
-                    slot_id: provide.slot.clone(),
-                    cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
-                    implementation: provide.implementation.clone(),
-                    scope_json: provide
-                        .scope
-                        .as_ref()
-                        .map(serde_json::to_value)
-                        .transpose()?,
-                    endpoint: build_provider_endpoint(
-                        provide,
-                        &manifest.networking,
-                        &primary_alias,
-                    )?,
-                });
-                actions.push(ExecutorAction::TransportGate {
-                    provider_id,
-                    timeout_seconds: 120,
-                });
-                actions.push(ExecutorAction::BootstrapGate {
-                    provider_id,
-                    timeout_seconds: 120,
-                });
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
+            Err(error) => return Err(error),
         }
-        state.orchestrator.apply_actions(actions).await?;
-        state
-            .orchestrator
-            .apply_builtin_downloader_profiles_now()
-            .await?;
-        eprintln!("first boot finished after {:?}", started.elapsed());
     }
-    let setup = stack::derived_id("elx:test/arr-stack", "setup");
+    eprintln!("first boot finished after {:?}", started.elapsed());
+    let setup = stack::derived_id(&stack_id, "setup");
     let (status, plan) = send(post(
         "/api/v1/extensions/blueprints/apply".into(),
         json!({ "blueprint_id": setup }),
@@ -19899,7 +19916,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             }
         }
         let docker = |args: &[&str]| std::process::Command::new("docker").args(args).output();
-        let label = format!("label=elixir.deployment_id={}", _cleanup.0);
+        let label = format!("label=elixir.deployment_id={}", deployment);
         let ps = docker(&[
             "ps",
             "-a",
@@ -19951,14 +19968,16 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     }
     assert_eq!(status, StatusCode::OK, "confirm: {run}");
     assert_eq!(run["status"], "completed", "run: {run}");
-    let calls = stack_calls.lock().unwrap().clone();
-    eprintln!("stack setup through the module: {calls:?}");
+    let calls = node_calls
+        .as_ref()
+        .map(|calls| calls.lock().unwrap().clone());
+    eprintln!("stack setup through the module (Node's log): {calls:?}");
     // The largest reply the module reads during setup: Prowlarr's indexer
     // catalog. A long-lived call accepts 16 MiB per reply.
     {
         use crate::marketplace::stack::StackMembers;
         let prowlarr = stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone())
-            .member("elx:test/arr-stack", "prowlarr")
+            .member(&stack_id, "prowlarr")
             .await?
             .context("prowlarr resolves")?;
         let schema = reqwest::Client::new()
@@ -19977,28 +19996,30 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             "indexer catalog fits one reply"
         );
     }
-    for expected in [
-        "sonarr:bootstrap",
-        "radarr:bootstrap",
-        "prowlarr:bootstrap",
-        "sonarr:apply_patch:set_root_folders",
-        "radarr:apply_patch:set_root_folders",
-        "sonarr:apply_patch:set_downloaders",
-        "radarr:apply_patch:set_downloaders",
-        "sonarr:apply_patch:apply_quality_policy_preset",
-        "radarr:apply_patch:apply_quality_policy_preset",
-        "prowlarr:apply_patch:register_indexers",
-        "prowlarr:apply_patch:register_apps",
-    ] {
-        assert!(
-            calls.iter().any(|call| call == expected),
-            "{expected} went through the module: {calls:?}"
-        );
+    if let Some(calls) = &calls {
+        for expected in [
+            "sonarr:bootstrap",
+            "radarr:bootstrap",
+            "prowlarr:bootstrap",
+            "sonarr:apply_patch:set_root_folders",
+            "radarr:apply_patch:set_root_folders",
+            "sonarr:apply_patch:set_downloaders",
+            "radarr:apply_patch:set_downloaders",
+            "sonarr:apply_patch:apply_quality_policy_preset",
+            "radarr:apply_patch:apply_quality_policy_preset",
+            "prowlarr:apply_patch:register_indexers",
+            "prowlarr:apply_patch:register_apps",
+        ] {
+            assert!(
+                calls.iter().any(|call| call == expected),
+                "{expected} went through the module: {calls:?}"
+            );
+        }
     }
 
     // Every stack container runs under the stack sandbox.
     for member in ["sonarr", "radarr", "prowlarr"] {
-        let id = stack::derived_id("elx:test/arr-stack", member);
+        let id = stack::derived_id(&stack_id, member);
         let out = std::process::Command::new("docker")
             .args([
                 "ps",
@@ -20069,7 +20090,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     let mut members = serde_json::Map::new();
     for member in ["sonarr", "radarr", "prowlarr"] {
         let endpoint = directory
-            .member("elx:test/arr-stack", member)
+            .member(&stack_id, member)
             .await?
             .with_context(|| format!("{member} resolves through the member directory"))?;
         assert!(endpoint.api_key.is_some(), "{member} API key is available");
@@ -20098,18 +20119,23 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
 
     // The server's own Find Media, control and web-page paths for the stack's
     // members, through the module against the real apps, as a signed-in user.
-    let (status, tokens) = send(post(
-        "/api/v1/auth/signup".into(),
-        json!({"email": "arr-stack-live@example.test", "password": "fixture-password-only"}),
-    )?)
-    .await?;
-    assert!(status.is_success(), "test account: {tokens}");
-    let bearer = format!(
-        "Bearer {}",
-        tokens["access_token"]
-            .as_str()
-            .context("test account access token")?
-    );
+    let bearer = match bearer {
+        Some(bearer) => bearer,
+        None => {
+            let (status, tokens) = send(post(
+                "/api/v1/auth/signup".into(),
+                json!({"email": "arr-stack-live@example.test", "password": "fixture-password-only"}),
+            )?)
+            .await?;
+            assert!(status.is_success(), "test account: {tokens}");
+            format!(
+                "Bearer {}",
+                tokens["access_token"]
+                    .as_str()
+                    .context("test account access token")?
+            )
+        }
+    };
     let post = |uri: String, payload: Value| {
         Request::post(uri)
             .header("authorization", bearer.clone())
@@ -20123,7 +20149,7 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     };
     let details = store.list_provider_details().await?;
     let provider_of = |member: &str, capability: &str| {
-        let id = stack::derived_id("elx:test/arr-stack", member);
+        let id = stack::derived_id(&stack_id, member);
         details
             .iter()
             .find(|detail| detail.extension_id == id && detail.provider.capability == capability)
@@ -20132,8 +20158,9 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
     };
     let search = provider_of("sonarr", "media.search.tv")?;
     let manager = provider_of("sonarr", "media.manager.tv")?;
-    // Sonarr's own metadata service (SkyHook) sometimes times out; a lookup
-    // that reached Sonarr through the module is retried.
+    // Sonarr's own metadata service (SkyHook) sometimes times out, or is slow
+    // enough that Sonarr misses the executor's 25-second member deadline; a
+    // lookup that reached Sonarr through the module is retried.
     let mut attempts = 0;
     let expanse = loop {
         attempts += 1;
@@ -20156,7 +20183,9 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             break item.clone();
         }
         assert!(
-            attempts < 5 && found.to_string().contains("SkyHook"),
+            attempts < 5
+                && (found.to_string().contains("SkyHook")
+                    || found.to_string().contains("SDK operation unavailable")),
             "find media search found The Expanse: {found}"
         );
         eprintln!("find media search: SkyHook failed, retrying");
@@ -20191,8 +20220,157 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
             .contains(added["intentId"].as_str().unwrap_or("?")),
         "the added series is tracked: {acquisition}"
     );
+    // Queue and episode tracking against the real apps, downloading nothing:
+    // a stopped torrent with a made-up hash, named like The Expanse S01E01,
+    // in Sonarr's download category. Sonarr lists it in its queue; the stack's
+    // code (the path Find Media uses) maps it to the series and the episode.
+    let intent = store
+        .list_active_managed_ingest_intents()
+        .await?
+        .into_iter()
+        .find(|intent| Some(intent.intent_id.to_string().as_str()) == added["intentId"].as_str())
+        .context("the added series has an active intent")?;
+    let item_id = intent
+        .manager_item_id
+        .context("Sonarr's ID for the added series")?;
+    let tracker = crate::http::handlers::discovery::manager::ExtensionManager::for_member(
+        &stack::derived_id(&stack_id, "sonarr"),
+        "media.manager.tv",
+    )?
+    .context("Sonarr is the stack's media manager")?;
+    // The built-in qBittorrent, signed in directly with its stored login, as
+    // its driver does it.
+    let qbittorrent = details
+        .iter()
+        .find(|detail| detail.provider.capability == "downloader.torrent")
+        .map(|detail| detail.provider.provider_id)
+        .context("the built-in qBittorrent")?;
+    let qbittorrent = store
+        .get_provider(qbittorrent)
+        .await?
+        .context("qBittorrent provider")?;
+    let endpoint: crate::orchestrator::model::ProviderEndpoint = serde_json::from_value(
+        qbittorrent
+            .endpoint_json
+            .clone()
+            .context("qBittorrent endpoint")?,
+    )?;
+    let base = format!("http://127.0.0.1:{}/api/v2", endpoint.port);
+    let mut login = Vec::new();
+    for key in ["qbittorrent_username", "qbittorrent_password"] {
+        let secret = store
+            .get_secret(SecretScope::Instance, Some(qbittorrent.instance_id), key)
+            .await?
+            .with_context(|| format!("qBittorrent {key}"))?;
+        login.push(state.secrets.decrypt(&secret.value_encrypted)?);
+    }
+    let client = reqwest::Client::new();
+    let signed_in = client
+        .post(format!("{base}/auth/login"))
+        // qBittorrent accepts only the host it is configured for.
+        .header(reqwest::header::HOST, "localhost:8080")
+        .form(&[
+            ("username", login[0].as_str()),
+            ("password", login[1].as_str()),
+        ])
+        .send()
+        .await?;
+    let cookie = signed_in
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value
+                .split(';')
+                .next()
+                .filter(|pair| pair.starts_with("SID="))
+        })
+        .map(str::to_owned)
+        .context("qBittorrent session")?;
+    let hash: String = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+        .chars()
+        .take(40)
+        .collect();
+    let magnet =
+        format!("magnet:?xt=urn:btih:{hash}&dn=The.Expanse.S01E01.720p.WEB-DL.x264-ELIXIRTEST");
+    let added_torrent = client
+        .post(format!("{base}/torrents/add"))
+        // qBittorrent accepts only the host it is configured for.
+        .header(reqwest::header::HOST, "localhost:8080")
+        .header(reqwest::header::COOKIE, &cookie)
+        .form(&[
+            ("urls", magnet.as_str()),
+            ("category", "tv"),
+            ("paused", "true"),
+            ("stopped", "true"),
+        ])
+        .send()
+        .await?;
+    assert!(
+        added_torrent.status().is_success(),
+        "stopped test torrent: {}",
+        added_torrent.status()
+    );
+    {
+        use crate::marketplace::stack::StackMembers;
+        let sonarr = stack::MemberDirectory::new(db_pool.clone(), state.secrets.as_ref().clone())
+            .member(&stack_id, "sonarr")
+            .await?
+            .context("sonarr resolves")?;
+        reqwest::Client::new()
+            .post(format!(
+                "{}/api/v3/command",
+                sonarr.base_url.trim_end_matches('/')
+            ))
+            .header("x-api-key", sonarr.api_key.clone().unwrap_or_default())
+            .json(&json!({"name": "RefreshMonitoredDownloads"}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    let mut tracked = Value::Null;
+    for _ in 0..45 {
+        tracked = tracker
+            .call("acquisition_status", json!({ "itemId": item_id }))
+            .await?;
+        if tracked["queue"]
+            .as_array()
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    eprintln!("queue and episode tracking through the stack's code: {tracked}");
+    let entry = &tracked["queue"][0];
+    assert_eq!(
+        entry["itemId"],
+        json!(item_id),
+        "the queue entry is the series: {tracked}"
+    );
+    let episode = entry["episodeId"]
+        .as_str()
+        .with_context(|| format!("the queue entry names its episode: {tracked}"))?;
+    assert_eq!(
+        (
+            &tracked["episodes"][episode]["season"],
+            &tracked["episodes"][episode]["episode"]
+        ),
+        (&json!(1), &json!(1)),
+        "the episode index maps it to S01E01: {tracked}"
+    );
+    client
+        .post(format!("{base}/torrents/delete"))
+        // qBittorrent accepts only the host it is configured for.
+        .header(reqwest::header::HOST, "localhost:8080")
+        .header(reqwest::header::COOKIE, &cookie)
+        .form(&[("hashes", hash.as_str()), ("deleteFiles", "true")])
+        .send()
+        .await?
+        .error_for_status()?;
     for member in ["sonarr", "radarr", "prowlarr"] {
-        let id = stack::derived_id("elx:test/arr-stack", member);
+        let id = stack::derived_id(&stack_id, member);
         let (status, surface) =
             send(get(format!("/api/v1/extensions/{id}/control-surface"))?).await?;
         assert_eq!(
@@ -20235,6 +20413,91 @@ async fn live_arr_stack_one_click_runs_members_under_the_stack_sandbox() -> Resu
         ran.is_empty(),
         "the legacy Arr stack's own code ran for this marketplace stack: {ran:?}"
     );
+    Ok(())
+}
+
+/// The built-in downloaders' first start, as main.rs does it at startup.
+async fn live_arr_stack_first_boot(
+    state: &AppState,
+    store: &crate::extensions::store::ExtensionStore<'_>,
+) -> Result<()> {
+    use crate::orchestrator::executor::ExecutorAction;
+    use crate::orchestrator::naming::build_aliases;
+    use crate::orchestrator::planner::{build_provider_endpoint, stable_provider_id};
+    let mut actions = Vec::new();
+    for extension_id in ["elixir.modules.qbittorrent", "elixir.modules.nzbget"] {
+        let extension = store
+            .get_extension(extension_id)
+            .await?
+            .context("downloader installed")?;
+        let manifest: crate::extensions::manifest::ExtensionManifest =
+            serde_json::from_value(extension.manifest_json)?;
+        let instance = match store.list_instances(Some(extension_id)).await?.pop() {
+            Some(instance) => instance,
+            None => {
+                let instance_id = uuid::Uuid::new_v4();
+                store
+                    .create_instance(&crate::extensions::store::NewExtensionInstance {
+                        instance_id,
+                        extension_id: extension_id.to_string(),
+                        instance_name: "default".to_string(),
+                        config_json: None,
+                        enabled: true,
+                    })
+                    .await?;
+                store
+                    .get_instance(instance_id)
+                    .await?
+                    .context("created instance")?
+            }
+        };
+        let runtime = manifest.runtime.clone().context("downloader runtime")?;
+        let (aliases, primary_alias) = build_aliases(
+            extension_id,
+            &instance.instance_name,
+            instance.instance_id,
+            runtime.service_name.clone(),
+        );
+        actions.push(ExecutorAction::EnsureRuntimeRunning {
+            instance_id: instance.instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: instance.instance_name.clone(),
+            runtime,
+            networking: manifest.networking.clone(),
+            aliases,
+        });
+        for provide in &manifest.provides {
+            let provider_id =
+                stable_provider_id(instance.instance_id, &provide.capability, &provide.slot);
+            actions.push(ExecutorAction::CreateOrUpdateProvider {
+                provider_id,
+                instance_id: instance.instance_id,
+                capability: provide.capability.clone(),
+                slot_id: provide.slot.clone(),
+                cardinality: provide.cardinality.unwrap_or(SlotCardinality::One),
+                implementation: provide.implementation.clone(),
+                scope_json: provide
+                    .scope
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+                endpoint: build_provider_endpoint(provide, &manifest.networking, &primary_alias)?,
+            });
+            actions.push(ExecutorAction::TransportGate {
+                provider_id,
+                timeout_seconds: 120,
+            });
+            actions.push(ExecutorAction::BootstrapGate {
+                provider_id,
+                timeout_seconds: 120,
+            });
+        }
+    }
+    state.orchestrator.apply_actions(actions).await?;
+    state
+        .orchestrator
+        .apply_builtin_downloader_profiles_now()
+        .await?;
     Ok(())
 }
 

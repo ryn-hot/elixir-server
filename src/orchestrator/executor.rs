@@ -5102,8 +5102,93 @@ async fn probe_provider_transport(
     endpoint: &ProviderEndpoint,
 ) -> Result<HostProbeTarget> {
     let target = resolve_probe_target(instance_id, endpoint).await?;
+    // A port published on this computer's loopback only (a marketplace stack
+    // member's) is reachable from the server process, but on Linux not from a
+    // probe container through the Docker host gateway, so the server checks
+    // it itself. Ports published on every interface keep the container probe.
+    // If the binding cannot be read, the container probe decides as before.
+    if endpoint.network.as_deref() == Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK)
+        && published_on_loopback_only(instance_id, endpoint.port)
+            .await
+            .unwrap_or(false)
+    {
+        probe_loopback_from_server(endpoint.port).await?;
+        return Ok(target);
+    }
     probe_host_target(probe, &target).await?;
     Ok(target)
+}
+
+/// Whether the instance's container publishes `host_port` on loopback only.
+async fn published_on_loopback_only(instance_id: Uuid, host_port: u16) -> Result<bool> {
+    let mut candidates = vec![container_name(instance_id)];
+    candidates.extend(list_docker_container_names(instance_id, true).await?);
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if candidate.trim().is_empty() || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let inspect_args = vec![
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{json .NetworkSettings.Ports}}".to_string(),
+            candidate,
+        ];
+        let ports_json = match run_docker_stdout(&inspect_args).await {
+            Ok(ports_json) => ports_json,
+            Err(err) if docker_container_missing_error(&err) => continue,
+            Err(err) => return Err(err),
+        };
+        if let Some(loopback) = host_port_is_loopback_only(&ports_json, host_port)? {
+            return Ok(loopback);
+        }
+    }
+    Ok(false)
+}
+
+/// `Some(true)` when every binding of `host_port` is on a loopback address,
+/// `None` when no binding uses that host port.
+fn host_port_is_loopback_only(ports_json: &str, host_port: u16) -> Result<Option<bool>> {
+    let ports: serde_json::Value =
+        serde_json::from_str(ports_json.trim()).context("parsing docker ports inspect output")?;
+    let mut found = None;
+    for binding in ports
+        .as_object()
+        .into_iter()
+        .flat_map(|ports| ports.values())
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+    {
+        let port = binding
+            .get("HostPort")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|port| port.trim().parse::<u16>().ok());
+        if port != Some(host_port) {
+            continue;
+        }
+        let loopback = binding
+            .get("HostIp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ip| ip.trim().parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        found = Some(found.unwrap_or(true) && loopback);
+    }
+    Ok(found)
+}
+
+async fn probe_loopback_from_server(port: u16) -> Result<()> {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => {
+            bail!("probe tcp failed: server could not connect to 127.0.0.1:{port}: {err}")
+        }
+        Err(_) => bail!("probe tcp failed: connecting to 127.0.0.1:{port} timed out"),
+    }
 }
 
 async fn endpoint_host_resolves(host: &str, port: u16) -> bool {
@@ -6565,6 +6650,18 @@ mod tests {
             "authenticationMethod": "forms",
             "authenticationRequired": "disabledForLocalAddresses"
         })));
+    }
+
+    #[test]
+    fn loopback_only_ports_are_told_apart_from_published_ones() -> Result<()> {
+        let stack = r#"{"8989/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}]}"#;
+        assert_eq!(host_port_is_loopback_only(stack, 32768)?, Some(true));
+        assert_eq!(host_port_is_loopback_only(stack, 32769)?, None);
+        let legacy = r#"{"8080/tcp":[{"HostIp":"0.0.0.0","HostPort":"32932"},{"HostIp":"::","HostPort":"32932"}]}"#;
+        assert_eq!(host_port_is_loopback_only(legacy, 32932)?, Some(false));
+        let unpublished = r#"{"8080/tcp":null}"#;
+        assert_eq!(host_port_is_loopback_only(unpublished, 8080)?, None);
+        Ok(())
     }
 
     #[test]
