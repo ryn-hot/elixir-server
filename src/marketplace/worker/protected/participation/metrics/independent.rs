@@ -101,6 +101,22 @@ impl IndependentAdmission {
         application_kernel_headroom(&self.ordinary, actual.resources())
     }
 }
+/// A long-lived executor reserves its memory once, when it starts: a stream
+/// that is starting or seeking goes first, and the server must have twice the
+/// reservation free. No measurement container is started.
+pub(in crate::marketplace) async fn serve_start_admitted(
+    playback: &crate::playback::PlaybackJobManager,
+    memory_bytes: u64,
+) -> Result<()> {
+    if !playback.startup_settled(PLAYBACK_STARTUP_WAIT).await {
+        bail!("extension executor waited too long for playback startup");
+    }
+    let available = host_available().await?;
+    if available < memory_bytes.saturating_mul(2) {
+        bail!("extension executor yields to low server memory");
+    }
+    Ok(())
+}
 fn application_kernel_headroom(ordinary: &OrdinaryLimits, resources: &str) -> Result<()> {
     let available = linux_available(resources)?;
     let required = ordinary.memory_bytes * 2;

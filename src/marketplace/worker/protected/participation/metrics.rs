@@ -31,7 +31,7 @@ mod cpu;
 mod macos;
 use crate::marketplace::host_observation as probe;
 mod independent;
-pub(in crate::marketplace) use independent::IndependentAdmission;
+pub(in crate::marketplace) use independent::{IndependentAdmission, serve_start_admitted};
 
 #[derive(Clone, Debug)]
 pub(in crate::marketplace::worker::protected) struct Facts {

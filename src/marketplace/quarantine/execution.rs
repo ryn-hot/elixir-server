@@ -13,11 +13,13 @@ use elixir_marketplace::source_execution::{
 mod container;
 mod native;
 mod retained;
+mod serve;
 #[cfg(unix)]
 pub(in crate::marketplace) use native::GatewayLaunch;
 pub(in crate::marketplace) use native::{HttpLaunch, NativeInvocation};
 pub(in crate::marketplace) use retained::require_byte_plan_for as require_retained_byte_plan;
 pub(in crate::marketplace) use retained::{CompiledPreparation, RetainedCode};
+pub(in crate::marketplace) use serve::{ServeOutcome, ServeSession};
 
 // Configuration check only, NOT evidence of a running executor or permission
 // to execute. Called before native creation against the pinned image's labels.
@@ -157,6 +159,97 @@ impl SourceChannel {
     }
 }
 
+/// SDK allowance spent so far by one invocation (or one long-lived call).
+#[derive(Default)]
+struct SdkCounters {
+    calls: u32,
+    requests: u64,
+    responses: u64,
+}
+/// One SDK exchange after its SdkCall event: the parent enforces the same
+/// allowance as the interpreter, then lets the broker decide and answer.
+async fn answer_sdk_call(
+    channel: &mut SourceChannel,
+    job: Digest,
+    limits: &SourceExecutionLimits,
+    broker: &mut dyn Broker,
+    counters: &mut SdkCounters,
+    call_id: u32,
+) -> Result<()> {
+    let allowance = limits
+        .sdk
+        .as_ref()
+        .context("source SDK transport is disabled")?;
+    counters.calls += 1;
+    if call_id != counters.calls || counters.calls > allowance.calls {
+        bail!("source SDK call sequence or allowance differs");
+    }
+    let remaining = allowance
+        .request_bytes
+        .saturating_sub(counters.requests)
+        .min(MAX_ARGUMENT_BYTES as u64) as usize;
+    if remaining == 0 {
+        bail!("source SDK request allowance exhausted");
+    }
+    let first = guarded(
+        broker,
+        channel.execution_event(job, Duration::from_secs(10)),
+    )
+    .await?;
+    let raw = channel
+        .execution_payload(first, job, PayloadKind::SdkRequest, remaining, broker)
+        .await?;
+    counters.requests = counters
+        .requests
+        .checked_add(raw.accounted_bytes() as u64)
+        .context("SDK request counter overflow")?;
+    if counters.requests > allowance.request_bytes {
+        bail!("source SDK request allowance exhausted");
+    }
+    let operation = SourceSdkRequest::parse(&raw)
+        .map_err(|_| anyhow::anyhow!("invalid private SDK request"))?;
+    // Reserve response capacity BEFORE the effect. An effect must
+    // not commit when no reply (even JSON true/null) can fit.
+    let maximum = allowance
+        .response_bytes
+        .saturating_sub(counters.responses)
+        .min(limits.json_bytes);
+    if maximum == 0 {
+        bail!("source SDK reply allowance exhausted");
+    }
+    broker.current().await?;
+    let reply = broker.request(&raw, maximum as usize).await?;
+    broker.current().await?;
+    let status = match &reply {
+        SourceSdkReply::Denied => SdkStatus::Denied,
+        SourceSdkReply::Unavailable => SdkStatus::Unavailable,
+        SourceSdkReply::Value(json) => {
+            operation.validate_reply(json)?;
+            if json.accounted_bytes() as u64 > maximum {
+                bail!("source SDK reply allowance exhausted");
+            }
+            counters.responses += json.accounted_bytes() as u64;
+            SdkStatus::Ok
+        }
+    };
+    guarded(
+        broker,
+        channel.execution_write(&Event::SdkReturn {
+            schema_version: 1,
+            job_id: job,
+            call_id,
+            status,
+        }),
+    )
+    .await?;
+    if let SourceSdkReply::Value(json) = reply {
+        channel
+            .execution_send(job, PayloadKind::SdkResponse, &json, broker)
+            .await?;
+    }
+    Ok(())
+}
+
 /// After independently inspected Ready. Parent enforces SDK limits as well as
 /// the interpreter: a compromised child cannot overrun them or return a result
 /// before completing the previous call. No response body is logged or Debugged.
@@ -189,9 +282,7 @@ async fn exchange_bound(
         .execution_send(job, PayloadKind::Arguments, arguments, broker)
         .await?;
     guarded(broker, channel.marker(JOB_END)).await?;
-    let mut calls = 0u32;
-    let mut requests = 0u64;
-    let mut responses = 0u64;
+    let mut counters = SdkCounters::default();
     loop {
         // Large response parsing/computation can be quiet. The enclosing
         // original absolute job/invocation deadline AND native guardian still
@@ -203,76 +294,7 @@ async fn exchange_bound(
         .await?;
         match event {
             Event::SdkCall { call_id, .. } => {
-                let allowance = limits
-                    .sdk
-                    .as_ref()
-                    .context("source SDK transport is disabled")?;
-                calls += 1;
-                if call_id != calls || calls > allowance.calls {
-                    bail!("source SDK call sequence or allowance differs");
-                }
-                let remaining = allowance
-                    .request_bytes
-                    .saturating_sub(requests)
-                    .min(MAX_ARGUMENT_BYTES as u64) as usize;
-                if remaining == 0 {
-                    bail!("source SDK request allowance exhausted");
-                }
-                let first = guarded(
-                    broker,
-                    channel.execution_event(job, Duration::from_secs(10)),
-                )
-                .await?;
-                let raw = channel
-                    .execution_payload(first, job, PayloadKind::SdkRequest, remaining, broker)
-                    .await?;
-                requests = requests
-                    .checked_add(raw.accounted_bytes() as u64)
-                    .context("SDK request counter overflow")?;
-                if requests > allowance.request_bytes {
-                    bail!("source SDK request allowance exhausted");
-                }
-                let operation = SourceSdkRequest::parse(&raw)
-                    .map_err(|_| anyhow::anyhow!("invalid private SDK request"))?;
-                // Reserve response capacity BEFORE the effect. An effect must
-                // not commit when no reply (even JSON true/null) can fit.
-                let maximum = allowance
-                    .response_bytes
-                    .saturating_sub(responses)
-                    .min(limits.json_bytes);
-                if maximum == 0 {
-                    bail!("source SDK reply allowance exhausted");
-                }
-                broker.current().await?;
-                let reply = broker.request(&raw, maximum as usize).await?;
-                broker.current().await?;
-                let status = match &reply {
-                    SourceSdkReply::Denied => SdkStatus::Denied,
-                    SourceSdkReply::Unavailable => SdkStatus::Unavailable,
-                    SourceSdkReply::Value(json) => {
-                        operation.validate_reply(json)?;
-                        if json.accounted_bytes() as u64 > maximum {
-                            bail!("source SDK reply allowance exhausted");
-                        }
-                        responses += json.accounted_bytes() as u64;
-                        SdkStatus::Ok
-                    }
-                };
-                guarded(
-                    broker,
-                    channel.execution_write(&Event::SdkReturn {
-                        schema_version: 1,
-                        job_id: job,
-                        call_id,
-                        status,
-                    }),
-                )
-                .await?;
-                if let SourceSdkReply::Value(json) = reply {
-                    channel
-                        .execution_send(job, PayloadKind::SdkResponse, &json, broker)
-                        .await?;
-                }
+                answer_sdk_call(channel, job, limits, broker, &mut counters, call_id).await?;
             }
             first @ Event::Payload {
                 kind: PayloadKind::Result,

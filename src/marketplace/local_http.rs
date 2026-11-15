@@ -372,6 +372,8 @@ async fn open(
         SdkHttpMethod::Get => Method::GET,
         SdkHttpMethod::Head => Method::HEAD,
         SdkHttpMethod::Post => Method::POST,
+        // Only a long-lived executor's own stack members accept these.
+        SdkHttpMethod::Put | SdkHttpMethod::Delete => bail!("local SDK HTTP method"),
     };
     let response = DirectEgressConnector::for_sdk()
         .execute(

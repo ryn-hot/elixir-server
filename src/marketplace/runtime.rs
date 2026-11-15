@@ -4,8 +4,10 @@
 use crate::runtime::{
     RuntimeManager,
     model::{
-        ContainerHandle, ContainerLogOptions, ContainerRuntimeState, ContainerSecurityOptions,
-        ContainerSpec, ContainerTmpfsMount, apply_container_spec_fingerprint,
+        CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerLogOptions, ContainerRuntimeState,
+        ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
+        ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL,
+        apply_container_spec_fingerprint,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -202,6 +204,16 @@ fn verify_inspect(
     state: &ContainerRuntimeState,
     limits: &OrdinaryLimits,
 ) -> Result<()> {
+    verify_inspect_with(spec, state, limits, false)
+}
+/// `governed_cpu`: the long-lived executor has no fixed CPU limit; the
+/// playback governor caps it while media plays. Every other check is the same.
+fn verify_inspect_with(
+    spec: &ContainerSpec,
+    state: &ContainerRuntimeState,
+    limits: &OrdinaryLimits,
+    governed_cpu: bool,
+) -> Result<()> {
     let build = build::is_command(&spec.command);
     if build {
         build::validate_spec(spec)?;
@@ -258,7 +270,11 @@ fn verify_inspect(
             .any(|cap| cap.eq_ignore_ascii_case("ALL"))
         || security.memory_limit_bytes != Some(limits.memory_bytes as i64)
         || security.memory_swap_limit_bytes != Some(limits.memory_bytes as i64)
-        || security.nano_cpus != Some(i64::from(limits.cpu_millicores) * 1_000_000)
+        || (if governed_cpu {
+            !matches!(security.nano_cpus, None | Some(0))
+        } else {
+            security.nano_cpus != Some(i64::from(limits.cpu_millicores) * 1_000_000)
+        })
         || security.pids_limit != Some(WORKER_PIDS as i64)
         || security.shared_memory_bytes != Some(MIB as i64)
         || !security
@@ -338,6 +354,9 @@ fn verify_inspect(
 }
 
 fn verify_kernel(output: &str, limits: &OrdinaryLimits) -> Result<()> {
+    verify_kernel_with(output, limits, false)
+}
+fn verify_kernel_with(output: &str, limits: &OrdinaryLimits, governed_cpu: bool) -> Result<()> {
     if output.len() > 32 * 1024 {
         bail!("oversized marketplace kernel report");
     }
@@ -347,19 +366,32 @@ fn verify_kernel(output: &str, limits: &OrdinaryLimits) -> Result<()> {
         .context("missing cgroup memory limit")?
         .parse()?;
     let swap: u64 = lines.next().context("missing cgroup swap limit")?.parse()?;
-    let cpu = lines
-        .next()
-        .context("missing cgroup CPU limit")?
-        .split_whitespace()
-        .map(str::parse::<u64>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let cpu_line = lines.next().context("missing cgroup CPU limit")?;
+    // Unlimited ("max <period>") or a governor cap, for the long-lived executor.
+    let governed = governed_cpu
+        && cpu_line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .as_slice()
+            .first()
+            .is_some_and(|quota| *quota == "max" || quota.parse::<u64>().is_ok_and(|q| q > 0));
+    let cpu = if governed {
+        Vec::new()
+    } else {
+        cpu_line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
     let pids: u64 = lines.next().context("missing cgroup PID limit")?.parse()?;
     if memory != limits.memory_bytes
         || swap != 0
         || pids != WORKER_PIDS
-        || cpu.len() != 2
-        || cpu[1] == 0
-        || u128::from(cpu[0]) * 1000 != u128::from(cpu[1]) * u128::from(limits.cpu_millicores)
+        || (!governed
+            && (cpu.len() != 2
+                || cpu[1] == 0
+                || u128::from(cpu[0]) * 1000
+                    != u128::from(cpu[1]) * u128::from(limits.cpu_millicores)))
     {
         bail!("marketplace cgroup limits are not enforced as requested");
     }
@@ -460,6 +492,103 @@ pub(super) async fn inspect_source_executor(
         .exec_container_command(handle, &format!("{WORKER_UID}:{WORKER_GID}"), &command)
         .await?;
     verify_quarantine_kernel(&report, limits, 1, 4, pid)
+}
+
+pub(crate) const SERVE_NAME_PREFIX: &str = "elixir-marketplace-serve-";
+pub(crate) const SERVE_ISOLATION: &str = "serve-v1";
+pub(crate) const SERVE_EXTENSION_LABEL: &str = "elixir-marketplace-serve";
+
+/// The long-lived executor's closed profile: offline, no mounts but its two
+/// private tmpfs, the hardened worker user and limits, no fixed CPU limit
+/// (the playback governor caps it), and exactly `--source-serve <descriptor>`.
+pub(crate) fn require_serve_spec(spec: &ContainerSpec) -> Result<()> {
+    let deployment = spec
+        .labels
+        .get(ELIXIR_DEPLOYMENT_ID_LABEL)
+        .filter(|v| {
+            !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .context("long-lived executor deployment missing")?;
+    let command_ok = spec.command.len() == 2
+        && spec.command[0] == "--source-serve"
+        && elixir_marketplace::source_execution::SourceServeDescriptor::parse(
+            spec.command[1].as_bytes(),
+        )
+        .is_ok();
+    if spec.name != format!("{SERVE_NAME_PREFIX}{deployment}")
+        || spec.labels.get(ELIXIR_MANAGED_LABEL).map(String::as_str) != Some("true")
+        || spec.labels.get("elixir.marketplace.isolation").map(String::as_str)
+            != Some(SERVE_ISOLATION)
+        || spec.labels.get(ELIXIR_EXTENSION_ID_LABEL).map(String::as_str)
+            != Some(SERVE_EXTENSION_LABEL)
+        || spec.labels.get(ELIXIR_INSTANCE_ID_LABEL)
+            != Some(&format!("marketplace-serve-{deployment}"))
+        || !spec.labels.contains_key(CONTAINER_SPEC_HASH_LABEL)
+        || !image_is_pinned(&spec.image)
+        || spec.network_mode.as_deref() != Some("none")
+        || !spec.aliases.is_empty()
+        || !spec.ports.is_empty()
+        || !spec.env.is_empty()
+        || !spec.volumes.is_empty()
+        || !spec.cap_add.is_empty()
+        || !spec.devices.is_empty()
+        || !spec.sysctls.is_empty()
+        || !spec.cap_drop.iter().any(|cap| cap == "ALL")
+        || !spec.security.read_only_rootfs
+        || !spec.security.no_new_privileges
+        || !spec.security.stdin_open
+        || spec.security.cpu_quota.is_some()
+        || spec.security.memory_limit_mb.is_none()
+        || spec.security.file_size_limit_bytes != Some(1)
+        || spec.security.user.as_deref() != Some("10004:10004")
+        || !command_ok
+    {
+        bail!("long-lived executor requires its closed offline profile");
+    }
+    Ok(())
+}
+
+/// Actual Docker configuration and kernel guards of a started long-lived
+/// executor, checked after its Ready and before any package byte is sent.
+pub(super) async fn inspect_serve_executor(
+    runtime: &dyn RuntimeManager,
+    handle: &ContainerHandle,
+    spec: &ContainerSpec,
+    limits: &SourceJobLimits,
+) -> Result<()> {
+    require_serve_spec(spec)?;
+    let state = runtime
+        .describe_container_runtime_state(&handle.id)
+        .await?
+        .context("long-lived executor inspection unavailable")?;
+    verify_inspect_with(spec, &state, limits, true)?;
+    if handle.name != spec.name
+        || state.security.stdin_open != Some(true)
+        || state.security.tty != Some(false)
+        || !state
+            .security
+            .file_size_limit
+            .as_ref()
+            .is_some_and(|limit| limit.soft == 1 && limit.hard == 1)
+        || state.mounts.iter().any(|mount| mount.mount_type != "tmpfs")
+    {
+        bail!("long-lived executor stream, file or mount profile differs");
+    }
+    let pid = inspect_native_child_pid(runtime, handle).await?;
+    let command = [
+        "/bin/cat",
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.swap.max",
+        "/sys/fs/cgroup/cpu.max",
+        "/sys/fs/cgroup/pids.max",
+        &format!("/proc/{pid}/status"),
+        "/proc/self/limits",
+    ]
+    .map(str::to_owned);
+    let report = runtime
+        .exec_container_command(handle, &format!("{WORKER_UID}:{WORKER_GID}"), &command)
+        .await?;
+    verify_quarantine_kernel_with(&report, limits, 1, 4, pid, true)
 }
 
 fn native_child_pid(raw: &str) -> Result<u32> {
@@ -581,7 +710,17 @@ fn verify_quarantine_kernel(
     minimum_filters: u64,
     pid: u32,
 ) -> Result<()> {
-    verify_kernel(report, limits)?;
+    verify_quarantine_kernel_with(report, limits, file_bytes, minimum_filters, pid, false)
+}
+fn verify_quarantine_kernel_with(
+    report: &str,
+    limits: &SourceJobLimits,
+    file_bytes: u64,
+    minimum_filters: u64,
+    pid: u32,
+    governed_cpu: bool,
+) -> Result<()> {
+    verify_kernel_with(report, limits, governed_cpu)?;
     let filters = report.lines().find_map(|line| {
         line.strip_prefix("Seccomp_filters:")
             .and_then(|v| v.trim().parse::<u64>().ok())

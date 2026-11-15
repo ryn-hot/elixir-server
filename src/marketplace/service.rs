@@ -86,8 +86,18 @@ pub struct MarketplaceService {
     source_calls: Arc<super::application::InstalledCallQueue>,
     #[cfg(unix)]
     local_http: Option<Arc<super::local_http::Client>>,
+    /// Long-lived executors, configured with installed restoration.
+    #[cfg(unix)]
+    serve: Arc<Mutex<Option<Arc<super::grant_store::installation::serve::ServeHost>>>>,
     #[cfg(all(test, unix))]
     installation_context: Arc<Mutex<Option<InstallContext>>>,
+}
+/// What a long-lived extension call produced.
+#[cfg(unix)]
+pub(crate) enum ServeReply {
+    Result(elixir_marketplace::source_execution::RuntimeJson),
+    /// The extension's code reported an error for this call.
+    Failed,
 }
 /// One immutable startup selection shared by fresh/manual installs and retained
 /// restoration. The optional native adapter never comes from management input.
@@ -121,6 +131,8 @@ impl Default for MarketplaceService {
             source_calls: Arc::new(super::application::InstalledCallQueue::default()),
             #[cfg(unix)]
             local_http: None,
+            #[cfg(unix)]
+            serve: Arc::default(),
             #[cfg(all(test, unix))]
             installation_context: Arc::default(),
         }
@@ -227,6 +239,7 @@ impl MarketplaceService {
         {
             bail!("installed restoration differs from its configured allocation");
         }
+        self.configure_serve(database.clone(), secrets.clone(), configuration.clone())?;
         let host = super::application::Host::from_runtime(
             database,
             secrets,
@@ -235,6 +248,77 @@ impl MarketplaceService {
             allocation.execution,
         )?;
         self.installation.begin_restoration(host)
+    }
+    /// Long-lived executors share installed restoration's trusted startup
+    /// configuration. Leftovers from a crash are removed; idle ones stop.
+    #[cfg(unix)]
+    pub(in crate::marketplace) fn configure_serve(
+        &self,
+        database: crate::db::Database,
+        secrets: crate::secrets::SecretsManager,
+        configuration: super::grant_store::installation::runtime::InstalledRuntime,
+    ) -> Result<()> {
+        let members: Arc<dyn super::stack::StackMembers> = Arc::new(
+            super::stack::MemberDirectory::new(database.pool.clone(), secrets.clone()),
+        );
+        let host = Arc::new(super::grant_store::installation::serve::ServeHost::new(
+            database,
+            secrets,
+            configuration,
+            Some(members),
+        ));
+        *self
+            .serve
+            .lock()
+            .map_err(|_| anyhow::anyhow!("extension executors unavailable"))? = Some(host.clone());
+        let weak = Arc::downgrade(&host);
+        tokio::spawn(async move {
+            if let Some(host) = weak.upgrade()
+                && let Err(error) = host.remove_orphans().await
+            {
+                tracing::warn!(error = %error, "could not remove leftover extension executors");
+            }
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let Some(host) = weak.upgrade() else { return };
+                if let Err(error) = host.reap().await {
+                    tracing::warn!(error = %error, "could not stop an idle extension executor");
+                }
+            }
+        });
+        Ok(())
+    }
+    /// One call to an installed extension's long-lived executor.
+    #[cfg(unix)]
+    pub(crate) async fn serve_call(
+        &self,
+        home: uuid::Uuid,
+        extension: &elixir_marketplace::identity::ExtensionId,
+        instance: uuid::Uuid,
+        arguments: elixir_marketplace::source_execution::RuntimeJson,
+    ) -> Result<ServeReply> {
+        let budget = self
+            .installation_allocation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("installed allocation unavailable"))?
+            .as_ref()
+            .map(|configuration| configuration.allocation.installations.clone())
+            .context("installed execution not configured by trusted startup")?;
+        let host = self
+            .serve
+            .lock()
+            .map_err(|_| anyhow::anyhow!("extension executors unavailable"))?
+            .clone()
+            .context("extension executors are not configured")?;
+        Ok(
+            match host
+                .call(home, extension, instance, budget, arguments)
+                .await?
+            {
+                super::quarantine::execution::ServeOutcome::Result(value) => ServeReply::Result(value),
+                super::quarantine::execution::ServeOutcome::Failed => ServeReply::Failed,
+            },
+        )
     }
     #[cfg(unix)]
     pub(in crate::marketplace) async fn finish_installed_restoration(&self) -> Result<()> {
@@ -605,6 +689,11 @@ impl MarketplaceService {
         let updates = self.updates.shutdown().await;
         #[cfg(unix)]
         let installation = self.installation.shutdown().await;
+        #[cfg(unix)]
+        let serve = match self.serve.lock().ok().and_then(|host| host.clone()) {
+            Some(host) => host.shutdown().await,
+            None => Ok(()),
+        };
         let (worker, search, preparation) = tokio::join!(
             self.inner.clone().shutdown(),
             self.search.join(),
@@ -614,6 +703,8 @@ impl MarketplaceService {
         sharing?;
         #[cfg(unix)]
         installation?;
+        #[cfg(unix)]
+        serve?;
         #[cfg(unix)]
         updates?;
         worker?;

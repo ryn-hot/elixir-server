@@ -1,7 +1,7 @@
 //! Offline server integration. The public network, billing, installation and
 //! contribution scheduler are not activated by creating this worker.
 mod protected;
-pub(in crate::marketplace) use protected::IndependentAdmission;
+pub(in crate::marketplace) use protected::{IndependentAdmission, serve_start_admitted};
 #[cfg(all(test, unix))]
 pub(in crate::marketplace) use protected::PeerPipeFixture;
 pub(in crate::marketplace) use protected::Retirement;

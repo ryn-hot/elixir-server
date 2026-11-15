@@ -3468,6 +3468,66 @@ impl RuntimeManager for DockerRuntimeManager {
         self.create_container_mode(spec, false).await
     }
 
+    async fn create_marketplace_serve_executor(
+        &self,
+        spec: &ContainerSpec,
+    ) -> Result<ContainerHandle> {
+        crate::marketplace::runtime::require_serve_spec(spec)?;
+        container_resource_args(&spec.security)?;
+        if self.get_container_handle(&spec.name).await?.is_some() {
+            bail!("long-lived executor name is already taken");
+        }
+        self.create_container_mode(spec, false).await
+    }
+
+    async fn start_marketplace_serve_executor(
+        &self,
+        handle: &ContainerHandle,
+        spec: &ContainerSpec,
+    ) -> Result<()> {
+        crate::marketplace::runtime::require_serve_spec(spec)?;
+        let value = self.inspect_container(&handle.id).await?;
+        let state = Self::extract_state(&value)?;
+        let labels = Self::extract_labels(&value);
+        if state.id != handle.id
+            || state.running
+            || state.name != spec.name
+            || spec.labels.iter().any(|(key, value)| labels.get(key) != Some(value))
+        {
+            bail!("long-lived executor differs from its created profile");
+        }
+        self.run_capture(&["start".to_owned(), handle.id.clone()])
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_marketplace_serve_executors(&self, keep: &[String]) -> Result<usize> {
+        let output = self
+            .run_stdout(&[
+                "ps".to_owned(),
+                "-aq".to_owned(),
+                "--no-trunc".to_owned(),
+                "--filter".to_owned(),
+                format!("label={ELIXIR_MANAGED_LABEL}=true"),
+                "--filter".to_owned(),
+                "label=elixir.marketplace.isolation=serve-v1".to_owned(),
+            ])
+            .await?;
+        let mut removed = 0;
+        for id in output.lines().map(str::trim).filter(|id| !id.is_empty()) {
+            if keep.iter().any(|kept| kept == id) {
+                continue;
+            }
+            self.remove_container(&ContainerHandle {
+                id: id.to_owned(),
+                name: id.to_owned(),
+            })
+            .await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     async fn start_quarantine_marketplace_writer(
         &self,
         handle: &ContainerHandle,
@@ -3973,6 +4033,7 @@ impl RuntimeManager for DockerRuntimeManager {
                 Some(
                     "fixed-v1"
                         | "quarantine-v1"
+                        | "serve-v1"
                         | "packet-v1"
                         | "connectivity-v1"
                         | "measurement-v1"
@@ -6258,7 +6319,7 @@ if(verb==='create'){
                 ..spec.clone()
             },
             QuarantineMarketplaceVolumeSpec {
-                cpu_millicores: 1001,
+                cpu_millicores: crate::marketplace::runtime::MAX_SOURCE_JOB_MILLICORES + 1,
                 ..spec.clone()
             },
             QuarantineMarketplaceVolumeSpec {

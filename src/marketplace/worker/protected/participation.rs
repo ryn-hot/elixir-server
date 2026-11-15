@@ -3,7 +3,7 @@
 //! This does not register a provider or publish support. Installed-byte sharing
 //! requires a separate current parent lease and a capable protected worker.
 pub(super) mod metrics;
-pub(in crate::marketplace) use metrics::IndependentAdmission;
+pub(in crate::marketplace) use metrics::{IndependentAdmission, serve_start_admitted};
 pub(in crate::marketplace) use metrics::SourceAdmissionDeferred as SourceResourceWait;
 mod blob_requests;
 mod catalog_progress;

@@ -23,6 +23,8 @@ pub(in crate::marketplace) mod operation;
 pub(in crate::marketplace) mod providers;
 mod record;
 pub(in crate::marketplace) mod runtime;
+#[cfg(unix)]
+pub(in crate::marketplace) mod serve;
 pub(in crate::marketplace) mod sharing;
 pub(in crate::marketplace) mod standing;
 mod store;

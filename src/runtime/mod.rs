@@ -494,6 +494,29 @@ pub trait RuntimeManager: Send + Sync {
     ) -> anyhow::Result<()> {
         anyhow::bail!("runtime does not support inspected immutable native source starts")
     }
+    /// Long-lived installed executor CREATE ONLY (`--source-serve`): offline,
+    /// no mounts, the hardened worker profile. Never adopts an existing name.
+    async fn create_marketplace_serve_executor(
+        &self,
+        _spec: &ContainerSpec,
+    ) -> anyhow::Result<ContainerHandle> {
+        anyhow::bail!("runtime does not support long-lived marketplace executors")
+    }
+    async fn start_marketplace_serve_executor(
+        &self,
+        _handle: &ContainerHandle,
+        _spec: &ContainerSpec,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("runtime does not support long-lived marketplace executors")
+    }
+    /// Removes long-lived executors this server does not hold (crash
+    /// leftovers). Only containers with the serve isolation label are touched.
+    async fn remove_marketplace_serve_executors(
+        &self,
+        _keep: &[String],
+    ) -> anyhow::Result<usize> {
+        Ok(0)
+    }
     async fn create_private_file_volume(
         &self,
         _spec: &PrivateFileVolumeSpec,

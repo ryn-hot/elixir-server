@@ -13,6 +13,7 @@ mod cache_tamper;
 mod compiled;
 pub(in crate::marketplace) use cache_tamper::mutate as mutate_cached_fixture_bytes;
 mod restart;
+mod serve;
 mod source_candidate;
 mod source_live;
 
@@ -349,7 +350,8 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
         // measurements. The SAME original unopened source must survive it.
         p.defer_next_source_admission()?;
         let client=p.client.clone();
-        let playback=client.installed_configuration(configured.source.clone(),configured.retention)?.playback;
+        let serve_configuration=client.installed_configuration(configured.source.clone(),configured.retention)?;
+        let playback=serve_configuration.playback.clone();
         let(desc,policy)=descriptor(&value)?;let(metadata,_metadata_owner)=MetadataObservation::fixture_for_verified_descriptor(desc,&policy)?;
         security_state::admit(&db,&metadata).await?;
         let(source,_source_owner)=PublicSourceObservation::fixture_for_source(release.release_id(),Digest::of(b"SPDX-License-Identifier: MIT\n"));
@@ -424,6 +426,9 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
         source_candidate::measure(&state,"idle",5).await?;
         playback.insert_test_job(steady,directory.join("steady-playback"),0).await;
         source_candidate::measure(&state,"playback",3).await?;
+        playback.stop_and_remove(steady).await;
+        serve::qualify(&state,&db,serve_configuration.clone(),principal.home_id,&release.payload().extension_id,owner).await?;
+        playback.insert_test_job(steady,directory.join("steady-playback"),0).await;
         require_idle_byte_workspace(runtime.as_ref(),&lane,true).await?;
         cache_tamper::qualify(&state,&db,runtime.as_ref(),(&lane,&image),principal.home_id,owner,&release.payload().extension_id).await?;
         assert_eq!(call(&app,&token,"GET","/api/v1/marketplace/installations/current",None).await?["operation"]["operation_id"],json!(next_id),
@@ -435,6 +440,7 @@ async fn run(postgres: Option<&str>, cpu_millicores: u32, compiled: bool) -> Res
         assert_eq!(targets["instances"].as_array().unwrap().len(),2);
         assert!(targets["instances"].as_array().unwrap().iter().all(|row|row["controls"].is_object()&&!row["pending"].as_bool().unwrap()));
         state.marketplace.shutdown().await?;
+        serve::require_stopped().await?;
         require_idle_byte_workspace(runtime.as_ref(),&lane,false).await?;
         assert!(ControllerLease::acquire(&lane).is_ok());
         println!("actual authenticated HTTP owned install A/cancel B/offline A invocation passed; target data, exact inputs and original native owners retained; synthetic discovery/protection only");

@@ -497,7 +497,15 @@ async fn recipe_binding_rejects_excess_resources_changed_image_and_mutation_reus
     let staged = f.stage(Uuid::new_v4(), 0, limit()).await?;
     let material = f.material()?;
     let authority = material.authority.verify()?;
-    for what in ["image", "memory", "cpu", "disk", "input", "output", "time"] {
+    // CPU is scheduled by the server (the reviewed figure is a request, not a
+    // ceiling), so a larger CPU budget still plans; every other excess fails.
+    let mut more_cpu = source_budget();
+    more_cpu.cpu_millicores = 101;
+    assert!(
+        SourceActivationPlan::new(authority.release(), &material.review, IMAGE, &more_cpu).is_ok(),
+        "cpu above the reviewed request"
+    );
+    for what in ["image", "memory", "disk", "input", "output", "time"] {
         let mut budget = source_budget();
         let image = if what == "image" {
             "worker:latest"
@@ -506,7 +514,6 @@ async fn recipe_binding_rejects_excess_resources_changed_image_and_mutation_reus
         };
         match what {
             "memory" => budget.memory_bytes = 256 * MIB,
-            "cpu" => budget.cpu_millicores = 101,
             "disk" => budget.disk_bytes = 1,
             "input" => budget.input_bytes = 1,
             "output" => budget.output_bytes = 1,

@@ -31,6 +31,83 @@ const STACK_MODULE_CAPABILITIES: [&str; 7] = [
     "indexer.registry",
 ];
 
+/// Where a long-lived stack executor reaches one of its own members.
+pub(crate) struct StackMemberEndpoint {
+    pub base_url: String,
+    pub api_key: Option<String>,
+}
+
+/// Resolves a stack's own members (by member name) for its long-lived
+/// executor. Only members of that stack resolve.
+#[async_trait::async_trait]
+pub(crate) trait StackMembers: Send + Sync {
+    async fn member(
+        &self,
+        stack_extension_id: &str,
+        member: &str,
+    ) -> Result<Option<StackMemberEndpoint>>;
+}
+
+/// The server's member directory: the member's provider endpoint (published
+/// on this computer) and the API key Elixir read during setup.
+pub(crate) struct MemberDirectory {
+    pool: sqlx::AnyPool,
+    secrets: crate::secrets::SecretsManager,
+}
+impl MemberDirectory {
+    pub(crate) fn new(pool: sqlx::AnyPool, secrets: crate::secrets::SecretsManager) -> Self {
+        Self { pool, secrets }
+    }
+}
+#[async_trait::async_trait]
+impl StackMembers for MemberDirectory {
+    async fn member(
+        &self,
+        stack_extension_id: &str,
+        member: &str,
+    ) -> Result<Option<StackMemberEndpoint>> {
+        use crate::extensions::store::ExtensionStore;
+        if member_name(member).is_err() {
+            return Ok(None);
+        }
+        let id = derived_id(stack_extension_id, member);
+        let store = ExtensionStore::new(&self.pool);
+        let Some(detail) = store
+            .list_provider_details()
+            .await?
+            .into_iter()
+            .find(|detail| detail.extension_id == id && detail.provider.endpoint_json.is_some())
+        else {
+            return Ok(None);
+        };
+        let provider = detail.provider;
+        let endpoint: crate::orchestrator::model::ProviderEndpoint =
+            serde_json::from_value(provider.endpoint_json.clone().unwrap_or_default())
+                .context("stack member endpoint")?;
+        let base_url = crate::http::handlers::discovery::resolve_provider_transport_base_url(
+            provider.instance_id,
+            &endpoint,
+        )
+        .await?;
+        let implementation = provider.implementation.clone().unwrap_or_default();
+        let mut api_key = None;
+        for key in [format!("{implementation}_api_key"), "api_key".to_owned()] {
+            if let Some(secret) = store
+                .get_secret(
+                    crate::db::models::SecretScope::Instance,
+                    Some(provider.instance_id),
+                    &key,
+                )
+                .await?
+            {
+                api_key = Some(self.secrets.decrypt(&secret.value_encrypted)?);
+                break;
+            }
+        }
+        Ok(Some(StackMemberEndpoint { base_url, api_key }))
+    }
+}
+
 pub(crate) fn is_stack_member_id(extension_id: &str) -> bool {
     extension_id.starts_with(STACK_MEMBER_PREFIX)
 }
@@ -288,6 +365,51 @@ pub(crate) fn materialize(
         members.push(member);
     }
     Ok(members)
+}
+
+/// The marketplace stack a derived member row belongs to, and the member's
+/// name: `stack.<hash>.<member>` matched against the enabled stack extensions.
+pub(crate) async fn owner_of(
+    pool: &sqlx::AnyPool,
+    member_extension_id: &str,
+) -> Result<Option<(String, String)>> {
+    use crate::extensions::store::ExtensionStore;
+    let Some(member) = member_extension_id
+        .strip_prefix(STACK_MEMBER_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, member)| member)
+        .filter(|member| member_name(member).is_ok())
+    else {
+        return Ok(None);
+    };
+    for row in ExtensionStore::new(pool).list_extensions().await? {
+        if row.enabled
+            && row.extension_id.starts_with("elx:")
+            && derived_id(&row.extension_id, member) == member_extension_id
+        {
+            return Ok(Some((row.extension_id, member.to_owned())));
+        }
+    }
+    Ok(None)
+}
+
+/// The home and installed instance of an enabled marketplace extension.
+pub(crate) async fn installed_instance(
+    pool: &sqlx::AnyPool,
+    extension_id: &str,
+) -> Result<Option<(uuid::Uuid, uuid::Uuid)>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT SUBSTR(g.home_id,1,37),SUBSTR(i.instance_id,1,37) FROM extension_instances i \
+         JOIN extensions e ON e.extension_id=i.extension_id \
+         JOIN marketplace_extension_grants g ON g.extension_id=i.extension_id \
+         WHERE i.extension_id=$1 AND i.enabled=TRUE AND e.enabled=TRUE AND g.enabled=TRUE \
+         ORDER BY i.instance_id LIMIT 1",
+    )
+    .bind(extension_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|(home, instance)| Ok((home.trim().parse()?, instance.trim().parse()?)))
+        .transpose()
 }
 
 /// What one stack reconcile pass did.

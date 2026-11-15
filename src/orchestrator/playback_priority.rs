@@ -36,6 +36,7 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Arr modules are left exactly as they are.
 pub fn is_governed(extension_id: &str) -> bool {
     crate::marketplace::stack::is_stack_member_id(extension_id)
+        || extension_id == crate::marketplace::runtime::SERVE_EXTENSION_LABEL
         || matches!(
             extension_id,
             "elixir.modules.qbittorrent" | "elixir.modules.nzbget"
@@ -315,6 +316,7 @@ mod tests {
         assert!(is_governed("stack.811a0ada.sonarr"));
         assert!(is_governed("elixir.modules.qbittorrent"));
         assert!(is_governed("elixir.modules.nzbget"));
+        assert!(is_governed(crate::marketplace::runtime::SERVE_EXTENSION_LABEL));
         assert!(!is_governed("elixir.modules.sonarr"));
         assert!(!is_governed("elixir.connectors.qbittorrent_defaults"));
         assert_eq!(

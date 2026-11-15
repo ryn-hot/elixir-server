@@ -40,7 +40,7 @@ use crate::{
 mod allowance;
 mod blob;
 mod participation;
-pub(in crate::marketplace) use participation::IndependentAdmission;
+pub(in crate::marketplace) use participation::{IndependentAdmission, serve_start_admitted};
 pub(in crate::marketplace) use participation::Retirement;
 pub(in crate::marketplace) use participation::SourceResourceWait;
 pub(in crate::marketplace) use participation::WarmSearchAdmission;
