@@ -314,10 +314,31 @@ impl<'a> Reconciler<'a> {
             self.reconcile_explicit_repairs(run_id, &mut step_index)
                 .await?;
         }
+        // A legacy Arr installation is left exactly as it is: never started,
+        // checked, patched or bound again (`crate::legacy_arr`).
+        let legacy = |extension_id: &str| crate::legacy_arr::is_legacy_arr_extension(extension_id);
         let mut providers = self.store.list_provider_details().await?;
+        providers.retain(|detail| !legacy(&detail.extension_id));
         let instances = self.store.list_instances(None).await?;
-        let extensions = self.store.list_extensions().await?;
-        let bindings = self.store.list_bindings().await?;
+        let legacy_providers: std::collections::HashSet<Uuid> = self
+            .store
+            .list_provider_details()
+            .await?
+            .into_iter()
+            .filter(|detail| legacy(&detail.extension_id))
+            .map(|detail| detail.provider.provider_id)
+            .collect();
+        let instances: Vec<_> = instances
+            .into_iter()
+            .filter(|instance| !legacy(&instance.extension_id))
+            .collect();
+        let mut extensions = self.store.list_extensions().await?;
+        extensions.retain(|extension| !legacy(&extension.extension_id));
+        let mut bindings = self.store.list_bindings().await?;
+        bindings.retain(|binding| {
+            !legacy_providers.contains(&binding.consumer_provider_id)
+                && !legacy_providers.contains(&binding.target_provider_id)
+        });
 
         let instance_map: HashMap<Uuid, _> = instances
             .into_iter()
@@ -342,6 +363,7 @@ impl<'a> Reconciler<'a> {
             .await?;
         if activated_standalone_providers {
             providers = self.store.list_provider_details().await?;
+            providers.retain(|detail| !legacy(&detail.extension_id));
         }
 
         self.reconcile_providers(
@@ -602,7 +624,8 @@ impl<'a> Reconciler<'a> {
     }
 
     async fn reconcile_explicit_repairs(&self, run_id: Uuid, step_index: &mut i32) -> Result<()> {
-        let desired = self.store.list_desired_blueprints(Some(true)).await?;
+        let mut desired = self.store.list_desired_blueprints(Some(true)).await?;
+        desired.retain(|item| !crate::legacy_arr::is_legacy_arr_extension(&item.blueprint_extension_id));
         if desired.is_empty() {
             return Ok(());
         }

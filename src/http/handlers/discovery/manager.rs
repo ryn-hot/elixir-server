@@ -81,161 +81,74 @@ pub(crate) struct ManagerHistoryEntry {
 }
 
 /// A media manager Find Media and release recovery talk to: an installed
-/// stack's module, or (until Stage 3) the server's own Sonarr/Radarr code.
-pub(crate) enum ManagerClient {
-    Legacy {
-        implementation: String,
-        base_url: String,
-        api_key: String,
-    },
+/// marketplace stack's module. A legacy Arr installation is not managed.
+pub(crate) struct ManagerClient {
     #[cfg(unix)]
-    Extension(ExtensionManager),
+    manager: ExtensionManager,
 }
 
 impl ManagerClient {
     pub(crate) async fn for_provider(
         state: &AppState,
-        store: &ExtensionStore<'_>,
+        _store: &ExtensionStore<'_>,
         provider: &ProviderContext,
     ) -> AnyResult<Self> {
         #[cfg(unix)]
         if let Some(manager) = ExtensionManager::for_provider(state, provider).await? {
-            return Ok(Self::Extension(manager));
+            return Ok(Self { manager });
         }
-        crate::legacy_arr::mark("manager: legacy Sonarr/Radarr client");
-        let implementation = provider
-            .detail
-            .provider
-            .implementation
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        let endpoint_json = provider
-            .detail
-            .provider
-            .endpoint_json
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-        let endpoint: ProviderEndpoint =
-            serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-        let base_url =
-            resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-                .await?;
-        let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
-        Ok(Self::Legacy {
-            implementation,
-            base_url,
-            api_key,
-        })
+        let _ = (state, provider);
+        bail!("{}", crate::legacy_arr::UNSUPPORTED)
+    }
+
+    #[cfg(unix)]
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        request: Value,
+    ) -> AnyResult<T> {
+        self.manager.call(operation, request).await
+    }
+
+    #[cfg(not(unix))]
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        _operation: &str,
+        _request: Value,
+    ) -> AnyResult<T> {
+        bail!("{}", crate::legacy_arr::UNSUPPORTED)
     }
 
     /// The first queue page, every item's entries.
     pub(crate) async fn queue(&self) -> AnyResult<Vec<ManagerQueueEntry>> {
-        match self {
-            Self::Legacy {
-                implementation,
-                base_url,
-                api_key,
-            } => {
-                let value = request_arr_json_with_query(
-                    base_url,
-                    api_key,
-                    &manager_queue_paths(implementation),
-                    &[("page", "1".to_string()), ("pageSize", "250".to_string())],
-                )
-                .await?;
-                Ok(legacy::queue(implementation, Some(&value)))
-            }
-            #[cfg(unix)]
-            Self::Extension(manager) => {
-                #[derive(Deserialize)]
-                struct Reply {
-                    entries: Vec<ManagerQueueEntry>,
-                }
-                Ok(manager.call::<Reply>("queue", json!({})).await?.entries)
-            }
+        #[derive(Deserialize)]
+        struct Reply {
+            entries: Vec<ManagerQueueEntry>,
         }
+        Ok(self.call::<Reply>("queue", json!({})).await?.entries)
     }
 
     /// The newest 100 history entries.
     pub(crate) async fn history(&self) -> AnyResult<Vec<ManagerHistoryEntry>> {
-        match self {
-            Self::Legacy {
-                implementation,
-                base_url,
-                api_key,
-            } => {
-                let value = request_arr_json_with_query(
-                    base_url,
-                    api_key,
-                    &["api/v3/history", "api/v4/history"],
-                    &[
-                        ("page", "1".to_string()),
-                        ("pageSize", "100".to_string()),
-                        ("sortDirection", "descending".to_string()),
-                        ("sortKey", "date".to_string()),
-                    ],
-                )
-                .await?;
-                Ok(legacy::history(implementation, &value))
-            }
-            #[cfg(unix)]
-            Self::Extension(manager) => {
-                #[derive(Deserialize)]
-                struct Reply {
-                    entries: Vec<ManagerHistoryEntry>,
-                }
-                Ok(manager.call::<Reply>("history", json!({})).await?.entries)
-            }
+        #[derive(Deserialize)]
+        struct Reply {
+            entries: Vec<ManagerHistoryEntry>,
         }
+        Ok(self.call::<Reply>("history", json!({})).await?.entries)
     }
 
     /// Marks a grabbed release failed; the manager blocklists it and searches.
     pub(crate) async fn mark_failed(&self, history_id: &str) -> AnyResult<()> {
-        match self {
-            Self::Legacy {
-                base_url, api_key, ..
-            } => {
-                let v3 = format!("api/v3/history/failed/{history_id}");
-                let v4 = format!("api/v4/history/failed/{history_id}");
-                request_arr_write(
-                    base_url,
-                    api_key,
-                    &[v3.as_str(), v4.as_str()],
-                    ReqwestMethod::POST,
-                    &json!({}),
-                )
-                .await
-            }
-            #[cfg(unix)]
-            Self::Extension(manager) => {
-                manager
-                    .call::<Value>("mark_failed", json!({ "historyId": history_id }))
-                    .await?;
-                Ok(())
-            }
-        }
+        self.call::<Value>("mark_failed", json!({ "historyId": history_id }))
+            .await?;
+        Ok(())
     }
 
     /// Starts a fresh search for one item.
     pub(crate) async fn search_item(&self, item_id: &str) -> AnyResult<()> {
-        match self {
-            Self::Legacy {
-                implementation,
-                base_url,
-                api_key,
-            } => {
-                let item_id = item_id.parse::<i64>().context("parsing manager item id")?;
-                request_arr_search_item(implementation, base_url, api_key, item_id).await
-            }
-            #[cfg(unix)]
-            Self::Extension(manager) => {
-                manager
-                    .call::<Value>("search_item", json!({ "itemId": item_id }))
-                    .await?;
-                Ok(())
-            }
-        }
+        self.call::<Value>("search_item", json!({ "itemId": item_id }))
+            .await?;
+        Ok(())
     }
 }
 
@@ -790,136 +703,6 @@ fn download_attempt_title(
         format!("{code} • {}", episode.title.trim())
     };
     (title, Some(destination))
-}
-
-/// Legacy Sonarr/Radarr JSON, converted to the general-purpose shapes. Used
-/// only for the server's own Arr code until Stage 3 removes it.
-pub(crate) mod legacy {
-    use super::*;
-
-    pub(crate) fn kind(implementation: &str) -> ManagerItemKind {
-        if implementation == "sonarr" {
-            ManagerItemKind::Series
-        } else {
-            ManagerItemKind::Movie
-        }
-    }
-    pub(crate) fn label(implementation: &str) -> &'static str {
-        match implementation {
-            "sonarr" => "Sonarr",
-            "radarr" => "Radarr",
-            _ => "The manager",
-        }
-    }
-    pub(crate) fn item_status(implementation: &str, value: &Value) -> ManagerItemStatus {
-        match implementation {
-            "sonarr" => {
-                let stats = sonarr_series_stats(value);
-                ManagerItemStatus {
-                    has_files: sonarr_item_has_files(value),
-                    file_count: stats.episode_file_count as u64,
-                    total_count: stats.episode_count as u64,
-                }
-            }
-            "radarr" => ManagerItemStatus {
-                has_files: radarr_item_has_file(value),
-                ..Default::default()
-            },
-            _ => ManagerItemStatus::default(),
-        }
-    }
-    pub(crate) fn queue_entry(implementation: &str, entry: &Value) -> ManagerQueueEntry {
-        let direct_id = match implementation {
-            "sonarr" => entry
-                .get("seriesId")
-                .or_else(|| entry.get("series").and_then(|value| value.get("id"))),
-            "radarr" => entry
-                .get("movieId")
-                .or_else(|| entry.get("movie").and_then(|value| value.get("id"))),
-            _ => None,
-        };
-        ManagerQueueEntry {
-            item_id: as_id_string(direct_id.unwrap_or(&Value::Null)),
-            episode_id: as_id_string(entry.get("episodeId").unwrap_or(&Value::Null)),
-            entry_id: as_id_string(entry.get("id").unwrap_or(&Value::Null)),
-            download_id: queue_entry_download_id(entry),
-            downloader: queue_entry_downloader_label(entry),
-            protocol: queue_entry_protocol(entry),
-            state: queue_entry_state(entry),
-            status_message: queue_entry_status_message(entry),
-            error_message: queue_entry_error_message(entry),
-            title: json_nonempty_string(entry.get("title")),
-        }
-    }
-    pub(crate) fn queue(
-        implementation: &str,
-        queue_value: Option<&Value>,
-    ) -> Vec<ManagerQueueEntry> {
-        queue_value
-            .map(extract_arr_queue_records)
-            .unwrap_or_default()
-            .iter()
-            .map(|entry| queue_entry(implementation, entry))
-            .collect()
-    }
-    /// Arr history records; entries without a numeric id are skipped.
-    pub(crate) fn history(implementation: &str, value: &Value) -> Vec<ManagerHistoryEntry> {
-        let records = if let Some(items) = value.as_array() {
-            items.clone()
-        } else {
-            value
-                .get("records")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        records
-            .iter()
-            .filter_map(|entry| {
-                let history_id = entry.get("id").and_then(Value::as_i64)?.to_string();
-                let item = match implementation {
-                    "sonarr" => entry.get("seriesId"),
-                    "radarr" => entry.get("movieId"),
-                    _ => None,
-                };
-                Some(ManagerHistoryEntry {
-                    history_id,
-                    item_id: item.and_then(|value| {
-                        value
-                            .as_i64()
-                            .map(|id| id.to_string())
-                            .or_else(|| value.as_str().map(|id| id.trim().to_string()))
-                    }),
-                    event_type: entry
-                        .get("eventType")
-                        .and_then(Value::as_str)
-                        .map(|value| value.trim().to_ascii_lowercase())
-                        .unwrap_or_default(),
-                    download_id: entry
-                        .get("downloadId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-            })
-            .collect()
-    }
-    pub(in crate::http::handlers::discovery) fn episodes(
-        index: &HashMap<i64, SonarrEpisodeDescriptor>,
-    ) -> ManagerEpisodeIndex {
-        index
-            .iter()
-            .map(|(id, episode)| {
-                (
-                    id.to_string(),
-                    ManagerEpisode {
-                        season: episode.season_number,
-                        episode: episode.episode_number,
-                        title: episode.title.clone(),
-                    },
-                )
-            })
-            .collect()
-    }
 }
 
 impl ManagerItemKind {

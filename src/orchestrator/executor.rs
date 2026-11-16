@@ -3,12 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use quick_xml::Reader;
-use quick_xml::events::Event;
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Url;
 use serde::Deserialize;
-use serde_json::Value;
 use sqlx::AnyPool;
 use tokio::fs;
 use tokio::net::lookup_host;
@@ -2329,15 +2326,6 @@ impl<'a> Executor<'a> {
                 &mut patch,
             )
             .await?;
-        } else {
-            resolve_indexer_apps(
-                &self.store,
-                self.secrets,
-                self.runtime,
-                self.probe,
-                &mut patch,
-            )
-            .await?;
         }
         resolve_downloader_credentials(&self.store, self.secrets, self.probe, &mut patch).await?;
 
@@ -2768,87 +2756,6 @@ impl<'a> Executor<'a> {
             .await?;
             return Ok(Some(ProviderReadinessPhase::BootstrapReady));
         }
-        if provider.capability == "media.manager.tv"
-            && provider.implementation.as_deref() == Some("sonarr")
-        {
-            let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
-            let key = read_sonarr_api_key(
-                self.runtime,
-                provider.instance_id,
-                config.config_dir.as_deref(),
-            )
-            .await?
-            .ok_or_else(|| anyhow!("sonarr config.xml not ready"))?;
-            upsert_sonarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
-            self.normalize_arr_auth_config_if_needed(
-                provider.instance_id,
-                &key,
-                endpoint,
-                &["/api/v3/config/host", "/api/v4/config/host"],
-            )
-            .await?;
-            self.record_provider_readiness(
-                provider.provider_id,
-                ProviderReadinessPhase::BootstrapReady,
-                None,
-            )
-            .await?;
-            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
-        }
-        if provider.capability == "media.manager.movies"
-            && provider.implementation.as_deref() == Some("radarr")
-        {
-            let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
-            let key = read_radarr_api_key(
-                self.runtime,
-                provider.instance_id,
-                config.config_dir.as_deref(),
-            )
-            .await?
-            .ok_or_else(|| anyhow!("radarr config.xml not ready"))?;
-            upsert_radarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
-            self.normalize_arr_auth_config_if_needed(
-                provider.instance_id,
-                &key,
-                endpoint,
-                &["/api/v3/config/host", "/api/v4/config/host"],
-            )
-            .await?;
-            self.record_provider_readiness(
-                provider.provider_id,
-                ProviderReadinessPhase::BootstrapReady,
-                None,
-            )
-            .await?;
-            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
-        }
-        if provider.capability == "indexer.registry"
-            && provider.implementation.as_deref() == Some("prowlarr")
-        {
-            let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
-            let key = read_prowlarr_api_key(
-                self.runtime,
-                provider.instance_id,
-                config.config_dir.as_deref(),
-            )
-            .await?
-            .ok_or_else(|| anyhow!("prowlarr config.xml not ready"))?;
-            upsert_prowlarr_secret(&self.store, self.secrets, provider.instance_id, &key).await?;
-            self.normalize_arr_auth_config_if_needed(
-                provider.instance_id,
-                &key,
-                endpoint,
-                &["/api/v1/config/host"],
-            )
-            .await?;
-            self.record_provider_readiness(
-                provider.provider_id,
-                ProviderReadinessPhase::BootstrapReady,
-                None,
-            )
-            .await?;
-            return Ok(Some(ProviderReadinessPhase::BootstrapReady));
-        }
         if provider.capability == "downloader.torrent"
             && provider.implementation.as_deref() == Some("qbittorrent")
         {
@@ -3092,100 +2999,6 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    async fn normalize_arr_auth_config_if_needed(
-        &self,
-        instance_id: Uuid,
-        api_key: &str,
-        endpoint: &ProviderEndpoint,
-        config_paths: &[&str],
-    ) -> Result<()> {
-        crate::legacy_arr::mark("executor: Arr web login normalization");
-        let Some(base_url) = resolve_driver_transport_base_url(instance_id, endpoint).await? else {
-            return Ok(());
-        };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .context("building arr host config client")?;
-
-        let mut config = None;
-        let mut selected_url = None;
-        for path in config_paths {
-            let url = Url::parse(&base_url)
-                .context("parsing arr transport base url")?
-                .join(path)
-                .with_context(|| format!("building arr host config url for {path}"))?;
-            let response = client
-                .get(url.clone())
-                .header("X-Api-Key", api_key)
-                .send()
-                .await
-                .with_context(|| format!("fetching arr host config {path}"))?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                continue;
-            }
-            let response = response
-                .error_for_status()
-                .with_context(|| format!("arr host config request failed for {path}"))?;
-            let value: Value = response
-                .json()
-                .await
-                .with_context(|| format!("decoding arr host config for {path}"))?;
-            config = Some(value);
-            selected_url = Some(url);
-            break;
-        }
-
-        let Some(mut config) = config else {
-            return Ok(());
-        };
-        let Some(url) = selected_url else {
-            return Ok(());
-        };
-
-        if !arr_host_auth_config_requires_normalization(&config) {
-            return Ok(());
-        }
-
-        let object = config
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("arr host config must be a JSON object"))?;
-        let authentication_method = object
-            .get("authenticationMethod")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-
-        if authentication_method == "none" {
-            let (username, password) =
-                ensure_arr_ui_credentials(&self.store, self.secrets, instance_id).await?;
-            object.insert(
-                "authenticationMethod".to_string(),
-                Value::String("forms".to_string()),
-            );
-            object.insert("username".to_string(), Value::String(username));
-            object.insert("password".to_string(), Value::String(password.clone()));
-            object.insert("passwordConfirmation".to_string(), Value::String(password));
-        }
-        object.insert(
-            "authenticationRequired".to_string(),
-            Value::String("disabledForLocalAddresses".to_string()),
-        );
-
-        client
-            .put(url)
-            .header("X-Api-Key", api_key)
-            .json(&config)
-            .send()
-            .await
-            .context("updating arr host config")?
-            .error_for_status()
-            .context("arr host config update failed")?;
-
-        Ok(())
-    }
-
     async fn selected_downloader_profile(&self) -> Result<DownloaderPerformanceProfile> {
         let override_value = self
             .store
@@ -3203,44 +3016,10 @@ const AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v2";
 const NZBGET_BALANCED_PERFORMANCE_PROFILE_VERSION: &str = "balanced-v4";
 const NZBGET_AGGRESSIVE_PERFORMANCE_PROFILE_VERSION: &str = "aggressive-v4";
 
-async fn resolve_sonarr_api_key(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    runtime: &dyn RuntimeManager,
-    instance: &crate::db::models::ExtensionInstance,
-) -> Result<String> {
-    crate::legacy_arr::mark("executor: Sonarr API key");
-    let config = parse_sonarr_instance_config(instance.config_json.as_ref())?;
-    if let Some(key) = config.api_key {
-        upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    if let Some(secret) = store
-        .get_secret(
-            SecretScope::Instance,
-            Some(instance.instance_id),
-            "sonarr_api_key",
-        )
-        .await?
-    {
-        return secrets.decrypt(&secret.value_encrypted);
-    }
-
-    if let Some(key) =
-        read_sonarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
-    {
-        upsert_sonarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    bail!("sonarr api key is not available yet");
-}
-
 pub(crate) async fn build_driver_ctx_for_provider(
     store: &ExtensionStore<'_>,
     secrets_manager: &SecretsManager,
-    runtime: &dyn RuntimeManager,
+    _runtime: &dyn RuntimeManager,
     provider: &Provider,
     instance: &crate::db::models::ExtensionInstance,
 ) -> Result<DriverCtx> {
@@ -3259,25 +3038,6 @@ pub(crate) async fn build_driver_ctx_for_provider(
     let identity = peer_facing_endpoint(store, provider, instance, &endpoint).await?;
 
     let mut secrets = HashMap::new();
-    if provider.capability == "media.manager.tv"
-        && provider.implementation.as_deref() == Some("sonarr")
-    {
-        let api_key = resolve_sonarr_api_key(store, secrets_manager, runtime, instance).await?;
-        secrets.insert("sonarr_api_key".to_string(), api_key);
-    }
-    if provider.capability == "media.manager.movies"
-        && provider.implementation.as_deref() == Some("radarr")
-    {
-        let api_key = resolve_radarr_api_key(store, secrets_manager, runtime, instance).await?;
-        secrets.insert("radarr_api_key".to_string(), api_key.clone());
-        secrets.insert("api_key".to_string(), api_key);
-    }
-    if provider.capability == "indexer.registry"
-        && provider.implementation.as_deref() == Some("prowlarr")
-    {
-        let api_key = resolve_prowlarr_api_key(store, secrets_manager, runtime, instance).await?;
-        secrets.insert("prowlarr_api_key".to_string(), api_key);
-    }
     if provider.capability == "downloader.torrent"
         && provider.implementation.as_deref() == Some("qbittorrent")
     {
@@ -3318,40 +3078,6 @@ pub(crate) async fn build_driver_ctx_for_provider(
     ))
 }
 
-async fn resolve_radarr_api_key(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    runtime: &dyn RuntimeManager,
-    instance: &crate::db::models::ExtensionInstance,
-) -> Result<String> {
-    crate::legacy_arr::mark("executor: Radarr API key");
-    let config = parse_radarr_instance_config(instance.config_json.as_ref())?;
-    if let Some(key) = config.api_key {
-        upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    if let Some(secret) = store
-        .get_secret(
-            SecretScope::Instance,
-            Some(instance.instance_id),
-            "radarr_api_key",
-        )
-        .await?
-    {
-        return secrets.decrypt(&secret.value_encrypted);
-    }
-
-    if let Some(key) =
-        read_radarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
-    {
-        upsert_radarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    bail!("radarr api key is not available yet");
-}
-
 /// A member's API key under the general `api_key` instance secret.
 async fn upsert_instance_api_key(
     store: &ExtensionStore<'_>,
@@ -3371,97 +3097,6 @@ async fn upsert_instance_api_key(
         })
         .await?;
     Ok(())
-}
-
-async fn upsert_sonarr_secret(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    instance_id: Uuid,
-    api_key: &str,
-) -> Result<()> {
-    let encrypted = secrets.encrypt(api_key)?;
-    store
-        .upsert_secret(&NewSecret {
-            secret_id: Uuid::new_v4(),
-            scope: SecretScope::Instance,
-            scope_id: Some(instance_id),
-            key: "sonarr_api_key".to_string(),
-            value_encrypted: encrypted,
-            rotatable: false,
-        })
-        .await
-}
-
-async fn upsert_radarr_secret(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    instance_id: Uuid,
-    api_key: &str,
-) -> Result<()> {
-    let encrypted = secrets.encrypt(api_key)?;
-    store
-        .upsert_secret(&NewSecret {
-            secret_id: Uuid::new_v4(),
-            scope: SecretScope::Instance,
-            scope_id: Some(instance_id),
-            key: "radarr_api_key".to_string(),
-            value_encrypted: encrypted,
-            rotatable: false,
-        })
-        .await
-}
-
-async fn resolve_prowlarr_api_key(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    runtime: &dyn RuntimeManager,
-    instance: &crate::db::models::ExtensionInstance,
-) -> Result<String> {
-    crate::legacy_arr::mark("executor: Prowlarr API key");
-    let config = parse_prowlarr_instance_config(instance.config_json.as_ref())?;
-    if let Some(key) = config.api_key {
-        upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    if let Some(secret) = store
-        .get_secret(
-            SecretScope::Instance,
-            Some(instance.instance_id),
-            "prowlarr_api_key",
-        )
-        .await?
-    {
-        return secrets.decrypt(&secret.value_encrypted);
-    }
-
-    if let Some(key) =
-        read_prowlarr_api_key(runtime, instance.instance_id, config.config_dir.as_deref()).await?
-    {
-        upsert_prowlarr_secret(store, secrets, instance.instance_id, &key).await?;
-        return Ok(key);
-    }
-
-    bail!("prowlarr api key is not available yet");
-}
-
-async fn upsert_prowlarr_secret(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    instance_id: Uuid,
-    api_key: &str,
-) -> Result<()> {
-    let encrypted = secrets.encrypt(api_key)?;
-    store
-        .upsert_secret(&NewSecret {
-            secret_id: Uuid::new_v4(),
-            scope: SecretScope::Instance,
-            scope_id: Some(instance_id),
-            key: "prowlarr_api_key".to_string(),
-            value_encrypted: encrypted,
-            rotatable: false,
-        })
-        .await
 }
 
 async fn upsert_arr_ui_secrets(
@@ -3805,70 +3440,6 @@ fn downloader_uses_gateway_namespace(
     container_network_namespace_matches(actual_network_mode, gateway_name, Some(gateway_id))
 }
 
-async fn resolve_indexer_apps(
-    store: &ExtensionStore<'_>,
-    secrets: &SecretsManager,
-    runtime: &dyn RuntimeManager,
-    probe: &dyn ProbeRunner,
-    patch: &mut DriverPatch,
-) -> Result<()> {
-    let apps = match patch {
-        DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps { apps }) => apps,
-        _ => return Ok(()),
-    };
-    crate::legacy_arr::mark("executor: Prowlarr app links by app name");
-    for app in apps {
-        if app
-            .api_key
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            continue;
-        }
-        let host_hint = url_host(&app.url);
-        if is_sonarr_app(&app.implementation) {
-            let target = resolve_sonarr_target_for_app(store, host_hint.as_deref()).await?;
-            ensure_dependency_provider_ready(
-                store,
-                &target,
-                "Sonarr",
-                "Prowlarr application registration",
-            )
-            .await?;
-            ensure_dependency_provider_reachable(
-                probe,
-                &target,
-                "Sonarr",
-                "Prowlarr application registration",
-            )
-            .await?;
-            let api_key = resolve_sonarr_api_key(store, secrets, runtime, &target.instance).await?;
-            app.url = target.peer_endpoint.canonical_url()?;
-            app.api_key = Some(api_key);
-        } else if is_radarr_app(&app.implementation) {
-            let target = resolve_radarr_target_for_app(store, host_hint.as_deref()).await?;
-            ensure_dependency_provider_ready(
-                store,
-                &target,
-                "Radarr",
-                "Prowlarr application registration",
-            )
-            .await?;
-            ensure_dependency_provider_reachable(
-                probe,
-                &target,
-                "Radarr",
-                "Prowlarr application registration",
-            )
-            .await?;
-            let api_key = resolve_radarr_api_key(store, secrets, runtime, &target.instance).await?;
-            app.url = target.peer_endpoint.canonical_url()?;
-            app.api_key = Some(api_key);
-        }
-    }
-    Ok(())
-}
-
 /// Fills in the address and API key of each application a marketplace stack's
 /// indexer list registers, from that stack's own media-manager members: the
 /// member the app's URL names (`http://<member>.stack:<port>`), else the one
@@ -4098,20 +3669,6 @@ fn provider_requires_bootstrap(provider: &Provider) -> bool {
     )
 }
 
-fn is_sonarr_app(implementation: &str) -> bool {
-    implementation
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("sonarr")
-}
-
-fn is_radarr_app(implementation: &str) -> bool {
-    implementation
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("radarr")
-}
-
 fn url_host(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
@@ -4161,36 +3718,6 @@ fn downloader_setting_missing(settings: &HashMap<String, serde_json::Value>, key
         Some(serde_json::Value::String(value)) => value.trim().is_empty(),
         Some(_) => false,
     }
-}
-
-async fn resolve_sonarr_target_for_app(
-    store: &ExtensionStore<'_>,
-    host_hint: Option<&str>,
-) -> Result<ManagedProviderTarget> {
-    resolve_provider_target(
-        store,
-        "media.manager.tv",
-        "sonarr",
-        host_hint,
-        "sonarr provider not found for prowlarr app registration",
-        "multiple sonarr providers found; specify a managed Sonarr host alias in the app url",
-    )
-    .await
-}
-
-async fn resolve_radarr_target_for_app(
-    store: &ExtensionStore<'_>,
-    host_hint: Option<&str>,
-) -> Result<ManagedProviderTarget> {
-    resolve_provider_target(
-        store,
-        "media.manager.movies",
-        "radarr",
-        host_hint,
-        "radarr provider not found for prowlarr app registration",
-        "multiple radarr providers found; specify a managed Radarr host alias in the app url",
-    )
-    .await
 }
 
 async fn resolve_qbittorrent_target_for_downloader(
@@ -4524,48 +4051,6 @@ async fn upsert_nzbget_secrets(
 }
 
 #[derive(Default, Deserialize)]
-struct SonarrInstanceConfig {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    runtime: Option<SonarrRuntimeConfig>,
-}
-
-#[derive(Default, Deserialize)]
-struct SonarrRuntimeConfig {
-    #[serde(default)]
-    config_dir: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct RadarrInstanceConfig {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    runtime: Option<RadarrRuntimeConfig>,
-}
-
-#[derive(Default, Deserialize)]
-struct RadarrRuntimeConfig {
-    #[serde(default)]
-    config_dir: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct ProwlarrInstanceConfig {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    runtime: Option<ProwlarrRuntimeConfig>,
-}
-
-#[derive(Default, Deserialize)]
-struct ProwlarrRuntimeConfig {
-    #[serde(default)]
-    config_dir: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
 struct QbittorrentInstanceConfig {
     #[serde(default)]
     username: Option<String>,
@@ -4593,21 +4078,6 @@ struct ManagedDefaultsConfig {
     nzbget_performance_profile_version: Option<String>,
 }
 
-struct ParsedSonarrConfig {
-    api_key: Option<String>,
-    config_dir: Option<String>,
-}
-
-struct ParsedRadarrConfig {
-    api_key: Option<String>,
-    config_dir: Option<String>,
-}
-
-struct ParsedProwlarrConfig {
-    api_key: Option<String>,
-    config_dir: Option<String>,
-}
-
 struct ParsedQbittorrentConfig {
     username: Option<String>,
     password: Option<String>,
@@ -4629,53 +4099,6 @@ struct PersistedNzbgetServerSecretSlot {
 struct PersistedNzbgetServerInventoryConfig {
     #[serde(default)]
     server_inventory: Vec<PersistedNzbgetServerSecretSlot>,
-}
-
-fn parse_sonarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedSonarrConfig> {
-    let Some(value) = value else {
-        return Ok(ParsedSonarrConfig {
-            api_key: None,
-            config_dir: None,
-        });
-    };
-    let config: SonarrInstanceConfig =
-        serde_json::from_value(value.clone()).context("parsing sonarr instance config")?;
-    Ok(ParsedSonarrConfig {
-        api_key: config.api_key,
-        config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
-    })
-}
-
-fn parse_radarr_instance_config(value: Option<&serde_json::Value>) -> Result<ParsedRadarrConfig> {
-    let Some(value) = value else {
-        return Ok(ParsedRadarrConfig {
-            api_key: None,
-            config_dir: None,
-        });
-    };
-    let config: RadarrInstanceConfig =
-        serde_json::from_value(value.clone()).context("parsing radarr instance config")?;
-    Ok(ParsedRadarrConfig {
-        api_key: config.api_key,
-        config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
-    })
-}
-
-fn parse_prowlarr_instance_config(
-    value: Option<&serde_json::Value>,
-) -> Result<ParsedProwlarrConfig> {
-    let Some(value) = value else {
-        return Ok(ParsedProwlarrConfig {
-            api_key: None,
-            config_dir: None,
-        });
-    };
-    let config: ProwlarrInstanceConfig =
-        serde_json::from_value(value.clone()).context("parsing prowlarr instance config")?;
-    Ok(ParsedProwlarrConfig {
-        api_key: config.api_key,
-        config_dir: config.runtime.and_then(|runtime| runtime.config_dir),
-    })
 }
 
 fn parse_qbittorrent_instance_config(
@@ -4758,101 +4181,6 @@ async fn resolve_nzbget_server_slot_secrets(
         }
     }
     Ok(resolved)
-}
-
-async fn read_sonarr_api_key(
-    runtime: &dyn RuntimeManager,
-    instance_id: Uuid,
-    config_dir: Option<&str>,
-) -> Result<Option<String>> {
-    read_arr_api_key(runtime, instance_id, config_dir).await
-}
-
-async fn read_radarr_api_key(
-    runtime: &dyn RuntimeManager,
-    instance_id: Uuid,
-    config_dir: Option<&str>,
-) -> Result<Option<String>> {
-    read_arr_api_key(runtime, instance_id, config_dir).await
-}
-
-async fn read_prowlarr_api_key(
-    runtime: &dyn RuntimeManager,
-    instance_id: Uuid,
-    config_dir: Option<&str>,
-) -> Result<Option<String>> {
-    read_arr_api_key(runtime, instance_id, config_dir).await
-}
-
-fn arr_host_auth_config_requires_normalization(config: &Value) -> bool {
-    let Some(object) = config.as_object() else {
-        return false;
-    };
-    let authentication_method = object
-        .get("authenticationMethod")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let authentication_required = object
-        .get("authenticationRequired")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    authentication_method == "none" || authentication_required == "enabled"
-}
-
-async fn read_arr_api_key(
-    runtime: &dyn RuntimeManager,
-    instance_id: Uuid,
-    config_dir: Option<&str>,
-) -> Result<Option<String>> {
-    crate::legacy_arr::mark("executor: config.xml API key reader");
-    let Some(content) = read_config_text(
-        runtime,
-        instance_id,
-        config_dir,
-        "config.xml",
-        "/config/config.xml",
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    parse_arr_api_key(&content)
-}
-
-fn parse_arr_api_key(xml: &str) -> Result<Option<String>> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut in_key = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(event)) => {
-                if event.name().as_ref() == b"ApiKey" {
-                    in_key = true;
-                }
-            }
-            Ok(Event::End(event)) => {
-                if event.name().as_ref() == b"ApiKey" {
-                    in_key = false;
-                }
-            }
-            Ok(Event::Text(event)) if in_key => {
-                let decoded = event.decode().context("decoding ApiKey text")?;
-                let value = quick_xml::escape::unescape(&decoded).context("decoding ApiKey")?;
-                return Ok(Some(value.to_string()));
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => return Err(err.into()),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(None)
 }
 
 async fn resolve_driver_transport_base_url(
@@ -6637,22 +5965,6 @@ mod tests {
     use crate::secrets::SecretsManager;
 
     #[test]
-    fn detects_invalid_arr_none_plus_enabled_auth_state() {
-        assert!(arr_host_auth_config_requires_normalization(&json!({
-            "authenticationMethod": "none",
-            "authenticationRequired": "enabled"
-        })));
-        assert!(arr_host_auth_config_requires_normalization(&json!({
-            "authenticationMethod": "none",
-            "authenticationRequired": "disabledForLocalAddresses"
-        })));
-        assert!(!arr_host_auth_config_requires_normalization(&json!({
-            "authenticationMethod": "forms",
-            "authenticationRequired": "disabledForLocalAddresses"
-        })));
-    }
-
-    #[test]
     fn loopback_only_ports_are_told_apart_from_published_ones() -> Result<()> {
         let stack = r#"{"8989/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}]}"#;
         assert_eq!(host_port_is_loopback_only(stack, 32768)?, Some(true));
@@ -8163,101 +7475,6 @@ mod tests {
                 ]
             }
         })
-    }
-
-    #[tokio::test]
-    async fn sonarr_health_gate_reads_config_xml() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-
-        insert_extension(&store, "ext.sonarr", sonarr_manifest("ext.sonarr")).await?;
-
-        let temp_dir = TempDir::new()?;
-        let config_dir = temp_dir.path().join("sonarr-config");
-        std::fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join("config.xml");
-        std::fs::write(
-            &config_path,
-            "<Config><ApiKey>test-api-key</ApiKey></Config>",
-        )?;
-
-        let instance_id = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id,
-                extension_id: "ext.sonarr".to_string(),
-                instance_name: "default".to_string(),
-                config_json: Some(json!({
-                    "runtime": {
-                        "config_dir": config_dir.to_string_lossy()
-                    }
-                })),
-                enabled: true,
-            })
-            .await?;
-
-        let provider_id = Uuid::new_v4();
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "svc-sonarr".to_string(),
-            8989,
-            None,
-            Some("elixir_net".to_string()),
-        )?;
-        store
-            .upsert_provider(&NewProvider {
-                provider_id,
-                instance_id,
-                capability: "media.manager.tv".to_string(),
-                slot_id: "default".to_string(),
-                cardinality: SlotCardinality::One,
-                implementation: Some("sonarr".to_string()),
-                scope_json: None,
-                endpoint_json: Some(serde_json::to_value(&endpoint)?),
-                health_state: ProviderHealthState::Unknown,
-            })
-            .await?;
-
-        let probe = StubProbe::default();
-        let drivers = DriverRegistry::new();
-        let runtime = StubRuntime;
-        let runtime_paths = RuntimePaths::from_roots(
-            temp_dir
-                .path()
-                .join("data")
-                .join("extensions")
-                .to_string_lossy()
-                .as_ref(),
-            temp_dir.path().to_string_lossy().as_ref(),
-        );
-
-        let secrets = SecretsManager::from_key_bytes([7u8; 32], true);
-        let executor = Executor::new(
-            &database.pool,
-            &probe,
-            &drivers,
-            &runtime,
-            runtime_paths,
-            &secrets,
-        );
-
-        executor.bootstrap_gate(provider_id, 5).await?;
-        executor.health_gate(provider_id, 5).await?;
-
-        let provider = store.get_provider(provider_id).await?.expect("provider");
-        assert_eq!(provider.health_state, ProviderHealthState::Healthy);
-
-        let secret = store
-            .get_secret(SecretScope::Instance, Some(instance_id), "sonarr_api_key")
-            .await?
-            .expect("sonarr api key secret");
-        let decrypted = secrets.decrypt(&secret.value_encrypted)?;
-        assert_eq!(decrypted, "test-api-key");
-
-        let calls = probe.calls();
-        assert!(calls.iter().any(|call| call == "dns:svc-sonarr"));
-        assert!(calls.iter().any(|call| call == "tcp:svc-sonarr:8989"));
-        Ok(())
     }
 
     #[tokio::test]
@@ -10435,95 +9652,6 @@ mod tests {
         assert!(message.contains("NZBGet provider"));
         assert!(message.contains("not driver-ready"));
         assert!(message.contains("download client registration"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resolve_indexer_apps_defers_when_sonarr_dependency_is_unreachable() -> Result<()> {
-        let database = setup_db().await?;
-        let store = ExtensionStore::new(&database.pool);
-        insert_extension(
-            &store,
-            "elixir.modules.sonarr",
-            json!({
-                "id": "elixir.modules.sonarr",
-                "version": "1.0.0",
-                "kind": "module",
-                "name": "Sonarr",
-                "provides": [{
-                    "capability": "media.manager.tv",
-                    "slot": "default",
-                    "implementation": "sonarr"
-                }],
-                "runtime": {
-                    "type": "container",
-                    "image": "example/sonarr:latest",
-                    "service_name": "elx-sonarr"
-                }
-            }),
-        )
-        .await?;
-
-        let instance_id = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id,
-                extension_id: "elixir.modules.sonarr".to_string(),
-                instance_name: "default".to_string(),
-                config_json: Some(json!({ "api_key": "sonarr-test-key" })),
-                enabled: true,
-            })
-            .await?;
-
-        let endpoint = ProviderEndpoint::new(
-            "http".to_string(),
-            "sonarr.example".to_string(),
-            8989,
-            None,
-            None,
-        )?;
-        let provider_id = Uuid::new_v4();
-        store
-            .upsert_provider(&NewProvider {
-                provider_id,
-                instance_id,
-                capability: "media.manager.tv".to_string(),
-                slot_id: "default".to_string(),
-                cardinality: SlotCardinality::One,
-                implementation: Some("sonarr".to_string()),
-                scope_json: None,
-                endpoint_json: Some(serde_json::to_value(&endpoint)?),
-                health_state: ProviderHealthState::Healthy,
-            })
-            .await?;
-        store
-            .upsert_provider_readiness(provider_id, ProviderReadinessPhase::DriverReady, None)
-            .await?;
-
-        let secrets = SecretsManager::from_key_bytes([9u8; 32], true);
-        let runtime = StubRuntime;
-        let probe = StubProbe::default().fail_tcp_for("sonarr.example", 8989);
-        let mut patch = DriverPatch::IndexerRegistry(IndexerRegistryPatch::RegisterApps {
-            apps: vec![crate::drivers::AppSpec {
-                name: "Sonarr".to_string(),
-                implementation: "Sonarr".to_string(),
-                url: "http://sonarr.example:8989".to_string(),
-                api_key: None,
-                tags: Vec::new(),
-                categories: vec!["5000".to_string()],
-                enabled: Some(true),
-                settings: HashMap::new(),
-            }],
-        });
-
-        let err = resolve_indexer_apps(&store, &secrets, &runtime, &probe, &mut patch)
-            .await
-            .expect_err("expected deferred dependency error");
-        let message =
-            deferred_dependency_message(&err).expect("deferred dependency message should exist");
-        assert!(message.contains("Sonarr is not reachable yet"));
-        assert!(message.contains("Prowlarr application registration"));
 
         Ok(())
     }

@@ -917,48 +917,6 @@ impl CustomFormatSpec {
     }
 }
 
-pub fn normalize_custom_format_specifications(
-    specifications: &[serde_json::Value],
-) -> Result<Vec<serde_json::Value>> {
-    specifications
-        .iter()
-        .cloned()
-        .map(normalize_custom_format_specification)
-        .collect()
-}
-
-fn normalize_custom_format_specification(
-    mut specification: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let Some(obj) = specification.as_object_mut() else {
-        bail!("custom_format.specifications entries must be objects");
-    };
-
-    let Some(fields) = obj.get_mut("fields") else {
-        return Ok(specification);
-    };
-
-    if fields.is_array() {
-        return Ok(specification);
-    }
-
-    let Some(field_map) = fields.as_object() else {
-        bail!("custom_format.specifications[].fields must be an object or array");
-    };
-
-    let normalized_fields = field_map
-        .iter()
-        .map(|(name, value)| {
-            serde_json::json!({
-                "name": name,
-                "value": value.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    *fields = serde_json::Value::Array(normalized_fields);
-    Ok(specification)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseProfileSpec {
     pub name: String,
@@ -1060,7 +1018,6 @@ fn slugify(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn media_manager_tv_patch_requires_url() {
@@ -1311,33 +1268,4 @@ mod tests {
         assert!(patch.validate().is_ok());
     }
 
-    #[test]
-    fn normalize_custom_format_specifications_converts_field_maps_to_arrays() {
-        let normalized = normalize_custom_format_specifications(&[json!({
-            "name": "AV1",
-            "implementation": "ReleaseTitleSpecification",
-            "negate": false,
-            "required": true,
-            "fields": {
-                "value": "\\\\bAV1\\\\b"
-            }
-        })])
-        .expect("normalize specifications");
-
-        assert_eq!(
-            normalized,
-            vec![json!({
-                "name": "AV1",
-                "implementation": "ReleaseTitleSpecification",
-                "negate": false,
-                "required": true,
-                "fields": [
-                    {
-                        "name": "value",
-                        "value": "\\\\bAV1\\\\b"
-                    }
-                ]
-            })]
-        );
-    }
 }

@@ -17,10 +17,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::header::{
-    ACCEPT, COOKIE as REQWEST_COOKIE, HOST as REQWEST_HOST, HeaderMap as ReqwestHeaderMap,
+    COOKIE as REQWEST_COOKIE, HOST as REQWEST_HOST, HeaderMap as ReqwestHeaderMap,
     HeaderValue as ReqwestHeaderValue, USER_AGENT,
 };
-use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
+use reqwest::{Client, Method as ReqwestMethod, Url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
@@ -68,7 +68,6 @@ use crate::extensions::store::{
     ExtensionStore, ManagedIngestIntent, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
     NewOperationStep, NewOrchestratorRun, NewSecret,
 };
-use crate::extensions::updater::{ProxyRuntimeUpdateState, load_proxy_runtime_update_state};
 use crate::http::auth::{CurrentPrincipal, CurrentUser};
 use crate::http::error::{ApiError, ApiResult};
 use crate::orchestrator::executor::ExecutorAction;
@@ -705,6 +704,9 @@ pub async fn apply_blueprint(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("blueprint extension not found"))?;
+    if crate::legacy_arr::is_legacy_arr_extension(&blueprint.extension_id) {
+        return Err(ApiError::bad_request(crate::legacy_arr::UNSUPPORTED));
+    }
     let manifest: ExtensionManifest = serde_json::from_value(blueprint.manifest_json.clone())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if manifest.execution.is_some() {
@@ -3925,178 +3927,9 @@ async fn cleanup_extension_downstream_state(
         }
         return Ok(());
     }
-    let api_key =
-        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
-    let endpoint_json = target_provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-
-    let proxy_names = cleanup
-        .proxies
-        .iter()
-        .map(|proxy| proxy.name.clone())
-        .collect::<Vec<_>>();
-    delete_prowlarr_entities_by_name(&base_url, &api_key, "api/v1/indexerProxy", &proxy_names)
-        .await?;
-
-    let proxy_tags = cleanup
-        .proxies
-        .iter()
-        .flat_map(|proxy| proxy.tags.iter().cloned())
-        .collect::<Vec<_>>();
-    delete_unused_prowlarr_tags(&base_url, &api_key, &proxy_tags).await?;
-
+    // A legacy Arr installation is not managed (`crate::legacy_arr`).
+    let _ = state;
     Ok(())
-}
-
-async fn delete_prowlarr_entities_by_name(
-    base_url: &str,
-    api_key: &str,
-    list_path: &str,
-    names: &[String],
-) -> anyhow::Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
-
-    let value = request_control_json(base_url, api_key, &[list_path]).await?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("{list_path} response was not an array"))?;
-    let expected_names = names
-        .iter()
-        .map(|name| normalize_connector_name(name))
-        .collect::<HashSet<_>>();
-
-    let mut delete_ids = Vec::new();
-    for item in items {
-        let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !expected_names.contains(&normalize_connector_name(name)) {
-            continue;
-        }
-        let Some(id) = prowlarr_entity_id(item) else {
-            continue;
-        };
-        delete_ids.push(id);
-    }
-
-    for id in delete_ids {
-        let path = format!("{list_path}/{id}");
-        request_control_write(
-            base_url,
-            api_key,
-            ReqwestMethod::DELETE,
-            &[path.as_str()],
-            None,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn delete_unused_prowlarr_tags(
-    base_url: &str,
-    api_key: &str,
-    labels: &[String],
-) -> anyhow::Result<()> {
-    if labels.is_empty() {
-        return Ok(());
-    }
-
-    let tags_value = request_control_json(base_url, api_key, &["api/v1/tag"]).await?;
-    let tags = tags_value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("api/v1/tag response was not an array"))?;
-    let expected_labels = labels
-        .iter()
-        .map(|label| normalize_connector_name(label))
-        .collect::<HashSet<_>>();
-    let mut candidate_tag_ids = Vec::new();
-    for tag in tags {
-        let Some(label) = tag.get("label").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !expected_labels.contains(&normalize_connector_name(label)) {
-            continue;
-        }
-        let Some(id) = prowlarr_entity_id(tag) else {
-            continue;
-        };
-        candidate_tag_ids.push(id);
-    }
-    if candidate_tag_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut used_tag_ids = HashSet::new();
-    for path in [
-        "api/v1/indexer",
-        "api/v1/indexerProxy",
-        "api/v1/applications",
-    ] {
-        let value = request_control_json(base_url, api_key, &[path]).await?;
-        let items = value
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("{path} response was not an array"))?;
-        for item in items {
-            for tag_id in prowlarr_entity_tag_ids(item) {
-                used_tag_ids.insert(tag_id);
-            }
-        }
-    }
-
-    candidate_tag_ids.sort_unstable();
-    candidate_tag_ids.dedup();
-    for tag_id in candidate_tag_ids {
-        if used_tag_ids.contains(&tag_id) {
-            continue;
-        }
-        let path = format!("api/v1/tag/{tag_id}");
-        request_control_write(
-            base_url,
-            api_key,
-            ReqwestMethod::DELETE,
-            &[path.as_str()],
-            None,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-fn prowlarr_entity_id(value: &serde_json::Value) -> Option<i64> {
-    value
-        .get("id")
-        .and_then(serde_json::Value::as_i64)
-        .or_else(|| {
-            value
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|id| i64::try_from(id).ok())
-        })
-}
-
-fn prowlarr_entity_tag_ids(value: &serde_json::Value) -> Vec<i64> {
-    value
-        .get("tags")
-        .and_then(serde_json::Value::as_array)
-        .map(|tags| {
-            tags.iter()
-                .filter_map(|tag| {
-                    tag.as_i64()
-                        .or_else(|| tag.as_u64().and_then(|id| i64::try_from(id).ok()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
@@ -4220,24 +4053,8 @@ async fn list_prowlarr_indexer_names(
     )? {
         return indexers.names("indexer_names").await;
     }
-    let api_key =
-        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
-    let endpoint_json = provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-    let value = request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("prowlarr indexer response was not an array"))?;
-    Ok(items
-        .iter()
-        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect())
+    let _ = state;
+    anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 pub(crate) async fn list_prowlarr_indexer_proxy_names(
@@ -4255,24 +4072,8 @@ pub(crate) async fn list_prowlarr_indexer_proxy_names(
     )? {
         return indexers.names("indexer_proxy_names").await;
     }
-    let api_key =
-        resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"]).await?;
-    let endpoint_json = provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("target provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-    let value = request_control_json(&base_url, &api_key, &["api/v1/indexerProxy"]).await?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("prowlarr indexer proxy response was not an array"))?;
-    Ok(items
-        .iter()
-        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect())
+    let _ = state;
+    anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 async fn summarize_connector_extension(
@@ -5005,26 +4806,14 @@ fn extension_status_item(
     }
 }
 
+/// No bundled module reports automatic image updates any more (the legacy
+/// Arr stack's FlareSolverr and Byparr updater was removed in Stage 3).
 async fn with_module_auto_update_summary(
-    store: &ExtensionStore<'_>,
-    extension: &Extension,
-    mut summary: ExtensionStatusSummaryItem,
+    _store: &ExtensionStore<'_>,
+    _extension: &Extension,
+    summary: ExtensionStatusSummaryItem,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
-    summary.auto_update = load_proxy_runtime_update_state(store, &extension.extension_id)
-        .await?
-        .map(extension_auto_update_summary);
     Ok(summary)
-}
-
-fn extension_auto_update_summary(state: ProxyRuntimeUpdateState) -> ExtensionAutoUpdateSummary {
-    ExtensionAutoUpdateSummary {
-        severity: state.severity,
-        status_code: state.status_code,
-        label: state.label,
-        description: state.description,
-        checked_at: Some(state.checked_at),
-        release_version: state.release_version,
-    }
 }
 
 const DOWNLOADER_TELEMETRY_SETTING_PREFIX: &str = "extensions.downloaders.telemetry.";
@@ -5201,13 +4990,6 @@ impl ExtensionControlBinding {
         }
     }
 
-    fn arr_implementation(self) -> Option<&'static str> {
-        match self {
-            Self::Sonarr => Some("sonarr"),
-            Self::Radarr => Some("radarr"),
-            _ => None,
-        }
-    }
 }
 
 async fn build_extension_control_surface(
@@ -5436,7 +5218,7 @@ fn normalized_name(value: &str) -> String {
 }
 
 async fn build_extension_control_prowlarr_indexers_section(
-    state: &AppState,
+    _state: &AppState,
     store: &ExtensionStore<'_>,
     context: &ExtensionControlContext,
 ) -> anyhow::Result<Option<ExtensionControlSection>> {
@@ -5478,11 +5260,8 @@ async fn build_extension_control_prowlarr_indexers_section(
                     .collect(),
             )
         }
-        _ => {
-            let (base_url, api_key) =
-                resolve_extension_control_arr_connection(state, store, context).await?;
-            request_control_json(&base_url, &api_key, &["api/v1/indexer"]).await?
-        }
+        // A legacy Arr installation is not managed (`crate::legacy_arr`).
+        _ => return Ok(None),
     };
     let Some(indexers) = value.as_array() else {
         return Ok(None);
@@ -5852,7 +5631,7 @@ async fn build_extension_control_open_web_ui_section(
         "prowlarr" => {
             "Use the native Prowlarr UI for trackers that need site-specific login, captcha, cookies, or settings Elixir does not own yet. Manual indexers remain visible in Elixir but are not overwritten."
         }
-        "sonarr" | "radarr" | "bazarr" => {
+        "sonarr" | "radarr" => {
             "Use the native service UI for advanced settings Elixir does not manage yet."
         }
         "qbittorrent" | "nzbget" => {
@@ -6770,17 +6549,10 @@ async fn build_arr_managed_invariants_section(
             continue;
         };
 
+        // The stack's code reports each client's host, port and category.
         let (live_host_port, live_category) = match &client.target {
             Some(target) => (target.host_port.clone(), target.category.clone()),
-            None => {
-                let detail =
-                    load_arr_control_download_client_detail(state, store, context, client.id)
-                        .await?;
-                (
-                    extract_arr_download_client_host_port(&detail),
-                    extract_arr_download_client_category(&detail),
-                )
-            }
+            None => (None, None),
         };
         match live_host_port {
             Some((host, port))
@@ -7205,56 +6977,6 @@ fn find_arr_download_client_by_implementation<'a>(
         })
 }
 
-fn extract_control_json_field_text(value: &serde_json::Value, name: &str) -> Option<String> {
-    value
-        .get("fields")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|fields| {
-            fields.iter().find_map(|field| {
-                let field_name = field.get("name").and_then(serde_json::Value::as_str)?;
-                if !field_name.eq_ignore_ascii_case(name) {
-                    return None;
-                }
-                field
-                    .get("value")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| field.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            })
-        })
-}
-
-fn extract_arr_download_client_host_port(value: &serde_json::Value) -> Option<(String, u16)> {
-    if let Some(url_text) = extract_control_json_field_text(value, "baseUrl")
-        .or_else(|| extract_control_json_field_text(value, "url"))
-    {
-        if let Ok(parsed) = Url::parse(&url_text) {
-            if let Some(host) = parsed.host_str() {
-                return Some((
-                    host.to_string(),
-                    parsed.port_or_known_default().unwrap_or(80),
-                ));
-            }
-        }
-    }
-
-    let host = extract_control_json_field_text(value, "host")?;
-    let port = extract_control_json_field_i64(value, "port")
-        .and_then(|number| u16::try_from(number).ok())?;
-    Some((host, port))
-}
-
-fn extract_arr_download_client_category(value: &serde_json::Value) -> Option<String> {
-    for key in ["category", "tvCategory", "movieCategory"] {
-        if let Some(value) = extract_control_json_field_text(value, key) {
-            return Some(value);
-        }
-    }
-    None
-}
-
 fn display_control_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
@@ -7647,86 +7369,6 @@ fn infer_arr_download_client_preference(
     }
 }
 
-fn control_json_value_as_i64(value: &serde_json::Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|number| number.trim().parse::<i64>().ok())
-        })
-}
-
-fn extract_control_json_field_i64(value: &serde_json::Value, name: &str) -> Option<i64> {
-    value
-        .get("fields")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|fields| {
-            fields.iter().find_map(|field| {
-                let field_name = field.get("name").and_then(serde_json::Value::as_str)?;
-                if !field_name.eq_ignore_ascii_case(name) {
-                    return None;
-                }
-                field
-                    .get("value")
-                    .and_then(control_json_value_as_i64)
-                    .or_else(|| control_json_value_as_i64(field))
-            })
-        })
-}
-
-fn parse_arr_control_download_client(
-    value: &serde_json::Value,
-) -> Option<ArrControlDownloadClient> {
-    let id = value.get("id").and_then(control_json_value_as_i64)?;
-    let name = value
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Download client")
-        .to_string();
-    let implementation = value
-        .get("implementation")
-        .or_else(|| value.get("implementationName"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let protocol = value
-        .get("protocol")
-        .and_then(serde_json::Value::as_str)
-        .map(arr_download_client_protocol_from_str)
-        .unwrap_or_else(|| {
-            implementation
-                .as_deref()
-                .map(arr_download_client_protocol_from_str)
-                .unwrap_or(ArrDownloadClientProtocol::Unknown)
-        });
-    let priority = value
-        .get("priority")
-        .and_then(control_json_value_as_i64)
-        .or_else(|| extract_control_json_field_i64(value, "priority"))
-        .unwrap_or(1);
-    let enabled = value
-        .get("enable")
-        .or_else(|| value.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-
-    Some(ArrControlDownloadClient {
-        id,
-        name,
-        implementation,
-        protocol,
-        priority,
-        enabled,
-        raw: value.clone(),
-        target: None,
-    })
-}
-
 async fn load_arr_control_download_clients(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -7761,41 +7403,9 @@ async fn load_arr_control_download_clients(
             })
             .collect();
     }
-    let (base_url, api_key) =
-        resolve_extension_control_arr_connection(state, store, context).await?;
-    let value = request_control_json(
-        &base_url,
-        &api_key,
-        &["api/v3/downloadclient", "api/v4/downloadclient"],
-    )
-    .await?;
-    let Some(items) = value.as_array() else {
-        anyhow::bail!("download client inventory response was not an array");
-    };
-
-    Ok(items
-        .iter()
-        .filter_map(parse_arr_control_download_client)
-        .collect())
-}
-
-async fn load_arr_control_download_client_detail(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    context: &ExtensionControlContext,
-    client_id: i64,
-) -> anyhow::Result<serde_json::Value> {
-    let (base_url, api_key) =
-        resolve_extension_control_arr_connection(state, store, context).await?;
-    request_control_json(
-        &base_url,
-        &api_key,
-        &[
-            &format!("api/v3/downloadclient/{client_id}"),
-            &format!("api/v4/downloadclient/{client_id}"),
-        ],
-    )
-    .await
+    // A legacy Arr installation is not managed (`crate::legacy_arr`).
+    let _ = (state, store, context);
+    anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 async fn load_arr_control_download_clients_with_fallback(
@@ -7951,12 +7561,9 @@ async fn update_arr_download_client_preference(
     save_cached_arr_control_download_clients(store, instance.instance_id, &clients).await?;
     let updates = plan_arr_download_client_priority_updates(&clients, preference)?;
 
+    // Only a marketplace stack's manager gets here (`load_arr_control_download_clients`).
     #[cfg(unix)]
-    let extension = control_extension_manager(state, context).await?;
-    #[cfg(not(unix))]
-    let extension: Option<()> = None;
-    #[cfg(unix)]
-    if let Some(manager) = extension.as_ref() {
+    if let Some(manager) = control_extension_manager(state, context).await? {
         for (id, target_priority, _) in &updates {
             manager
                 .call::<serde_json::Value>(
@@ -7965,27 +7572,6 @@ async fn update_arr_download_client_preference(
                 )
                 .await?;
         }
-    }
-    let (base_url, api_key) = if extension.is_none() {
-        resolve_extension_control_arr_connection(state, store, context).await?
-    } else {
-        (String::new(), String::new())
-    };
-    for (id, target_priority, _) in updates.iter().filter(|_| extension.is_none()) {
-        let mut detail =
-            load_arr_control_download_client_detail(state, store, context, *id).await?;
-        set_arr_control_download_client_priority(&mut detail, *target_priority)?;
-        request_control_write(
-            &base_url,
-            &api_key,
-            ReqwestMethod::PUT,
-            &[
-                &format!("api/v3/downloadclient/{id}"),
-                &format!("api/v4/downloadclient/{id}"),
-            ],
-            Some(&detail),
-        )
-        .await?;
     }
 
     if !updates.is_empty() {
@@ -8036,22 +7622,6 @@ async fn build_extension_control_open_service_ui_action(
     }
     let implementation = provider.implementation.as_deref()?.to_ascii_lowercase();
     let (label, description) = match implementation.as_str() {
-        "prowlarr" => (
-            "Open Prowlarr UI",
-            "Open the native Prowlarr UI for advanced or site-specific setup.",
-        ),
-        "sonarr" => (
-            "Open Sonarr UI",
-            "Open the native Sonarr UI for advanced manager setup.",
-        ),
-        "radarr" => (
-            "Open Radarr UI",
-            "Open the native Radarr UI for advanced manager setup.",
-        ),
-        "bazarr" => (
-            "Open Bazarr UI",
-            "Open the native Bazarr UI for advanced subtitle setup.",
-        ),
         "qbittorrent" => (
             "Open qBittorrent UI",
             "Open the native qBittorrent UI for queue and transfer management.",
@@ -8062,12 +7632,6 @@ async fn build_extension_control_open_service_ui_action(
         ),
         _ => return None,
     };
-    if !matches!(
-        implementation.as_str(),
-        "prowlarr" | "sonarr" | "radarr" | "bazarr" | "qbittorrent" | "nzbget"
-    ) {
-        return None;
-    }
     let instance = context.selected_instance.as_ref()?;
     let start_path = format!(
         "/api/v1/extensions/instances/{}/ui/start",
@@ -8113,7 +7677,6 @@ enum ExtensionUiUpstreamAuth {
         name: String,
         value: String,
     },
-    ApiKey(String),
     BasicAuth {
         username: String,
         password: String,
@@ -8135,6 +7698,9 @@ async fn resolve_extension_ui_proxy_target(
         .ok_or_else(|| anyhow::anyhow!("extension instance not found"))?;
     if !instance.enabled {
         anyhow::bail!("extension instance is not enabled");
+    }
+    if crate::legacy_arr::is_legacy_arr_extension(&instance.extension_id) {
+        anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED);
     }
 
     let providers = store.list_providers(Some(instance_id)).await?;
@@ -8185,22 +7751,6 @@ async fn resolve_extension_ui_proxy_target(
         });
     }
     let upstream_auth = match implementation_key.as_str() {
-        "prowlarr" => ExtensionUiUpstreamAuth::ApiKey(
-            resolve_control_api_key(state, store, &instance, &["prowlarr_api_key", "api_key"])
-                .await?,
-        ),
-        "sonarr" => ExtensionUiUpstreamAuth::ApiKey(
-            resolve_control_api_key(state, store, &instance, &["sonarr_api_key", "api_key"])
-                .await?,
-        ),
-        "radarr" => ExtensionUiUpstreamAuth::ApiKey(
-            resolve_control_api_key(state, store, &instance, &["radarr_api_key", "api_key"])
-                .await?,
-        ),
-        "bazarr" => ExtensionUiUpstreamAuth::ApiKey(
-            resolve_control_api_key(state, store, &instance, &["bazarr_api_key", "api_key"])
-                .await?,
-        ),
         "nzbget" => ExtensionUiUpstreamAuth::BasicAuth {
             username: resolve_control_secret_value(
                 state,
@@ -8493,12 +8043,6 @@ async fn build_extension_ui_upstream_request(
                 reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
                     .map_err(anyhow::Error::from)?,
                 ReqwestHeaderValue::from_str(value).map_err(anyhow::Error::from)?,
-            );
-        }
-        ExtensionUiUpstreamAuth::ApiKey(api_key) => {
-            request = request.header(
-                "X-Api-Key",
-                ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
             );
         }
         ExtensionUiUpstreamAuth::BasicAuth { username, password } => {
@@ -9039,7 +8583,7 @@ mod extension_ui_proxy_tests {
     }
 
     #[tokio::test]
-    async fn open_service_ui_action_supports_sonarr_and_qbittorrent() {
+    async fn open_service_ui_action_supports_stack_members_and_qbittorrent() {
         fn context_for(
             extension_id: &str,
             extension_name: &str,
@@ -9160,12 +8704,22 @@ mod extension_ui_proxy_tests {
         }
 
         let sonarr_action = build_extension_control_open_service_ui_action(&context_for(
-            "elixir.modules.sonarr",
+            "stack.0123abcd.sonarr",
             "Sonarr",
             "sonarr",
         ))
         .await
-        .expect("sonarr action");
+        .expect("a stack member's page");
+        assert!(
+            build_extension_control_open_service_ui_action(&context_for(
+                "elixir.modules.sonarr",
+                "Sonarr",
+                "sonarr",
+            ))
+            .await
+            .is_none(),
+            "a legacy Arr installation's page is not offered"
+        );
         assert_eq!(sonarr_action.label, "Open Sonarr UI");
         assert!(
             sonarr_action
@@ -9264,41 +8818,6 @@ async fn load_cached_registry_entry_by_extension_id(
     }))
 }
 
-async fn resolve_extension_control_arr_connection(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    context: &ExtensionControlContext,
-) -> anyhow::Result<(String, String)> {
-    let provider = context
-        .selected_provider
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no active provider is available for this extension yet"))?;
-    let instance = context
-        .selected_instance
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no active instance is available for this extension yet"))?;
-    let endpoint_json = provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-    let implementation = provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let candidate_keys = match implementation.as_str() {
-        "sonarr" => vec!["sonarr_api_key", "api_key"],
-        "radarr" => vec!["radarr_api_key", "api_key"],
-        "prowlarr" => vec!["prowlarr_api_key", "api_key"],
-        _ => vec!["api_key"],
-    };
-    let api_key = resolve_control_api_key(state, store, instance, &candidate_keys).await?;
-    Ok((base_url, api_key))
-}
-
 async fn resolve_extension_control_intent(
     store: &ExtensionStore<'_>,
     provider_id: Uuid,
@@ -9314,140 +8833,6 @@ async fn resolve_extension_control_intent(
         .into_iter()
         .find(|intent| intent.intent_id == intent_id && intent.manager_provider_id == provider_id)
         .ok_or_else(|| anyhow::anyhow!("managed item is no longer available"))
-}
-
-async fn execute_extension_control_manager_command(
-    implementation: &str,
-    base_url: &str,
-    api_key: &str,
-    action_id: &str,
-    item_id: Option<i64>,
-) -> anyhow::Result<String> {
-    match (implementation, action_id) {
-        ("sonarr", "search_missing") => {
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "MissingEpisodeSearch" })),
-            )
-            .await?;
-            Ok("Sonarr started a missing episode search.".to_string())
-        }
-        ("sonarr", "refresh_manager") => {
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "RefreshSeries" })),
-            )
-            .await?;
-            Ok("Sonarr refresh started.".to_string())
-        }
-        ("sonarr", "search_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "SeriesSearch", "seriesId": item_id })),
-            )
-            .await?;
-            Ok("Sonarr started a search for this series.".to_string())
-        }
-        ("sonarr", "refresh_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "RefreshSeries", "seriesId": item_id })),
-            )
-            .await?;
-            Ok("Sonarr refresh started for this series.".to_string())
-        }
-        ("sonarr", "remove_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::DELETE,
-                &[
-                    &format!("api/v3/series/{item_id}?deleteFiles=false"),
-                    &format!("api/v4/series/{item_id}?deleteFiles=false"),
-                ],
-                None,
-            )
-            .await?;
-            Ok("Sonarr removed this series.".to_string())
-        }
-        ("radarr", "search_missing") => {
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "MissingMoviesSearch" })),
-            )
-            .await?;
-            Ok("Radarr started a missing movie search.".to_string())
-        }
-        ("radarr", "refresh_manager") => {
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "RefreshMovie" })),
-            )
-            .await?;
-            Ok("Radarr refresh started.".to_string())
-        }
-        ("radarr", "search_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "MoviesSearch", "movieIds": [item_id] })),
-            )
-            .await?;
-            Ok("Radarr started a search for this movie.".to_string())
-        }
-        ("radarr", "refresh_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::POST,
-                &["api/v3/command", "api/v4/command"],
-                Some(&json!({ "name": "RefreshMovie", "movieId": item_id })),
-            )
-            .await?;
-            Ok("Radarr refresh started for this movie.".to_string())
-        }
-        ("radarr", "remove_item") => {
-            let item_id = item_id.ok_or_else(|| anyhow::anyhow!("manager item id is required"))?;
-            request_control_write(
-                base_url,
-                api_key,
-                ReqwestMethod::DELETE,
-                &[
-                    &format!("api/v3/movie/{item_id}?deleteFiles=false"),
-                    &format!("api/v4/movie/{item_id}?deleteFiles=false"),
-                ],
-                None,
-            )
-            .await?;
-            Ok("Radarr removed this movie.".to_string())
-        }
-        _ => anyhow::bail!("unsupported control action '{action_id}' for {implementation}"),
-    }
 }
 
 pub(crate) async fn remove_managed_library_item_from_manager(
@@ -9477,225 +8862,9 @@ pub(crate) async fn remove_managed_library_item_from_manager(
             .await?;
         return Ok(reply.message);
     }
-    let endpoint_json = provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-    let base_url =
-        resolve_control_provider_transport_base_url(instance.instance_id, &endpoint).await?;
-    let implementation = provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let candidate_keys = match implementation.as_str() {
-        "sonarr" => vec!["sonarr_api_key", "api_key"],
-        "radarr" => vec!["radarr_api_key", "api_key"],
-        _ => anyhow::bail!("stop tracking is not supported for {}", implementation),
-    };
-    let api_key = resolve_control_api_key(state, store, &instance, &candidate_keys).await?;
-    execute_extension_control_manager_command(
-        implementation.as_str(),
-        &base_url,
-        &api_key,
-        "remove_item",
-        Some(manager_item_id),
-    )
-    .await
-}
-
-async fn load_sonarr_control_snapshot(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    instance: &ExtensionInstance,
-    base_url: &str,
-) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key =
-        resolve_control_api_key(state, store, instance, &["sonarr_api_key", "api_key"]).await?;
-    let status = request_control_json(
-        base_url,
-        &api_key,
-        &["api/v3/system/status", "api/v4/system/status"],
-    )
-    .await?;
-    let series =
-        request_control_json(base_url, &api_key, &["api/v3/series", "api/v4/series"]).await?;
-    let mut metrics = vec![
-        ExtensionControlMetric {
-            id: "version".to_string(),
-            label: "Service version".to_string(),
-            value: status
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Unknown")
-                .to_string(),
-        },
-        ExtensionControlMetric {
-            id: "seriesCount".to_string(),
-            label: "Series".to_string(),
-            value: series
-                .as_array()
-                .map(|value| value.len())
-                .unwrap_or(0)
-                .to_string(),
-        },
-    ];
-    if let Some(download_client_count) =
-        cached_arr_control_download_client_count(store, instance.instance_id).await?
-    {
-        metrics.push(ExtensionControlMetric {
-            id: "downloadClientCount".to_string(),
-            label: "Download clients".to_string(),
-            value: download_client_count.to_string(),
-        });
-    }
-
-    Ok(ExtensionControlLiveSnapshot {
-        version: status
-            .get("version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        metrics,
-    })
-}
-
-async fn load_radarr_control_snapshot(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    instance: &ExtensionInstance,
-    base_url: &str,
-) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key =
-        resolve_control_api_key(state, store, instance, &["radarr_api_key", "api_key"]).await?;
-    let status = request_control_json(
-        base_url,
-        &api_key,
-        &["api/v3/system/status", "api/v4/system/status"],
-    )
-    .await?;
-    let movies =
-        request_control_json(base_url, &api_key, &["api/v3/movie", "api/v4/movie"]).await?;
-    let mut metrics = vec![
-        ExtensionControlMetric {
-            id: "version".to_string(),
-            label: "Service version".to_string(),
-            value: status
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Unknown")
-                .to_string(),
-        },
-        ExtensionControlMetric {
-            id: "movieCount".to_string(),
-            label: "Movies".to_string(),
-            value: movies
-                .as_array()
-                .map(|value| value.len())
-                .unwrap_or(0)
-                .to_string(),
-        },
-    ];
-    if let Some(download_client_count) =
-        cached_arr_control_download_client_count(store, instance.instance_id).await?
-    {
-        metrics.push(ExtensionControlMetric {
-            id: "downloadClientCount".to_string(),
-            label: "Download clients".to_string(),
-            value: download_client_count.to_string(),
-        });
-    }
-
-    Ok(ExtensionControlLiveSnapshot {
-        version: status
-            .get("version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        metrics,
-    })
-}
-
-async fn load_prowlarr_control_snapshot(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    instance: &ExtensionInstance,
-    base_url: &str,
-) -> anyhow::Result<ExtensionControlLiveSnapshot> {
-    let api_key =
-        resolve_control_api_key(state, store, instance, &["prowlarr_api_key", "api_key"]).await?;
-    let status = request_control_json(base_url, &api_key, &["api/v1/system/status"]).await?;
-    let indexers = request_control_json(base_url, &api_key, &["api/v1/indexer"]).await?;
-    let applications = request_control_json(base_url, &api_key, &["api/v1/applications"]).await?;
-
-    Ok(ExtensionControlLiveSnapshot {
-        version: status
-            .get("version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        metrics: vec![
-            ExtensionControlMetric {
-                id: "version".to_string(),
-                label: "Service version".to_string(),
-                value: status
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "indexerCount".to_string(),
-                label: "Indexers".to_string(),
-                value: indexers
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-            ExtensionControlMetric {
-                id: "appCount".to_string(),
-                label: "Connected apps".to_string(),
-                value: applications
-                    .as_array()
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                    .to_string(),
-            },
-        ],
-    })
-}
-
-pub(crate) async fn resolve_control_api_key(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    instance: &ExtensionInstance,
-    candidate_keys: &[&str],
-) -> anyhow::Result<String> {
-    crate::legacy_arr::mark("control: Arr API key");
-    if let Some(value) = instance
-        .config_json
-        .as_ref()
-        .and_then(|value| value.get("api_key"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(value.to_string());
-    }
-
-    for key in candidate_keys {
-        if let Some(secret) = store
-            .get_secret(SecretScope::Instance, Some(instance.instance_id), key)
-            .await?
-        {
-            let value = state.secrets.decrypt(&secret.value_encrypted)?;
-            let value = value.trim();
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
-        }
-    }
-
-    anyhow::bail!("service api key is not available yet");
+    // A legacy Arr installation is not managed (`crate::legacy_arr`).
+    let _ = (state, instance, manager_item_id);
+    anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 async fn resolve_control_secret_value(
@@ -9731,73 +8900,6 @@ async fn resolve_control_secret_value(
     }
 
     anyhow::bail!("required service credential is not available yet");
-}
-
-async fn request_control_json(
-    base_url: &str,
-    api_key: &str,
-    paths: &[&str],
-) -> anyhow::Result<serde_json::Value> {
-    let client = build_extension_control_arr_client(api_key)?;
-
-    for path in paths {
-        let url = build_extension_control_url(base_url, path)?;
-        let resp = client
-            .request(ReqwestMethod::GET, url)
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?;
-        if resp.status() == ReqwestStatusCode::NOT_FOUND {
-            continue;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{path} failed ({status}): {}", detail.trim());
-        }
-        return resp
-            .json::<serde_json::Value>()
-            .await
-            .map_err(anyhow::Error::from);
-    }
-
-    anyhow::bail!("service endpoint is not available")
-}
-
-async fn request_control_write(
-    base_url: &str,
-    api_key: &str,
-    method: ReqwestMethod,
-    paths: &[&str],
-    body: Option<&serde_json::Value>,
-) -> anyhow::Result<serde_json::Value> {
-    let client = build_extension_control_arr_client(api_key)?;
-
-    for path in paths {
-        let url = build_extension_control_url(base_url, path)?;
-        let mut request = client.request(method.clone(), url);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let resp = request.send().await.map_err(anyhow::Error::from)?;
-        if resp.status() == ReqwestStatusCode::NOT_FOUND {
-            continue;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} failed ({status}): {}", path, detail.trim());
-        }
-        let bytes = resp.bytes().await.map_err(anyhow::Error::from)?;
-        if bytes.is_empty() {
-            return Ok(json!({}));
-        }
-        let value =
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| json!({}));
-        return Ok(value);
-    }
-
-    anyhow::bail!("service endpoint is not available")
 }
 
 pub(crate) async fn resolve_control_provider_transport_base_url(
@@ -9937,21 +9039,6 @@ async fn run_control_docker_stdout(args: &[&str]) -> anyhow::Result<String> {
         anyhow::bail!("docker {} failed: {}", args.join(" "), stderr.trim());
     }
     String::from_utf8(output.stdout).map_err(anyhow::Error::from)
-}
-
-fn build_extension_control_arr_client(api_key: &str) -> anyhow::Result<Client> {
-    let mut headers = ReqwestHeaderMap::new();
-    headers.insert(
-        "X-Api-Key",
-        ReqwestHeaderValue::from_str(api_key).map_err(anyhow::Error::from)?,
-    );
-    headers.insert(USER_AGENT, ReqwestHeaderValue::from_static("Elixir/1.0"));
-    headers.insert(ACCEPT, ReqwestHeaderValue::from_static("application/json"));
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .default_headers(headers)
-        .build()
-        .map_err(anyhow::Error::from)
 }
 
 fn build_extension_control_url(base_url: &str, path: &str) -> anyhow::Result<Url> {
@@ -10553,10 +9640,7 @@ async fn fetch_registry_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        managed_prowlarr_proxy_cleanup_from_manifest, missing_required_connector_targets,
-        prowlarr_entity_id, prowlarr_entity_tag_ids,
-    };
+    use super::{managed_prowlarr_proxy_cleanup_from_manifest, missing_required_connector_targets};
     use crate::extensions::manifest::ExtensionManifest;
     use serde_json::json;
     use std::collections::HashSet;
@@ -10611,23 +9695,6 @@ mod tests {
                 .map(|target| target.capability.as_str()),
             Some("indexer.registry")
         );
-    }
-
-    #[test]
-    fn prowlarr_entity_helpers_handle_numeric_ids() {
-        let signed = json!({
-            "id": 7,
-            "tags": [2, 7]
-        });
-        let unsigned = json!({
-            "id": 9u64,
-            "tags": [2u64, 9u64]
-        });
-
-        assert_eq!(prowlarr_entity_id(&signed), Some(7));
-        assert_eq!(prowlarr_entity_id(&unsigned), Some(9));
-        assert_eq!(prowlarr_entity_tag_ids(&signed), vec![2, 7]);
-        assert_eq!(prowlarr_entity_tag_ids(&unsigned), vec![2, 9]);
     }
 
     #[test]

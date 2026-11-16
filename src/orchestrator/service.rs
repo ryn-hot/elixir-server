@@ -47,8 +47,6 @@ use crate::runtime::probe::{NetworkProbe, ProbeConfig, ProbeResult, ProbeRunner}
 use crate::runtime::{RuntimeManager, RuntimePaths};
 use crate::secrets::SecretsManager;
 
-const STARTUP_STALE_INSTANCE_GRACE_MINUTES: i64 = 30;
-const KNOWN_STALE_BAZARR_EXTENSION_ID: &str = "elixir.modules.bazarr";
 const MANAGED_RUNTIME_NETWORKS: [&str; 1] = ["elixir_net"];
 const RUNTIME_HEALTH_STATE_SETTING_KEY: &str = "docker_runtime.health";
 
@@ -1466,19 +1464,6 @@ impl OrchestratorService {
             );
         }
 
-        let stale_before =
-            Utc::now() - chrono::Duration::minutes(STARTUP_STALE_INSTANCE_GRACE_MINUTES);
-        let pruned = store
-            .prune_stale_suffix_instances(KNOWN_STALE_BAZARR_EXTENSION_ID, "default", stale_before)
-            .await?;
-        if pruned > 0 {
-            tracing::warn!(
-                "orchestrator: pruned {} stale startup instance(s) for {}",
-                pruned,
-                KNOWN_STALE_BAZARR_EXTENSION_ID
-            );
-        }
-
         let pruned_secrets = store.prune_orphaned_instance_secrets().await?;
         if pruned_secrets > 0 {
             tracing::warn!(
@@ -2782,11 +2767,11 @@ mod tests {
     use crate::db::Database;
     use crate::db::models::{
         BindingStatus, ExtensionKind, ExtensionTrustLevel, OrchestratorRunStatus,
-        ProviderHealthState, SecretScope, SlotCardinality,
+        ProviderHealthState, SlotCardinality,
     };
     use crate::extensions::store::{
         ExtensionStore, NewBinding, NewExtension, NewExtensionInstance, NewOrchestratorRun,
-        NewProvider, NewSecret,
+        NewProvider,
     };
     use crate::runtime::probe::{ProbeResult, ProbeRunner};
     use crate::secrets::SecretsManager;
@@ -3261,152 +3246,6 @@ mod tests {
         .fetch_one(&database.pool)
         .await?;
         assert_eq!(lock_rows, 0, "stale apply lock should be cleared");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recover_orphaned_state_prunes_stale_bazarr_suffix_instances() -> Result<()> {
-        let config = DatabaseConfig {
-            url: "sqlite::memory:?cache=shared".to_string(),
-            max_connections: 1,
-            connect_timeout_seconds: 5,
-        };
-        let database = Database::connect(&config).await?;
-        database.run_migrations().await?;
-        let store = ExtensionStore::new(&database.pool);
-
-        store
-            .upsert_extension(&NewExtension {
-                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
-                name: "Bazarr".to_string(),
-                version: "1.0.0".to_string(),
-                kind: ExtensionKind::Module,
-                publisher_name: None,
-                signing_key_id: None,
-                trust_level: ExtensionTrustLevel::Community,
-                manifest_json: json!({}),
-                package_hash: None,
-                enabled: true,
-            })
-            .await?;
-
-        let default_instance = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id: default_instance,
-                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
-                instance_name: "default".to_string(),
-                config_json: Some(json!({"runtime": {"config_dir": "/tmp/bazarr"}})),
-                enabled: true,
-            })
-            .await?;
-        store
-            .update_instance_runtime_version(default_instance, "1.0.0", None)
-            .await?;
-        store
-            .upsert_provider(&NewProvider {
-                provider_id: Uuid::new_v4(),
-                instance_id: default_instance,
-                capability: "subtitles.manager".to_string(),
-                slot_id: "default".to_string(),
-                cardinality: SlotCardinality::One,
-                implementation: Some("bazarr".to_string()),
-                scope_json: None,
-                endpoint_json: None,
-                health_state: ProviderHealthState::Healthy,
-            })
-            .await?;
-
-        let stale_instance = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id: stale_instance,
-                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
-                instance_name: "default-2".to_string(),
-                config_json: None,
-                enabled: true,
-            })
-            .await?;
-        sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances
-             SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
-             WHERE instance_id = $1",
-        )
-        .bind(stale_instance.to_string())
-        .execute(&database.pool)
-        .await?;
-
-        let keep_instance = Uuid::new_v4();
-        store
-            .create_instance(&NewExtensionInstance {
-                instance_id: keep_instance,
-                extension_id: KNOWN_STALE_BAZARR_EXTENSION_ID.to_string(),
-                instance_name: "default-3".to_string(),
-                config_json: None,
-                enabled: true,
-            })
-            .await?;
-        store
-            .upsert_secret(&NewSecret {
-                secret_id: Uuid::new_v4(),
-                scope: SecretScope::Instance,
-                scope_id: Some(keep_instance),
-                key: "api_key".to_string(),
-                value_encrypted: "encrypted".to_string(),
-                rotatable: false,
-            })
-            .await?;
-        sqlx::query::<sqlx::Any>(
-            "UPDATE extension_instances
-             SET created_at = '2026-01-01 00:00:00', updated_at = '2026-01-01 00:00:00'
-             WHERE instance_id = $1",
-        )
-        .bind(keep_instance.to_string())
-        .execute(&database.pool)
-        .await?;
-
-        let service = OrchestratorService::new(
-            database.pool.clone(),
-            "/tmp/extensions".to_string(),
-            "/tmp/extensions/bundled".to_string(),
-            "/tmp/media".to_string(),
-            vec![],
-            "qmcgaw/gluetun:v3.39.0".to_string(),
-            None,
-            DockerStartupConfig {
-                auto_start_runtime: false,
-                startup_timeout: Duration::from_secs(1),
-                startup_poll_interval: Duration::from_millis(100),
-            },
-            DownloaderPerformanceProfile::Balanced,
-            Arc::new(SecretsManager::from_key_bytes([7u8; 32], true)),
-        );
-        let reconcile_config = ReconcileConfig {
-            interval: Duration::from_secs(60),
-            retry_attempts: 1,
-            retry_backoff: Duration::from_secs(1),
-            startup_settle: Duration::ZERO,
-            lock_ttl: Duration::from_secs(60),
-            mode: crate::orchestrator::reconcile::ReconcileMode::SteadyState,
-        };
-
-        service
-            .recover_orphaned_db_state_after_restart(&reconcile_config)
-            .await?;
-
-        assert!(
-            store.get_instance(stale_instance).await?.is_none(),
-            "stale bazarr suffix instance should be pruned"
-        );
-        assert!(
-            store.get_instance(keep_instance).await?.is_some(),
-            "instances with attached secrets should be preserved"
-        );
-        assert!(
-            store.get_instance(default_instance).await?.is_some(),
-            "primary provider-backed instance should be preserved"
-        );
 
         Ok(())
     }

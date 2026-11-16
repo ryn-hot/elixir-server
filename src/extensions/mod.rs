@@ -5,13 +5,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use globwalk::GlobWalkerBuilder;
 use serde::{Deserialize, Serialize};
-use sqlx::AnyPool;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::{config::SonarrConfig, db::models::MediaType, extensions::sonarr::load_sonarr_sources};
+use crate::db::models::MediaType;
 use elixir_classifier::HintParser;
 use elixir_classifier::hint::general_parser::GeneralParser;
 use elixir_classifier::hint::{FileInput, LibraryType};
@@ -30,9 +29,7 @@ pub mod required_secrets;
 pub mod source_artifacts;
 pub mod source_network_safety;
 pub mod store;
-pub mod updater;
 
-mod sonarr;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileSourceManifest {
@@ -171,20 +168,6 @@ impl ExtensionManager {
         Ok(results)
     }
 
-    pub async fn scan_all_with_db(
-        &self,
-        pool: &AnyPool,
-        sonarr_config: &SonarrConfig,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<MediaFileCandidate>> {
-        let mut results = self.scan_all(since).await?;
-        let sonarr_sources = load_sonarr_sources(pool, sonarr_config).await?;
-        for source in sonarr_sources {
-            let mut entries = source.scan(since).await?;
-            results.append(&mut entries);
-        }
-        Ok(results)
-    }
 }
 
 async fn read_file_source_manifest(path: &str) -> Result<FileSourceManifest> {

@@ -11,8 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
-use reqwest::{Client, Method as ReqwestMethod, StatusCode as ReqwestStatusCode, Url};
+use reqwest::{Method as ReqwestMethod, Url};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
 use sqlx::Row;
@@ -22,6 +21,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub(crate) mod manager;
+#[cfg(test)]
+pub(crate) mod arr_fixture;
+#[cfg(test)]
+pub(crate) use arr_fixture::{SonarrEpisodeDescriptor, derive_arr_acquisition_state};
 
 use super::{
     acquisition_sources::{
@@ -84,7 +87,7 @@ use crate::{
         HTTP_STREAM_DEFAULT_LOGICAL_ID, TORRENT_DEFAULT_LOGICAL_ID,
     },
     drivers::{
-        AddMediaOptions as DriverAddMediaOptions, AddMediaRequest, DriverCtx, DriverRegistry,
+        AddMediaOptions as DriverAddMediaOptions, AddMediaRequest,
     },
     extensions::{
         ExternalIds,
@@ -720,13 +723,6 @@ struct AcquisitionItemState {
     downloader_label: Option<String>,
     protocol: Option<String>,
     children: Vec<FindMediaAcquisitionChildItem>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SonarrEpisodeDescriptor {
-    season_number: i64,
-    episode_number: i64,
-    title: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6590,109 +6586,14 @@ async fn resolve_acquisition_item_state(
         .await;
     }
 
-    let endpoint_json = provider
-        .detail
-        .provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint =
-        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let base_url =
-        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-            .await?;
-    let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
-
-    let item_value = match request_arr_json_with_query(
-        &base_url,
-        &api_key,
-        &manager_item_paths(&implementation, manager_item_id),
-        &[],
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok(acquisition_attention(
-                "manager_status_unavailable",
-                "Manager status unavailable",
-                format!("Manager status could not be loaded: {err}"),
-                base_acquisition_evidence(true, false, false, 0, None, None),
-            ));
-        }
-    };
-
-    if !library_matched || library_needs_hydration {
-        match detect_and_ingest_managed_import_events(
-            state,
-            store,
-            intent,
-            &implementation,
-            &item_value,
-            &base_url,
-            &api_key,
-        )
-        .await
-        {
-            Ok(true) => {
-                library_matched = true;
-            }
-            Ok(false) => {}
-            Err(err) => {
-                warn!(
-                    intent_id = %intent.intent_id,
-                    implementation,
-                    "failed to process managed import events: {err}"
-                );
-            }
-        }
-    }
-
-    let queue_value = request_arr_json_with_query(
-        &base_url,
-        &api_key,
-        &manager_queue_paths(&implementation),
-        &[("page", "1".to_string()), ("pageSize", "250".to_string())],
-    )
-    .await
-    .ok();
-
-    let sonarr_episode_index = if implementation == "sonarr" {
-        let has_matching_queue_entries = queue_value
-            .as_ref()
-            .map(extract_arr_queue_records)
-            .unwrap_or_default()
-            .into_iter()
-            .any(|entry| {
-                queue_entry_matches_manager_item(&entry, &implementation, manager_item_id)
-            });
-        if has_matching_queue_entries {
-            match load_sonarr_episode_index(&base_url, &api_key, manager_item_id).await {
-                Ok(index) => Some(index),
-                Err(err) => {
-                    warn!(
-                        manager_item_id = manager_item_id,
-                        "failed to load sonarr episode index for acquisition batch: {err}"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    Ok(derive_arr_acquisition_state(
-        &implementation,
-        manager_item_id,
-        &item_value,
-        queue_value.as_ref(),
-        library_matched,
-        recovery_view,
-        downloader_progress,
-        sonarr_episode_index.as_ref(),
+    // A legacy Arr installation is not managed (`crate::legacy_arr`).
+    let _ = (store, recovery_view, downloader_progress, &mut library_matched);
+    let _ = library_needs_hydration;
+    Ok(acquisition_attention(
+        "manager_unsupported",
+        "Manager no longer supported",
+        crate::legacy_arr::UNSUPPORTED.to_string(),
+        base_acquisition_evidence(true, false, false, 0, None, None),
     ))
 }
 
@@ -7123,27 +7024,6 @@ pub(crate) async fn remove_qbittorrent_download_by_download_id(
     Ok(true)
 }
 
-pub(crate) async fn request_arr_search_item(
-    implementation: &str,
-    base_url: &str,
-    api_key: &str,
-    manager_item_id: i64,
-) -> AnyResult<()> {
-    let body = match implementation {
-        "sonarr" => json!({ "name": "SeriesSearch", "seriesId": manager_item_id }),
-        "radarr" => json!({ "name": "MoviesSearch", "movieIds": [manager_item_id] }),
-        _ => bail!("item search is not supported for implementation '{implementation}'"),
-    };
-    request_arr_write(
-        base_url,
-        api_key,
-        &["api/v3/command", "api/v4/command"],
-        ReqwestMethod::POST,
-        &body,
-    )
-    .await
-}
-
 async fn load_qbittorrent_acquisition_progress_index(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -7330,57 +7210,6 @@ async fn load_acquisition_downloader_totals(
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct SonarrEpisodeRecord {
-    #[serde(default)]
-    id: i64,
-    #[serde(rename = "seasonNumber", default)]
-    season_number: i64,
-    #[serde(rename = "episodeNumber", default)]
-    episode_number: i64,
-    #[serde(default)]
-    title: String,
-}
-
-async fn load_sonarr_episode_index(
-    base_url: &str,
-    api_key: &str,
-    series_id: &str,
-) -> AnyResult<HashMap<i64, SonarrEpisodeDescriptor>> {
-    let value = request_arr_json_with_query(
-        base_url,
-        api_key,
-        &["api/v3/episode", "api/v4/episode"],
-        &[("seriesId", series_id.to_string())],
-    )
-    .await?;
-
-    let items = if let Some(entries) = value.as_array() {
-        entries.clone()
-    } else {
-        value
-            .get("records")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
-
-    let mut index = HashMap::new();
-    for episode in serde_json::from_value::<Vec<SonarrEpisodeRecord>>(Value::Array(items))
-        .context("parsing sonarr episode batch index")?
-    {
-        index.insert(
-            episode.id,
-            SonarrEpisodeDescriptor {
-                season_number: episode.season_number,
-                episode_number: episode.episode_number,
-                title: episode.title,
-            },
-        );
-    }
-    Ok(index)
-}
-
 fn acquisition_attention(
     code: impl Into<String>,
     title: impl Into<String>,
@@ -7430,43 +7259,6 @@ fn acquisition_phase_from_str(value: &str) -> AcquisitionPhase {
     }
 }
 
-fn manager_item_paths(implementation: &str, manager_item_id: &str) -> [String; 2] {
-    match implementation {
-        "sonarr" => [
-            format!("api/v3/series/{manager_item_id}"),
-            format!("api/v4/series/{manager_item_id}"),
-        ],
-        "radarr" => [
-            format!("api/v3/movie/{manager_item_id}"),
-            format!("api/v4/movie/{manager_item_id}"),
-        ],
-        _ => [String::new(), String::new()],
-    }
-}
-
-pub(crate) fn manager_queue_paths(implementation: &str) -> [&str; 2] {
-    match implementation {
-        "sonarr" => ["api/v3/queue", "api/v4/queue"],
-        "radarr" => ["api/v3/queue", "api/v4/queue"],
-        _ => ["", ""],
-    }
-}
-
-async fn detect_and_ingest_managed_import_events(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    intent: &crate::extensions::store::ManagedIngestIntent,
-    implementation: &str,
-    item_value: &Value,
-    base_url: &str,
-    api_key: &str,
-) -> AnyResult<bool> {
-    let events =
-        detect_managed_import_events(state, intent, implementation, item_value, base_url, api_key)
-            .await?;
-    ingest_managed_import_events(state, store, intent, events).await
-}
-
 /// Persists and links detected import events; true when any linked.
 async fn ingest_managed_import_events(
     state: &AppState,
@@ -7511,237 +7303,6 @@ async fn ingest_managed_import_events(
     }
 
     Ok(linked)
-}
-
-async fn detect_managed_import_events(
-    state: &AppState,
-    intent: &crate::extensions::store::ManagedIngestIntent,
-    implementation: &str,
-    item_value: &Value,
-    base_url: &str,
-    api_key: &str,
-) -> AnyResult<Vec<NewManagedImportEvent>> {
-    match implementation {
-        "radarr" => Ok(
-            detect_radarr_managed_import_event(state, intent, item_value)
-                .into_iter()
-                .collect(),
-        ),
-        "sonarr" => {
-            detect_sonarr_managed_import_events(state, intent, item_value, base_url, api_key).await
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn detect_radarr_managed_import_event(
-    state: &AppState,
-    intent: &crate::extensions::store::ManagedIngestIntent,
-    item_value: &Value,
-) -> Option<NewManagedImportEvent> {
-    let manager_path = radarr_imported_file_path(item_value)?;
-    let library_path = resolve_manager_imported_file_path(
-        &state.settings.library.local_root,
-        &manager_path,
-        MediaType::Movie,
-    )?;
-    let file = ManagedImportFile {
-        path: library_path,
-        season_number: None,
-        episode_number: None,
-        absolute_episode_number: None,
-        episode_title: None,
-        size_bytes: item_value
-            .get("movieFile")
-            .and_then(|file| file.get("size"))
-            .and_then(Value::as_i64),
-        container: StdPath::new(&manager_path)
-            .extension()
-            .map(|value| value.to_string_lossy().to_string()),
-        video_codec: None,
-        audio_codec: None,
-    };
-    let event_key = managed_import_event_key(
-        intent,
-        "radarr",
-        &[format!("movie:{}", file.path.to_ascii_lowercase())],
-    );
-
-    Some(NewManagedImportEvent {
-        event_key,
-        intent_id: intent.intent_id,
-        media_type: MediaType::Movie,
-        external_ids: Some(merge_external_ids_for_event(
-            intent.external_ids.clone().unwrap_or_default(),
-            radarr_external_ids_from_item(item_value),
-        )),
-        manager_provider_id: intent.manager_provider_id,
-        manager_item_id: intent.manager_item_id.clone(),
-        manager_label: intent.manager_label.clone(),
-        manager_implementation: Some("radarr".to_string()),
-        imported_files: vec![file],
-        raw_manager_payload: Some(item_value.clone()),
-        imported_at: Some(Utc::now()),
-    })
-}
-
-async fn detect_sonarr_managed_import_events(
-    state: &AppState,
-    intent: &crate::extensions::store::ManagedIngestIntent,
-    item_value: &Value,
-    base_url: &str,
-    api_key: &str,
-) -> AnyResult<Vec<NewManagedImportEvent>> {
-    let Some(manager_item_id) = intent.manager_item_id.as_deref() else {
-        return Ok(Vec::new());
-    };
-    if !sonarr_item_has_files(item_value) {
-        return Ok(Vec::new());
-    }
-
-    let episode_value = request_arr_json_with_query(
-        base_url,
-        api_key,
-        &["api/v3/episode", "api/v4/episode"],
-        &[("seriesId", manager_item_id.to_string())],
-    )
-    .await?;
-    let episode_file_value = request_arr_json_with_query(
-        base_url,
-        api_key,
-        &["api/v3/episodefile", "api/v4/episodefile"],
-        &[("seriesId", manager_item_id.to_string())],
-    )
-    .await?;
-    let episodes = arr_records(episode_value);
-    let episode_files = arr_records(episode_file_value);
-    let file_map: HashMap<i64, Value> = episode_files
-        .into_iter()
-        .filter_map(|file| {
-            let id = file.get("id").and_then(Value::as_i64)?;
-            Some((id, file))
-        })
-        .collect();
-
-    let mut events = Vec::new();
-    for episode in episodes {
-        let Some(file_id) = episode.get("episodeFileId").and_then(Value::as_i64) else {
-            continue;
-        };
-        if file_id <= 0 {
-            continue;
-        }
-        let Some(file_value) = file_map.get(&file_id) else {
-            continue;
-        };
-        let Some(manager_path) = sonarr_episode_file_path(item_value, file_value) else {
-            continue;
-        };
-        let Some(library_path) = resolve_manager_imported_file_path(
-            &state.settings.library.local_root,
-            &manager_path,
-            intent.media_type,
-        ) else {
-            warn!(
-                intent_id = %intent.intent_id,
-                manager_path = %manager_path,
-                "sonarr imported file path is outside the managed tv root"
-            );
-            continue;
-        };
-        let season_number = episode
-            .get("seasonNumber")
-            .and_then(Value::as_i64)
-            .map(|value| value as i32);
-        let episode_number = episode
-            .get("episodeNumber")
-            .and_then(Value::as_i64)
-            .map(|value| value as i32);
-        let file = ManagedImportFile {
-            path: library_path,
-            season_number,
-            episode_number,
-            absolute_episode_number: episode
-                .get("absoluteEpisodeNumber")
-                .and_then(Value::as_i64)
-                .map(|value| value as i32),
-            episode_title: json_nonempty_string(episode.get("title")),
-            size_bytes: file_value.get("size").and_then(Value::as_i64),
-            container: StdPath::new(&manager_path)
-                .extension()
-                .map(|value| value.to_string_lossy().to_string()),
-            video_codec: file_value
-                .get("mediaInfo")
-                .and_then(|info| json_nonempty_string(info.get("videoCodec")))
-                .map(|value| value.to_ascii_lowercase()),
-            audio_codec: file_value
-                .get("mediaInfo")
-                .and_then(|info| json_nonempty_string(info.get("audioCodec")))
-                .map(|value| value.to_ascii_lowercase()),
-        };
-        let event_key = managed_import_event_key(
-            intent,
-            "sonarr",
-            &[format!(
-                "episode:{}:s{}e{}",
-                file.path.to_ascii_lowercase(),
-                file.season_number.unwrap_or_default(),
-                file.episode_number.unwrap_or_default()
-            )],
-        );
-        events.push(NewManagedImportEvent {
-            event_key,
-            intent_id: intent.intent_id,
-            media_type: intent.media_type,
-            external_ids: Some(merge_external_ids_for_event(
-                intent.external_ids.clone().unwrap_or_default(),
-                sonarr_external_ids_from_item(item_value),
-            )),
-            manager_provider_id: intent.manager_provider_id,
-            manager_item_id: intent.manager_item_id.clone(),
-            manager_label: intent.manager_label.clone(),
-            manager_implementation: Some("sonarr".to_string()),
-            imported_files: vec![file],
-            raw_manager_payload: Some(json!({
-                "series": item_value,
-                "episode": episode,
-                "episodeFile": file_value
-            })),
-            imported_at: Some(Utc::now()),
-        });
-    }
-
-    Ok(events)
-}
-
-/// Legacy Sonarr/Radarr reads, converted to the general-purpose shapes.
-#[allow(clippy::too_many_arguments)]
-fn derive_arr_acquisition_state(
-    implementation: &str,
-    manager_item_id: &str,
-    item_value: &Value,
-    queue_value: Option<&Value>,
-    library_matched: bool,
-    recovery_view: Option<&IntentRecoveryView>,
-    downloader_progress: &AcquisitionDownloaderProgressIndex,
-    sonarr_episode_index: Option<&HashMap<i64, SonarrEpisodeDescriptor>>,
-) -> AcquisitionItemState {
-    let item = manager::legacy::item_status(implementation, item_value);
-    let queue = manager::legacy::queue(implementation, queue_value);
-    let episodes = sonarr_episode_index.map(manager::legacy::episodes);
-    manager::derive_manager_acquisition_state(
-        manager::ManagerAcquisitionInput {
-            kind: manager::legacy::kind(implementation),
-            manager_label: manager::legacy::label(implementation),
-            item_id: manager_item_id,
-            item: &item,
-            queue: &queue,
-            episodes: episodes.as_ref(),
-        },
-        library_matched,
-        recovery_view,
-        downloader_progress,
-    )
 }
 
 fn summarize_sonarr_batch_children(
@@ -7824,22 +7385,6 @@ fn build_sonarr_batch_blocker(counts: SonarrBatchCounts) -> Option<FindMediaAcqu
         ),
         severity: "warning".to_string(),
     })
-}
-
-fn sonarr_series_stats(value: &Value) -> SonarrSeriesStats {
-    let statistics = value.get("statistics");
-    SonarrSeriesStats {
-        episode_count: statistics
-            .and_then(|item| item.get("episodeCount"))
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(0),
-        episode_file_count: statistics
-            .and_then(|item| item.get("episodeFileCount"))
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(0),
-    }
 }
 
 fn format_transfer_count(count: usize) -> String {
@@ -7931,89 +7476,6 @@ fn acquisition_evidence(
     }
 }
 
-pub(crate) fn extract_arr_queue_records(value: &Value) -> Vec<Value> {
-    if let Some(items) = value.as_array() {
-        return items.clone();
-    }
-    value
-        .get("records")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-pub(crate) fn queue_entry_matches_manager_item(
-    entry: &Value,
-    implementation: &str,
-    manager_item_id: &str,
-) -> bool {
-    let direct_id = match implementation {
-        "sonarr" => entry
-            .get("seriesId")
-            .or_else(|| entry.get("series").and_then(|value| value.get("id"))),
-        "radarr" => entry
-            .get("movieId")
-            .or_else(|| entry.get("movie").and_then(|value| value.get("id"))),
-        _ => None,
-    };
-    as_id_string(direct_id.unwrap_or(&Value::Null))
-        .map(|value| value == manager_item_id)
-        .unwrap_or(false)
-}
-
-fn sonarr_item_has_files(value: &Value) -> bool {
-    value
-        .get("statistics")
-        .and_then(|statistics| statistics.get("episodeFileCount"))
-        .and_then(Value::as_i64)
-        .map(|count| count > 0)
-        .unwrap_or(false)
-        || value
-            .get("statistics")
-            .and_then(|statistics| statistics.get("sizeOnDisk"))
-            .and_then(Value::as_u64)
-            .map(|size| size > 0)
-            .unwrap_or(false)
-}
-
-fn radarr_item_has_file(value: &Value) -> bool {
-    value
-        .get("hasFile")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || value
-            .get("movieFileId")
-            .and_then(Value::as_i64)
-            .map(|id| id > 0)
-            .unwrap_or(false)
-        || value
-            .get("sizeOnDisk")
-            .and_then(Value::as_u64)
-            .map(|size| size > 0)
-            .unwrap_or(false)
-}
-
-fn radarr_imported_file_path(value: &Value) -> Option<String> {
-    let movie_file = value.get("movieFile")?;
-    json_nonempty_string(movie_file.get("path"))
-        .or_else(|| {
-            let movie_path = json_nonempty_string(value.get("path"))?;
-            let relative_path = json_nonempty_string(movie_file.get("relativePath"))?;
-            Some(join_arr_path(&movie_path, &relative_path))
-        })
-        .filter(|path| !path.trim().is_empty())
-}
-
-fn sonarr_episode_file_path(series: &Value, file: &Value) -> Option<String> {
-    json_nonempty_string(file.get("path"))
-        .or_else(|| {
-            let series_path = json_nonempty_string(series.get("path"))?;
-            let relative_path = json_nonempty_string(file.get("relativePath"))?;
-            Some(join_arr_path(&series_path, &relative_path))
-        })
-        .filter(|path| !path.trim().is_empty())
-}
-
 fn resolve_manager_imported_file_path(
     local_root: &str,
     manager_path: &str,
@@ -8045,17 +7507,6 @@ fn resolve_manager_imported_file_path(
     )
 }
 
-fn arr_records(value: Value) -> Vec<Value> {
-    if let Some(items) = value.as_array() {
-        return items.clone();
-    }
-    value
-        .get("records")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
 fn managed_import_event_key(
     intent: &crate::extensions::store::ManagedIngestIntent,
     implementation: &str,
@@ -8083,150 +7534,6 @@ fn merge_external_ids_for_event(mut base: ExternalIds, incoming: ExternalIds) ->
     base.mal = base.mal.or(incoming.mal);
     base.kitsu = base.kitsu.or(incoming.kitsu);
     base
-}
-
-fn radarr_external_ids_from_item(value: &Value) -> ExternalIds {
-    ExternalIds {
-        imdb: json_nonempty_string(value.get("imdbId")),
-        tmdb: value
-            .get("tmdbId")
-            .and_then(Value::as_i64)
-            .map(|value| value.to_string())
-            .or_else(|| json_nonempty_string(value.get("tmdbId"))),
-        tvdb: json_nonempty_string(value.get("tvdbId")),
-        tvdb_series: None,
-        tvdb_movie: json_nonempty_string(value.get("tvdbId")),
-        anilist: None,
-        anidb: None,
-        mal: None,
-        kitsu: None,
-    }
-}
-
-fn sonarr_external_ids_from_item(value: &Value) -> ExternalIds {
-    let tvdb = value
-        .get("tvdbId")
-        .and_then(Value::as_i64)
-        .map(|value| value.to_string())
-        .or_else(|| json_nonempty_string(value.get("tvdbId")));
-    ExternalIds {
-        imdb: json_nonempty_string(value.get("imdbId")),
-        tmdb: None,
-        tvdb: tvdb.clone(),
-        tvdb_series: tvdb,
-        tvdb_movie: None,
-        anilist: None,
-        anidb: None,
-        mal: None,
-        kitsu: None,
-    }
-}
-
-fn json_nonempty_string(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn join_arr_path(root: &str, relative: &str) -> String {
-    format!(
-        "{}/{}",
-        root.trim_end_matches('/'),
-        relative.trim_start_matches('/')
-    )
-}
-
-fn queue_entry_state(entry: &Value) -> String {
-    let mut parts = Vec::new();
-    for key in ["trackedDownloadState", "trackedDownloadStatus", "status"] {
-        if let Some(value) = entry.get(key).and_then(Value::as_str) {
-            let value = value.trim().to_ascii_lowercase();
-            if !value.is_empty() {
-                parts.push(value);
-            }
-        }
-    }
-    parts.join(" ")
-}
-
-fn queue_entry_status_message(entry: &Value) -> Option<String> {
-    let message = entry
-        .get("errorMessage")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-
-    let tracked_status = entry
-        .get("trackedDownloadStatus")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-
-    tracked_status.eq("ok").then(|| message.to_string())
-}
-
-fn queue_entry_error_message(entry: &Value) -> Option<String> {
-    let error_message = entry
-        .get("errorMessage")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let status = entry
-        .get("status")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if status.contains("downloadclientunavailable") {
-        return Some(error_message.unwrap_or_else(|| {
-            "Manager could not hand this release to a download client.".to_string()
-        }));
-    }
-    let tracked_status = entry
-        .get("trackedDownloadStatus")
-        .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if tracked_status.contains("warning")
-        || tracked_status.contains("error")
-        || tracked_status.contains("unavailable")
-    {
-        return Some(
-            error_message
-                .unwrap_or_else(|| "Downloader reported a problem for this item.".to_string()),
-        );
-    }
-    None
-}
-
-pub(crate) fn queue_entry_download_id(entry: &Value) -> Option<String> {
-    entry
-        .get("downloadId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-pub(crate) fn queue_entry_downloader_label(entry: &Value) -> Option<String> {
-    entry
-        .get("downloadClient")
-        .or_else(|| entry.get("downloadClientName"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn queue_entry_protocol(entry: &Value) -> Option<String> {
-    entry
-        .get("protocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 fn nzbget_group_download_id(group: &AcquisitionNzbgetGroup) -> Option<&str> {
@@ -10427,14 +9734,6 @@ async fn provider_field_is_available(
         }
     }
 
-    if field.eq_ignore_ascii_case("api_key")
-        && resolve_arr_api_key(state, store, provider, implementation)
-            .await
-            .is_ok()
-    {
-        return Ok(true);
-    }
-
     let mut secret_keys = vec![field.to_string()];
     if !implementation.is_empty() {
         secret_keys.push(format!("{implementation}_{field}"));
@@ -10503,60 +9802,6 @@ async fn resolve_find_media_add_options(
     })
 }
 
-async fn build_manager_driver_ctx(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-) -> AnyResult<DriverCtx> {
-    let implementation = provider
-        .detail
-        .provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
-
-    let endpoint_json = provider
-        .detail
-        .provider
-        .endpoint_json
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-    let endpoint: ProviderEndpoint =
-        serde_json::from_value(endpoint_json).context("parsing provider endpoint")?;
-    let transport_base_url =
-        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-            .await?;
-
-    let mut secrets = HashMap::new();
-    if let Some(api_key) = resolve_arr_api_key(
-        state,
-        store,
-        provider,
-        implementation.as_deref().unwrap_or_default(),
-    )
-    .await
-    .ok()
-    .filter(|value| !value.trim().is_empty())
-    {
-        secrets.insert("api_key".to_string(), api_key.clone());
-        if let Some(implementation) = implementation.as_deref() {
-            secrets.insert(format!("{implementation}_api_key"), api_key);
-        }
-    }
-
-    Ok(DriverCtx::new(
-        provider.detail.provider.provider_id,
-        provider.detail.provider.instance_id,
-        provider.detail.provider.capability.clone(),
-        endpoint,
-        Some(transport_base_url),
-        implementation,
-        provider.instance_config.clone(),
-        secrets,
-    ))
-}
-
 async fn add_with_manager_provider(
     state: &AppState,
     store: &ExtensionStore<'_>,
@@ -10596,40 +9841,8 @@ async fn add_with_manager_provider(
         let added: Added = manager.call("add", manager::add_request(&request)).await?;
         return Ok(added.item_id);
     }
-
-    let ctx = build_manager_driver_ctx(state, store, provider).await?;
-
-    debug!(
-        manager_provider_id = %provider.detail.provider.provider_id,
-        implementation = ?ctx.implementation,
-        capability = %provider.detail.provider.capability,
-        base_url = ?ctx.transport_base_url,
-        "dispatching find media add to manager provider"
-    );
-
-    let effective_options = resolve_find_media_add_options(store, provider, options).await?;
-    let request = AddMediaRequest {
-        media_type,
-        title,
-        year: item.year,
-        external_ids: item.external_ids.clone(),
-        options: DriverAddMediaOptions {
-            monitor: effective_options.monitor.unwrap_or(true),
-            search: effective_options.search.unwrap_or(false),
-            root_folder_path: effective_options.root_folder_path.clone(),
-            quality_profile_id: effective_options.quality_profile_id,
-        },
-    };
-    let drivers = DriverRegistry::with_defaults();
-    let driver = drivers
-        .get(&provider.detail.provider.capability)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no driver registered for capability '{}'",
-                provider.detail.provider.capability
-            )
-        })?;
-    Ok(driver.add_media(ctx, request).await?.manager_item_id)
+    let _ = (state, store, provider, media_type, title, item, options);
+    bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 fn normalize_name(value: &str) -> String {
@@ -10776,19 +9989,11 @@ mod ranking_tests {
 
 async fn search_with_provider(
     state: &AppState,
-    store: &ExtensionStore<'_>,
+    _store: &ExtensionStore<'_>,
     provider: &ProviderContext,
     query: &str,
     media_type: MediaType,
 ) -> AnyResult<Vec<DiscoveryResult>> {
-    let implementation = provider
-        .detail
-        .provider
-        .implementation
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-
     let endpoint_json = provider
         .detail
         .provider
@@ -10820,302 +10025,8 @@ async fn search_with_provider(
             reply,
         ));
     }
-
-    let base_url =
-        resolve_provider_transport_base_url(provider.detail.provider.instance_id, &endpoint)
-            .await?;
-
-    let api_key = resolve_arr_api_key(state, store, provider, &implementation).await?;
-
-    match implementation.as_str() {
-        "sonarr" => search_sonarr(&base_url, &api_key, query, media_type).await,
-        "radarr" => search_radarr(&base_url, &api_key, query).await,
-        _ => bail!(
-            "search is not supported for implementation '{}'",
-            implementation
-        ),
-    }
-}
-
-pub(crate) async fn resolve_arr_api_key(
-    state: &AppState,
-    store: &ExtensionStore<'_>,
-    provider: &ProviderContext,
-    implementation: &str,
-) -> AnyResult<String> {
-    crate::legacy_arr::mark("discovery: Sonarr/Radarr API key");
-    if let Some(value) = provider
-        .instance_config
-        .as_ref()
-        .and_then(|value| value.get("api_key"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(value.to_string());
-    }
-
-    let secret_key = match implementation {
-        "sonarr" => "sonarr_api_key",
-        "radarr" => "radarr_api_key",
-        _ => "api_key",
-    };
-    if let Some(secret) = store
-        .get_secret(
-            crate::db::models::SecretScope::Instance,
-            Some(provider.detail.provider.instance_id),
-            secret_key,
-        )
-        .await?
-    {
-        return state
-            .secrets
-            .decrypt(&secret.value_encrypted)
-            .context("decrypting manager api key");
-    }
-    if let Some(secret) = store
-        .get_secret(
-            crate::db::models::SecretScope::Instance,
-            Some(provider.detail.provider.instance_id),
-            "api_key",
-        )
-        .await?
-    {
-        return state
-            .secrets
-            .decrypt(&secret.value_encrypted)
-            .context("decrypting manager api key");
-    }
-
-    bail!("manager api key is not available yet");
-}
-
-async fn search_sonarr(
-    base_url: &str,
-    api_key: &str,
-    query: &str,
-    media_type: MediaType,
-) -> AnyResult<Vec<DiscoveryResult>> {
-    let items = request_arr_lookup(
-        base_url,
-        api_key,
-        query,
-        &["api/v3/series/lookup", "api/v4/series/lookup"],
-    )
-    .await?;
-    let mut out = Vec::new();
-    for item in items {
-        let title = item
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default();
-        if title.is_empty() {
-            continue;
-        }
-        let tvdb_series = item.get("tvdbId").and_then(as_id_string);
-        let imdb = item.get("imdbId").and_then(as_id_string);
-        let tmdb = item.get("tmdbId").and_then(as_id_string);
-        let year = item
-            .get("year")
-            .and_then(Value::as_i64)
-            .map(|value| value as i32)
-            .or_else(|| parse_year_from_text(item.get("firstAired").and_then(Value::as_str)));
-        let description = item
-            .get("overview")
-            .and_then(Value::as_str)
-            .map(|value| value.to_string());
-        let poster_url = extract_arr_poster_url(base_url, &item);
-        let popularity_score = extract_arr_popularity_score(&item);
-
-        out.push(DiscoveryResult {
-            title: title.to_string(),
-            r#type: if media_type == MediaType::Anime {
-                MediaType::Anime
-            } else {
-                MediaType::Series
-            },
-            year,
-            external_ids: Some(ExternalIds {
-                imdb,
-                tmdb,
-                tvdb_series,
-                ..Default::default()
-            }),
-            description,
-            poster_url,
-            popularity_score,
-        });
-    }
-    Ok(out)
-}
-
-async fn search_radarr(
-    base_url: &str,
-    api_key: &str,
-    query: &str,
-) -> AnyResult<Vec<DiscoveryResult>> {
-    let items = request_arr_lookup(
-        base_url,
-        api_key,
-        query,
-        &["api/v3/movie/lookup", "api/v4/movie/lookup"],
-    )
-    .await?;
-    let mut out = Vec::new();
-    for item in items {
-        let title = item
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_default();
-        if title.is_empty() {
-            continue;
-        }
-        let tmdb = item.get("tmdbId").and_then(as_id_string);
-        let imdb = item.get("imdbId").and_then(as_id_string);
-        let tvdb_movie = item.get("tvdbId").and_then(as_id_string);
-        let year = item
-            .get("year")
-            .and_then(Value::as_i64)
-            .map(|value| value as i32);
-        let description = item
-            .get("overview")
-            .and_then(Value::as_str)
-            .map(|value| value.to_string());
-        let poster_url = extract_arr_poster_url(base_url, &item);
-        let popularity_score = extract_arr_popularity_score(&item);
-
-        out.push(DiscoveryResult {
-            title: title.to_string(),
-            r#type: MediaType::Movie,
-            year,
-            external_ids: Some(ExternalIds {
-                imdb,
-                tmdb,
-                tvdb_movie,
-                ..Default::default()
-            }),
-            description,
-            poster_url,
-            popularity_score,
-        });
-    }
-    Ok(out)
-}
-
-async fn request_arr_lookup(
-    base_url: &str,
-    api_key: &str,
-    query: &str,
-    paths: &[&str],
-) -> AnyResult<Vec<Value>> {
-    let client = build_arr_client(api_key)?;
-
-    for path in paths {
-        let mut url = build_arr_lookup_url(base_url, path)?;
-        url.query_pairs_mut().append_pair("term", query);
-
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("calling {}", path))?;
-        if resp.status() == ReqwestStatusCode::NOT_FOUND {
-            continue;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            bail!("lookup failed ({status}): {}", detail.trim());
-        }
-        let items = resp
-            .json::<Vec<Value>>()
-            .await
-            .with_context(|| format!("parsing {}", path))?;
-        return Ok(items);
-    }
-
-    bail!("lookup endpoint is not available");
-}
-
-pub(crate) async fn request_arr_json_with_query<P: AsRef<str>>(
-    base_url: &str,
-    api_key: &str,
-    paths: &[P],
-    query_pairs: &[(&str, String)],
-) -> AnyResult<Value> {
-    let client = build_arr_client(api_key)?;
-
-    for path in paths {
-        let path = path.as_ref();
-        if path.trim().is_empty() {
-            continue;
-        }
-        let mut url = build_arr_lookup_url(base_url, path)?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in query_pairs {
-                pairs.append_pair(key, value);
-            }
-        }
-
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("calling {path}"))?;
-        if resp.status() == ReqwestStatusCode::NOT_FOUND {
-            continue;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            bail!("{path} failed ({status}): {}", detail.trim());
-        }
-        return resp
-            .json::<Value>()
-            .await
-            .with_context(|| format!("parsing {path}"));
-    }
-
-    bail!("manager endpoint is not available");
-}
-
-pub(crate) async fn request_arr_write(
-    base_url: &str,
-    api_key: &str,
-    paths: &[&str],
-    method: ReqwestMethod,
-    body: &Value,
-) -> AnyResult<()> {
-    let client = build_arr_client(api_key)?;
-
-    for path in paths {
-        if path.trim().is_empty() {
-            continue;
-        }
-        let url = build_arr_lookup_url(base_url, path)?;
-        let response = client
-            .request(method.clone(), url)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("calling {path}"))?;
-        if response.status() == ReqwestStatusCode::NOT_FOUND {
-            continue;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let detail = response.text().await.unwrap_or_default();
-            bail!("{path} failed ({status}): {}", detail.trim());
-        }
-        return Ok(());
-    }
-
-    bail!("manager write endpoint is not available");
+    let _ = (state, query, media_type, endpoint);
+    bail!("{}", crate::legacy_arr::UNSUPPORTED)
 }
 
 pub(crate) async fn resolve_provider_transport_base_url(
@@ -11212,102 +10123,6 @@ async fn run_docker_stdout(args: &[&str]) -> AnyResult<String> {
         bail!("docker {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8(output.stdout).context("docker output was not utf-8")?)
-}
-
-fn build_arr_client(api_key: &str) -> AnyResult<Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-Api-Key",
-        HeaderValue::from_str(api_key).context("invalid api key header")?,
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static("Elixir/1.0"));
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .default_headers(headers)
-        .build()
-        .context("building arr discovery client")
-}
-
-fn build_arr_lookup_url(base_url: &str, path: &str) -> AnyResult<Url> {
-    let mut root = Url::parse(base_url).context("parsing manager base url")?;
-    let trimmed = root.path().trim_end_matches('/');
-    let next_path = if trimmed.is_empty() || trimmed == "/" {
-        format!("/{}", path.trim_start_matches('/'))
-    } else {
-        format!("{}/{}", trimmed, path.trim_start_matches('/'))
-    };
-    root.set_path(&next_path);
-    root.set_query(None);
-    Ok(root)
-}
-
-fn as_id_string(value: &Value) -> Option<String> {
-    if let Some(value) = value.as_str() {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-        return None;
-    }
-    if let Some(value) = value.as_i64() {
-        return Some(value.to_string());
-    }
-    if let Some(value) = value.as_u64() {
-        return Some(value.to_string());
-    }
-    None
-}
-
-fn parse_year_from_text(value: Option<&str>) -> Option<i32> {
-    let value = value?;
-    let year = value.get(0..4)?;
-    year.parse::<i32>().ok()
-}
-
-fn extract_arr_poster_url(base_url: &str, value: &Value) -> Option<String> {
-    let images = value.get("images").and_then(Value::as_array)?;
-    let url = images
-        .iter()
-        .find(|image| {
-            image
-                .get("coverType")
-                .and_then(Value::as_str)
-                .map(|cover| {
-                    let cover = cover.trim().to_ascii_lowercase();
-                    cover == "poster" || cover == "cover"
-                })
-                .unwrap_or(false)
-        })
-        .or_else(|| images.first())?
-        .get("url")
-        .and_then(Value::as_str)?
-        .trim();
-    if url.is_empty() {
-        return None;
-    }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Some(url.to_string());
-    }
-    let root = Url::parse(base_url).ok()?;
-    let joined = root.join(url.trim_start_matches('/')).ok()?;
-    Some(joined.to_string())
-}
-
-fn extract_arr_popularity_score(value: &Value) -> Option<f64> {
-    value
-        .get("ratings")
-        .and_then(|ratings| ratings.get("value"))
-        .and_then(value_as_f64)
-        .or_else(|| value.get("popularity").and_then(value_as_f64))
-        .or_else(|| value.get("voteCount").and_then(value_as_f64))
-}
-
-fn value_as_f64(value: &Value) -> Option<f64> {
-    if let Some(number) = value.as_f64() {
-        return Some(number);
-    }
-    value.as_str()?.trim().parse::<f64>().ok()
 }
 
 #[cfg(test)]

@@ -7919,7 +7919,7 @@ pub async fn run_extension_scan(
 ) -> Result<()> {
     let candidates = state
         .extensions
-        .scan_all_with_db(&state.db_pool, &state.settings.library.sonarr, None)
+        .scan_all(None)
         .await?;
     let anime_matching = state.anime_inference.matching_service();
     run_full_scan_with_anime_matching(

@@ -166,7 +166,6 @@ impl Settings {
             )?
             .set_default("library.artwork_cache_dir", default_artwork_cache_dir())?
             .set_default("library.hash_dedupe_enabled", default_false())?
-            .set_default("library.sonarr.enabled", default_false())?
             .set_default("extensions.registries", Vec::<String>::new())?
             .set_default("extensions.storage_root", default_extensions_root())?
             .set_default("extensions.bundled_dir", default_extensions_bundled_dir())?
@@ -196,10 +195,6 @@ impl Settings {
             .set_default(
                 "extensions.registry_refresh_interval_seconds",
                 default_registry_refresh_interval_seconds(),
-            )?
-            .set_default(
-                "extensions.proxy_runtime_update_interval_seconds",
-                default_proxy_runtime_update_interval_seconds(),
             )?
             .set_default(
                 "extensions.reconcile_retry_attempts",
@@ -704,8 +699,6 @@ pub struct LibraryConfig {
     pub scan_interval_seconds: u64,
     #[serde(default = "default_artwork_cache_dir")]
     pub artwork_cache_dir: String,
-    #[serde(default)]
-    pub sonarr: SonarrConfig,
     #[serde(default = "default_false")]
     pub hash_dedupe_enabled: bool,
 }
@@ -716,18 +709,9 @@ impl Default for LibraryConfig {
             local_root: default_local_root(),
             scan_interval_seconds: default_scan_interval_seconds(),
             artwork_cache_dir: default_artwork_cache_dir(),
-            sonarr: SonarrConfig::default(),
             hash_dedupe_enabled: default_false(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct SonarrConfig {
-    #[serde(default = "default_false")]
-    pub enabled: bool,
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -752,8 +736,6 @@ pub struct ExtensionsConfig {
     pub reconcile_interval_seconds: u64,
     #[serde(default = "default_registry_refresh_interval_seconds")]
     pub registry_refresh_interval_seconds: u64,
-    #[serde(default = "default_proxy_runtime_update_interval_seconds")]
-    pub proxy_runtime_update_interval_seconds: u64,
     #[serde(default = "default_reconcile_retry_attempts")]
     pub reconcile_retry_attempts: u32,
     #[serde(default = "default_reconcile_retry_backoff_seconds")]
@@ -777,7 +759,6 @@ impl Default for ExtensionsConfig {
             docker: ExtensionsDockerConfig::default(),
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             registry_refresh_interval_seconds: default_registry_refresh_interval_seconds(),
-            proxy_runtime_update_interval_seconds: default_proxy_runtime_update_interval_seconds(),
             reconcile_retry_attempts: default_reconcile_retry_attempts(),
             reconcile_retry_backoff_seconds: default_reconcile_retry_backoff_seconds(),
             reconcile_startup_settle_seconds: default_reconcile_startup_settle_seconds(),
@@ -1227,10 +1208,6 @@ fn default_reconcile_interval_seconds() -> u64 {
 
 fn default_registry_refresh_interval_seconds() -> u64 {
     900
-}
-
-fn default_proxy_runtime_update_interval_seconds() -> u64 {
-    6 * 60 * 60
 }
 
 fn default_reconcile_retry_attempts() -> u32 {

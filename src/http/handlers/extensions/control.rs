@@ -80,24 +80,9 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
         if let Some(manager) = super::control_extension_manager(state, context).await? {
             return super::extension_control_snapshot(store, instance, &manager).await;
         }
-        let endpoint_json = provider
-            .endpoint_json
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-        let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-        let base_url =
-            super::resolve_control_provider_transport_base_url(instance.instance_id, &endpoint)
-                .await?;
-
-        match self.implementation {
-            "sonarr" => {
-                super::load_sonarr_control_snapshot(state, store, instance, &base_url).await
-            }
-            "radarr" => {
-                super::load_radarr_control_snapshot(state, store, instance, &base_url).await
-            }
-            _ => Ok(ExtensionControlLiveSnapshot::default()),
-        }
+        // A legacy Arr installation is not managed (`crate::legacy_arr`).
+        let _ = (state, store, instance, provider);
+        Ok(ExtensionControlLiveSnapshot::default())
     }
 
     async fn build_sections(
@@ -206,16 +191,7 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
                 if let Some(manager) = super::control_extension_manager(state, context).await? {
                     return extension_command(&manager, action_id, None).await;
                 }
-                let (base_url, api_key) =
-                    super::resolve_extension_control_arr_connection(state, store, context).await?;
-                super::execute_extension_control_manager_command(
-                    self.implementation,
-                    &base_url,
-                    &api_key,
-                    action_id,
-                    None,
-                )
-                .await
+                anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED)
             }
             "search_item" | "refresh_item" | "remove_item" => {
                 let provider = context.selected_provider.as_ref().ok_or_else(|| {
@@ -241,19 +217,7 @@ impl ExtensionControlProvider for ArrManagerControlAdapter {
                     Some(manager) => {
                         extension_command(&manager, action_id, Some(manager_item_id)).await?
                     }
-                    _ => {
-                        let (base_url, api_key) =
-                            super::resolve_extension_control_arr_connection(state, store, context)
-                                .await?;
-                        super::execute_extension_control_manager_command(
-                            self.implementation,
-                            &base_url,
-                            &api_key,
-                            action_id,
-                            Some(manager_item_id),
-                        )
-                        .await?
-                    }
+                    _ => anyhow::bail!("{}", crate::legacy_arr::UNSUPPORTED),
                 };
                 if action_id == "remove_item" {
                     store
@@ -1148,15 +1112,9 @@ impl ExtensionControlProvider for ProwlarrControlAdapter {
         )? {
             return super::extension_prowlarr_snapshot(&indexers).await;
         }
-        let endpoint_json = provider
-            .endpoint_json
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("provider endpoint is missing"))?;
-        let endpoint: ProviderEndpoint = serde_json::from_value(endpoint_json)?;
-        let base_url =
-            super::resolve_control_provider_transport_base_url(instance.instance_id, &endpoint)
-                .await?;
-        super::load_prowlarr_control_snapshot(state, store, instance, &base_url).await
+        // A legacy Arr installation is not managed (`crate::legacy_arr`).
+        let _ = (state, store, instance, provider);
+        Ok(ExtensionControlLiveSnapshot::default())
     }
 
     async fn build_sections(

@@ -1,61 +1,73 @@
-//! Marks the legacy Arr stack's own code: the server's Sonarr, Radarr and
-//! Prowlarr drivers, the code that reads their API keys from `config.xml`,
-//! the server's direct calls to their APIs, its web-page rules for them and
-//! its Sonarr library source. Stage 3 deletes all of it. A test turns recording
-//! on to prove a marketplace stack never runs any of it; otherwise each mark is
-//! one relaxed atomic load. See docs/architecture/arr-stack-marketplace-extension.md.
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+//! The legacy Arr stack: Sonarr, Radarr, Prowlarr, Bazarr, Byparr and
+//! FlareSolverr as bundled modules, their connectors and the Arr stack
+//! blueprint, installed by Elixir before the marketplace Arr Stack. The server
+//! no longer contains their code (Stage 3 of
+//! docs/architecture/arr-stack-marketplace-extension.md). An installation left
+//! from that time is kept exactly as it is: Elixir never starts, sets up,
+//! changes or calls it again, and only recognizes it to say so. It can be
+//! uninstalled as usual.
 
-static RECORDING: AtomicBool = AtomicBool::new(false);
-static RAN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+/// Shown wherever a legacy Arr installation would have been used.
+pub const UNSUPPORTED: &str = "This Sonarr, Radarr or Prowlarr was installed by an older version of \
+     Elixir and is no longer managed. Install the Arr Stack extension from the marketplace; this \
+     installation can be uninstalled.";
 
-/// Called where a piece of the legacy Arr stack's code starts.
-#[inline]
-pub fn mark(name: &'static str) {
-    if RECORDING.load(Ordering::Relaxed) {
-        if let Ok(mut ran) = RAN.lock() {
-            if !ran.contains(&name) {
-                ran.push(name);
-            }
-        }
+const MODULES: &[&str] = &[
+    "elixir.modules.sonarr",
+    "elixir.modules.radarr",
+    "elixir.modules.prowlarr",
+    "elixir.modules.bazarr",
+    "elixir.modules.byparr",
+    "elixir.modules.flaresolverr",
+];
+
+/// The legacy blueprint's own connectors that are not named after an Arr app.
+const DOWNLOADER_CONNECTORS: &[&str] = &[
+    "elixir.connectors.qbittorrent_defaults",
+    "elixir.connectors.nzbget_defaults",
+];
+
+/// Whether an installed extension belongs to the legacy Arr stack.
+pub fn is_legacy_arr_extension(extension_id: &str) -> bool {
+    let id = extension_id.trim();
+    if MODULES.contains(&id)
+        || DOWNLOADER_CONNECTORS.contains(&id)
+        || id == "elixir.blueprints.arr_stack"
+    {
+        return true;
     }
-}
-
-/// Clears the record and starts recording.
-pub fn start_recording() {
-    if let Ok(mut ran) = RAN.lock() {
-        ran.clear();
-    }
-    RECORDING.store(true, Ordering::Relaxed);
-}
-
-/// Stops recording and returns what ran since `start_recording`.
-pub fn stop_recording() -> Vec<&'static str> {
-    RECORDING.store(false, Ordering::Relaxed);
-    RAN.lock().map(|ran| ran.clone()).unwrap_or_default()
+    id.strip_prefix("elixir.connectors.").is_some_and(|name| {
+        ["sonarr_", "radarr_", "prowlarr_", "bazarr_"]
+            .iter()
+            .any(|app| name.starts_with(app))
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::is_legacy_arr_extension;
+
     #[test]
-    fn records_only_while_recording() {
-        // Other tests may mark legacy code concurrently; check only our names.
-        super::mark("legacy_arr test: before");
-        super::start_recording();
-        super::mark("legacy_arr test: during");
-        super::mark("legacy_arr test: during");
-        let ran = super::stop_recording();
-        super::mark("legacy_arr test: after");
-        assert_eq!(
-            ran.iter()
-                .filter(|name| **name == "legacy_arr test: during")
-                .count(),
-            1
-        );
-        assert!(!ran.contains(&"legacy_arr test: before"));
-        assert!(!super::stop_recording().contains(&"legacy_arr test: after"));
+    fn recognizes_only_the_legacy_arr_stack() {
+        for legacy in [
+            "elixir.modules.sonarr",
+            "elixir.modules.flaresolverr",
+            "elixir.blueprints.arr_stack",
+            "elixir.connectors.prowlarr_sonarr_app",
+            "elixir.connectors.radarr_qbittorrent",
+            "elixir.connectors.qbittorrent_defaults",
+        ] {
+            assert!(is_legacy_arr_extension(legacy), "{legacy}");
+        }
+        for current in [
+            "elixir.modules.qbittorrent",
+            "elixir.modules.nzbget",
+            "stack.0123abcd.sonarr",
+            "stack.0123abcd.prowlarr-sonarr",
+            "elx:publisher/arr-stack",
+            "elixir.sources.prism",
+        ] {
+            assert!(!is_legacy_arr_extension(current), "{current}");
+        }
     }
 }

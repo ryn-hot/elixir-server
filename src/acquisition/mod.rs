@@ -1415,7 +1415,7 @@ mod tests {
             ]
         });
 
-        let history = crate::http::handlers::discovery::manager::legacy::history("radarr", &history);
+        let history = crate::http::handlers::discovery::arr_fixture::legacy::history("radarr", &history);
         let entry = find_latest_history_entry_for_download(
             &history,
             "6",

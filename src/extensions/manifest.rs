@@ -5,10 +5,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::{ExtensionKind, ExtensionTrustLevel, SlotCardinality};
-use crate::extensions::managed_paths::{
-    DOWNLOADS_ROOT, NZBGET_INCOMPLETE_DIR, NZBGET_NZB_DIR, NZBGET_QUEUE_DIR, NZBGET_TEMP_DIR,
-    QBITTORRENT_INCOMPLETE_DIR,
-};
 
 pub const LIVE_CATALOG_PROVIDER_CAPABILITY: &str = "live.catalog_provider";
 pub const ACQUISITION_CANDIDATE_PROVIDER_CAPABILITY: &str = "acquisition.candidate_provider";
@@ -1896,7 +1892,6 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match extension_id {
-        "elixir.blueprints.arr_stack" => remove_object_field(raw_json, "connectors"),
         "elixir.modules.qbittorrent" => repair_downloader_broker_scope(
             raw_json,
             "downloader.torrent",
@@ -1909,54 +1904,8 @@ pub fn repair_builtin_manifest_json(raw_json: &mut serde_json::Value) -> bool {
             "managed",
             "downloaders.usenet.default",
         ),
-        "elixir.modules.sonarr" | "elixir.modules.radarr" => {
-            repair_manager_download_requirements(raw_json)
-        }
-        "elixir.connectors.prowlarr_sonarr_app" | "elixir.connectors.prowlarr_radarr_app" => {
-            remove_driver_patch_app_tags(raw_json)
-        }
-        "elixir.connectors.qbittorrent_defaults" => repair_qbittorrent_defaults_manifest(raw_json),
-        "elixir.connectors.nzbget_defaults" => repair_nzbget_defaults_manifest(raw_json),
         _ => false,
     }
-}
-
-fn repair_qbittorrent_defaults_manifest(root: &mut serde_json::Value) -> bool {
-    let mut repaired = false;
-    repaired |=
-        set_driver_patch_string_field(root, "set_preferences", "default_save_path", DOWNLOADS_ROOT);
-    repaired |= set_driver_patch_string_field(
-        root,
-        "set_preferences",
-        "incomplete_path",
-        QBITTORRENT_INCOMPLETE_DIR,
-    );
-    repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
-    repaired
-}
-
-fn repair_nzbget_defaults_manifest(root: &mut serde_json::Value) -> bool {
-    let mut repaired = false;
-    repaired |=
-        set_driver_patch_string_field(root, "set_preferences", "default_save_path", DOWNLOADS_ROOT);
-    repaired |= set_driver_patch_string_field(
-        root,
-        "set_preferences",
-        "incomplete_path",
-        NZBGET_INCOMPLETE_DIR,
-    );
-    repaired |= set_driver_patch_string_field(root, "set_preferences", "nzb_dir", NZBGET_NZB_DIR);
-    repaired |=
-        set_driver_patch_string_field(root, "set_preferences", "queue_dir", NZBGET_QUEUE_DIR);
-    repaired |= set_driver_patch_string_field(root, "set_preferences", "temp_dir", NZBGET_TEMP_DIR);
-    repaired |= set_driver_patch_bool_field(root, "set_preferences", "use_incomplete", true);
-    repaired
-}
-
-fn remove_object_field(root: &mut serde_json::Value, field: &str) -> bool {
-    root.as_object_mut()
-        .and_then(|object| object.remove(field))
-        .is_some()
 }
 
 fn repair_downloader_broker_scope(
@@ -2003,69 +1952,6 @@ fn repair_downloader_broker_scope(
     repaired
 }
 
-fn repair_manager_download_requirements(root: &mut serde_json::Value) -> bool {
-    let desired = [
-        ("torrent", "downloaders.torrent.default"),
-        ("usenet", "downloaders.usenet.default"),
-    ];
-    let Some(root_object) = root.as_object_mut() else {
-        return false;
-    };
-    let mut repaired = false;
-    let requires = root_object
-        .entry("requires".to_string())
-        .or_insert_with(|| {
-            repaired = true;
-            serde_json::Value::Object(serde_json::Map::new())
-        });
-    if requires.is_array() {
-        let legacy = std::mem::replace(requires, serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(object) = requires.as_object_mut() {
-            if legacy
-                .as_array()
-                .map(|items| !items.is_empty())
-                .unwrap_or(false)
-            {
-                object.insert("capabilities".to_string(), legacy);
-            }
-        }
-        repaired = true;
-    }
-    if !requires.is_object() {
-        *requires = serde_json::Value::Object(serde_json::Map::new());
-        repaired = true;
-    }
-    let Some(requires) = requires.as_object_mut() else {
-        return repaired;
-    };
-    let downloads = requires.entry("downloads".to_string()).or_insert_with(|| {
-        repaired = true;
-        serde_json::Value::Array(Vec::new())
-    });
-    if !downloads.is_array() {
-        *downloads = serde_json::Value::Array(Vec::new());
-        repaired = true;
-    }
-    let Some(downloads) = downloads.as_array_mut() else {
-        return repaired;
-    };
-    for (kind, logical_id) in desired {
-        if downloads.iter().any(|item| {
-            item.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
-                || item.get("logical_id").and_then(serde_json::Value::as_str) == Some(logical_id)
-        }) {
-            continue;
-        }
-        downloads.push(serde_json::json!({
-            "kind": kind,
-            "mode": "broker",
-            "logical_id": logical_id
-        }));
-        repaired = true;
-    }
-    repaired
-}
-
 fn ensure_json_object_field<'a>(
     value: &'a mut serde_json::Value,
     key: &str,
@@ -2108,104 +1994,6 @@ fn set_json_bool_field(
     }
     object.insert(key.to_string(), serde_json::Value::Bool(desired));
     true
-}
-
-fn remove_driver_patch_app_tags(root: &mut serde_json::Value) -> bool {
-    let Some(actions) = root
-        .get_mut("actions")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    let mut repaired = false;
-    for action in actions {
-        let Some(patch) = action.get_mut("patch") else {
-            continue;
-        };
-        let op = patch
-            .get("op")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        match op {
-            "register_app" => {
-                if let Some(app) = patch
-                    .get_mut("app")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    repaired |= app.remove("tags").is_some();
-                }
-            }
-            "register_apps" => {
-                if let Some(apps) = patch
-                    .get_mut("apps")
-                    .and_then(serde_json::Value::as_array_mut)
-                {
-                    for app in apps {
-                        if let Some(object) = app.as_object_mut() {
-                            repaired |= object.remove("tags").is_some();
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    repaired
-}
-
-fn set_driver_patch_string_field(
-    root: &mut serde_json::Value,
-    op: &str,
-    key: &str,
-    desired: &str,
-) -> bool {
-    let Some(patch) = find_driver_patch_mut(root, op) else {
-        return false;
-    };
-    let Some(object) = patch.as_object_mut() else {
-        return false;
-    };
-    if object.get(key).and_then(serde_json::Value::as_str) == Some(desired) {
-        return false;
-    }
-    object.insert(
-        key.to_string(),
-        serde_json::Value::String(desired.to_string()),
-    );
-    true
-}
-
-fn set_driver_patch_bool_field(
-    root: &mut serde_json::Value,
-    op: &str,
-    key: &str,
-    desired: bool,
-) -> bool {
-    let Some(patch) = find_driver_patch_mut(root, op) else {
-        return false;
-    };
-    let Some(object) = patch.as_object_mut() else {
-        return false;
-    };
-    if object.get(key).and_then(serde_json::Value::as_bool) == Some(desired) {
-        return false;
-    }
-    object.insert(key.to_string(), serde_json::Value::Bool(desired));
-    true
-}
-
-fn find_driver_patch_mut<'a>(
-    root: &'a mut serde_json::Value,
-    op: &str,
-) -> Option<&'a mut serde_json::Value> {
-    root.get_mut("actions")
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|actions| {
-            actions.iter_mut().find_map(|action| {
-                let patch = action.get_mut("patch")?;
-                (patch.get("op").and_then(serde_json::Value::as_str) == Some(op)).then_some(patch)
-            })
-        })
 }
 
 fn default_slot() -> String {
@@ -4063,35 +3851,6 @@ runtime:
     }
 
     #[test]
-    fn repair_builtin_manifest_removes_legacy_arr_stack_connectors() {
-        let mut raw = json!({
-            "id": "elixir.blueprints.arr_stack",
-            "execution": {
-                "packages": [
-                    "elixir.connectors.qbittorrent_defaults",
-                    "elixir.connectors.nzbget_defaults"
-                ]
-            },
-            "connectors": [
-                "elixir.connectors.prowlarr_public_indexers",
-                "elixir.connectors.prowlarr_sonarr_app",
-                "elixir.connectors.prowlarr_radarr_app",
-                "elixir.connectors.qbittorrent_defaults",
-                "elixir.connectors.sonarr_qbittorrent",
-                "elixir.connectors.sonarr_nzbget"
-            ]
-        });
-
-        assert!(repair_builtin_manifest_json(&mut raw));
-        assert!(raw.get("connectors").is_none());
-        assert_eq!(
-            raw.pointer("/execution/packages/1")
-                .and_then(serde_json::Value::as_str),
-            Some("elixir.connectors.nzbget_defaults")
-        );
-    }
-
-    #[test]
     fn repair_builtin_manifest_is_noop_when_arr_stack_has_no_legacy_connectors() {
         let mut raw = json!({
             "id": "elixir.blueprints.arr_stack",
@@ -4104,85 +3863,6 @@ runtime:
         });
 
         assert!(!repair_builtin_manifest_json(&mut raw));
-    }
-
-    #[test]
-    fn repair_builtin_manifest_updates_qbittorrent_defaults_to_downloads_incomplete_path() {
-        let mut raw = json!({
-            "id": "elixir.connectors.qbittorrent_defaults",
-            "actions": [
-                {
-                    "type": "driver_patch",
-                    "patch": {
-                        "op": "set_categories",
-                        "categories": []
-                    }
-                },
-                {
-                    "type": "driver_patch",
-                    "patch": {
-                        "op": "set_preferences",
-                        "default_save_path": "/downloads",
-                        "incomplete_path": "/runtime/incomplete",
-                        "use_incomplete": true
-                    }
-                }
-            ]
-        });
-
-        assert!(repair_builtin_manifest_json(&mut raw));
-        assert_eq!(
-            raw.pointer("/actions/1/patch/incomplete_path")
-                .and_then(serde_json::Value::as_str),
-            Some("/downloads/.incomplete")
-        );
-    }
-
-    #[test]
-    fn repair_builtin_manifest_updates_nzbget_defaults_to_runtime_paths() {
-        let mut raw = json!({
-            "id": "elixir.connectors.nzbget_defaults",
-            "actions": [
-                {
-                    "type": "driver_patch",
-                    "patch": {
-                        "op": "set_categories",
-                        "categories": []
-                    }
-                },
-                {
-                    "type": "driver_patch",
-                    "patch": {
-                        "op": "set_preferences",
-                        "default_save_path": "/downloads",
-                        "incomplete_path": "/downloads/.incomplete",
-                        "use_incomplete": true
-                    }
-                }
-            ]
-        });
-
-        assert!(repair_builtin_manifest_json(&mut raw));
-        assert_eq!(
-            raw.pointer("/actions/1/patch/incomplete_path")
-                .and_then(serde_json::Value::as_str),
-            Some("/runtime/incomplete")
-        );
-        assert_eq!(
-            raw.pointer("/actions/1/patch/nzb_dir")
-                .and_then(serde_json::Value::as_str),
-            Some("/runtime/nzb")
-        );
-        assert_eq!(
-            raw.pointer("/actions/1/patch/queue_dir")
-                .and_then(serde_json::Value::as_str),
-            Some("/runtime/queue")
-        );
-        assert_eq!(
-            raw.pointer("/actions/1/patch/temp_dir")
-                .and_then(serde_json::Value::as_str),
-            Some("/runtime/tmp")
-        );
     }
 
     #[test]
@@ -4235,39 +3915,4 @@ runtime:
         );
     }
 
-    #[test]
-    fn repair_builtin_manifest_removes_prowlarr_app_tag_filters() {
-        for extension_id in [
-            "elixir.connectors.prowlarr_sonarr_app",
-            "elixir.connectors.prowlarr_radarr_app",
-        ] {
-            let mut raw = json!({
-                "id": extension_id,
-                "actions": [
-                    {
-                        "type": "driver_patch",
-                        "patch": {
-                            "op": "register_apps",
-                            "apps": [
-                                {
-                                    "name": "App",
-                                    "implementation": "App",
-                                    "url": "http://example:1234",
-                                    "categories": ["5000"],
-                                    "tags": ["elixir"],
-                                    "enabled": true
-                                }
-                            ]
-                        }
-                    }
-                ]
-            });
-
-            assert!(repair_builtin_manifest_json(&mut raw));
-            assert!(
-                raw.pointer("/actions/0/patch/apps/0/tags").is_none(),
-                "app tags should be removed for {extension_id}"
-            );
-        }
-    }
 }

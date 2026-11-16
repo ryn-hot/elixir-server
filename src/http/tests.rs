@@ -2896,6 +2896,127 @@ async fn start_mock_prowlarr_control_server(
     Ok((host, addr, shutdown_tx))
 }
 
+/// What a unit test's marketplace stack answers in place of its code: the
+/// server's general logic is tested, the module's own code has its own tests.
+type StackStandIn = Arc<dyn Fn(&str, &str, &Value) -> Result<Value> + Send + Sync>;
+static STACK_STAND_INS: std::sync::Mutex<Vec<(String, StackStandIn)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Routes the server's calls into stack code to each test's own stand-in, by
+/// the test's own stack, so parallel tests never share one.
+struct RoutedStackCode;
+#[async_trait::async_trait]
+impl crate::orchestrator::stack_setup::StackCode for RoutedStackCode {
+    async fn call(
+        &self,
+        member_id: &str,
+        _interface: &str,
+        operation: &str,
+        request: Value,
+    ) -> Result<Value> {
+        let (prefix, stand_in) = STACK_STAND_INS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(prefix, _)| member_id.starts_with(prefix.as_str()))
+            .cloned()
+            .with_context(|| format!("no stand-in for stack member {member_id}"))?;
+        stand_in(&member_id[prefix.len()..], operation, &request)
+    }
+}
+
+/// A new marketplace stack whose members answer through `stand_in(member,
+/// operation, request)`; returns the stack's ID.
+fn stack_stand_in(
+    stand_in: impl Fn(&str, &str, &Value) -> Result<Value> + Send + Sync + 'static,
+) -> String {
+    let stack = format!("elx:test/{}", Uuid::new_v4().simple());
+    let member = crate::marketplace::stack::derived_id(&stack, "x");
+    let prefix = member[..member.len() - 1].to_owned();
+    STACK_STAND_INS
+        .lock()
+        .unwrap()
+        .push((prefix, Arc::new(stand_in)));
+    crate::orchestrator::stack_setup::install(Some(Arc::new(RoutedStackCode)));
+    stack
+}
+
+/// A stand-in Sonarr member answering from a mock's recorded state.
+fn sonarr_stand_in(
+    state: MockArrControlState,
+) -> impl Fn(&str, &str, &Value) -> Result<Value> + Send + Sync + 'static {
+    move |_member: &str, operation: &str, request: &Value| {
+        Ok(match operation {
+            "status" => json!({ "version": "4.0.0.778", "itemCount": 2 }),
+            "download_clients" => {
+                stand_in_download_clients(&state.download_clients.lock().unwrap())
+            }
+            "set_download_client_priority" => {
+                state
+                    .download_client_updates
+                    .lock()
+                    .unwrap()
+                    .push(request.clone());
+                for client in state.download_clients.lock().unwrap().iter_mut() {
+                    if client["id"] == request["id"] {
+                        client["priority"] = request["priority"].clone();
+                    }
+                }
+                json!({})
+            }
+            "remove_item" => {
+                state
+                    .deletes
+                    .lock()
+                    .unwrap()
+                    .push(request["itemId"].as_str().unwrap_or_default().to_owned());
+                // The module's own message for a Sonarr member.
+                json!({ "message": "Sonarr removed this series." })
+            }
+            "command" | "search_item" => {
+                state
+                    .commands
+                    .lock()
+                    .unwrap()
+                    .push(json!({ "operation": operation, "request": request }));
+                json!({ "message": "Sent to the manager." })
+            }
+            "queue" | "history" => json!({ "entries": [] }),
+            other => anyhow::bail!("the stand-in Sonarr has no {other}"),
+        })
+    }
+}
+
+/// The module's `download_clients` reply for recorded Sonarr/Radarr clients.
+fn stand_in_download_clients(details: &[Value]) -> Value {
+    let field = |client: &Value, name: &str| {
+        client["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|field| field["name"] == name)
+            .map(|field| field["value"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let clients: Vec<Value> = details
+        .iter()
+        .map(|client| {
+            let category = [field(client, "tvCategory"), field(client, "movieCategory")]
+                .into_iter()
+                .find(|value| !value.is_null())
+                .unwrap_or(Value::Null);
+            json!({
+                "id": client["id"], "name": client["name"],
+                "implementation": client["implementation"], "protocol": client["protocol"],
+                "priority": client["priority"], "enabled": client["enable"],
+                "host": field(client, "host"), "port": field(client, "port"),
+                "category": category,
+            })
+        })
+        .collect();
+    json!({ "clients": clients })
+}
+
 #[derive(Clone, Default)]
 struct MockArrControlState {
     commands: Arc<Mutex<Vec<Value>>>,
@@ -10727,151 +10848,6 @@ async fn find_media_add_returns_missing_required_secrets_conflict() -> Result<()
 }
 
 #[tokio::test]
-async fn find_media_add_movie_uses_prefixed_manager_lookup_terms() -> Result<()> {
-    let mut settings = test_settings_with_db();
-    settings.auth.access_token_secret = "find-media-add-movie-prefixed-lookup".to_string();
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let db_pool = database.pool.clone();
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let state = AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    );
-    let app = router(state.clone());
-    let store = ExtensionStore::new(&db_pool);
-
-    let user_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
-        .bind(user_id.to_string())
-        .bind("find-media-add-movie@example.com")
-        .bind("hashed")
-        .execute(&db_pool)
-        .await?;
-    let token = state.auth_service.issue_access_token(user_id)?.token;
-
-    let (radarr_host, radarr_addr, radarr_state, shutdown_tx) = start_mock_radarr_server().await?;
-    let instance_id = Uuid::new_v4();
-    let provider_id = Uuid::new_v4();
-
-    store
-        .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.radarr".to_string(),
-            name: "Radarr".to_string(),
-            version: "1.0.0".to_string(),
-            kind: ExtensionKind::Module,
-            publisher_name: None,
-            signing_key_id: None,
-            trust_level: ExtensionTrustLevel::Community,
-            manifest_json: json!({}),
-            package_hash: None,
-            enabled: true,
-        })
-        .await?;
-    store
-        .create_instance(&NewExtensionInstance {
-            instance_id,
-            extension_id: "elixir.modules.radarr".to_string(),
-            instance_name: "default".to_string(),
-            config_json: Some(json!({ "api_key": "test-radarr-key" })),
-            enabled: true,
-        })
-        .await?;
-    store
-        .upsert_provider(&NewProvider {
-            provider_id,
-            instance_id,
-            capability: "media.manager.movies".to_string(),
-            slot_id: "default".to_string(),
-            cardinality: SlotCardinality::One,
-            implementation: Some("radarr".to_string()),
-            scope_json: Some(json!({
-                "media_types": ["movie"],
-                "actions": ["add", "search", "monitor"]
-            })),
-            endpoint_json: Some(json!({
-                "scheme": "http",
-                "host": radarr_host,
-                "port": radarr_addr.port(),
-                "base_path": "/"
-            })),
-            health_state: ProviderHealthState::Healthy,
-        })
-        .await?;
-
-    let response = app
-        .oneshot(
-            Request::post("/api/v1/find-media/add")
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "mediaType": "movie",
-                        "managerProviderId": provider_id.to_string(),
-                        "item": {
-                            "title": "Scream",
-                            "year": 1996,
-                            "externalIds": {
-                                "tmdb": "4232",
-                                "imdb": "tt0117571"
-                            }
-                        }
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    let _ = shutdown_tx.send(());
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
-    let payload: Value = serde_json::from_slice(&body)?;
-    assert_eq!(
-        payload.get("managerItemId").and_then(Value::as_str),
-        Some("4232")
-    );
-    let created_movies = radarr_state.created_movies.lock().unwrap();
-    assert_eq!(created_movies.len(), 1);
-    assert_eq!(
-        created_movies[0]
-            .get("addOptions")
-            .and_then(Value::as_object)
-            .and_then(|options| options.get("searchForMovie"))
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert!(
-        created_movies[0]
-            .get("addOptions")
-            .and_then(Value::as_object)
-            .and_then(|options| options.get("monitor"))
-            .is_none(),
-        "expected Radarr addOptions.monitor to be omitted: {}",
-        created_movies[0]
-    );
-    assert_eq!(
-        created_movies[0]
-            .get("tags")
-            .and_then(Value::as_array)
-            .cloned(),
-        Some(vec![json!(1)]),
-        "expected created movie to inherit the managed elixir tag: {}",
-        created_movies[0]
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn find_media_add_clears_show_and_episode_tombstones_for_readded_show() -> Result<()> {
     let mut settings = test_settings_with_db();
     settings.auth.access_token_secret = "find-media-add-clears-episode-blocks".to_string();
@@ -10906,12 +10882,19 @@ async fn find_media_add_clears_show_and_episode_tombstones_for_readded_show() ->
     let token = state.auth_service.issue_access_token(user_id)?.token;
 
     let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let stack = stack_stand_in(
+        |_member: &str, operation: &str, _request: &Value| match operation {
+            "add" => Ok(json!({ "itemId": "42" })),
+            other => anyhow::bail!("the stand-in Sonarr has no {other}"),
+        },
+    );
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -10926,7 +10909,7 @@ async fn find_media_add_clears_show_and_episode_tombstones_for_readded_show() ->
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -19699,8 +19682,7 @@ pub(crate) struct LiveArrStack {
 }
 
 /// One-click setup of the Arr Stack's real apps, then Find Media, the control
-/// screens and the web pages through the server's own routes. Fails if any of
-/// the legacy Arr stack's code runs.
+/// screens and the web pages through the server's own routes.
 pub(crate) async fn live_arr_stack_one_click(live: LiveArrStack) -> Result<()> {
     use crate::extensions::store::{ExtensionStore, NewExtension};
     use crate::marketplace::stack;
@@ -19716,9 +19698,6 @@ pub(crate) async fn live_arr_stack_one_click(live: LiveArrStack) -> Result<()> {
         bearer,
     } = live;
     let db_pool = state.db_pool.clone();
-    // Stage 2, slice 4: nothing of the legacy Arr stack's own code may run for
-    // this stack, from setup to Find Media, the control screens and web pages.
-    crate::legacy_arr::start_recording();
     let send = |request: Request<Body>| {
         let app = app.clone();
         async move {
@@ -20408,11 +20387,6 @@ pub(crate) async fn live_arr_stack_one_click(live: LiveArrStack) -> Result<()> {
     );
     assert_eq!(system["appName"], "Sonarr", "{system}");
 
-    let ran = crate::legacy_arr::stop_recording();
-    assert!(
-        ran.is_empty(),
-        "the legacy Arr stack's own code ran for this marketplace stack: {ran:?}"
-    );
     Ok(())
 }
 
@@ -22008,13 +21982,18 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
     ));
 
     let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(MockArrControlState {
+        download_clients: Arc::new(Mutex::new(mock_arr_download_client_details())),
+        ..MockArrControlState::default()
+    }));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22022,7 +22001,7 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
             signing_key_id: None,
             trust_level: ExtensionTrustLevel::Community,
             manifest_json: json!({
-                "id": "elixir.modules.sonarr",
+                "id": sonarr_member,
                 "version": "1.0.0",
                 "kind": "module",
                 "name": "Sonarr",
@@ -22046,7 +22025,7 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({
                 "api_key": "test-sonarr-key"
@@ -22077,8 +22056,10 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
-                .body(Body::empty())?,
+            Request::get(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface"
+            ))
+            .body(Body::empty())?,
         )
         .await?;
     let _ = shutdown_tx.send(());
@@ -22089,7 +22070,7 @@ async fn extension_control_surface_returns_sonarr_metrics_and_action() -> Result
 
     assert_eq!(
         payload.get("extensionId").and_then(Value::as_str),
-        Some("elixir.modules.sonarr")
+        Some(sonarr_member.as_str())
     );
     assert_eq!(payload.get("name").and_then(Value::as_str), Some("Sonarr"));
     assert_eq!(
@@ -22181,13 +22162,18 @@ async fn extension_control_action_test_connection_returns_success() -> Result<()
     ));
 
     let (sonarr_host, sonarr_addr, shutdown_tx) = start_mock_sonarr_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(MockArrControlState {
+        download_clients: Arc::new(Mutex::new(mock_arr_download_client_details())),
+        ..MockArrControlState::default()
+    }));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22195,7 +22181,7 @@ async fn extension_control_action_test_connection_returns_success() -> Result<()
             signing_key_id: None,
             trust_level: ExtensionTrustLevel::Community,
             manifest_json: json!({
-                "id": "elixir.modules.sonarr",
+                "id": sonarr_member,
                 "version": "1.0.0",
                 "kind": "module",
                 "name": "Sonarr",
@@ -22219,7 +22205,7 @@ async fn extension_control_action_test_connection_returns_success() -> Result<()
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({
                 "api_key": "test-sonarr-key"
@@ -22250,9 +22236,9 @@ async fn extension_control_action_test_connection_returns_success() -> Result<()
     let response = app
         .clone()
         .oneshot(
-            Request::post(
-                "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/test_connection",
-            )
+            Request::post(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface/actions/test_connection"
+            ))
             .header("content-type", "application/json")
             .body(Body::from("{}"))?,
         )
@@ -22308,15 +22294,17 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
         secrets,
     ));
 
-    let (sonarr_host, sonarr_addr, _server_state, shutdown_tx) =
+    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22331,7 +22319,7 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -22372,8 +22360,10 @@ async fn extension_control_surface_includes_sonarr_defaults_and_managed_items() 
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
-                .body(Body::empty())?,
+            Request::get(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface"
+            ))
+            .body(Body::empty())?,
         )
         .await?;
     let _ = shutdown_tx.send(());
@@ -22495,6 +22485,8 @@ async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> 
 
     let (sonarr_host, sonarr_addr, server_state, sonarr_shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let (nzbget_host, nzbget_addr, _nzbget_mock_state, nzbget_shutdown_tx) =
         start_mock_nzbget_control_server(Vec::new(), json!("")).await?;
     let store = ExtensionStore::new(&db_pool);
@@ -22503,7 +22495,7 @@ async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> 
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22518,7 +22510,7 @@ async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> 
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -22568,8 +22560,10 @@ async fn extension_control_surface_reports_sonarr_managed_downloader_drift() -> 
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
-                .body(Body::empty())?,
+            Request::get(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface"
+            ))
+            .body(Body::empty())?,
         )
         .await?;
     let _ = sonarr_shutdown_tx.send(());
@@ -22629,15 +22623,17 @@ async fn extension_control_surface_accepts_managed_downloader_alias_hosts() -> R
         secrets.clone(),
     ));
 
-    let (sonarr_host, sonarr_addr, _server_state, sonarr_shutdown_tx) =
+    let (sonarr_host, sonarr_addr, server_state, sonarr_shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let sonarr_instance_id = Uuid::new_v4();
     let sonarr_provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22652,7 +22648,7 @@ async fn extension_control_surface_accepts_managed_downloader_alias_hosts() -> R
     store
         .create_instance(&NewExtensionInstance {
             instance_id: sonarr_instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -22796,8 +22792,10 @@ async fn extension_control_surface_accepts_managed_downloader_alias_hosts() -> R
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/extensions/elixir.modules.sonarr/control-surface")
-                .body(Body::empty())?,
+            Request::get(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface"
+            ))
+            .body(Body::empty())?,
         )
         .await?;
     let _ = sonarr_shutdown_tx.send(());
@@ -22849,13 +22847,15 @@ async fn extension_control_action_remove_item_deactivates_intent() -> Result<()>
 
     let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22870,7 +22870,7 @@ async fn extension_control_action_remove_item_deactivates_intent() -> Result<()>
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -22911,9 +22911,9 @@ async fn extension_control_action_remove_item_deactivates_intent() -> Result<()>
     let response = app
         .clone()
         .oneshot(
-            Request::post(
-                "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/remove_item",
-            )
+            Request::post(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface/actions/remove_item"
+            ))
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&json!({
                 "params": {
@@ -22962,6 +22962,8 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
 
     let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
@@ -22977,7 +22979,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -22992,7 +22994,7 @@ async fn library_delete_item_can_stop_tracking_and_create_tombstone() -> Result<
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -24767,129 +24769,6 @@ async fn library_restore_episode_clears_matching_tombstone() -> Result<()> {
 }
 
 #[tokio::test]
-async fn extension_control_action_search_and_refresh_item_issue_sonarr_commands() -> Result<()> {
-    let settings = test_settings_with_db();
-    let database = Database::connect(&settings.database).await?;
-    database.run_migrations().await?;
-    let db_pool = database.pool.clone();
-    let auth_service = AuthService::new(settings.auth.clone())?;
-    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
-    let linkers = LinkerService::new(settings.classifier.clone())?;
-    let artwork = test_artwork_service(&settings)?;
-    let secrets = SecretsManager::from_settings(&settings)?;
-    let app = router(AppState::new(
-        settings,
-        database,
-        auth_service,
-        ExtensionManager::new(),
-        metadata,
-        linkers,
-        artwork,
-        secrets,
-    ));
-
-    let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
-        start_mock_sonarr_control_server().await?;
-    let store = ExtensionStore::new(&db_pool);
-    let instance_id = Uuid::new_v4();
-    let provider_id = Uuid::new_v4();
-
-    store
-        .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
-            name: "Sonarr".to_string(),
-            version: "1.0.0".to_string(),
-            kind: ExtensionKind::Module,
-            publisher_name: None,
-            signing_key_id: None,
-            trust_level: ExtensionTrustLevel::Community,
-            manifest_json: json!({}),
-            package_hash: None,
-            enabled: true,
-        })
-        .await?;
-    store
-        .create_instance(&NewExtensionInstance {
-            instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
-            instance_name: "default".to_string(),
-            config_json: Some(json!({ "api_key": "test-sonarr-key" })),
-            enabled: true,
-        })
-        .await?;
-    store
-        .upsert_provider(&NewProvider {
-            provider_id,
-            instance_id,
-            capability: "media.manager.tv".to_string(),
-            slot_id: "default".to_string(),
-            cardinality: SlotCardinality::One,
-            implementation: Some("sonarr".to_string()),
-            scope_json: None,
-            endpoint_json: Some(json!({
-                "scheme": "http",
-                "host": sonarr_host,
-                "port": sonarr_addr.port(),
-                "base_path": "/"
-            })),
-            health_state: ProviderHealthState::Healthy,
-        })
-        .await?;
-    let intent_id = store
-        .upsert_managed_ingest_intent(&NewManagedIngestIntent {
-            media_type: MediaType::Series,
-            title: "Noble House".to_string(),
-            normalized_title: "noble house".to_string(),
-            year: Some(1988),
-            external_ids: None,
-            manager_provider_id: provider_id,
-            manager_item_id: Some("42".to_string()),
-            manager_label: Some("default (sonarr)".to_string()),
-            source: "find_media".to_string(),
-        })
-        .await?;
-
-    for action_id in ["search_item", "refresh_item"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post(format!(
-                    "/api/v1/extensions/elixir.modules.sonarr/control-surface/actions/{action_id}"
-                ))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&json!({
-                    "params": {
-                        "intentId": intent_id.to_string()
-                    }
-                }))?))?,
-            )
-            .await?;
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-    let _ = shutdown_tx.send(());
-
-    let commands = server_state.commands.lock().unwrap().clone();
-    assert!(
-        commands.iter().any(|payload| {
-            payload.get("name").and_then(Value::as_str) == Some("SeriesSearch")
-                && payload.get("seriesId").and_then(Value::as_i64) == Some(42)
-        }),
-        "expected SeriesSearch command: {:?}",
-        commands
-    );
-    assert!(
-        commands.iter().any(|payload| {
-            payload.get("name").and_then(Value::as_str) == Some("RefreshSeries")
-                && payload.get("seriesId").and_then(Value::as_i64) == Some(42)
-        }),
-        "expected RefreshSeries command: {:?}",
-        commands
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn extension_control_settings_update_persists_sonarr_defaults() -> Result<()> {
     let settings = test_settings_with_db();
     let database = Database::connect(&settings.database).await?;
@@ -25171,12 +25050,14 @@ async fn extension_control_settings_update_applies_sonarr_download_client_prefer
 
     let (sonarr_host, sonarr_addr, server_state, shutdown_tx) =
         start_mock_sonarr_control_server().await?;
+    let stack = stack_stand_in(sonarr_stand_in(server_state.clone()));
+    let sonarr_member = crate::marketplace::stack::derived_id(&stack, "sonarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             name: "Sonarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -25191,7 +25072,7 @@ async fn extension_control_settings_update_applies_sonarr_download_client_prefer
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.sonarr".to_string(),
+            extension_id: sonarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-sonarr-key" })),
             enabled: true,
@@ -25219,13 +25100,15 @@ async fn extension_control_settings_update_applies_sonarr_download_client_prefer
     let response = app
         .clone()
         .oneshot(
-            Request::put("/api/v1/extensions/elixir.modules.sonarr/control-surface")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&json!({
-                    "values": {
-                        "downloadClientPreference": "torrent"
-                    }
-                }))?))?,
+            Request::put(format!(
+                "/api/v1/extensions/{sonarr_member}/control-surface"
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "values": {
+                    "downloadClientPreference": "torrent"
+                }
+            }))?))?,
         )
         .await?;
     let _ = shutdown_tx.send(());
@@ -25255,40 +25138,14 @@ async fn extension_control_settings_update_applies_sonarr_download_client_prefer
     );
 
     let clients = server_state.download_clients.lock().unwrap().clone();
-    let nzbget_priority = clients
-        .iter()
-        .find(|client| client.get("name").and_then(Value::as_str) == Some("NZBGet"))
-        .and_then(|client| {
-            client
-                .get("fields")
-                .and_then(Value::as_array)
-                .and_then(|fields| {
-                    fields.iter().find_map(|field| {
-                        if field.get("name").and_then(Value::as_str) == Some("priority") {
-                            field.get("value").and_then(Value::as_i64)
-                        } else {
-                            None
-                        }
-                    })
-                })
-        });
-    let qbittorrent_priority = clients
-        .iter()
-        .find(|client| client.get("name").and_then(Value::as_str) == Some("qBittorrent"))
-        .and_then(|client| {
-            client
-                .get("fields")
-                .and_then(Value::as_array)
-                .and_then(|fields| {
-                    fields.iter().find_map(|field| {
-                        if field.get("name").and_then(Value::as_str) == Some("priority") {
-                            field.get("value").and_then(Value::as_i64)
-                        } else {
-                            None
-                        }
-                    })
-                })
-        });
+    let priority = |name: &str| {
+        clients
+            .iter()
+            .find(|client| client.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|client| client.get("priority").and_then(Value::as_i64))
+    };
+    let nzbget_priority = priority("NZBGet");
+    let qbittorrent_priority = priority("qBittorrent");
     assert_eq!(nzbget_priority, Some(11));
     assert_eq!(qbittorrent_priority, Some(10));
 
@@ -26507,31 +26364,50 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
         secrets,
     ));
 
-    let (prowlarr_host, prowlarr_addr, shutdown_tx) = start_mock_prowlarr_control_server(
-        vec![
-            json!({
-                "name": "AnimeTosho",
-                "implementation": "Torznab",
-                "enable": true,
-                "appProfileId": 1
-            }),
-            json!({
-                "name": "Private Tracker",
-                "implementation": "Torznab",
-                "enable": true,
-                "appProfileId": 1
-            }),
-        ],
-        vec![json!({ "name": "Sonarr" }), json!({ "name": "Radarr" })],
-    )
-    .await?;
+    let indexers = vec![
+        json!({
+            "name": "AnimeTosho",
+            "implementation": "Torznab",
+            "enable": true,
+            "appProfileId": 1
+        }),
+        json!({
+            "name": "Private Tracker",
+            "implementation": "Torznab",
+            "enable": true,
+            "appProfileId": 1
+        }),
+    ];
+    let applications = vec![json!({ "name": "Sonarr" }), json!({ "name": "Radarr" })];
+    let (prowlarr_host, prowlarr_addr, shutdown_tx) =
+        start_mock_prowlarr_control_server(indexers.clone(), applications.clone()).await?;
+    let stack = stack_stand_in(move |_member: &str, operation: &str, _request: &Value| {
+        let names = || {
+            indexers
+                .iter()
+                .map(|item| item["name"].clone())
+                .collect::<Vec<_>>()
+        };
+        Ok(match operation {
+            "status" => json!({ "version": "1.17.2.4511", "indexerCount": indexers.len(),
+                "appCount": applications.len() }),
+            "indexers" => json!({ "indexers": indexers.iter().map(|item| json!({
+                "name": item["name"], "implementation": item["implementation"],
+                "enabled": item["enable"], "appProfileId": item["appProfileId"],
+            })).collect::<Vec<_>>() }),
+            "indexer_names" => json!({ "names": names() }),
+            "indexer_proxy_names" => json!({ "names": [] }),
+            other => anyhow::bail!("the stand-in Prowlarr has no {other}"),
+        })
+    });
+    let prowlarr_member = crate::marketplace::stack::derived_id(&stack, "prowlarr");
     let store = ExtensionStore::new(&db_pool);
     let instance_id = Uuid::new_v4();
     let provider_id = Uuid::new_v4();
 
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.prowlarr".to_string(),
+            extension_id: prowlarr_member.clone(),
             name: "Prowlarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -26539,7 +26415,7 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
             signing_key_id: None,
             trust_level: ExtensionTrustLevel::Community,
             manifest_json: json!({
-                "id": "elixir.modules.prowlarr",
+                "id": prowlarr_member,
                 "version": "1.0.0",
                 "kind": "module",
                 "name": "Prowlarr",
@@ -26556,7 +26432,7 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.prowlarr".to_string(),
+            extension_id: prowlarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: Some(json!({ "api_key": "test-prowlarr-key" })),
             enabled: true,
@@ -26653,8 +26529,10 @@ async fn extension_control_surface_includes_prowlarr_managed_and_manual_indexers
     let response = app
         .clone()
         .oneshot(
-            Request::get("/api/v1/extensions/elixir.modules.prowlarr/control-surface")
-                .body(Body::empty())?,
+            Request::get(format!(
+                "/api/v1/extensions/{prowlarr_member}/control-surface"
+            ))
+            .body(Body::empty())?,
         )
         .await?;
     let _ = shutdown_tx.send(());

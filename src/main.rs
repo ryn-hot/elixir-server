@@ -31,7 +31,6 @@ use elixir_server::extensions::required_secrets::{
 use elixir_server::extensions::store::{
     ExtensionStore, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
 };
-use elixir_server::extensions::updater::start_proxy_runtime_update_loop;
 use elixir_server::http::handlers::extensions::{
     InstallPolicy, install_internal_extension_from_dir, resume_prism_certification_jobs,
 };
@@ -462,19 +461,6 @@ async fn start_post_listener_background_tasks(
             registries,
             storage_root,
             std::time::Duration::from_secs(registry_interval),
-        )
-        .await;
-    });
-
-    let proxy_runtime_update_interval = state
-        .settings
-        .extensions
-        .proxy_runtime_update_interval_seconds;
-    let proxy_runtime_update_state = state.clone();
-    tokio::spawn(async move {
-        start_proxy_runtime_update_loop(
-            proxy_runtime_update_state,
-            std::time::Duration::from_secs(proxy_runtime_update_interval),
         )
         .await;
     });
