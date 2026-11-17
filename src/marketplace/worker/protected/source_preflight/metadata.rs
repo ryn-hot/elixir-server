@@ -480,7 +480,7 @@ impl Client {
         &self,
         descriptor: &CandidateDescriptor,
     ) -> Result<MetadataObservation> {
-        self.verify_metadata_scheduled(descriptor, Duration::from_secs(120), Work::Foreground)
+        self.verify_metadata_scheduled(descriptor, SELECTION_VALIDITY, Work::Foreground)
             .await
     }
     async fn verify_metadata_scheduled(

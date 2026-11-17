@@ -49,6 +49,9 @@ const OBSERVATION_TTL: Duration = Duration::from_secs(300);
 // protected health cycle may itself take 72 s, before a helper/readback and
 // the existing 15-s retry cadence. This is scheduling, never a TTL extension.
 pub(super) const SHARING_RENEWAL_LEAD: Duration = Duration::from_secs(180);
+// A selection (and a viewed search card's renewal) reuses a cached metadata
+// receipt only with at least this much left; otherwise it verifies again.
+pub(super) const SELECTION_VALIDITY: Duration = Duration::from_secs(120);
 
 fn observation_utc() -> Result<u64> {
     u64::try_from(chrono::Utc::now().timestamp()).context("source observation clock unavailable")

@@ -28,7 +28,8 @@ impl SearchSourceObservation {
             protection: source.protection.clone(),
         })
     }
-    fn copy(&self) -> Self {
+    /// Keeps the original observation time: a copy never extends validity.
+    pub(in crate::marketplace) fn copy(&self) -> Self {
         Self {
             release_id: self.release_id,
             location_id: self.location_id,

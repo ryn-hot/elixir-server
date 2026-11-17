@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 mod deferral;
 mod first_view;
 mod ranking_ready;
+mod renewal;
 mod selection;
 mod view_progress;
 
@@ -107,6 +108,9 @@ pub(super) struct Fake {
     hints_started: Notify,
     hints_resume: Notify,
     catalog_hints: Mutex<Vec<PeerKey>>,
+    renewing: AtomicBool,
+    fail_renewal: AtomicBool,
+    renewals: AtomicUsize,
 }
 impl Fake {
     pub(super) fn new(descriptors: Vec<CandidateDescriptor>) -> Self {
@@ -159,6 +163,9 @@ impl Fake {
             hints_started: Notify::new(),
             hints_resume: Notify::new(),
             catalog_hints: Mutex::new(vec![]),
+            renewing: AtomicBool::new(false),
+            fail_renewal: AtomicBool::new(false),
+            renewals: AtomicUsize::new(0),
         }
     }
 }
@@ -254,6 +261,23 @@ impl Backend for Fake {
             bail!("synthetic retained fence advanced");
         }
         Ok(())
+    }
+    fn renews(&self) -> bool {
+        self.renewing.load(Ordering::SeqCst)
+    }
+    async fn renew(&self, value: &Verified) -> Result<Arc<Verified>> {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        if self.fail_renewal.load(Ordering::SeqCst) {
+            bail!("synthetic busy verifier");
+        }
+        let policy =
+            IssuerPolicy::new([PublicKey::from_bytes(key(3).verifying_key().to_bytes())?])?;
+        let (metadata, owner) = MetadataObservation::fixture_for_verified_descriptor(
+            value.metadata.descriptor().clone(),
+            &policy,
+        )?;
+        self.owners.lock().unwrap().push(Box::new(owner));
+        Ok(Arc::new(Verified::new(metadata, value.source.copy())?))
     }
     async fn catalog_peers(&self, _: &Verified) -> Result<Vec<PeerKey>> {
         if self.hold_catalog_hints.swap(false, Ordering::SeqCst) {

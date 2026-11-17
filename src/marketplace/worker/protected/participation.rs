@@ -311,6 +311,8 @@ pub struct ParticipationClient {
 impl ParticipationClient {
     pub(in crate::marketplace) const SHARING_RENEWAL_LEAD: Duration =
         super::source_preflight::SHARING_RENEWAL_LEAD;
+    pub(in crate::marketplace) const SELECTION_VALIDITY: Duration =
+        super::source_preflight::SELECTION_VALIDITY;
 
     pub(in crate::marketplace) fn queue_busy(error: &anyhow::Error) -> bool {
         error.is::<RequestQueueBusy>()

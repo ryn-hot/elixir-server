@@ -237,6 +237,16 @@ trait Backend: Send + Sync {
         interest: &Interest,
     ) -> Result<Arc<Verified>>;
     async fn current(&self, value: &Verified) -> Result<()>;
+    /// Whether this backend can verify a viewed card again before it expires.
+    /// Only the live backend owns a native verifier; nothing else renews.
+    fn renews(&self) -> bool {
+        false
+    }
+    /// A NEW native metadata verification of the same release, paired with the
+    /// same source fact. Never extends an existing receipt.
+    async fn renew(&self, _value: &Verified) -> Result<Arc<Verified>> {
+        bail!("search card renewal is unavailable")
+    }
     async fn support(&self, value: &Verified) -> Result<SupportSummary> {
         self.current(value).await?;
         Ok(value.metadata.support()?.clone())
@@ -567,6 +577,25 @@ impl Backend for Live {
     async fn current(&self, value: &Verified) -> Result<()> {
         self.client.check_catalog_current(&value.metadata).await
     }
+    fn renews(&self) -> bool {
+        true
+    }
+    async fn renew(&self, value: &Verified) -> Result<Arc<Verified>> {
+        // The same bounded verifier a selection uses: a cached receipt only
+        // with at least RENEWAL_LEAD left, otherwise a new native check.
+        let expected = value.source.release_id();
+        let metadata = self
+            .client
+            .verify_selection_metadata(value.metadata.descriptor())
+            .await?;
+        let release = metadata.ids()?.release;
+        if release != expected || metadata.descriptor().head.payload.stable_release_id != release {
+            bail!("renewed search card changed release");
+        }
+        self.client.check_catalog_current(&metadata).await?;
+        // The search source fact keeps its own original observation time.
+        Ok(Arc::new(Verified::new(metadata, value.source.copy())?))
+    }
     async fn catalog_peers(&self, value: &Verified) -> Result<Vec<PeerKey>> {
         let origins = self
             .session
@@ -746,9 +775,40 @@ struct Slot {
     running: bool,
     task: Option<JoinHandle<()>>,
 }
-#[derive(Default)]
+/// A query stays wanted while its owner polled it within this lease.
+const INTEREST_LEASE: Duration = Duration::from_secs(30);
+/// A viewed card is verified again once it has less than this left. The
+/// verifier then reuses a cached receipt only with at least this much left.
+const RENEWAL_LEAD: Duration = ParticipationClient::SELECTION_VALIDITY;
+/// After a busy or failed renewal. The old card stays until it expires.
+const RENEWAL_RETRY: Duration = Duration::from_secs(5);
+const RENEWAL_MIN_WAIT: Duration = Duration::from_millis(250);
 struct Inner {
     slot: Mutex<Slot>,
+    /// Wakes a renewal wait at once when the query is replaced or stopped.
+    changed: tokio::sync::Notify,
+    /// Held across one renewal's native check. A selection waits for it, so
+    /// an owner's install never meets a "busy" verifier because of renewal.
+    renewal: tokio::sync::Mutex<()>,
+    /// The service's selection capacity: no renewal starts while a release
+    /// is selected, since the selection runs its own fresh checks.
+    selections: Arc<Semaphore>,
+}
+impl Inner {
+    fn new(selections: Arc<Semaphore>) -> Self {
+        Self {
+            slot: Mutex::new(Slot::default()),
+            changed: tokio::sync::Notify::new(),
+            renewal: tokio::sync::Mutex::new(()),
+            selections,
+        }
+    }
+}
+#[cfg(test)]
+impl Default for Inner {
+    fn default() -> Self {
+        Self::new(Arc::new(Semaphore::new(1)))
+    }
 }
 struct Interest {
     inner: Weak<Inner>,
@@ -785,7 +845,7 @@ impl Interest {
                     slot.query.as_ref().is_some_and(|query| {
                         query.id == self.id
                             && query.preparation_until.map_or_else(
-                                || query.last_active.elapsed() < Duration::from_secs(30),
+                                || query.last_active.elapsed() < INTEREST_LEASE,
                                 |until| Instant::now() < until,
                             )
                     })
@@ -802,10 +862,11 @@ pub struct SearchService {
 }
 impl Default for SearchService {
     fn default() -> Self {
+        let selections = Arc::new(Semaphore::new(1));
         Self {
-            inner: Arc::new(Inner::default()),
+            inner: Arc::new(Inner::new(selections.clone())),
             views: Semaphore::new(1),
-            selections: Arc::new(Semaphore::new(1)),
+            selections,
             retiring: tokio::sync::Mutex::new(None),
         }
     }
@@ -913,32 +974,10 @@ impl SearchService {
             first_view: FirstView::Unclaimed,
             rank_after_view: None,
         });
+        // A renewal wait of the previous query stops now, not at its timer.
+        self.inner.changed.notify_waiters();
         if !slot.running {
-            // At most one active task and one replaceable latest query. Old
-            // durable candidate work retires normally; only read-only waiters
-            // cancel on replacement. Never abort an uncertain database commit.
-            slot.running = true;
-            let inner = self.inner.clone();
-            slot.task = Some(tokio::spawn(async move {
-                if std::panic::AssertUnwindSafe(run(inner.clone()))
-                    .catch_unwind()
-                    .await
-                    .is_err()
-                {
-                    // Do not leave a query permanently "checking" or a stuck
-                    // running flag after a task unwind. Native job retirement
-                    // and uncertain-commit guards retain their own ownership.
-                    if let Ok(mut slot) = inner.slot.lock() {
-                        slot.running = false;
-                        if let Some(query) = slot.query.as_mut() {
-                            query.phase = SearchPhase::Unavailable;
-                            query.values.clear();
-                            query.first_view.finish();
-                        }
-                    }
-                    tracing::error!("marketplace search task failed; no results retained");
-                }
-            }));
+            spawn_run(&self.inner, &mut slot);
         }
         Ok(id)
     }
@@ -946,6 +985,7 @@ impl SearchService {
         if let Ok(mut slot) = self.inner.slot.lock() {
             slot.query = None;
         }
+        self.inner.changed.notify_waiters();
     }
     pub(super) async fn join(&self) -> Result<()> {
         // Keep the SAME handle in the owner if this borrowed wait times out or
@@ -1077,6 +1117,15 @@ impl SearchService {
                 .filter(|query| query.id == id)
                 .context("search query was replaced or stopped")?;
             query.last_active = Instant::now();
+            // An owner back on a page whose lease lapsed: renew it again.
+            if !slot.running && slot.query.as_ref().is_some_and(renewal_wanted) {
+                spawn_run(&self.inner, &mut slot);
+            }
+            let query = slot
+                .query
+                .as_mut()
+                .filter(|query| query.id == id)
+                .context("search query was replaced or stopped")?;
             (
                 query.request.clone(),
                 query.backend.clone(),
@@ -1228,20 +1277,82 @@ impl SearchService {
         Ok(view)
     }
 }
+fn spawn_run(inner: &Arc<Inner>, slot: &mut Slot) {
+    // At most one active task and one replaceable latest query. Old durable
+    // candidate work retires normally; only read-only waiters cancel on
+    // replacement. Never abort an uncertain database commit.
+    slot.running = true;
+    let inner = inner.clone();
+    slot.task = Some(tokio::spawn(async move {
+        if std::panic::AssertUnwindSafe(run(inner.clone()))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            // Do not leave a query permanently "checking" or a stuck running
+            // flag after a task unwind. Native job retirement and
+            // uncertain-commit guards retain their own ownership.
+            if let Ok(mut slot) = inner.slot.lock() {
+                slot.running = false;
+                if let Some(query) = slot.query.as_mut() {
+                    query.phase = SearchPhase::Unavailable;
+                    query.values.clear();
+                    query.first_view.finish();
+                }
+            }
+            tracing::error!("marketplace search task failed; no results retained");
+        }
+    }));
+}
+/// A ready page someone is still polling, with a card left to keep current.
+/// renew_while_viewed returns exactly when this stops being true.
+fn renewal_wanted(query: &Query) -> bool {
+    query.phase == SearchPhase::Ready
+        && query.preparation_until.is_none()
+        && query.backend.renews()
+        && query.last_active.elapsed() < INTEREST_LEASE
+        && query
+            .values
+            .iter()
+            .any(|value| value.valid_for() >= selection::MIN_LIFETIME)
+}
+enum Next {
+    Check(Uuid, SearchRequest, Arc<dyn Backend>),
+    Renew(Uuid, Arc<dyn Backend>),
+}
 async fn run(inner: Arc<Inner>) {
     loop {
-        let Some((id, request, backend)) = inner.slot.lock().ok().and_then(|mut slot| {
-            let next = slot
-                .query
-                .as_ref()
-                .filter(|query| query.phase == SearchPhase::Checking)
-                .map(|query| (query.id, query.request.clone(), query.backend.clone()));
+        let Some(next) = inner.slot.lock().ok().and_then(|mut slot| {
+            let next = slot.query.as_ref().and_then(|query| {
+                if query.phase == SearchPhase::Checking {
+                    Some(Next::Check(
+                        query.id,
+                        query.request.clone(),
+                        query.backend.clone(),
+                    ))
+                } else if renewal_wanted(query) {
+                    Some(Next::Renew(query.id, query.backend.clone()))
+                } else {
+                    None
+                }
+            });
             if next.is_none() {
                 slot.running = false;
             }
             next
         }) else {
             return;
+        };
+        let (id, request, backend) = match next {
+            Next::Check(id, request, backend) => (id, request, backend),
+            Next::Renew(id, backend) => {
+                let interest = Interest {
+                    inner: Arc::downgrade(&inner),
+                    id,
+                };
+                renew_while_viewed(&inner, &interest, backend.as_ref()).await;
+                continue;
+            }
         };
         let interest = Interest {
             inner: Arc::downgrade(&inner),
@@ -1317,6 +1428,82 @@ async fn run(inner: Arc<Inner>) {
             {
                 query.preparation_until = None;
             }
+        }
+    }
+}
+/// Keeps a viewed page's cards current: each is verified again, one at a time,
+/// before its checks expire. Returns when the page is replaced, stopped, no
+/// longer polled, or has no live card left (see renewal_wanted).
+async fn renew_while_viewed(inner: &Arc<Inner>, interest: &Interest, backend: &dyn Backend) {
+    loop {
+        // Registered before every check below, so a replacement or stop that
+        // happens at any point in this pass still ends the wait at once.
+        let changed = inner.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if !interest.active() {
+            return;
+        }
+        let Some(values) = inner.slot.lock().ok().and_then(|slot| {
+            slot.query
+                .as_ref()
+                .filter(|query| query.id == interest.id && query.phase == SearchPhase::Ready)
+                .map(|query| query.values.clone())
+        }) else {
+            return;
+        };
+        let Some(earliest) = values
+            .into_iter()
+            .filter(|value| value.valid_for() >= selection::MIN_LIFETIME)
+            .min_by_key(|value| value.valid_for())
+        else {
+            return;
+        };
+        let remaining = earliest.valid_for();
+        let wait = if remaining > RENEWAL_LEAD {
+            // Never a zero wait: at the boundary that would spin this loop.
+            (remaining - RENEWAL_LEAD)
+                .min(INTEREST_LEASE)
+                .max(RENEWAL_MIN_WAIT)
+        } else if inner.selections.available_permits() == 0 {
+            // A selected release runs its own fresh checks; stay out of its way.
+            RENEWAL_RETRY
+        } else if let Ok(_renewing) = inner.renewal.try_lock() {
+            // Re-check under the guard: a selection may have started meanwhile.
+            let renewed = if inner.selections.available_permits() == 0 {
+                Err(anyhow::anyhow!("a release is selected"))
+            } else {
+                remote::while_interested(interest, backend.renew(&earliest)).await
+            };
+            match renewed {
+                Ok(fresh) if fresh.valid_for() > earliest.valid_for() => {
+                    if let Ok(mut slot) = inner.slot.lock()
+                        && let Some(query) = slot
+                            .query
+                            .as_mut()
+                            .filter(|query| query.id == interest.id)
+                        && let Some(entry) = query
+                            .values
+                            .iter_mut()
+                            .find(|value| Arc::ptr_eq(value, &earliest))
+                    {
+                        *entry = fresh;
+                    }
+                    continue;
+                }
+                // Usually a busy verifier. Retried quietly: no error detail,
+                // and the old card stays only until its own expiry.
+                Ok(_) | Err(_) => {
+                    tracing::debug!("marketplace search card renewal deferred");
+                    RENEWAL_RETRY
+                }
+            }
+        } else {
+            RENEWAL_RETRY
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = &mut changed => {}
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::marketplace::selected_source::{AcceptedPublication, SelectedSource};
 use std::collections::BTreeSet;
 use tokio::sync::OwnedSemaphorePermit;
 
-const MIN_LIFETIME: Duration = Duration::from_secs(2);
+pub(super) const MIN_LIFETIME: Duration = Duration::from_secs(2);
 const CHECK_DEADLINE: Duration = Duration::from_secs(10);
 // An owned transfer can occupy the same private pipe while this read waits.
 // Two existing 10s durable checks bracket one existing 30s capacity+RPC wait.
@@ -442,6 +442,9 @@ impl SearchService {
             .clone()
             .try_acquire_owned()
             .context("one marketplace release is already selected")?;
+        // Let an in-flight search card renewal finish its native check; no new
+        // renewal starts while this capacity is held.
+        drop(self.inner.renewal.lock().await);
         client.require_blob_owner()?;
         if !client.provider_discovery_enabled() {
             bail!("direct source requires protected content discovery");
@@ -500,6 +503,9 @@ impl SearchService {
             .clone()
             .try_acquire_owned()
             .context("one marketplace release is already selected")?;
+        // Let an in-flight search card renewal finish its native check; no new
+        // renewal starts while this capacity is held.
+        drop(self.inner.renewal.lock().await);
         let (backend, value) = {
             let mut slot = self
                 .inner
