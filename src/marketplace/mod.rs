@@ -28,6 +28,8 @@ mod observation_time;
 pub mod packet;
 mod packet_client;
 pub mod preferences;
+#[cfg(all(unix, feature = "private-test-network"))]
+pub(crate) mod private_test_offer;
 mod preparation;
 #[cfg(unix)]
 pub mod provider;

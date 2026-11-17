@@ -378,6 +378,12 @@ fn peer_key(value: &str) -> Result<String> {
 fn read_profile(path: &Path) -> Result<Profile> {
     Profile::parse(&read_private_profile_bytes(path)?)
 }
+/// The issuer keys the configured network trusts, read from the private
+/// startup profile with the same checks as startup.
+#[cfg(all(unix, feature = "private-test-network"))]
+pub(crate) fn trusted_issuer_keys(path: &Path) -> Result<Vec<PublicKey>> {
+    Ok(Profile::parse(&read_private_profile_bytes(path)?)?.issuer_keys)
+}
 #[cfg(unix)]
 pub(super) fn read_private_profile_bytes(path: &Path) -> Result<Vec<u8>> {
     ensure!(

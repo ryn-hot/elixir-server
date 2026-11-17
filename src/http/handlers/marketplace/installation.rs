@@ -116,6 +116,26 @@ async fn publisher_seeding(
     state.marketplace.set_publisher_seeding(&database(&state),&principal,request).await.map(Json)
         .map_err(|_|ApiError::conflict("Publisher seeding could not be changed. Refresh its revision and check the installed release and protected connection. Nothing is made searchable."))
 }
+#[cfg(feature = "private-test-network")]
+async fn private_test_offer(
+    State(state): State<AppState>,
+    principal: CurrentPrincipal,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> ApiResult<Json<crate::marketplace::private_test_offer::Offered>> {
+    mutation(&state, &principal, &headers)?;
+    authorize(&state, &principal).await?;
+    let request = crate::marketplace::private_test_offer::Request::parse(&bytes)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    timeout(
+        Duration::from_secs(60),
+        crate::marketplace::private_test_offer::offer(&state, request),
+    )
+    .await
+    .map_err(|_| ApiError::internal("private test offer deadline"))?
+    .map(Json)
+    .map_err(|e| ApiError::conflict(format!("Private test offer refused: {e:#}")))
+}
 async fn submit_withdrawal(
     State(state): State<AppState>,
     principal: CurrentPrincipal,
@@ -297,7 +317,7 @@ pub(crate) fn installation_read_routes() -> Router<AppState> {
 }
 /// Private mutation composition only; a boolean HTTP request cannot mount it.
 pub(crate) fn installation_routes() -> Router<AppState> {
-    Router::new()
+    let routes = Router::new()
         .route(
             "/api/v1/marketplace/withdrawals",
             post(submit_withdrawal).layer(DefaultBodyLimit::max(
@@ -329,8 +349,15 @@ pub(crate) fn installation_routes() -> Router<AppState> {
         .route(
             "/api/v1/marketplace/installations/:id/actions",
             post(action).layer(DefaultBodyLimit::max(management::MAX_ACTION_BYTES)),
-        )
-        .layer(middleware::map_response(private_response))
+        );
+    #[cfg(feature = "private-test-network")]
+    let routes = routes.route(
+        "/api/v1/marketplace/private-test/offer",
+        post(private_test_offer).layer(DefaultBodyLimit::max(
+            crate::marketplace::private_test_offer::MAX_REQUEST_BYTES,
+        )),
+    );
+    routes.layer(middleware::map_response(private_response))
 }
 
 #[cfg(test)]

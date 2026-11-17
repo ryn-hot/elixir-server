@@ -72,6 +72,10 @@ elixir_marketplace = { path = "../crates/elixir_marketplace" }
 
 [features]
 default = []
+# Private test networks only: an owner route that signs the public TEST
+# supporter proofs for a release (src/marketplace/private_test_offer.rs).
+# Never enable it for a build that joins a real network.
+private-test-network = []
 docker-probe-tests = []
 docker-sonarr-tests = []
 docker-wireguard-tests = []
