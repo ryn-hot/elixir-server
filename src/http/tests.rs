@@ -45,8 +45,9 @@ use crate::{
     },
     db::Database,
     db::models::{
-        BindingStatus, ExtensionKind, ExtensionTrustLevel, MediaType, OrchestratorRunStatus,
-        ProviderHealthState, ProviderReadinessPhase, SecretScope, SlotCardinality,
+        BindingStatus, ExtensionKind, ExtensionTrustLevel, MediaType, OperationStepStatus,
+        OrchestratorRunStatus, ProviderHealthState, ProviderReadinessPhase, SecretScope,
+        SlotCardinality,
     },
     extensions::ExtensionManager,
     extensions::ExternalIds,
@@ -57,7 +58,8 @@ use crate::{
     extensions::store::{
         ExtensionStore, NewBinding, NewDesiredBlueprint, NewExtension, NewExtensionInstance,
         NewManagedEpisodeTombstone, NewManagedIngestIntent, NewManagedLibraryProvenance,
-        NewManagedMediaTombstone, NewMediaOwnership, NewOrchestratorRun, NewProvider, NewSecret,
+        NewManagedMediaTombstone, NewMediaOwnership, NewOperationStep, NewOrchestratorRun,
+        NewProvider, NewSecret,
     },
     http::router,
     library::LinkerService,
@@ -7391,6 +7393,364 @@ async fn extension_status_summary_includes_optional_addons_for_blueprints() -> R
         Some(expected_instance_id.as_str())
     );
 
+    Ok(())
+}
+
+async fn status_test_app() -> Result<(Router, sqlx::AnyPool, SecretsManager)> {
+    let settings = test_settings_with_db();
+    let database = Database::connect(&settings.database).await?;
+    database.run_migrations().await?;
+    let db_pool = database.pool.clone();
+    let auth_service = AuthService::new(settings.auth.clone())?;
+    let metadata = MetadataService::new(crate::config::MetadataConfig::default())?;
+    let linkers = LinkerService::new(settings.classifier.clone())?;
+    let artwork = test_artwork_service(&settings)?;
+    let secrets = SecretsManager::from_settings(&settings)?;
+    let app = router(AppState::new(
+        settings,
+        database,
+        auth_service,
+        ExtensionManager::new(),
+        metadata,
+        linkers,
+        artwork,
+        secrets.clone(),
+    ));
+    Ok((app, db_pool, secrets))
+}
+
+fn status_test_extension(
+    extension_id: &str,
+    name: &str,
+    kind: ExtensionKind,
+    manifest_json: Value,
+) -> NewExtension {
+    NewExtension {
+        extension_id: extension_id.to_string(),
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        kind,
+        publisher_name: None,
+        signing_key_id: None,
+        trust_level: ExtensionTrustLevel::Community,
+        manifest_json,
+        package_hash: None,
+        enabled: true,
+    }
+}
+
+async fn status_test_instance(store: &ExtensionStore<'_>, extension_id: &str) -> Result<Uuid> {
+    let instance_id = Uuid::new_v4();
+    store
+        .create_instance(&NewExtensionInstance {
+            instance_id,
+            extension_id: extension_id.to_string(),
+            instance_name: "default".to_string(),
+            config_json: None,
+            enabled: true,
+        })
+        .await?;
+    Ok(instance_id)
+}
+
+async fn record_runtime_start(
+    store: &ExtensionStore<'_>,
+    instance_id: Uuid,
+    step_index: i32,
+    error: Option<&str>,
+) -> Result<()> {
+    let run_id = Uuid::new_v4();
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id,
+            source: "reconcile".to_string(),
+            status: OrchestratorRunStatus::Completed,
+            phase: None,
+            plan_json: None,
+            error: None,
+        })
+        .await?;
+    store
+        .create_step(&NewOperationStep {
+            step_id: Uuid::new_v4(),
+            run_id,
+            step_index,
+            action_type: "ensure_runtime_running".to_string(),
+            action_json: Some(json!({ "runtime": { "instance_id": instance_id } })),
+            status: if error.is_some() {
+                OperationStepStatus::Failed
+            } else {
+                OperationStepStatus::Completed
+            },
+            error: error.map(str::to_string),
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_names_what_a_stack_and_its_downloader_wait_for() -> Result<()> {
+    let (app, db_pool, _secrets) = status_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+
+    // A marketplace stack's own module declares no services of its own.
+    let root = "elx:stackstatusfixture/arr-stack";
+    store
+        .upsert_extension(&status_test_extension(
+            root,
+            "Arr Stack",
+            ExtensionKind::Module,
+            json!({
+                "id": root, "version": "1.0.0", "kind": "module", "name": "Arr Stack",
+                "stack": {
+                    "modules": [],
+                    "blueprint": {
+                        "id": "setup", "version": "1.0.0", "kind": "blueprint",
+                        "name": "Arr Stack"
+                    }
+                }
+            }),
+        ))
+        .await?;
+    status_test_instance(&store, root).await?;
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["statusCode"], "stack_setup_preparing", "{stack}");
+    let desired_id = Uuid::new_v4();
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id,
+            blueprint_extension_id: crate::marketplace::stack::derived_id(root, "setup"),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+        })
+        .await?;
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "attention", "{stack}");
+    assert_eq!(stack["statusCode"], "pending_stack_setup", "{stack}");
+    assert!(
+        stack["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Arr Stack blueprint card"),
+        "{stack}"
+    );
+    store.mark_desired_applied(desired_id, true).await?;
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "ready", "{stack}");
+
+    // Any other module without services is ready once its instance exists.
+    store
+        .upsert_extension(&status_test_extension(
+            "elixir.modules.serviceless",
+            "Serviceless",
+            ExtensionKind::Module,
+            json!({
+                "id": "elixir.modules.serviceless", "version": "1.0.0", "kind": "module",
+                "name": "Serviceless"
+            }),
+        ))
+        .await?;
+    status_test_instance(&store, "elixir.modules.serviceless").await?;
+    let serviceless = extension_status_summary_item(&app, "elixir.modules.serviceless").await?;
+    assert_eq!(serviceless["severity"], "ready", "{serviceless}");
+
+    // A downloader whose last start failed only for a missing VPN config.
+    let downloader = "elixir.modules.vpn_downloader";
+    store
+        .upsert_extension(&status_test_extension(
+            downloader,
+            "Torrent Client",
+            ExtensionKind::Module,
+            json!({
+                "id": downloader, "version": "1.0.0", "kind": "module",
+                "name": "Torrent Client",
+                "provides": [{ "capability": "downloader.torrent", "slot": "default" }]
+            }),
+        ))
+        .await?;
+    let downloader_instance = status_test_instance(&store, downloader).await?;
+    store
+        .upsert_extension(&status_test_extension(
+            "elixir.connectors.downloader_defaults",
+            "Torrent Client Defaults",
+            ExtensionKind::Connector,
+            json!({
+                "id": "elixir.connectors.downloader_defaults", "version": "1.0.0",
+                "kind": "connector", "name": "Torrent Client Defaults",
+                "targets": [{ "capability": "downloader.torrent", "slot": "default" }],
+                "actions": [{
+                    "type": "driver_patch",
+                    "target": { "capability": "downloader.torrent", "slot": "default" },
+                    "patch": { "op": "noop" }
+                }]
+            }),
+        ))
+        .await?;
+    let before = extension_status_summary_item(&app, downloader).await?;
+    assert_eq!(before["statusCode"], "provider_not_ready", "{before}");
+    record_runtime_start(&store, downloader_instance, 1, None).await?;
+    record_runtime_start(
+        &store,
+        downloader_instance,
+        2,
+        Some(&format!(
+            "resolving wireguard config secret 'global:wireguard_config' for instance {downloader_instance}"
+        )),
+    )
+    .await?;
+    let waiting = extension_status_summary_item(&app, downloader).await?;
+    assert_eq!(waiting["statusCode"], "vpn_config_required", "{waiting}");
+    assert_eq!(waiting["label"], "Needs VPN", "{waiting}");
+    assert!(
+        waiting["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Settings → Network Protection"),
+        "{waiting}"
+    );
+    let defaults =
+        extension_status_summary_item(&app, "elixir.connectors.downloader_defaults").await?;
+    assert_eq!(
+        defaults["statusCode"], "waiting_for_app_start",
+        "{defaults}"
+    );
+    assert!(
+        defaults["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Waiting for Torrent Client to start"),
+        "{defaults}"
+    );
+    // A later start that failed for another reason, or succeeded, is not a
+    // VPN problem.
+    record_runtime_start(&store, downloader_instance, 3, Some("image pull failed")).await?;
+    let other = extension_status_summary_item(&app, downloader).await?;
+    assert_eq!(other["statusCode"], "provider_not_ready", "{other}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_status_summary_keeps_an_unset_optional_addon_out_of_attention() -> Result<()> {
+    let (app, db_pool, secrets) = status_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    store
+        .upsert_extension(&status_test_extension(
+            "elixir.modules.prowlarr",
+            "Prowlarr",
+            ExtensionKind::Module,
+            json!({
+                "id": "elixir.modules.prowlarr", "version": "1.0.0", "kind": "module",
+                "name": "Prowlarr",
+                "provides": [{ "capability": "indexer.registry", "slot": "default" }]
+            }),
+        ))
+        .await?;
+    let prowlarr = status_test_instance(&store, "elixir.modules.prowlarr").await?;
+    store
+        .upsert_provider(&NewProvider {
+            provider_id: Uuid::new_v4(),
+            instance_id: prowlarr,
+            capability: "indexer.registry".to_string(),
+            slot_id: "default".to_string(),
+            cardinality: SlotCardinality::One,
+            implementation: Some("prowlarr".to_string()),
+            scope_json: None,
+            endpoint_json: None,
+            health_state: ProviderHealthState::Healthy,
+        })
+        .await?;
+    store
+        .upsert_extension(&status_test_extension(
+            "elixir.blueprints.stack",
+            "Arr Stack",
+            ExtensionKind::Blueprint,
+            json!({
+                "id": "elixir.blueprints.stack", "version": "1.0.0", "kind": "blueprint",
+                "name": "Arr Stack",
+                "optional_addons": [{
+                    "extension_id": "elixir.connectors.nzbgeek",
+                    "title": "NZBGeek",
+                    "description": "Add your NZBGeek account to Prowlarr.",
+                    "target": { "capability": "indexer.registry", "slot": "default" },
+                    "required_fields": ["api_key"],
+                    "secret_key_prefix": "indexer.nzbgeek"
+                }]
+            }),
+        ))
+        .await?;
+    store
+        .upsert_extension(&status_test_extension(
+            "elixir.connectors.nzbgeek",
+            "Prowlarr NZBGeek Indexer",
+            ExtensionKind::Connector,
+            json!({
+                "id": "elixir.connectors.nzbgeek", "version": "1.0.0", "kind": "connector",
+                "name": "Prowlarr NZBGeek Indexer",
+                "targets": [{ "capability": "indexer.registry", "slot": "default" }],
+                "actions": [{
+                    "type": "driver_patch",
+                    "target": { "capability": "indexer.registry", "slot": "default" },
+                    "patch": {
+                        "op": "register_indexers",
+                        "indexers": [{
+                            "name": "NZBgeek",
+                            "implementation": "NZBgeek",
+                            "url": "https://api.nzbgeek.info",
+                            "auth": { "requires_account": true, "required_fields": ["api_key"] },
+                            "tags": ["usenet"],
+                            "enabled": true
+                        }]
+                    }
+                }]
+            }),
+        ))
+        .await?;
+
+    let connector = extension_status_summary_item(&app, "elixir.connectors.nzbgeek").await?;
+    assert_eq!(connector["severity"], "available", "{connector}");
+    assert_eq!(
+        connector["statusCode"], "optional_not_set_up",
+        "{connector}"
+    );
+    assert_eq!(connector["label"], "Optional", "{connector}");
+    assert!(
+        connector["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Add it from the Arr Stack card"),
+        "{connector}"
+    );
+    let blueprint = extension_status_summary_item(&app, "elixir.blueprints.stack").await?;
+    let addon = &blueprint["optionalAddons"][0];
+    assert_eq!(addon["label"], "Not set up", "{addon}");
+    assert_eq!(addon["action"], "activate", "{addon}");
+    assert_eq!(addon["actionLabel"], "Add API key", "{addon}");
+    assert_eq!(
+        addon["description"],
+        "Add your NZBGeek account to Prowlarr."
+    );
+
+    // Once the owner adds the key, an unverified indexer is a real problem
+    // again. (This fixture's Prowlarr is not a stack member, so the server
+    // refuses to verify it; either way it needs attention.)
+    store
+        .upsert_secret(&NewSecret {
+            secret_id: Uuid::new_v4(),
+            scope: SecretScope::Instance,
+            scope_id: Some(prowlarr),
+            key: "indexer.nzbgeek.api_key".to_string(),
+            value_encrypted: secrets.encrypt("owner-key")?,
+            rotatable: false,
+        })
+        .await?;
+    let connector = extension_status_summary_item(&app, "elixir.connectors.nzbgeek").await?;
+    assert_eq!(connector["severity"], "attention", "{connector}");
+    assert_ne!(
+        connector["statusCode"], "optional_not_set_up",
+        "{connector}"
+    );
+    let blueprint = extension_status_summary_item(&app, "elixir.blueprints.stack").await?;
+    assert_eq!(blueprint["optionalAddons"][0]["action"], "open");
     Ok(())
 }
 

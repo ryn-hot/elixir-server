@@ -3325,9 +3325,31 @@ async fn build_extension_status_summary(
     }
 
     let mut pending_blueprints = HashSet::new();
+    let mut applied_blueprints = HashSet::new();
     for blueprint in desired_blueprints {
-        if !blueprint.applied {
+        if blueprint.applied {
+            applied_blueprints.insert(blueprint.blueprint_extension_id);
+        } else {
             pending_blueprints.insert(blueprint.blueprint_extension_id);
+        }
+    }
+
+    // The enabled module that provides each target, so a connector waiting
+    // on an installed app names it instead of asking for one to be installed.
+    let mut module_name_by_target: HashMap<(String, String), String> = HashMap::new();
+    for extension in &extensions {
+        if !extension.enabled || extension.kind != ExtensionKind::Module {
+            continue;
+        }
+        let Ok(manifest) =
+            serde_json::from_value::<ExtensionManifest>(extension.manifest_json.clone())
+        else {
+            continue;
+        };
+        for provide in &manifest.provides {
+            module_name_by_target
+                .entry((provide.capability.clone(), provide.slot.clone()))
+                .or_insert_with(|| extension.name.clone());
         }
     }
 
@@ -3359,6 +3381,7 @@ async fn build_extension_status_summary(
                     &extension,
                     manifest.as_ref(),
                     &available_targets,
+                    &module_name_by_target,
                     &provider_instances_by_target,
                     &providers_by_instance,
                     &runtime_snapshot,
@@ -3376,11 +3399,39 @@ async fn build_extension_status_summary(
                     &readiness_by_provider,
                     &failed_bindings_by_consumer,
                     &runtime_snapshot,
+                    &BlueprintSetups {
+                        pending: &pending_blueprints,
+                        applied: &applied_blueprints,
+                    },
                 )
                 .await?
             }
         };
         items.push(item);
+    }
+
+    // An optional add-on whose account details the owner has not entered is
+    // available to set up, not a problem: it stays out of "needs attention".
+    let unset_addons = optional_addons_without_details(
+        store,
+        &extensions_by_id,
+        &manifests_by_id,
+        &provider_instances_by_target,
+    )
+    .await?;
+    for item in &mut items {
+        let Some(description) = unset_addons.get(&item.extension_id) else {
+            continue;
+        };
+        if item.severity != "attention" {
+            continue;
+        }
+        item.severity = "available".to_string();
+        item.status_code = OPTIONAL_ADDON_NOT_SET_UP.to_string();
+        item.label = "Optional".to_string();
+        item.description = description.clone();
+        item.primary_action = "open".to_string();
+        item.primary_action_label = "Open".to_string();
     }
 
     let item_summary_by_id: HashMap<String, ExtensionStatusSummaryItem> = items
@@ -3651,26 +3702,16 @@ async fn summarize_blueprint_optional_addons(
             .iter()
             .map(|field| addon_secret_key(addon, field))
             .collect();
-
-        let mut missing_secret_keys = Vec::new();
-        if let Some(instance_id) = target_instance_id {
-            for key in &secret_keys {
-                let exists = store
-                    .get_secret(SecretScope::Instance, Some(instance_id), key)
-                    .await?
-                    .is_some();
-                if !exists {
-                    missing_secret_keys.push(key.clone());
-                }
-            }
-        } else {
-            missing_secret_keys = secret_keys.clone();
-        }
+        let missing_secret_keys =
+            addon_missing_secret_keys(store, &secret_keys, target_instance_id).await?;
 
         let mut item = if let Some(summary) = item_summary_by_id.get(&addon.extension_id) {
             let installed_enabled = installed_extension
                 .map(|value| value.enabled)
                 .unwrap_or(false);
+            // Installed with the stack but waiting for the owner's details:
+            // the row asks for them instead of opening the connector.
+            let unset = installed_enabled && summary.status_code == OPTIONAL_ADDON_NOT_SET_UP;
             ExtensionOptionalAddonSummaryItem {
                 extension_id: addon.extension_id.clone(),
                 title: addon.title.clone().unwrap_or_else(|| summary.name.clone()),
@@ -3684,19 +3725,23 @@ async fn summarize_blueprint_optional_addons(
                 },
                 severity: summary.severity.clone(),
                 status_code: summary.status_code.clone(),
-                label: if installed_enabled && summary.severity == "ready" {
+                label: if unset {
+                    "Not set up".to_string()
+                } else if installed_enabled && summary.severity == "ready" {
                     "Active".to_string()
                 } else if !installed_enabled {
                     "Not active".to_string()
                 } else {
                     summary.label.clone()
                 },
-                action: if installed_enabled {
+                action: if installed_enabled && !unset {
                     "open".to_string()
                 } else {
                     "activate".to_string()
                 },
-                action_label: if installed_enabled {
+                action_label: if unset {
+                    addon_details_action_label(&addon.required_fields).to_string()
+                } else if installed_enabled {
                     "Open".to_string()
                 } else {
                     "Activate".to_string()
@@ -3746,6 +3791,179 @@ async fn summarize_blueprint_optional_addons(
             .cmp(&right.title.to_ascii_lowercase())
     });
     Ok(items)
+}
+
+/// Stack setups (blueprint extension IDs) the orchestrator still has to run
+/// and those it has finished.
+struct BlueprintSetups<'a> {
+    pending: &'a HashSet<String>,
+    applied: &'a HashSet<String>,
+}
+
+/// A module that declares no services never registers a provider, so the
+/// provider count cannot tell whether it is set up. A marketplace stack's own
+/// module follows its stack's setup; any other such module is ready.
+fn serviceless_module_status(
+    extension: &Extension,
+    manifest: Option<&ExtensionManifest>,
+    blueprint_setups: &BlueprintSetups<'_>,
+) -> Option<ExtensionStatusSummaryItem> {
+    let manifest = manifest?;
+    if !manifest.provides.is_empty() {
+        return None;
+    }
+    let Some(stack) = manifest.stack.as_ref() else {
+        return Some(ready_extension_status(
+            extension,
+            "ready",
+            "Ready",
+            "This extension is installed. It has no services to set up.",
+            "open",
+            "Open",
+        ));
+    };
+    let setup = crate::marketplace::stack::derived_id(&extension.extension_id, &stack.blueprint.id);
+    if blueprint_setups.applied.contains(&setup) {
+        return Some(ready_extension_status(
+            extension,
+            "ready",
+            "Ready",
+            "This stack is set up. Its apps are listed as separate extensions.",
+            "open",
+            "Open",
+        ));
+    }
+    if blueprint_setups.pending.contains(&setup) {
+        return Some(attention_extension_status(
+            extension,
+            "pending_stack_setup",
+            "Needs setup",
+            &format!(
+                "Use Finish setup on the {} blueprint card to configure this stack's apps.",
+                stack.blueprint.name
+            ),
+            "open",
+            "Open",
+        ));
+    }
+    Some(progress_extension_status(
+        extension,
+        "stack_setup_preparing",
+        "Starting up",
+        "Elixir is preparing this stack's setup.",
+        "open",
+        "Open",
+    ))
+}
+
+/// Fragment of the orchestrator's error when a downloader's WireGuard config
+/// cannot be resolved: "resolving wireguard config secret '…' for instance …"
+/// or "wireguard config secret '…' resolved to empty value".
+const MISSING_VPN_CONFIG_ERROR: &str = "wireguard config secret";
+
+/// Whether the latest start of an enabled instance failed only because no
+/// VPN (WireGuard) config is saved for its protected downloads.
+async fn runtime_waits_for_vpn_config(
+    store: &ExtensionStore<'_>,
+    instances: &[ExtensionInstance],
+) -> anyhow::Result<bool> {
+    for instance in instances.iter().filter(|instance| instance.enabled) {
+        if store
+            .latest_runtime_start_error(instance.instance_id)
+            .await?
+            .is_some_and(|error| error.contains(MISSING_VPN_CONFIG_ERROR))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Status code of an installed optional add-on still waiting for the owner's
+/// account details.
+const OPTIONAL_ADDON_NOT_SET_UP: &str = "optional_not_set_up";
+
+/// The add-on's required secret keys not yet saved on its target instance;
+/// all of them when no single target instance exists yet.
+async fn addon_missing_secret_keys(
+    store: &ExtensionStore<'_>,
+    secret_keys: &[String],
+    target_instance_id: Option<Uuid>,
+) -> anyhow::Result<Vec<String>> {
+    let Some(instance_id) = target_instance_id else {
+        return Ok(secret_keys.to_vec());
+    };
+    let mut missing = Vec::new();
+    for key in secret_keys {
+        if store
+            .get_secret(SecretScope::Instance, Some(instance_id), key)
+            .await?
+            .is_none()
+        {
+            missing.push(key.clone());
+        }
+    }
+    Ok(missing)
+}
+
+fn addon_details_action_label(required_fields: &[String]) -> &'static str {
+    if required_fields.len() == 1 && required_fields[0].trim() == "api_key" {
+        "Add API key"
+    } else {
+        "Add account"
+    }
+}
+
+/// Optional add-ons of enabled blueprints whose required account details are
+/// still missing, with the description their own card should show.
+async fn optional_addons_without_details(
+    store: &ExtensionStore<'_>,
+    extensions_by_id: &HashMap<String, Extension>,
+    manifests_by_id: &HashMap<String, ExtensionManifest>,
+    provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut unset = HashMap::new();
+    for (extension_id, manifest) in manifests_by_id {
+        let Some(blueprint) = extensions_by_id.get(extension_id) else {
+            continue;
+        };
+        if blueprint.kind != ExtensionKind::Blueprint || !blueprint.enabled {
+            continue;
+        }
+        for addon in &manifest.optional_addons {
+            if addon.required_fields.is_empty() {
+                continue;
+            }
+            let target_instance_id = addon.target.as_ref().and_then(|target| {
+                resolve_addon_target_instance(provider_instances_by_target, target)
+            });
+            let secret_keys: Vec<String> = addon
+                .required_fields
+                .iter()
+                .map(|field| addon_secret_key(addon, field))
+                .collect();
+            if addon_missing_secret_keys(store, &secret_keys, target_instance_id)
+                .await?
+                .is_empty()
+            {
+                continue;
+            }
+            let purpose = addon
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Add your account details to use it.");
+            unset.insert(
+                addon.extension_id.clone(),
+                format!(
+                    "Optional. {purpose} Add it from the {} card when you want it.",
+                    blueprint.name
+                ),
+            );
+        }
+    }
+    Ok(unset)
 }
 
 fn resolve_addon_target_instance(
@@ -4082,6 +4300,7 @@ async fn summarize_connector_extension(
     extension: &Extension,
     manifest: Option<&ExtensionManifest>,
     available_targets: &HashSet<(String, String)>,
+    module_name_by_target: &HashMap<(String, String), String>,
     provider_instances_by_target: &HashMap<(String, String), Vec<Uuid>>,
     providers_by_instance: &HashMap<Uuid, Vec<Provider>>,
     runtime_snapshot: &DockerRuntimeHealthSnapshot,
@@ -4106,6 +4325,23 @@ async fn summarize_connector_extension(
         .unwrap_or(true);
 
     if !has_target {
+        // The app is installed but not providing its service yet (stopped or
+        // still starting): name it, rather than asking for an install.
+        let installed_app = manifest.and_then(|manifest| {
+            manifest.targets.iter().find_map(|target| {
+                module_name_by_target.get(&(target.capability.clone(), target.slot.clone()))
+            })
+        });
+        if let Some(app) = installed_app {
+            return Ok(attention_extension_status(
+                extension,
+                "waiting_for_app_start",
+                "Needs setup",
+                &format!("Waiting for {app} to start. Its card shows what it needs."),
+                "open",
+                "Open",
+            ));
+        }
         return Ok(attention_extension_status(
             extension,
             "waiting_for_app",
@@ -4217,6 +4453,7 @@ async fn summarize_module_extension(
     readiness_by_provider: &HashMap<Uuid, ProviderReadiness>,
     failed_bindings_by_consumer: &HashMap<Uuid, usize>,
     runtime_snapshot: &DockerRuntimeHealthSnapshot,
+    blueprint_setups: &BlueprintSetups<'_>,
 ) -> anyhow::Result<ExtensionStatusSummaryItem> {
     let zero_config_provider = manifest
         .map(is_zero_config_auto_instance_manifest)
@@ -4403,6 +4640,27 @@ async fn summarize_module_extension(
     }
 
     if provider_count == 0 {
+        if let Some(status) = serviceless_module_status(extension, manifest, blueprint_setups) {
+            return with_module_auto_update_summary(store, extension, status).await;
+        }
+        if runtime_waits_for_vpn_config(store, instances).await? {
+            return with_module_auto_update_summary(
+                store,
+                extension,
+                attention_extension_status(
+                    extension,
+                    "vpn_config_required",
+                    "Needs VPN",
+                    &format!(
+                        "{} downloads only through your VPN. Add your VPN details in Settings → Network Protection so it can start.",
+                        extension.name
+                    ),
+                    "open",
+                    "Open",
+                ),
+            )
+            .await;
+        }
         if zero_config_provider {
             return with_module_auto_update_summary(
                 store,

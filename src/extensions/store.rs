@@ -3619,6 +3619,25 @@ impl<'a> ExtensionStore<'a> {
         Ok(items)
     }
 
+    /// The error of this instance's latest runtime start, when that start
+    /// failed. `None` when it succeeded or was never attempted.
+    pub async fn latest_runtime_start_error(&self, instance_id: Uuid) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT status, CAST(error AS TEXT) as error FROM operation_steps WHERE action_type = 'ensure_runtime_running' AND CAST(action_json AS TEXT) LIKE $1 ORDER BY created_at DESC, step_index DESC LIMIT 1",
+        )
+        .bind(format!("%{instance_id}%"))
+        .fetch_optional(self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row.try_get("status")?;
+        if status != "failed" {
+            return Ok(None);
+        }
+        Ok(row.try_get::<Option<String>, _>("error")?)
+    }
+
     pub async fn create_runtime_log(&self, data: &NewRuntimeLog) -> Result<()> {
         sqlx::query::<sqlx::Any>(
             "INSERT INTO runtime_logs (log_id, instance_id, log_uri) VALUES ($1, $2, $3)",
