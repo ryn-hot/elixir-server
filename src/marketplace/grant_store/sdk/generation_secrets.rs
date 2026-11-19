@@ -6,8 +6,9 @@ use elixir_marketplace::canonical;
 use namespaces::Coordinates;
 
 pub(in crate::marketplace::grant_store) const MAX_PLAINTEXT: usize = 64 * 1024;
+// Credential setup, not extension execution: stays at the finite 1 MiB.
 pub(in crate::marketplace::grant_store) const MAX_SETUP_BYTES: usize =
-    elixir_marketplace::source_execution::MAX_ARGUMENT_BYTES;
+    elixir_marketplace::source_execution::FINITE_ARGUMENT_BYTES;
 
 /// Encrypted host-input DATA only. Never accepted as an SDK operation or as
 /// source/grant/native authority; the owner copy transaction supplies authority.

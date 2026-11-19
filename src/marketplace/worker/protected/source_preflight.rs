@@ -88,7 +88,7 @@ mod security;
 pub use evidence::EvidenceObservation;
 pub use metadata::MetadataObservation;
 pub use publication::PublicationObservation;
-pub(in crate::marketplace) use sdk_http::{SdkHttpAuthority, SdkHttpCall, SdkHttpClient};
+pub(in crate::marketplace) use sdk_http::SdkHttpAuthority;
 pub use security::SecurityObservation;
 
 #[derive(Clone)]

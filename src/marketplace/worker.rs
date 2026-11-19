@@ -16,7 +16,7 @@ pub use protected::{
     ProtectionState, PublicSourceObservation, PublicationObservation, SearchSourceObservation,
     SecurityObservation,
 };
-pub(in crate::marketplace) use protected::{SdkHttpAuthority, SdkHttpCall, SdkHttpClient};
+pub(in crate::marketplace) use protected::SdkHttpAuthority;
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};

@@ -191,7 +191,7 @@ impl ServeSession {
         if !self.healthy {
             bail!("long-lived executor is not serving");
         }
-        if arguments.accounted_bytes() > MAX_ARGUMENT_BYTES {
+        if arguments.accounted_bytes() > self.descriptor.limits.profile.maximum_argument_bytes() {
             bail!("long-lived call arguments exceed limit");
         }
         self.healthy = false;

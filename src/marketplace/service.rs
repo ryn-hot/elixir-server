@@ -443,9 +443,6 @@ impl MarketplaceService {
             arguments,
             allocation.installations,
             allocation.execution,
-            self.client()
-                .ok()
-                .and_then(|client| client.installed_http()),
             turn,
         )
     }

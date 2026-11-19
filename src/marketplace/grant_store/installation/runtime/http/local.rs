@@ -78,4 +78,45 @@ impl InstalledBroker<'_> {
             }
         }
     }
+    /// An ordinary public web request, sent directly by this server. The
+    /// installed scope must still allow network egress (checked by the
+    /// authority on every boundary), and only public addresses are reachable.
+    pub(super) fn public_call(
+        &self,
+        raw: &RuntimeJson,
+        maximum: usize,
+        native: Arc<NativeInvocation>,
+        streaming: bool,
+    ) -> Result<Option<Call>> {
+        if let Some(call) = self.http_call.as_ref()
+            && !call.application_idle()
+        {
+            bail!("the original installed HTTP call is still owned");
+        }
+        let authority = Arc::new(Authority {
+            database: self.database.clone(),
+            binding: self.binding.clone(),
+            native,
+            stop: self.stop.clone(),
+            expires: self.expires,
+            application_admission: None,
+        });
+        let started = if streaming {
+            self.public_http
+                .start_public_stream(raw, maximum, authority)
+                .map(Call::LocalStream)
+        } else {
+            self.public_http
+                .start_public(raw, maximum, authority)
+                .map(Call::Local)
+        };
+        match started {
+            Ok(call) => Ok(Some(call)),
+            Err(error) => {
+                tracing::debug!(reason = %error, "public SDK HTTP request unavailable");
+                self.check()?;
+                Ok(None)
+            }
+        }
+    }
 }

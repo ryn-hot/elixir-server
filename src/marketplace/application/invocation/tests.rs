@@ -54,7 +54,9 @@ async fn invalid_arguments_and_missing_original_owner_fail_before_any_call_is_re
         (
             Uuid::new_v4(),
             Uuid::new_v4(),
-            RuntimeJson::from_value(json!("x".repeat(MAX_ARGUMENT_BYTES)))?,
+            RuntimeJson::from_value(json!("x".repeat(
+                elixir_marketplace::source_execution::FINITE_ARGUMENT_BYTES
+            )))?,
         ),
     ] {
         let error = service

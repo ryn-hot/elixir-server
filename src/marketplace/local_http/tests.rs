@@ -400,13 +400,14 @@ async fn original_cancel_and_authority_loss_close_the_actual_response_socket_wit
 async fn actual_http_rejects_oversize_compression_invalid_utf8_and_encoded_reply_overflow()
 -> Result<()> {
     for response in [
-        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", MAX_HTTP_BODY + 1).into_bytes(),
+        // Larger than this request's reply allowance (the only body bound).
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", 64 * 1024 + 1).into_bytes(),
         b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx".to_vec(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n\xff".to_vec(),
     ] {
         let (port, received, _, server) = raw_origin(response, false).await?;
         let client = client();
-        let mut call = client.start_request(request(port, "GET", None, MAX_JSON_BYTES)?, authority())?;
+        let mut call = client.start_request(request(port, "GET", None, 64 * 1024)?, authority())?;
         assert!(timeout(Duration::from_secs(2), call.finish()).await?.is_err());
         received.await?;
         call.cancel().await?;
@@ -430,7 +431,7 @@ async fn actual_http_rejects_oversize_compression_invalid_utf8_and_encoded_reply
 async fn real_head_does_not_charge_the_advertised_body_length() -> Result<()> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        MAX_HTTP_BODY + 1
+        2 * 1024 * 1024 + 1
     )
     .into_bytes();
     let (port, _, _, server) = raw_origin(response, false).await?;
@@ -439,5 +440,33 @@ async fn real_head_does_not_charge_the_advertised_body_length() -> Result<()> {
     assert_eq!(value(call.finish().await?)?["body"], "");
     call.cancel().await?;
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_requests_reach_public_addresses_only() -> Result<()> {
+    let client = Arc::new(Client::new(true, playback()));
+    let url = "https://torrentio.example/stream/movie/tt0317705.json";
+    let raw = RuntimeJson::from_value(serde_json::json!({
+        "operation":"fetch","url":url,"method":"GET","headers":[],
+    }))?;
+    let request = client.prepare_public(&raw, 4096)?;
+    let target = request.policy.validate_initial(url)?;
+    assert!(
+        request
+            .policy
+            .resolve_target(target.clone(), vec!["8.8.8.8".parse()?])
+            .is_ok()
+    );
+    // Never this server, its LAN, loopback or cloud metadata addresses.
+    for private in ["10.0.0.8", "192.168.1.1", "127.0.0.1", "169.254.169.254", "::1"] {
+        assert!(
+            request
+                .policy
+                .resolve_target(target.clone(), vec![private.parse()?])
+                .is_err(),
+            "{private} must be refused"
+        );
+    }
     Ok(())
 }

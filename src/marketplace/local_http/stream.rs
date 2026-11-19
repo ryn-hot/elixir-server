@@ -46,6 +46,24 @@ impl Client {
         let request = self.prepare(&request.to_json()?, maximum, endpoint)?;
         self.start_stream_request(request, stream_id, maximum_body_bytes as usize, authority)
     }
+    /// Streaming form of `start_public`: public addresses only, no VPN.
+    pub(in crate::marketplace) fn start_public_stream(
+        self: &Arc<Self>,
+        raw: &RuntimeJson,
+        maximum: usize,
+        authority: Arc<dyn SdkHttpAuthority>,
+    ) -> Result<StreamCall> {
+        let SourceSdkRequest::FetchOpen {
+            stream_id,
+            request,
+            maximum_body_bytes,
+        } = SourceSdkRequest::parse(raw)?
+        else {
+            bail!("public SDK stream open required")
+        };
+        let request = self.prepare_public(&request.to_json()?, maximum)?;
+        self.start_stream_request(request, stream_id, maximum_body_bytes as usize, authority)
+    }
     pub(super) fn start_stream_request(
         self: &Arc<Self>,
         request: Request,

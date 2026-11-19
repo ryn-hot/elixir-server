@@ -407,14 +407,6 @@ impl ParticipationClient {
         let (send, reply) = oneshot::channel();
         self.enqueue(Request::Sharing(operation, send), reply).await
     }
-    /// Optional capability from this actual protected actor, not an endpoint,
-    /// JSON observation or permission to send an extension's request. Installed
-    /// callers still need current standing grants and their native executor.
-    pub(in crate::marketplace) fn installed_http(
-        &self,
-    ) -> Option<super::source_preflight::SdkHttpClient> {
-        self.source_preflight.as_ref()?.sdk_http()
-    }
     /// Same main-server database captured by the actual protected owner. It is
     /// never selected by an extension, peer response or preparation request.
     pub(in crate::marketplace) fn source_database(&self) -> &Database {

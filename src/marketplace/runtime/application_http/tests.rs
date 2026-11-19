@@ -89,9 +89,9 @@ fn application_http_has_no_catalog_storage_or_background_allocation() -> Result<
     let spec = p.spec();
     assert_eq!(spec.command, ["--sdk-http-stream-large"]);
     assert_eq!(spec.security.user.as_deref(), Some("10005:10005"));
-    assert_eq!(spec.security.memory_limit_mb, Some(96));
-    assert_eq!(spec.security.memory_swap_limit_mb, Some(96));
-    assert_eq!(spec.security.cpu_quota.as_deref(), Some("0.090"));
+    assert_eq!(spec.security.memory_limit_mb, Some(512));
+    assert_eq!(spec.security.memory_swap_limit_mb, Some(512));
+    assert_eq!(spec.security.cpu_quota.as_deref(), Some("1.000"));
     assert!(spec.env.is_empty() && spec.volumes.is_empty() && spec.security.tmpfs.is_empty());
     assert!(spec.ports.is_empty() && spec.devices.is_empty() && spec.cap_add.is_empty());
     assert_eq!(p.native_deadline(), Duration::from_secs(65));

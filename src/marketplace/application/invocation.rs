@@ -3,7 +3,7 @@
 use super::*;
 use elixir_marketplace::{
     identity::ExtensionId,
-    source_execution::{MAX_ARGUMENT_BYTES, RuntimeJson},
+    source_execution::RuntimeJson,
 };
 use std::{sync::Weak, time::Duration};
 use tokio::time::timeout;
@@ -17,13 +17,12 @@ struct Request {
     instance: Uuid,
     arguments: RuntimeJson,
     provider: Option<installation::providers::Expectation>,
-    http: Option<crate::marketplace::worker::SdkHttpClient>,
 }
 impl Request {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, limits: &SourceExecutionLimits) -> Result<()> {
         if self.home.is_nil()
             || self.instance.is_nil()
-            || self.arguments.accounted_bytes() > MAX_ARGUMENT_BYTES
+            || self.arguments.accounted_bytes() > limits.profile.maximum_argument_bytes()
             || self.provider.as_ref().is_some_and(|p| p.provider.is_nil())
         {
             bail!("invalid or oversized configured installed call");
@@ -147,9 +146,9 @@ async fn run(
                 if let Some(provider)=request.provider {
                     let coordinates=installation::providers::Coordinates{provider:provider.provider,home:request.home,
                         extension:request.extension,instance:request.instance};
-                    controller.begin_provider(&coordinates,provider.revision,budget,limits,request.arguments,request.http).await
+                    controller.begin_provider(&coordinates,provider.revision,budget,limits,request.arguments).await
                 } else {
-                    controller.begin_configured(request.home,&request.extension,request.instance,budget,limits,request.arguments,request.http).await
+                    controller.begin_configured(request.home,&request.extension,request.instance,budget,limits,request.arguments).await
                 }
             }) => result?,
         }
@@ -190,7 +189,6 @@ impl Service {
                 instance,
                 arguments,
                 provider: None,
-                http: None,
             },
             budget,
             limits,
@@ -205,7 +203,6 @@ impl Service {
         arguments: RuntimeJson,
         budget: InstallBudget,
         limits: SourceExecutionLimits,
-        http: Option<crate::marketplace::worker::SdkHttpClient>,
         turn: queue::Turn,
     ) -> Result<InstalledCall> {
         let request = Request {
@@ -214,7 +211,6 @@ impl Service {
             instance,
             arguments,
             provider: None,
-            http,
         };
         self.reserve_installed_call(request, budget, limits, Some(turn))
     }
@@ -224,7 +220,6 @@ impl Service {
         arguments: RuntimeJson,
         budget: InstallBudget,
         limits: SourceExecutionLimits,
-        http: Option<crate::marketplace::worker::SdkHttpClient>,
         turn: queue::Turn,
     ) -> Result<InstalledCall> {
         self.reserve_installed_call(
@@ -237,7 +232,6 @@ impl Service {
                     provider: descriptor.provider,
                     revision: descriptor.revision,
                 }),
-                http,
             },
             budget,
             limits,
@@ -251,7 +245,7 @@ impl Service {
         limits: SourceExecutionLimits,
         turn: Option<queue::Turn>,
     ) -> Result<InstalledCall> {
-        request.validate()?;
+        request.validate(&limits)?;
         budget.validate()?;
         limits.validate()?;
         self.reap_finished()?;

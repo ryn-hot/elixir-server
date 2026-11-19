@@ -320,18 +320,10 @@ mod tests {
         let plan =
             SourceQuarantinePlan::for_release(&release, None, &super::super::tests::budget())?;
         playback.set_test_startup_queue_len(1);
-        let blocked = admission.before_measurement(&plan).await;
+        let admitted = admission.before_measurement(&plan).await;
         playback.set_test_startup_queue_len(0);
-        assert!(
-            matches!(
-                blocked
-                    .as_ref()
-                    .err()
-                    .and_then(|e| e.downcast_ref::<SourceResourceWait>()),
-                Some(SourceResourceWait::Bootstrap { playback: true, .. })
-            ),
-            "live startup/seek must stop admission before a native probe is allocated"
-        );
+        // Installed calls are no longer held back while a stream starts.
+        assert!(admitted.is_ok(), "stream startup must not hold an installed call back");
         let volume = format!("elixir-marketplace-source-{deployment}");
         let labels = HashMap::from([
             (ELIXIR_MANAGED_LABEL.into(), "true".into()),

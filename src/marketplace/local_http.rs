@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use elixir_marketplace::{
-    sdk_http::{HTTP_DEADLINE_MILLIS, MAX_HTTP_BODY},
+    sdk_http::HTTP_DEADLINE_MILLIS,
     source_execution::{
         MAX_JSON_BYTES, RuntimeJson, SdkHeader, SdkHttpMethod, SourceSdkReply, SourceSdkRequest,
     },
@@ -129,11 +129,38 @@ impl Client {
     ) -> Result<Call> {
         self.start_request(self.prepare(raw, maximum, endpoint)?, authority)
     }
+    /// An installed extension's ordinary web request, sent straight from this
+    /// server with no VPN: any public address, never this server, its LAN or
+    /// loopback. The extension's sandbox has no network of its own.
+    pub(in crate::marketplace) fn start_public(
+        self: &Arc<Self>,
+        raw: &RuntimeJson,
+        maximum: usize,
+        authority: Arc<dyn SdkHttpAuthority>,
+    ) -> Result<Call> {
+        self.start_request(self.prepare_public(raw, maximum)?, authority)
+    }
+    pub(super) fn prepare_public(&self, raw: &RuntimeJson, maximum: usize) -> Result<Request> {
+        self.prepare_with(raw, maximum, |_, denylist| {
+            Ok(DestinationPolicy::for_public_session(vec![], true, denylist)?)
+        })
+    }
     fn prepare(
         &self,
         raw: &RuntimeJson,
         maximum: usize,
         endpoint: LocalEndpoint,
+    ) -> Result<Request> {
+        let enabled = self.enabled;
+        self.prepare_with(raw, maximum, |url, denylist| {
+            endpoint.policy_for(url, enabled, denylist)
+        })
+    }
+    fn prepare_with(
+        &self,
+        raw: &RuntimeJson,
+        maximum: usize,
+        policy_for: impl FnOnce(&str, LocalDestinationDenylist) -> Result<DestinationPolicy>,
     ) -> Result<Request> {
         let request = SourceSdkRequest::parse(raw)?;
         let SourceSdkRequest::Fetch { url, .. } = &request else {
@@ -158,11 +185,7 @@ impl Client {
             // Keep a nonempty fixture denylist even on loopback-only CI hosts.
             local.push(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         }
-        let policy = endpoint.policy_for(
-            url,
-            self.enabled,
-            LocalDestinationDenylist::new(local, vec![])?,
-        )?;
+        let policy = policy_for(url, LocalDestinationDenylist::new(local, vec![])?)?;
         #[cfg(test)]
         let policy = if self.resolver.fixture_loopback() {
             policy.allow_fixture_loopback()
@@ -302,6 +325,17 @@ pub(in crate::marketplace) struct Call {
     join_failed: bool,
 }
 impl Call {
+    /// A call whose original task already failed to join: its retirement is
+    /// never confirmed, so whoever holds it must not be reused.
+    #[cfg(test)]
+    pub(in crate::marketplace) fn fixture_unconfirmed_retirement() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            task: None,
+            result: None,
+            join_failed: true,
+        }
+    }
     async fn join(&mut self) -> Result<()> {
         if self.join_failed {
             bail!("original local SDK HTTP owner join failed")
@@ -457,7 +491,9 @@ async fn exchange(
     target: &ResolvedTarget,
     cancellation: &CancellationToken,
 ) -> Result<SourceSdkReply> {
-    let maximum = MAX_HTTP_BODY.min(request.maximum);
+    // The body is returned as UTF-8 text inside the reply, so the reply
+    // allowance is its only bound (no fixed 2 MiB cap).
+    let maximum = request.maximum;
     let Opened {
         mut response,
         status,

@@ -2,9 +2,70 @@
 //! activation is added here; those must retain actual reviewed provenance.
 use super::*;
 use crate::marketplace::runtime::container_execution as profile;
-use elixir_marketplace::container_execution::{
-    ContainerExecutionDescriptor, GUARDIAN_PATH, LIFECYCLE_RESULT, PROBE_RESULT,
+use elixir_marketplace::{
+    container_execution::{
+        ContainerExecutionDescriptor, GUARDIAN_PATH, LIFECYCLE_RESULT, PROBE_RESULT,
+    },
+    source_execution::NO_RESERVATION,
 };
+
+/// The worker image's contract for Unrestricted compiled calls (the guardian
+/// accepts the profile with no frame, SDK, memory or CPU limit). Images
+/// without it keep running the finite profiles.
+const CONTAINER_UNRESTRICTED_LABEL: &str =
+    "elixir.marketplace.worker.container_execution_unrestricted";
+
+/// Configuration check only, against the job's pinned worker image labels.
+/// Finite profiles need nothing new; Unrestricted needs the explicit contract.
+fn require_container_profile(
+    labels: &std::collections::HashMap<String, String>,
+    limits: &SourceExecutionLimits,
+) -> Result<()> {
+    if limits.is_unrestricted()
+        && labels.get(CONTAINER_UNRESTRICTED_LABEL).map(String::as_str) != Some("1")
+    {
+        bail!(
+            "compiled invocation image lacks the unrestricted container execution profile \
+             ({CONTAINER_UNRESTRICTED_LABEL}=1); update the worker image or use a finite profile"
+        );
+    }
+    Ok(())
+}
+
+/// Memory admission for one compiled call. Unrestricted returns
+/// NO_RESERVATION (0): there is no minimum to compare.
+///
+/// The per-call container's cgroup memory limit is not this value: it is the
+/// job plan's `memory_bytes`, which the guardian and kernel inspection see.
+/// For Unrestricted the server should create the job with its 1 TiB
+/// no-ceiling budget (`installed_startup::UNBOUNDED_BYTES`), so `memory.max`
+/// stays a readable number; the guardian then requires no particular value.
+fn require_memory(
+    limits: &SourceExecutionLimits,
+    mode: SourceExecutionMode,
+    admitted: u64,
+) -> Result<()> {
+    let minimum = limits.minimum_memory_bytes_for(mode)?;
+    if minimum != NO_RESERVATION && minimum > admitted {
+        bail!("compiled invocation exceeds the original admitted memory allocation");
+    }
+    Ok(())
+}
+
+/// Private (input, output) bytes charged to the job budget before launch.
+/// Unrestricted reserves nothing (`None`), never a 0-byte budget; finite
+/// profiles keep their control allowances plus 64 KiB of diagnostics.
+fn io_reservation(
+    limits: &SourceExecutionLimits,
+    mode: SourceExecutionMode,
+) -> Result<Option<(u64, u64)>> {
+    let input = limits.control_input_allowance_for(mode)?;
+    let output = limits.control_output_allowance_for(mode)?;
+    if limits.is_unrestricted() {
+        return Ok(None);
+    }
+    Ok(Some((input, output + 64 * 1024)))
+}
 
 fn require_acknowledgement(mode: SourceExecutionMode, result: &RuntimeJson) -> Result<()> {
     let expected = match mode {
@@ -117,11 +178,12 @@ impl SourceMatchedQuarantine {
             mode,
         };
         elixir_marketplace::container_execution::validate_arguments(&descriptor, arguments)?;
-        if descriptor.limits.minimum_memory_bytes_for(mode)?
-            > self.source.job.plan.limits.memory_bytes
-        {
-            bail!("compiled invocation exceeds the original admitted memory allocation");
-        }
+        require_memory(
+            &descriptor.limits,
+            mode,
+            self.source.job.plan.limits.memory_bytes,
+        )?;
+        let reservation = io_reservation(&descriptor.limits, mode)?;
         let expires = self.expires().min(
             Instant::now() + Duration::from_millis(u64::from(descriptor.limits.timeout_millis)),
         );
@@ -129,6 +191,10 @@ impl SourceMatchedQuarantine {
         // Pinning changes neither its owner/deadline nor cancellation cleanup.
         let operation = Box::pin(async {
             broker.current().await?;
+            if descriptor.limits.is_unrestricted() {
+                let labels = runtime.image_labels(&self.source.job.volume.image).await?;
+                require_container_profile(&labels, &descriptor.limits)?;
+            }
             self.source.job.cleanup_activity(runtime.as_ref()).await?;
             self.source.job.recover_writer(runtime.as_ref()).await?;
             image.require_source(self)?;
@@ -140,14 +206,7 @@ impl SourceMatchedQuarantine {
             let handle = self
                 .source
                 .job
-                .launch_writer_budgeted(
-                    &spec,
-                    expires,
-                    Some((
-                        descriptor.limits.control_input_allowance_for(mode)?,
-                        descriptor.limits.control_output_allowance_for(mode)? + 64 * 1024,
-                    )),
-                )
+                .launch_writer_budgeted(&spec, expires, reservation)
                 .await?;
             image.require_source(self)?;
             let process = runtime.attach_private_stdio(&handle, &spec.labels).await?;
@@ -259,6 +318,70 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+    #[test]
+    fn unrestricted_compiled_calls_need_the_image_contract_and_finite_calls_do_not() -> Result<()> {
+        let unrestricted = SourceExecutionLimits::unrestricted();
+        let finite = SourceExecutionLimits::large_feed();
+        let mut labels = std::collections::HashMap::new();
+        // Old images keep working with finite profiles.
+        require_container_profile(&labels, &finite)?;
+        let error = require_container_profile(&labels, &unrestricted)
+            .err()
+            .context("unrestricted compiled call admitted without the image contract")?;
+        assert!(format!("{error:#}").contains(CONTAINER_UNRESTRICTED_LABEL));
+        // The QuickJS runtime's contract is not the compiled one.
+        labels.insert(
+            "elixir.marketplace.worker.source_eval_unrestricted".to_owned(),
+            "1".to_owned(),
+        );
+        assert!(require_container_profile(&labels, &unrestricted).is_err());
+        labels.insert(CONTAINER_UNRESTRICTED_LABEL.to_owned(), "0".to_owned());
+        assert!(require_container_profile(&labels, &unrestricted).is_err());
+        labels.insert(CONTAINER_UNRESTRICTED_LABEL.to_owned(), "1".to_owned());
+        require_container_profile(&labels, &unrestricted)?;
+        require_container_profile(&labels, &finite)?;
+        Ok(())
+    }
+    #[test]
+    fn unrestricted_compiled_calls_reserve_no_memory_or_io_and_finite_calls_keep_theirs()
+    -> Result<()> {
+        let invoke = SourceExecutionMode::Invoke;
+        let unrestricted = SourceExecutionLimits::unrestricted();
+        // No minimum and no I/O budget, whatever the job admitted.
+        for admitted in [0, 64 * 1024 * 1024, 1 << 40] {
+            require_memory(&unrestricted, invoke, admitted)?;
+        }
+        assert_eq!(io_reservation(&unrestricted, invoke)?, None);
+        // Still Invoke only.
+        for mode in [SourceExecutionMode::Probe, SourceExecutionMode::Lifecycle] {
+            assert!(require_memory(&unrestricted, mode, 1 << 40).is_err());
+            assert!(io_reservation(&unrestricted, mode).is_err());
+        }
+        let standard = SourceExecutionLimits {
+            profile: Default::default(),
+            heap_bytes: 32 * 1024 * 1024,
+            timeout_millis: 10_000,
+            max_file_bytes: 8 * 1024 * 1024,
+            json_bytes: 1024 * 1024,
+            pending_jobs: 128,
+            sdk: None,
+        };
+        // Finite profiles keep their exact minimum and reservation.
+        for finite in [standard, SourceExecutionLimits::large_feed()] {
+            let minimum = finite.minimum_memory_bytes_for(invoke)?;
+            assert!(minimum > NO_RESERVATION);
+            require_memory(&finite, invoke, minimum)?;
+            assert!(require_memory(&finite, invoke, minimum - 1).is_err());
+            assert_eq!(
+                io_reservation(&finite, invoke)?,
+                Some((
+                    finite.control_input_allowance_for(invoke)?,
+                    finite.control_output_allowance_for(invoke)? + 64 * 1024,
+                ))
+            );
+        }
         Ok(())
     }
     #[test]

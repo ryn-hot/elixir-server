@@ -23,7 +23,8 @@ pub(crate) const MAX_PUBLISHER_SEEDING_BYTES: usize =
 pub(crate) const MAX_INSTALL_BYTES: usize = 4096;
 pub(crate) const MAX_DIRECT_INSTALL_BYTES: usize =
     elixir_marketplace::publication::MAX_PUBLICATION_BYTES + MAX_INSTALL_BYTES;
-pub(crate) const MAX_ACTION_BYTES: usize = elixir_marketplace::source_execution::MAX_ARGUMENT_BYTES;
+pub(crate) const MAX_ACTION_BYTES: usize =
+    elixir_marketplace::source_execution::FINITE_ARGUMENT_BYTES;
 const MAX_REVISION: i64 = (1i64 << 53) - 1;
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T> {

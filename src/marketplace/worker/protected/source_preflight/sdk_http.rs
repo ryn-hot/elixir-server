@@ -1,6 +1,10 @@
 //! Fixed owned HTTP effect, not installed-grant/native-execution authority.
 //! Shares the existing helper slot and worker allocation. No host fallback,
 //! persistent queue, cache, retry, cookie jar or new packet allowance.
+//! Installed extensions no longer use this client: their web requests go
+//! straight out from the server. Only its own tests construct it now; the
+//! authority trait below is still shared with the opt-in VPN path.
+#![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 use elixir_marketplace::{
     sdk_http::{HttpReply, HttpRequest, MAX_NATIVE_HTTP_OUTPUT, NativeHttpExit},

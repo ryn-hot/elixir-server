@@ -48,11 +48,13 @@ impl SourceJobLimits {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !(64 * MIB..=256 * MIB).contains(&self.0.memory_bytes)
+        // 1 TiB is far above any host: in practice no memory ceiling. A
+        // number (not "max") keeps the container's cgroup readable.
+        if !(64 * MIB..=1024 * 1024 * MIB).contains(&self.0.memory_bytes)
             || !self.0.memory_bytes.is_multiple_of(MIB)
             || !(1..=MAX_SOURCE_JOB_MILLICORES).contains(&self.0.cpu_millicores)
         {
-            bail!("foreground source job requires 64-256 MiB and 1-64 CPU cores");
+            bail!("foreground source job requires 64 MiB-1 TiB and 1-64 CPU cores");
         }
         Ok(())
     }
@@ -997,7 +999,7 @@ mod tests {
         for (memory, cpu) in [
             (63 * MIB, 100),
             (64 * MIB + 1, 100),
-            (257 * MIB, 100),
+            (1024 * 1024 * MIB + MIB, 100),
             (64 * MIB, 0),
             (64 * MIB, MAX_SOURCE_JOB_MILLICORES + 1),
         ] {

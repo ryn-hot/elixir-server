@@ -14,6 +14,14 @@ use std::path::Path;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// 1 TiB: far above any host, so in practice no ceiling, while the
+/// container's cgroup memory limit stays a readable number.
+pub(in crate::marketplace) const UNBOUNDED_BYTES: u64 = 1 << 40;
+pub(in crate::marketplace) const UNRESTRICTED_LABEL: &str =
+    "elixir.marketplace.worker.source_eval_unrestricted";
+const CONTAINER_UNRESTRICTED_LABEL: &str =
+    "elixir.marketplace.worker.container_execution_unrestricted";
+
 mod application_http;
 mod compiled;
 pub(super) mod storage;
@@ -27,7 +35,9 @@ struct Profile {
     source: Source,
     retention: Retention,
     execution: SourceExecutionLimits,
-    // Explicit trusted-operator opt-in only; no peer/admin request can set it.
+    // Optional operator opt-in to send installed extensions' web requests
+    // through a VPN gateway. Omitted (the default), they go straight out from
+    // this server to public addresses. No peer/admin request can set it.
     application_http: Option<application_http::Profile>,
     // Optional independently reviewed local Docker toolchains/helpers only.
     // This is read from the same protected operator file, never HTTP/peers.
@@ -72,6 +82,17 @@ impl Profile {
             compiled.validate()?;
         }
         Ok(profile)
+    }
+    /// The pinned worker image runs installed extensions without execution
+    /// limits: use that, whatever finite values this file lists. Sandbox
+    /// isolation and the 10-minute safety stop remain.
+    fn unrestrict(&mut self) {
+        self.execution = SourceExecutionLimits::unrestricted();
+        self.source.memory_bytes = UNBOUNDED_BYTES;
+        self.source.input_bytes = UNBOUNDED_BYTES;
+        self.source.output_bytes = UNBOUNDED_BYTES;
+        let stop = u64::from(self.execution.timeout_millis).div_ceil(1000);
+        self.source.wall_seconds = self.source.wall_seconds.max(stop + 300);
     }
     fn allocation(&self) -> Allocation {
         Allocation {
@@ -133,7 +154,7 @@ async fn activate(
     stage: &mut &'static str,
 ) -> Result<()> {
     let path = path.to_owned();
-    let (profile, compiled) = tokio::task::spawn_blocking(move || {
+    let (mut profile, compiled) = tokio::task::spawn_blocking(move || {
         let profile = Profile::parse(&super::startup::read_private_profile_bytes(&path)?)?;
         // Hashing bounded local helper files must not block playback's async
         // executor. No process, network role or native work is launched here.
@@ -143,6 +164,25 @@ async fn activate(
     .await??;
     if shutdown.is_cancelled() {
         return Ok(());
+    }
+    *stage = "runtime_readiness";
+    state.orchestrator.ensure_runtime_ready().await?;
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
+    // No execution limits whenever the pinned image supports it. Older
+    // images keep this file's finite profile and keep working.
+    *stage = "execution_profile";
+    let labels = state
+        .orchestrator
+        .runtime_manager()
+        .image_labels(&profile.worker_image)
+        .await?;
+    let supports = |label: &str| labels.get(label).map(String::as_str) == Some("1");
+    if supports(UNRESTRICTED_LABEL)
+        && (profile.compiled.is_none() || supports(CONTAINER_UNRESTRICTED_LABEL))
+    {
+        profile.unrestrict();
     }
     *stage = "private_storage";
     let mut configuration = configuration(state, &profile, compiled.as_ref())?;
@@ -158,12 +198,7 @@ async fn activate(
         profile.allocation().installations,
         profile.execution.clone(),
     )?;
-    *stage = "runtime_readiness";
-    state.orchestrator.ensure_runtime_ready().await?;
-    if shutdown.is_cancelled() {
-        return Ok(());
-    }
-    if let Some(http) = &profile.application_http {
+    if let Some(http) = profile.application_http {
         *stage = "application_http";
         let protected = http
             .configure(

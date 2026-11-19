@@ -13,7 +13,7 @@ use crate::{
             execution::{Broker, CompiledPreparation, NativeInvocation, RetainedCode},
         },
         worker::{
-            IndependentAdmission, ParticipationClient, SdkHttpAuthority, SdkHttpCall, SdkHttpClient,
+            IndependentAdmission, ParticipationClient, SdkHttpAuthority,
         },
     },
     playback::PlaybackJobManager,
@@ -21,7 +21,7 @@ use crate::{
 };
 use elixir_marketplace::{
     records::RuntimeProfile,
-    source_execution::{MAX_ARGUMENT_BYTES, RuntimeJson, SourceExecutionLimits, SourceSdkReply},
+    source_execution::{RuntimeJson, SourceExecutionLimits, SourceSdkReply},
     source_job::SourceMatchDescriptor,
 };
 use standing::InstalledBinding;
@@ -59,14 +59,11 @@ pub(in crate::marketplace) struct InstalledRuntime {
 }
 impl InstalledRuntime {
     /// Each installed call starts its own container, so its CPU is chosen
-    /// here: every CPU on the Docker host while nothing plays, the configured
-    /// smaller budget while a stream starts or plays, so playback wins. If the
-    /// host cannot be asked, the configured budget applies.
+    /// here: every CPU on the Docker host, whether or not anything is playing.
+    /// If the host cannot be asked, the configured budget applies.
     async fn call_budget(&self) -> SourceJobBudget {
         let mut budget = self.source_budget.clone();
-        if !self.playback.has_latency_sensitive_work()
-            && let Ok(cpus) = self.runtime.host_cpus().await
-        {
+        if let Ok(cpus) = self.runtime.host_cpus().await {
             let host = u32::try_from(cpus.saturating_mul(1000)).unwrap_or(u32::MAX);
             budget.cpu_millicores = budget
                 .cpu_millicores
@@ -100,7 +97,6 @@ impl InstalledCall {
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
         owner: Arc<ControllerLease>,
-        http: Option<SdkHttpClient>,
         #[cfg(unix)] image_cache:Option<Arc<crate::marketplace::quarantine::image_cache::Pool>>,
     ) -> Result<Self> {
         Self::start(
@@ -110,7 +106,6 @@ impl InstalledCall {
             configuration,
             limits,
             arguments,
-            http,
             |stop| RunControl {
                 stop,
                 owner: Some(owner),
@@ -136,7 +131,6 @@ impl InstalledCall {
             configuration,
             limits,
             arguments,
-            None,
             RunControl::fixture,
         )
     }
@@ -147,12 +141,11 @@ impl InstalledCall {
         configuration: InstalledRuntime,
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
-        http: Option<SdkHttpClient>,
         control: impl FnOnce(watch::Receiver<bool>) -> RunControl,
     ) -> Result<Self> {
         configuration.retention.validate()?;
         limits.validate()?;
-        if arguments.accounted_bytes() > MAX_ARGUMENT_BYTES
+        if arguments.accounted_bytes() > limits.profile.maximum_argument_bytes()
             || limits.minimum_memory_bytes()? > configuration.source_budget.memory_bytes
         {
             bail!("installed invocation exceeds its argument or memory reservation");
@@ -174,7 +167,6 @@ impl InstalledCall {
                 limits,
                 arguments,
                 control(stopped),
-                http,
             ));
         Ok(Self {
             stop,
@@ -470,7 +462,9 @@ struct InstalledBroker<'a> {
     binding: Arc<InstalledBinding>,
     descriptor: SourceMatchDescriptor,
     native: Option<Arc<NativeInvocation>>,
-    http: Option<&'a SdkHttpClient>,
+    // Ordinary web requests go straight out from this server: public
+    // addresses only, no VPN, never the marketplace worker.
+    public_http: Arc<crate::marketplace::local_http::Client>,
     local_http: Option<&'a Arc<crate::marketplace::local_http::Client>>,
     application_http: Option<&'a crate::marketplace::application_egress::Configuration>,
     application_image: &'a str,
@@ -549,7 +543,6 @@ async fn run(
     limits: SourceExecutionLimits,
     arguments: RuntimeJson,
     mut stop: RunControl,
-    http: Option<SdkHttpClient>,
 ) -> CallCompletion {
     let expires = Deadline::now() + Duration::from_secs(configuration.source_budget.wall_seconds);
     let mut owner = Owner::default();
@@ -584,7 +577,10 @@ async fn run(
             binding: binding.clone(),
             descriptor: code.descriptor(),
             native: None,
-            http: http.as_ref(),
+            public_http: Arc::new(crate::marketplace::local_http::Client::new(
+                true,
+                configuration.playback.clone(),
+            )),
             local_http: configuration.local_http.as_ref(),
             application_http: configuration.application_http.as_ref(),
             application_image: &configuration.image,

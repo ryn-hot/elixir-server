@@ -251,10 +251,9 @@ async fn foreground_comparison_requires_declared_quota_and_keeps_entrypoint_byte
             None,
             &more_memory,
         )?;
-        assert!(
-            more_memory.require_execution_resources(resources).is_err(),
-            "memory stays bounded by the reviewed manifest"
-        );
+        // Reviewed memory is also a request: the server's own sandbox ceiling
+        // applies to every call.
+        more_memory.require_execution_resources(resources)?;
     }
     Ok(())
 }

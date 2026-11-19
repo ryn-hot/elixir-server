@@ -480,7 +480,7 @@ impl ApplicationGatewayProfile {
                 memory_limit_mb: Some(128),
                 memory_swap_limit_mb: Some(128),
                 pids_limit: Some(64),
-                cpu_quota: Some("0.100".into()),
+                cpu_quota: None,
                 shared_memory_mb: Some(1),
                 disable_core_dumps: true,
                 open_files_limit: Some(256),

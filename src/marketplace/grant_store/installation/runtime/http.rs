@@ -5,7 +5,6 @@ mod local;
 
 /// Original effect owner retained outside the VM, regardless of transport.
 pub(super) enum Call {
-    Protected(SdkHttpCall),
     Local(crate::marketplace::local_http::Call),
     LocalStream(crate::marketplace::local_http::StreamCall),
     Application {
@@ -20,7 +19,6 @@ impl Call {
     }
     pub(super) async fn finish(&mut self) -> Result<SourceSdkReply> {
         match self {
-            Self::Protected(call) => call.finish().await,
             Self::Local(call) => call.finish().await,
             Self::LocalStream(_) => bail!("stream requires its original read operation"),
             Self::Application {
@@ -33,7 +31,6 @@ impl Call {
     }
     pub(super) async fn cancel(&mut self) -> Result<()> {
         match self {
-            Self::Protected(call) => call.cancel().await,
             Self::Local(call) => call.cancel().await,
             Self::LocalStream(call) => call.cancel().await,
             Self::Application { stream, .. } => stream.cancel().await,
@@ -190,31 +187,12 @@ impl InstalledBroker<'_> {
                     Prepared::Unavailable => return Ok(SourceSdkReply::Unavailable),
                 }
             } else {
-                // The existing fixed public helper only implements buffered v1.
-                // Never simulate streaming by retrying, Range requests or host I/O.
-                if streaming {
-                    return Ok(SourceSdkReply::Unavailable);
-                }
-                let Some(client) = self.http else {
+                // An ordinary web request goes straight out from this server:
+                // public addresses only, no VPN, never the marketplace worker.
+                let Some(call) = self.public_call(raw, maximum, native.clone(), streaming)? else {
                     return Ok(SourceSdkReply::Unavailable);
                 };
-                let authority = Arc::new(Authority {
-                    database: self.database.clone(),
-                    binding: self.binding.clone(),
-                    native: native.clone(),
-                    stop: self.stop.clone(),
-                    expires: self.expires,
-                    application_admission: None,
-                });
-                // Admission unavailability is not permission to retry a request.
-                match client.start(raw, maximum, authority) {
-                    Ok(call) => Some(Call::Protected(call)),
-                    Err(error) => {
-                        tracing::debug!(reason = %error, "installed SDK HTTP admission unavailable");
-                        self.check()?;
-                        return Ok(SourceSdkReply::Unavailable);
-                    }
-                }
+                Some(call)
             }
         };
         if let Some(call) = call {

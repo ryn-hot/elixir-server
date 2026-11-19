@@ -20,8 +20,11 @@ use std::{collections::HashMap, time::Duration};
 pub use crate::marketplace::lease::activity::http::HttpCreateAttempt;
 
 const MIB: u64 = 1024 * 1024;
-pub(crate) const MEMORY_BYTES: u64 = 96 * MIB;
-pub(crate) const CPU_MILLICORES: u32 = 90;
+// Sandbox memory ceiling. The helper's kernel report must show a CPU quota,
+// so it gets one full core: a single fetch runs on one thread and cannot use
+// more, so this does not slow it down.
+pub(crate) const MEMORY_BYTES: u64 = 512 * MIB;
+pub(crate) const CPU_MILLICORES: u32 = 1000;
 pub(crate) const ISOLATION: &str = "application-http-v1";
 pub(crate) const ENTRYPOINT: &str = "/opt/elixir-marketplace/bin/elixir-marketplace-launcher";
 const SCOPE_LABEL: &str = "elixir.marketplace.application_http.scope";
@@ -176,7 +179,11 @@ impl ApplicationHttpProfile {
                 memory_limit_mb: Some(MEMORY_BYTES / MIB),
                 memory_swap_limit_mb: Some(MEMORY_BYTES / MIB),
                 pids_limit: Some(64),
-                cpu_quota: Some(format!("0.{CPU_MILLICORES:03}")),
+                cpu_quota: Some(format!(
+                    "{}.{:03}",
+                    CPU_MILLICORES / 1000,
+                    CPU_MILLICORES % 1000
+                )),
                 shared_memory_mb: Some(1),
                 disable_core_dumps: true,
                 open_files_limit: Some(64),

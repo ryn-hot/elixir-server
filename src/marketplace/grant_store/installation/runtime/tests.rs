@@ -39,7 +39,10 @@ async fn broker<'a>(
         binding: binding.clone(),
         descriptor: binding.material(&f.db).await?.descriptor()?,
         native: None,
-        http: None,
+        public_http: Arc::new(crate::marketplace::local_http::Client::new(
+            true,
+            Arc::new(PlaybackJobManager::new(f.db.pool.clone(), None)),
+        )),
         local_http: None,
         application_http: None,
         application_image: "",
@@ -216,7 +219,9 @@ async fn invalid_call_reservations_are_rejected_before_a_native_lane_is_opened()
             standing_tests::binding(&f, instance).await?,
             configuration(&f, &image, "preflight-fixture")?,
             limits(),
-            RuntimeJson::from_value(json!("x".repeat(MAX_ARGUMENT_BYTES + 1)))?
+            RuntimeJson::from_value(json!("x".repeat(
+                elixir_marketplace::source_execution::FINITE_ARGUMENT_BYTES + 1
+            )))?
         )
         .is_err()
     );
@@ -269,7 +274,6 @@ async fn cold_controller_future_stays_bounded_without_increasing_executor_stack(
         limits(),
         RuntimeJson::parse(b"null")?,
         RunControl::fixture(stopped),
-        None,
     );
     let bytes = std::mem::size_of_val(&future);
     eprintln!("cold installed controller future: {bytes} bytes");

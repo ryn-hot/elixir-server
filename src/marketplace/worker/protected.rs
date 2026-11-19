@@ -57,7 +57,7 @@ pub use source_preflight::{
     DiscoverySourceFact, EvidenceObservation, MetadataObservation, PublicSourceObservation,
     PublicationObservation, SearchSourceObservation, SecurityObservation,
 };
-pub(in crate::marketplace) use source_preflight::{SdkHttpAuthority, SdkHttpCall, SdkHttpClient};
+pub(in crate::marketplace) use source_preflight::SdkHttpAuthority;
 
 const RENEW_DEADLINE: Duration = Duration::from_secs(12);
 // A foreground caller may wait for this existing inspection/credit/refresh

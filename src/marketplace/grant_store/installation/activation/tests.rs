@@ -505,7 +505,14 @@ async fn recipe_binding_rejects_excess_resources_changed_image_and_mutation_reus
         SourceActivationPlan::new(authority.release(), &material.review, IMAGE, &more_cpu).is_ok(),
         "cpu above the reviewed request"
     );
-    for what in ["image", "memory", "disk", "input", "output", "time"] {
+    let mut more_memory = source_budget();
+    more_memory.memory_bytes = 256 * MIB;
+    assert!(
+        SourceActivationPlan::new(authority.release(), &material.review, IMAGE, &more_memory)
+            .is_ok(),
+        "memory above the reviewed request"
+    );
+    for what in ["image", "disk", "input", "output", "time"] {
         let mut budget = source_budget();
         let image = if what == "image" {
             "worker:latest"
@@ -513,7 +520,6 @@ async fn recipe_binding_rejects_excess_resources_changed_image_and_mutation_reus
             IMAGE
         };
         match what {
-            "memory" => budget.memory_bytes = 256 * MIB,
             "disk" => budget.disk_bytes = 1,
             "input" => budget.input_bytes = 1,
             "output" => budget.output_bytes = 1,

@@ -192,14 +192,13 @@ impl InstalledController {
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
     ) -> Result<()> {
-        self.begin_with_http(binding, limits, arguments, None)
+        self.begin_owned_call(binding, limits, arguments)
     }
-    fn begin_with_http(
+    fn begin_owned_call(
         &mut self,
         binding: InstalledBinding,
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
-        http: Option<SdkHttpClient>,
     ) -> Result<()> {
         self.require_owner()?;
         if self.active.is_some() || self.candidate.is_some() {
@@ -214,7 +213,6 @@ impl InstalledController {
             limits,
             arguments,
             self.lease.clone(),
-            http,
             #[cfg(unix)] self.image_cache.clone(),
         )?;
         // No await between starting the task and retaining its ONLY owner.
@@ -231,13 +229,12 @@ impl InstalledController {
         budget: InstallBudget,
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
-        http: Option<SdkHttpClient>,
     ) -> Result<()> {
         self.require_idle()?;
         let binding =
             InstalledBinding::load_configured(&self.database, home, extension, instance, budget)
                 .await?;
-        self.begin_with_http(binding, limits, arguments, http)
+        self.begin_owned_call(binding, limits, arguments)
     }
     pub(in crate::marketplace) fn require_idle(&self) -> Result<()> {
         self.require_owner()?;
@@ -261,13 +258,12 @@ impl InstalledController {
         budget: InstallBudget,
         limits: SourceExecutionLimits,
         arguments: RuntimeJson,
-        http: Option<SdkHttpClient>,
     ) -> Result<()> {
         self.require_idle()?;
         let (binding, _) =
             InstalledBinding::load_provider(&self.database, coordinates, budget, Some(revision))
                 .await?;
-        self.begin_with_http(binding, limits, arguments, http)
+        self.begin_owned_call(binding, limits, arguments)
     }
     /// Pure preflight precedes taking the original claim. No await occurs
     /// between its move into the task and retaining that task's only handle.

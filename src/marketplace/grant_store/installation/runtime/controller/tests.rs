@@ -5,11 +5,6 @@ use super::super::tests::{configuration, limits};
 use super::*;
 use crate::marketplace::lease::activity::{Fence, Target};
 
-// Actual protected transport / native VM composition, separate from the
-// synthetic completion fixtures in this module.
-#[cfg(unix)]
-mod native_http;
-
 fn manager() -> SecretsManager {
     SecretsManager::from_key_bytes([57; 32], false)
 }
@@ -21,7 +16,7 @@ async fn joined_vm_result_cannot_release_a_controller_with_unconfirmed_http_reti
     let mut owner = controller(&f).await?;
     let instance = installed::enroll(&f).await?;
     let generation = installed::binding(&f, instance).await?.generation();
-    let (http, _process_owner) = SdkHttpCall::fixture_unconfirmed_retirement()?;
+    let http = crate::marketplace::local_http::Call::fixture_unconfirmed_retirement();
     let (stop, _stopped) = watch::channel(false);
     owner.active = Some(RegisteredCall {
         generation,
@@ -30,7 +25,7 @@ async fn joined_vm_result_cannot_release_a_controller_with_unconfirmed_http_reti
             task: Some(tokio::spawn(async move {
                 CallCompletion {
                     result: Ok(RuntimeJson::parse(b"null").unwrap()),
-                    http: Some(super::super::http::Call::Protected(http)),
+                    http: Some(super::super::http::Call::Local(http)),
                 }
             })),
             result: None,

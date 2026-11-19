@@ -175,14 +175,6 @@ async fn original_http_pipe_receives_no_input_until_protection_is_ready() -> Res
     Ok(())
 }
 
-impl SdkHttpCall {
-    /// Negative-only cross-component fixture, never positive native proof.
-    pub(in crate::marketplace) fn fixture_unconfirmed_retirement() -> Result<(Self, impl Send)> {
-        let fixture = super::super::tests::fixture()?;
-        let call = call(fixture.owner.clone(), fake("missing")?)?;
-        Ok((call, fixture))
-    }
-}
 #[tokio::test]
 async fn denied_authority_never_launches_a_helper_or_faults_the_shared_worker() -> Result<()> {
     let f = super::super::tests::fixture()?;

@@ -1,13 +1,14 @@
 //! Bounded FIFO admission, NOT native ownership or retirement authority.
-//! One active consumer/result plus at most three waiting callers. Cancellation
+//! One active consumer/result plus up to 4,095 waiting callers. A waiter has
+//! no deadline of its own: only its caller's deadline or cancellation ends it.
+//! Cancellation
 //! releases only this coordination slot; the original application/controller
 //! must still prove native cleanup before it can start another invocation.
 use anyhow::{Context, Result, bail};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
-const CAPACITY: usize = 4;
-const WAIT: Duration = Duration::from_secs(5);
+const CAPACITY: usize = 4096;
 
 struct Inner {
     slots: Arc<Semaphore>,
@@ -92,7 +93,6 @@ impl Queue {
             .context("installed call queue is full")?;
         let serial = tokio::select! {biased;
             _ = stopped.changed() => bail!("installed call queue is stopping"),
-            _ = tokio::time::sleep(WAIT) => bail!("installed call queue wait expired"),
             serial = self.0.serial.clone().lock_owned() => serial,
         };
         let turn = Turn {
@@ -113,16 +113,15 @@ impl Drop for Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::time::{Instant, timeout};
 
     #[tokio::test(start_paused = true)]
-    async fn four_total_slots_are_fifo_and_overflow_never_waits() -> Result<()> {
+    async fn all_slots_are_fifo_and_overflow_never_waits() -> Result<()> {
         let queue = Queue::default();
         let first = queue.acquire().await?;
-        let mut second = Box::pin(queue.acquire());
-        let mut third = Box::pin(queue.acquire());
-        let mut fourth = Box::pin(queue.acquire());
-        for pending in [&mut second, &mut third, &mut fourth] {
+        let mut waiting: Vec<_> = (1..CAPACITY).map(|_| Box::pin(queue.acquire())).collect();
+        for pending in waiting.iter_mut() {
             assert!(
                 timeout(Duration::from_millis(1), pending.as_mut())
                     .await
@@ -134,20 +133,20 @@ mod tests {
         assert!(queue.acquire().await.is_err());
         assert_eq!(Instant::now(), before);
         drop(first);
+        // The next turn goes to the earliest waiter, never a later one.
         assert!(
-            timeout(Duration::from_millis(1), third.as_mut())
+            timeout(Duration::from_millis(1), waiting[1].as_mut())
                 .await
                 .is_err()
         );
-        let second = timeout(Duration::from_secs(1), second.as_mut()).await??;
-        drop(second);
-        let third = timeout(Duration::from_secs(1), third.as_mut()).await??;
-        drop(third);
-        let fourth = timeout(Duration::from_secs(1), fourth.as_mut()).await??;
-        drop(fourth);
+        for pending in waiting.iter_mut() {
+            let turn = timeout(Duration::from_secs(1), pending.as_mut()).await??;
+            drop(turn);
+        }
         assert_eq!(queue.0.slots.available_permits(), CAPACITY);
         Ok(())
     }
+
     #[tokio::test(start_paused = true)]
     async fn cancelled_waiter_releases_its_slot_and_does_not_steal_a_turn() -> Result<()> {
         let queue = Queue::default();
@@ -167,15 +166,21 @@ mod tests {
         Ok(())
     }
     #[tokio::test(start_paused = true)]
-    async fn queue_wait_has_one_finite_deadline_without_replacing_the_active_turn() -> Result<()> {
+    async fn queue_wait_has_no_deadline_of_its_own_and_never_replaces_the_active_turn()
+    -> Result<()> {
         let queue = Queue::default();
         let active = queue.acquire().await?;
-        let before = Instant::now();
-        assert!(queue.acquire().await.is_err());
-        assert_eq!(Instant::now() - before, WAIT);
-        assert_eq!(queue.0.slots.available_permits(), CAPACITY - 1);
+        let mut waiting = Box::pin(queue.acquire());
+        // Hours of paused time pass; the waiter is still waiting, not failed.
+        assert!(
+            timeout(Duration::from_secs(4 * 3600), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.0.slots.available_permits(), CAPACITY - 2);
         queue.require(&active)?;
         drop(active);
+        drop(timeout(Duration::from_secs(1), waiting.as_mut()).await??);
         drop(queue.try_acquire()?);
         Ok(())
     }

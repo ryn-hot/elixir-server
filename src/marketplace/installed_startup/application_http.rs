@@ -1,4 +1,4 @@
-//! Optional operator wiring for separately protected installed HTTP. This only
+//! Optional operator wiring for a VPN-protected installed HTTP path. This only
 //! provisions one stable, owned bridge; it supplies no credentials, packet
 //! credit, native source/grant authority or proof that a VPN works.
 use crate::{
@@ -10,7 +10,7 @@ use elixir_marketplace::{connectivity::ProbeFamily, identity::Digest};
 use serde::Deserialize;
 use std::{path::Path, time::Duration};
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Profile {
     family: ProbeFamily,

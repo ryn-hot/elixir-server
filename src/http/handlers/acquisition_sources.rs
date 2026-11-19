@@ -60,7 +60,9 @@ pub const ACQUISITION_STREAM_CANDIDATE_PROVIDER_CAPABILITY: &str =
 
 const CANDIDATE_PROVIDER_SCHEMA_VERSION: u32 = 1;
 const CANDIDATE_PROVIDER_SEARCH_PATH: &str = "search";
-const CANDIDATE_PROVIDER_TIMEOUT_SECONDS: u64 = 30;
+// Not a performance limit: the same 10-minute safety stop installed calls
+// get, so only a hung source is cut off.
+const CANDIDATE_PROVIDER_TIMEOUT_SECONDS: u64 = 600;
 const STREAM_CANDIDATE_DEFAULT_LIMIT: u32 = 25;
 const STREAM_CANDIDATE_MAX_LIMIT: u32 = 100;
 const STREAM_CANDIDATE_MAX_TARGETS: usize = 100;

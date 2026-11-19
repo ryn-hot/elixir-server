@@ -128,7 +128,8 @@ async fn application_gateway_is_ephemeral_bounded_and_not_a_main_reconciler_depl
     assert_eq!(security.user.as_deref(), Some("0:0"));
     assert_eq!(security.memory_limit_mb, Some(128));
     assert_eq!(security.memory_swap_limit_mb, Some(128));
-    assert_eq!(security.cpu_quota.as_deref(), Some("0.100"));
+    // No CPU cap: the tunnel's encryption must not throttle extension traffic.
+    assert_eq!(security.cpu_quota, None);
     assert_eq!(security.pids_limit, Some(64));
     assert_eq!(security.log_options, Some(ContainerLogOptions::Disabled));
     assert_eq!(security.tmpfs.len(), 2);

@@ -27,12 +27,11 @@ use tokio::{io::AsyncReadExt, time::Instant};
 
 pub(in crate::marketplace) const IDLE_STOP: Duration = Duration::from_secs(10 * 60);
 const SESSION_SECONDS: u32 = 3600;
-/// Replace an executor this long before its hard lifetime ends.
-const RENEW_BEFORE: Duration = Duration::from_secs(10 * 60);
+/// Replace an executor this long before its hard lifetime ends: longer than
+/// one call can run (the 10-minute stop plus its grace).
+const RENEW_BEFORE: Duration = Duration::from_secs(11 * 60);
 const CHECK: Duration = Duration::from_millis(500);
 const MIB: u64 = 1024 * 1024;
-/// A member's reply body, as text, at most this large.
-const MEMBER_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Per-call limits of a long-lived call. The heap is shared by the session.
 pub(in crate::marketplace) fn serve_limits() -> SourceExecutionLimits {
@@ -176,22 +175,41 @@ impl ServeHost {
         if facts.release().payload().runtime_profile != RuntimeProfile::SourceJs {
             bail!("only source modules can run as long-lived executors");
         }
+        // No execution limits whenever the pinned image supports it; older
+        // images keep the finite long-lived profile and keep working.
+        let unrestricted = self
+            .configuration
+            .runtime
+            .image_labels(&self.configuration.image)
+            .await?
+            .get(crate::marketplace::installed_startup::UNRESTRICTED_LABEL)
+            .map(String::as_str)
+            == Some("1");
         let serve = SourceServeDescriptor {
             schema_version: 1,
             session_id: Digest::of(Uuid::new_v4().as_bytes()),
             source: descriptor.clone(),
-            limits: serve_limits(),
+            limits: if unrestricted {
+                SourceExecutionLimits::unrestricted()
+            } else {
+                serve_limits()
+            },
             session_seconds: SESSION_SECONDS,
         };
         // Exactly what the executor needs: its heap, file and JSON working set,
-        // and the package and proof while it verifies them.
-        let memory = serve.minimum_memory_bytes()?.div_ceil(MIB) * MIB;
+        // and the package and proof while it verifies them. Unrestricted has
+        // no memory ceiling at all.
+        let memory = if unrestricted {
+            crate::marketplace::installed_startup::UNBOUNDED_BYTES
+        } else {
+            serve.minimum_memory_bytes()?.div_ceil(MIB) * MIB
+        };
         let resources = binding
             .review()
             .scope()
             .runtime()
             .context("installed source has no reviewed runtime resources")?;
-        if memory > resources.memory_bytes {
+        if !unrestricted && memory > resources.memory_bytes {
             bail!(
                 "this extension's approved memory ({} MiB) is below what a long-lived executor needs ({} MiB)",
                 resources.memory_bytes / MIB,
@@ -413,7 +431,8 @@ impl ServeBroker<'_> {
         };
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(25))
+            // Only a hung member is cut off: the same 10-minute stop as calls.
+            .timeout(Duration::from_secs(10 * 60))
             .no_proxy()
             .build()?;
         let mut request = client.request(method, target);
@@ -434,7 +453,8 @@ impl ServeBroker<'_> {
             .and_then(|value| value.to_str().ok())
             .filter(|value| value.len() <= 256 && !value.bytes().any(|c| c < 32 || c == 127))
             .map(str::to_owned);
-        let limit = maximum.saturating_sub(4096).min(MEMBER_BODY_BYTES);
+        // The reply allowance is the only bound on a member's body.
+        let limit = maximum.saturating_sub(4096);
         let mut bytes = Vec::new();
         let mut stream = response;
         while let Some(chunk) = stream.chunk().await? {

@@ -2,7 +2,7 @@
 //! activation, networking or reusable execution authority is introduced here.
 use super::*;
 use elixir_marketplace::source_execution::{
-    MAX_ARGUMENT_BYTES, MAX_EVENT_BYTES, PayloadKind, RESULT_ACK, RuntimeJson,
+    MAX_EVENT_BYTES, PayloadKind, RESULT_ACK, RuntimeJson,
     SOURCE_LIFECYCLE_RESULT, SOURCE_PROBE_RESULT, SdkStatus, SourceExecutionDescriptor,
     SourceExecutionEvent as Event, SourceExecutionLimits, SourceExecutionMode,
     SourceLifecycleContext, SourcePayloadFrames, SourcePayloadReceiver, SourceSdkReply,
@@ -43,6 +43,14 @@ fn require_execution_features(
             != Some("1")
     {
         bail!("source invocation image lacks the finite large-feed execution profile");
+    }
+    if limits.profile == elixir_marketplace::source_execution::SourceExecutionProfile::Unrestricted
+        && features
+            .get("elixir.marketplace.worker.source_eval_unrestricted")
+            .map(String::as_str)
+            != Some("1")
+    {
+        bail!("source invocation image lacks the unrestricted execution profile");
     }
     let extra = match mode {
         SourceExecutionMode::Invoke => None,
@@ -187,7 +195,7 @@ async fn answer_sdk_call(
     let remaining = allowance
         .request_bytes
         .saturating_sub(counters.requests)
-        .min(MAX_ARGUMENT_BYTES as u64) as usize;
+        .min(limits.profile.maximum_argument_bytes() as u64) as usize;
     if remaining == 0 {
         bail!("source SDK request allowance exhausted");
     }
@@ -339,18 +347,11 @@ impl SourceQuarantinePlan {
         &self,
         resources: &super::super::grants::RuntimeResources,
     ) -> Result<()> {
-        let plan = self;
-        let tmp_bytes = 8.min(plan.limits.memory_bytes / MIB / 16) * MIB;
-        // CPU is scheduled by the server (the whole host, capped while media
-        // plays), so the reviewed CPU figure is the publisher's request, not
-        // a ceiling. Memory and processes stay bounded by the review.
-        if plan.limits.memory_bytes > resources.memory_bytes
-            || super::super::runtime::WORKER_PIDS > u64::from(resources.pids)
-            || !resources
-                .temporary_mounts
-                .iter()
-                .any(|m| m.path == "/tmp" && m.bytes >= tmp_bytes)
-        {
+        // The reviewed CPU, memory and /tmp figures are the publisher's
+        // request, not a ceiling: every call gets the server's own sandbox
+        // ceilings (all host CPUs, the configured memory). Only the process
+        // count stays bounded by the review.
+        if super::super::runtime::WORKER_PIDS > u64::from(resources.pids) {
             bail!("source invocation profile exceeds owner-approved resources");
         }
         Ok(())
@@ -536,7 +537,7 @@ async fn evaluate_job(
     invocation_id: Digest,
     expected: Option<&SourceMatchSummary>,
 ) -> Result<RuntimeJson> {
-    if arguments.accounted_bytes() > MAX_ARGUMENT_BYTES {
+    if arguments.accounted_bytes() > limits.profile.maximum_argument_bytes() {
         bail!("source invocation arguments exceed limit");
     }
     let descriptor = SourceExecutionDescriptor {
