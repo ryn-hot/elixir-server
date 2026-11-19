@@ -8767,8 +8767,30 @@ fn provider_is_extension_suite_source_candidate(
     is_extension_suite_source_provider_capability(&provider.detail.provider.capability)
         && provider.media_types.contains(&media_type)
         && provider_supports_action(provider, "search")
-        && provider.detail.provider.health_state == ProviderHealthState::Healthy
+        && source_provider_is_offerable(provider)
         && provider.detail.provider.endpoint_json.is_some()
+}
+
+/// A container source must have passed its health check. An installed
+/// marketplace source has no container to check: it runs per call, so nothing
+/// ever marks it healthy. Offer it unless it was found unhealthy, the same as
+/// the acquisition search does.
+fn source_provider_is_offerable(provider: &ProviderContext) -> bool {
+    match provider.detail.provider.health_state {
+        ProviderHealthState::Healthy => true,
+        ProviderHealthState::Unhealthy => false,
+        _ => provider
+            .detail
+            .provider
+            .endpoint_json
+            .as_ref()
+            .is_some_and(is_marketplace_source_endpoint),
+    }
+}
+
+fn is_marketplace_source_endpoint(endpoint: &Value) -> bool {
+    serde_json::from_str::<Value>(crate::marketplace::service::SOURCE_PROVIDER_ENDPOINT)
+        .is_ok_and(|expected| *endpoint == expected)
 }
 
 fn collect_search_providers(
@@ -12429,6 +12451,41 @@ mod tests {
         assert_eq!(
             eligible[0].detail.provider.implementation.as_deref(),
             Some("torrentio_stremio")
+        );
+    }
+
+    #[test]
+    fn installed_marketplace_sources_are_offered_without_a_container_health_check() {
+        let marketplace_endpoint: Value =
+            serde_json::from_str(crate::marketplace::service::SOURCE_PROVIDER_ENDPOINT).unwrap();
+        let mut installed = test_suite_candidate_provider_context(
+            "elx:publisher/torrentio-source",
+            "default",
+            "torrentio",
+            vec![MediaType::Movie],
+            ProviderHealthState::Unknown,
+            true,
+        );
+        installed.detail.provider.endpoint_json = Some(marketplace_endpoint.clone());
+        let mut found_unhealthy = installed.clone();
+        found_unhealthy.detail.provider.provider_id = Uuid::new_v4();
+        found_unhealthy.detail.provider.health_state = ProviderHealthState::Unhealthy;
+        let unchecked_container = test_suite_candidate_provider_context(
+            "elixir.sources.unchecked",
+            "default",
+            "unchecked_source",
+            vec![MediaType::Movie],
+            ProviderHealthState::Unknown,
+            true,
+        );
+
+        let providers = vec![found_unhealthy, unchecked_container, installed.clone()];
+        let eligible = collect_extension_suite_provider_candidates(&providers, MediaType::Movie);
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(
+            eligible[0].detail.provider.provider_id,
+            installed.detail.provider.provider_id
         );
     }
 
