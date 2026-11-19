@@ -67,11 +67,6 @@ pub(super) async fn prepare(
         preferences::load_internal(&database).await?.revision > 0,
         "marketplace owner setup is required before provider startup"
     );
-    ensure!(
-        available_transfer(&database, now()?, &profile.limits).await?
-            >= BOOTSTRAP_PROBE_BYTES + INITIAL_WORKER_BYTES + TRANSPORT_BOOTSTRAP_BYTES,
-        "marketplace provider startup allowance is unavailable"
-    );
     ProtectedWorker::await_startup_host(&profile.limits, &playback).await?;
     orchestrator.ensure_runtime_ready().await?;
     ProtectedWorker::await_startup_host(&profile.limits, &playback).await?;

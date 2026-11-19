@@ -30,7 +30,7 @@ fn worker_startup_credit_has_headroom_without_raising_the_monthly_cap_or_minimum
 }
 
 #[tokio::test]
-async fn worker_startup_credit_is_committed_once_and_unused_bytes_are_not_refunded() -> Result<()> {
+async fn worker_startup_credit_is_committed_once_and_never_runs_out() -> Result<()> {
     let (_directory, database) = database().await?;
     let now = 1_790_000_000;
     let limits = OrdinaryLimits {
@@ -39,19 +39,15 @@ async fn worker_startup_credit_is_committed_once_and_unused_bytes_are_not_refund
     };
     let first = reserve_worker_startup_credit(&database, now, &limits).await?;
     assert_eq!(first.bytes(), PREFERRED_WORKER_STARTUP_BYTES);
-    assert_eq!(first.remaining_after(), INITIAL_WORKER_BYTES);
     let original_revision = first.into_packet_credit()?.revision;
-    let second = reserve_worker_startup_credit(&database, now, &limits).await?;
-    assert_eq!(second.bytes(), INITIAL_WORKER_BYTES);
-    assert_eq!(second.remaining_after(), 0);
-    assert!(second.into_packet_credit()?.revision > original_revision);
-    assert_eq!(available_transfer(&database, now, &limits).await?, 0);
-    assert!(
-        reserve_worker_startup_credit(&database, now, &limits)
-            .await
-            .is_err()
-    );
-    assert_eq!(available_transfer(&database, now, &limits).await?, 0);
+    // Past the configured monthly figure, every start still gets its full
+    // window: there is no monthly cap to exhaust.
+    for _ in 0..3 {
+        let next = reserve_worker_startup_credit(&database, now, &limits).await?;
+        assert_eq!(next.bytes(), PREFERRED_WORKER_STARTUP_BYTES);
+        assert!(next.into_packet_credit()?.revision > original_revision);
+    }
+    assert_eq!(available_transfer(&database, now, &limits).await?, u64::MAX);
     Ok(())
 }
 
@@ -813,7 +809,7 @@ async fn key_preparation_requires_bound_owner_encrypted_scoped_keys_and_never_de
 }
 
 #[tokio::test]
-async fn missing_or_wrong_key_store_and_spent_allowance_cannot_prepare_a_provider() -> Result<()> {
+async fn missing_or_wrong_key_store_cannot_prepare_a_provider_but_past_month_use_does_not_block() -> Result<()> {
     let (_directory, database) = database().await?;
     let actor = owner(&database).await?;
     bind_initial_home(&database, actor.home, Uuid::new_v4()).await?;
@@ -837,9 +833,12 @@ async fn missing_or_wrong_key_store_and_spent_allowance_cannot_prepare_a_provide
         .await
         .is_err()
     );
+    // Use past the configured monthly figure is no reason to refuse startup.
     let limits = profile.limits.clone();
     reserve_transfer(&database, now()?, limits.monthly_transfer_bytes, &limits).await?;
-    assert!(prepare_vpn(&database, &manager, &profile).await.is_err());
+    if let Err(error) = prepare_vpn(&database, &manager, &profile).await {
+        assert!(!format!("{error:#}").contains("allowance"), "{error:#}");
+    }
     Ok(())
 }
 

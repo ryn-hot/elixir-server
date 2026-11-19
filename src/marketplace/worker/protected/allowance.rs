@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_requires_a_real_durable_debit_without_refunds_or_quota_reset() -> Result<()>
+    async fn replacement_requires_a_real_durable_debit_and_is_never_capped_monthly() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
         let database = Database::connect(&crate::config::DatabaseConfig {
@@ -222,14 +222,14 @@ mod tests {
             assert_eq!(first.bytes(), MIN_TARGET_BYTES);
             // Leaving scope without apply never refunds a committed debit.
         }
-        {
-            let final_window = allowance.reserve_replacement(expired).await?.unwrap();
-            assert_eq!(final_window.bytes(), 8192);
-            assert_eq!(final_window.remaining_after(), 0);
+        // Past the configured monthly figure, replacement windows stay full
+        // size: there is no monthly cap to run out of.
+        for _ in 0..3 {
+            let window = allowance.reserve_replacement(expired).await?.unwrap();
+            assert_eq!(window.bytes(), MIN_TARGET_BYTES);
         }
-        assert!(allowance.reserve_replacement(expired).await.is_err());
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        assert_eq!(available_transfer(&database, now, &limits).await?, 0);
+        assert_eq!(available_transfer(&database, now, &limits).await?, u64::MAX);
         sqlx::query("DELETE FROM marketplace_transfer_accounting")
             .execute(&database.pool)
             .await?;

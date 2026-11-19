@@ -1046,12 +1046,13 @@ mod tests {
             assert_eq!(row.try_get::<i64, _>(0)?, 0, "offline admission cannot mint packet credit");
             assert_eq!(row.try_get::<String, _>(1)?, "");
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            let debit = reserve_transfer(&database, now, limits.monthly_transfer_bytes, &limits).await?;
-            assert_eq!(debit.remaining_after(), 0);
+            // Past the configured monthly figure the allowance stays open:
+            // there is no monthly cap.
+            reserve_transfer(&database, now, limits.monthly_transfer_bytes, &limits).await?;
             let before: String = sqlx::query_scalar("SELECT state_json FROM marketplace_transfer_accounting WHERE singleton=1")
                 .fetch_one(&database.pool).await?;
             let exhausted = timeout(Duration::from_secs(8), source.collect()).await??;
-            assert!(!exhausted.background_allowance);
+            assert!(exhausted.background_allowance);
             let after: String = sqlx::query_scalar("SELECT state_json FROM marketplace_transfer_accounting WHERE singleton=1")
                 .fetch_one(&database.pool).await?;
             assert_eq!(before, after, "measurement cannot roll or refund a debit");

@@ -41,27 +41,21 @@ pub async fn available_transfer(
         }
         TransferLedger::restore(snapshot.as_bytes())?
     };
-    Ok(ledger.available_bytes(now, limits.monthly_transfer_bytes)?)
+    Ok(ledger.available_bytes(now)?)
 }
 
 /// Evidence of one committed debit, not permission to send unmetered traffic.
 /// Deliberately not Clone/Deserialize: a controller must consume a debit
-/// once when installing its bounded packet allowance. Unused bytes are lost;
-/// no worker-provided completion report can refund them.
+/// once when installing its bounded packet allowance.
 #[derive(Debug)]
 pub struct CommittedTransferReservation {
     revision: u64,
     bytes: u64,
-    remaining_after: u64,
 }
 
 impl CommittedTransferReservation {
     pub fn bytes(&self) -> u64 {
         self.bytes
-    }
-
-    pub fn remaining_after(&self) -> u64 {
-        self.remaining_after
     }
 
     /// Consume this committed debit for a single kernel credit transaction.
@@ -113,7 +107,7 @@ pub async fn reserve_transfer(
             }
             TransferLedger::restore(snapshot.as_bytes())?
         };
-        ledger.reserve(now, bytes, limits.monthly_transfer_bytes)?;
+        ledger.reserve(now, bytes)?;
         let encoded = String::from_utf8(ledger.to_database_snapshot()?)?;
         let mut transaction = connection.begin().await?;
         if database.driver == DatabaseDriver::Postgres {
@@ -136,7 +130,6 @@ pub async fn reserve_transfer(
             return Ok(CommittedTransferReservation {
                 revision: next_revision as u64,
                 bytes,
-                remaining_after: limits.monthly_transfer_bytes - ledger.used_bytes(),
             });
         }
         // A second process won the debit. Reload rather than overwriting it.
@@ -186,28 +179,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_debits_survive_restart_and_unused_allowance_is_not_refunded() -> Result<()> {
+    async fn committed_debits_survive_restart_and_have_no_monthly_cap() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("server.sqlite");
         let database = connect(&path).await?;
         initialize(&database).await?;
         let reservation = reserve_transfer(&database, NOW, 100, &limits(150)).await?;
         assert_eq!(reservation.bytes(), 100);
-        assert_eq!(reservation.remaining_after(), 50);
         // A crash before the packet allowance is installed loses the reserved
         // bytes. There is deliberately no Drop/refund behavior.
         drop(reservation);
         database.pool.close().await;
         let restarted = connect(&path).await?;
         assert_eq!(used(&restarted).await?, 100);
-        assert!(
-            reserve_transfer(&restarted, NOW + 1, 51, &limits(150))
-                .await
-                .is_err()
-        );
-        assert_eq!(used(&restarted).await?, 100);
-        reserve_transfer(&restarted, NOW + 1, 50, &limits(150)).await?;
-        assert_eq!(used(&restarted).await?, 150);
+        // The configured monthly figure is not a cap: going past it commits.
+        reserve_transfer(&restarted, NOW + 1, 51, &limits(150)).await?;
+        assert_eq!(used(&restarted).await?, 151);
         assert!(
             reserve_transfer(&restarted, NOW - 1000, 1, &limits(150))
                 .await
@@ -225,7 +212,7 @@ mod tests {
         let database = connect(&directory.path().join("preview.sqlite")).await?;
         initialize(&database).await?;
         let limits = limits(150);
-        assert_eq!(available_transfer(&database, NOW, &limits).await?, 150);
+        assert_eq!(available_transfer(&database, NOW, &limits).await?, u64::MAX);
         let row = sqlx::query(
             "SELECT revision,state_json FROM marketplace_transfer_accounting WHERE singleton=1",
         )
@@ -233,9 +220,12 @@ mod tests {
         .await?;
         assert_eq!(row.try_get::<i64, _>(0)?, 0);
         assert_eq!(row.try_get::<String, _>(1)?, "");
-        reserve_transfer(&database, NOW, 100, &limits).await?;
-        assert_eq!(available_transfer(&database, NOW + 1, &limits).await?, 50);
-        assert_eq!(used(&database).await?, 100);
+        reserve_transfer(&database, NOW, 200, &limits).await?;
+        assert_eq!(
+            available_transfer(&database, NOW + 1, &limits).await?,
+            u64::MAX
+        );
+        assert_eq!(used(&database).await?, 200);
         assert!(
             available_transfer(&database, NOW - 301, &limits)
                 .await
@@ -253,7 +243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn independent_server_pools_cannot_double_spend_a_shared_allowance() -> Result<()> {
+    async fn independent_server_pools_never_lose_or_double_count_a_shared_debit() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("server.sqlite");
         let database = connect(&path).await?;
@@ -265,20 +255,18 @@ mod tests {
                 reserve_transfer(&independent, NOW, 100, &limits(250)).await
             }));
         }
-        let mut successes = 0;
+        let mut successes: u64 = 0;
         for task in tasks {
             if task.await?.is_ok() {
                 successes += 1;
             }
         }
-        assert_eq!(successes, 2);
-        assert_eq!(used(&database).await?, 200);
+        // No cap, so more than the old 250-byte figure commits; every commit
+        // is counted exactly once.
+        assert!(successes > 2, "only {successes} concurrent debits committed");
+        assert_eq!(used(&database).await?, 100 * successes);
         reserve_transfer(&database, NOW, 50, &limits(250)).await?;
-        assert!(
-            reserve_transfer(&database, NOW, 1, &limits(250))
-                .await
-                .is_err()
-        );
+        assert_eq!(used(&database).await?, 100 * successes + 50);
         Ok(())
     }
 
@@ -361,11 +349,6 @@ mod tests {
         initialize(&database).await?;
         assert!(
             reserve_transfer(&database, NOW, 0, &limits(150))
-                .await
-                .is_err()
-        );
-        assert!(
-            reserve_transfer(&database, NOW, 151, &limits(150))
                 .await
                 .is_err()
         );
@@ -461,25 +444,20 @@ mod tests {
                 reserve_transfer(&independent, NOW, 100, &limits(250)).await
             }));
         }
-        let mut successes = 0;
+        let mut successes: u64 = 0;
         for task in tasks {
             if task.await?.is_ok() {
                 successes += 1;
             }
         }
-        assert_eq!(successes, 2);
-        assert_eq!(used(&database).await?, 200);
+        assert!(successes > 2, "only {successes} concurrent debits committed");
+        assert_eq!(used(&database).await?, 100 * successes);
         database.pool.close().await;
         let restarted = Database::connect(&config).await?;
         restarted.run_migrations().await?;
-        assert_eq!(used(&restarted).await?, 200);
-        assert!(
-            reserve_transfer(&restarted, NOW, 51, &limits(250))
-                .await
-                .is_err()
-        );
-        let final_debit = reserve_transfer(&restarted, NOW, 50, &limits(250)).await?;
-        assert_eq!(final_debit.remaining_after(), 0);
+        assert_eq!(used(&restarted).await?, 100 * successes);
+        reserve_transfer(&restarted, NOW, 51, &limits(250)).await?;
+        assert_eq!(used(&restarted).await?, 100 * successes + 51);
         assert!(
             reserve_transfer(&restarted, NOW - 1000, 1, &limits(250))
                 .await

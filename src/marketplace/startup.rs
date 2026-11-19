@@ -503,11 +503,6 @@ async fn prepare_vpn(
         preferences::load_internal(database).await?.revision > 0,
         "marketplace owner setup is required before startup"
     );
-    ensure!(
-        available_transfer(database, now()?, &profile.limits).await?
-            >= BOOTSTRAP_PROBE_BYTES + INITIAL_WORKER_BYTES,
-        "marketplace startup allowance is unavailable"
-    );
     if let Provider::SavedWireguard { profile_id } = &profile.provider {
         return saved_wireguard::resolve(database, manager, profile_id, &profile.limits).await;
     }
