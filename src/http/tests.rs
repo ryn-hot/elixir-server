@@ -2790,56 +2790,6 @@ async fn start_mock_radarr_server()
     Ok((host, addr, state, shutdown_tx))
 }
 
-async fn start_mock_prowlarr_indexer_server(
-    indexer_names: Vec<&'static str>,
-) -> Result<(String, SocketAddr, oneshot::Sender<()>)> {
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let addr = listener.local_addr()?;
-    let host = discover_test_host_ip()?;
-    let names = Arc::new(
-        indexer_names
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-    );
-
-    let app = Router::new().route(
-        "/api/v1/indexer",
-        get({
-            let names = Arc::clone(&names);
-            move || {
-                let names = Arc::clone(&names);
-                async move {
-                    Json(Value::Array(
-                        names.iter().map(|name| json!({ "name": name })).collect(),
-                    ))
-                }
-            }
-        }),
-    );
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
-
-    let ready_url = format!("http://{}:{}/api/v1/indexer", host, addr.port());
-    for _ in 0..20 {
-        if let Ok(response) = reqwest::get(&ready_url).await {
-            if response.status().is_success() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-
-    Ok((host, addr, shutdown_tx))
-}
-
 async fn start_mock_prowlarr_control_server(
     indexers: Vec<Value>,
     applications: Vec<Value>,
@@ -6760,7 +6710,8 @@ async fn extension_status_summary_auto_provisions_missing_zero_config_instance()
                 "provides": [{
                     "capability": "acquisition.candidate_provider",
                     "slot": "torrentio",
-                    "implementation": "torrentio"
+                    "implementation": "torrentio",
+                    "scope": { "actions": ["search"] }
                 }],
                 "runtime": {
                     "type": "container",
@@ -7774,14 +7725,22 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
         metadata,
         linkers,
         artwork,
-        secrets.clone(),
+        secrets,
     ));
 
-    let (host, addr, shutdown_tx) = start_mock_prowlarr_indexer_server(vec![]).await?;
+    // Prowlarr is an Arr Stack member, read through the stack's own code; its
+    // indexer list has none of the connector's indexers yet.
+    let stack = stack_stand_in(|_member: &str, operation: &str, _request: &Value| {
+        Ok(match operation {
+            "indexer_names" | "indexer_proxy_names" => json!({ "names": [] }),
+            other => anyhow::bail!("the stand-in Prowlarr has no {other}"),
+        })
+    });
+    let prowlarr_member = crate::marketplace::stack::derived_id(&stack, "prowlarr");
     let store = ExtensionStore::new(&db_pool);
     store
         .upsert_extension(&NewExtension {
-            extension_id: "elixir.modules.prowlarr".to_string(),
+            extension_id: prowlarr_member.clone(),
             name: "Prowlarr".to_string(),
             version: "1.0.0".to_string(),
             kind: ExtensionKind::Module,
@@ -7789,7 +7748,7 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
             signing_key_id: None,
             trust_level: ExtensionTrustLevel::Community,
             manifest_json: json!({
-                "id": "elixir.modules.prowlarr",
+                "id": prowlarr_member,
                 "version": "1.0.0",
                 "kind": "module",
                 "name": "Prowlarr",
@@ -7807,7 +7766,7 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
     store
         .create_instance(&NewExtensionInstance {
             instance_id,
-            extension_id: "elixir.modules.prowlarr".to_string(),
+            extension_id: prowlarr_member.clone(),
             instance_name: "default".to_string(),
             config_json: None,
             enabled: true,
@@ -7822,24 +7781,8 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
             cardinality: SlotCardinality::One,
             implementation: Some("prowlarr".to_string()),
             scope_json: None,
-            endpoint_json: Some(serde_json::to_value(ProviderEndpoint::new(
-                "http".to_string(),
-                host,
-                addr.port(),
-                Some("/".to_string()),
-                None,
-            )?)?),
+            endpoint_json: None,
             health_state: ProviderHealthState::Healthy,
-        })
-        .await?;
-    store
-        .upsert_secret(&NewSecret {
-            secret_id: Uuid::new_v4(),
-            scope: SecretScope::Instance,
-            scope_id: Some(instance_id),
-            key: "api_key".to_string(),
-            value_encrypted: secrets.encrypt("test-api-key")?,
-            rotatable: false,
         })
         .await?;
     store
@@ -7929,8 +7872,6 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
             .contains("AnimeTosho"),
         "expected missing downstream description: {connector}"
     );
-
-    let _ = shutdown_tx.send(());
     Ok(())
 }
 
