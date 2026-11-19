@@ -198,6 +198,23 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = debrid::ensure_debrid_builtin(&state).await {
         tracing::warn!("debrid provider bootstrap failed: {err}");
     }
+    // Before any downloader starts, so they come up behind WARP.
+    match elixir_server::network::protection::enable_default_download_protection(
+        &state.settings,
+        &state.db_pool,
+        &state.secrets,
+    )
+    .await
+    {
+        Ok(Some(profile_id)) => {
+            tracing::info!(
+                profile_id,
+                "turned on default Cloudflare WARP download protection"
+            )
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("default download protection setup failed: {err:#}"),
+    }
 
     let reconcile_config = ReconcileConfig::from_settings(&settings);
     if let Err(err) = state

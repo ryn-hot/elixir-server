@@ -367,7 +367,6 @@ pub struct CloudflareWarpDisclosure {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudflareWarpProfileRequest {
-    pub accepted_disclosure: bool,
     #[serde(default)]
     pub profile_id: Option<String>,
     #[serde(default)]
@@ -432,8 +431,6 @@ pub enum DownloadProtectionFirstRunChoice {
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProtectionFirstRunRequest {
     pub choice: DownloadProtectionFirstRunChoice,
-    #[serde(default)]
-    pub accepted_warp_disclosure: bool,
     #[serde(default = "default_true")]
     pub apply: bool,
 }
@@ -845,7 +842,6 @@ where
                 pool,
                 secrets,
                 CloudflareWarpProfileRequest {
-                    accepted_disclosure: request.accepted_warp_disclosure,
                     profile_id: None,
                     name: None,
                 },
@@ -2333,10 +2329,6 @@ pub async fn ensure_cloudflare_warp_profile(
     secrets: &SecretsManager,
     request: CloudflareWarpProfileRequest,
 ) -> Result<CloudflareWarpProfileResponse> {
-    if !request.accepted_disclosure {
-        bail!("Cloudflare WARP disclosure must be accepted before creating a WARP profile");
-    }
-
     let profile_id = request
         .profile_id
         .as_deref()
@@ -2385,6 +2377,87 @@ pub async fn ensure_cloudflare_warp_profile(
         checks,
         blocker,
     })
+}
+
+/// Elixir's managed downloaders are protected by Cloudflare WARP from the
+/// first start, with nothing to opt into. This turns WARP on when no
+/// downloader protection is active yet. A server already using something
+/// (WARP, an imported VPN, an existing stack, or skipped downloads) keeps
+/// it, and so does an older `network.vpn` WireGuard setup whose config is
+/// saved. Returns the profile it turned on, if any.
+///
+/// Runs at startup before any downloader starts, so downloaders come up
+/// behind WARP and are blocked, never direct, while it is unavailable.
+pub async fn enable_default_download_protection(
+    settings: &Settings,
+    pool: &AnyPool,
+    secrets: &SecretsManager,
+) -> Result<Option<String>> {
+    let active: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM download_network_profiles WHERE active = TRUE AND scope NOT IN ('marketplace_http', 'marketplace_network') LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("checking for active downloader protection")?;
+    if active.is_some() {
+        return Ok(None);
+    }
+
+    let vpn = &settings.network.vpn;
+    if vpn.enabled && (vpn.auto_wrap_qbittorrent || vpn.auto_wrap_nzbget) {
+        let store = ExtensionStore::new(pool);
+        let inventory = ManagedDownloaderInventory::from_store(
+            &store.list_instances(None).await?,
+            &store.list_providers(None).await?,
+        );
+        let saved = check_wireguard_secret(
+            &store,
+            secrets,
+            &vpn.wireguard_config_secret,
+            inventory.protected_instance_ids(vpn.auto_wrap_qbittorrent, vpn.auto_wrap_nzbget),
+        )
+        .await?;
+        if matches!(saved, SecretCheck::Present) {
+            return Ok(None);
+        }
+    }
+
+    let warp = ensure_cloudflare_warp_profile(
+        pool,
+        secrets,
+        CloudflareWarpProfileRequest {
+            profile_id: None,
+            name: None,
+        },
+    )
+    .await?;
+    let profile = load_download_network_profile(pool, &warp.profile.id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "Cloudflare WARP profile '{}' was not readable",
+                warp.profile.id
+            )
+        })?;
+    activate_download_network_profile(pool, &profile).await?;
+    upsert_default_download_routes(
+        pool,
+        DownloadBrokerBindingKind::ManagedProtected,
+        Some(profile.id.clone()),
+    )
+    .await?;
+    record_download_network_event(
+        pool,
+        Some(profile.id.as_str()),
+        "default_protection",
+        "enabled",
+        &serde_json::json!({
+            "profileId": profile.id,
+            "reason": "No downloader protection was active, so Cloudflare WARP was turned on."
+        }),
+    )
+    .await?;
+    Ok(Some(profile.id))
 }
 
 async fn status_from_legacy_config(
@@ -4939,7 +5012,6 @@ pub async fn reset_cloudflare_warp_profile(
             pool,
             secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: Some(profile_id.to_string()),
                 name: None,
             },
@@ -6262,6 +6334,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fresh_server_turns_on_warp_download_protection_by_itself() -> Result<()> {
+        let settings = test_settings(VpnConfig::default());
+        let database = test_database().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_qbittorrent_instance(&store).await?;
+        let secrets = SecretsManager::from_key_bytes([61_u8; 32], true);
+
+        let enabled =
+            enable_default_download_protection(&settings, &database.pool, &secrets).await?;
+
+        assert_eq!(enabled.as_deref(), Some(CLOUDFLARE_WARP_PROFILE_ID));
+        assert_eq!(active_profile_count(&database.pool).await?, 1);
+        assert!(matches!(
+            active_managed_downloader_runtime(&database.pool).await?,
+            ActiveManagedDownloaderRuntime::CloudflareWarp { .. }
+        ));
+        let routes = list_acquisition_routes(&database.pool, &store).await?;
+        for logical_id in [TORRENT_DEFAULT_LOGICAL_ID, USENET_DEFAULT_LOGICAL_ID] {
+            let route = routes
+                .routes
+                .iter()
+                .find(|route| route.logical_id == logical_id && route.owner_id == "default")
+                .expect("default route");
+            assert_eq!(
+                route.binding_kind,
+                DownloadBrokerBindingKind::ManagedProtected
+            );
+            assert_eq!(
+                route.profile_id.as_deref(),
+                Some(CLOUDFLARE_WARP_PROFILE_ID)
+            );
+        }
+        let status =
+            observed_download_protection_status(&settings, &database.pool, &secrets).await?;
+        assert_eq!(status.mode, DownloadProtectionMode::CloudflareWarp);
+
+        // Later starts leave it as it is.
+        assert_eq!(
+            enable_default_download_protection(&settings, &database.pool, &secrets).await?,
+            None
+        );
+        assert_eq!(active_profile_count(&database.pool).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_warp_leaves_a_chosen_download_option_alone() -> Result<()> {
+        let settings = test_settings(VpnConfig::default());
+        let database = test_database().await?;
+        let secrets = SecretsManager::from_key_bytes([62_u8; 32], true);
+        apply_download_protection_first_run_choice_with_orchestrated_apply(
+            &settings,
+            &database.pool,
+            &secrets,
+            DownloadProtectionFirstRunRequest {
+                choice: DownloadProtectionFirstRunChoice::ExistingStack,
+                apply: true,
+            },
+            || async { Ok(()) },
+            || async { Ok(test_runtime_evidence_pass()) },
+        )
+        .await?;
+
+        assert_eq!(
+            enable_default_download_protection(&settings, &database.pool, &secrets).await?,
+            None
+        );
+        let status =
+            observed_download_protection_status(&settings, &database.pool, &secrets).await?;
+        assert_eq!(status.mode, DownloadProtectionMode::ExternalOnly);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_warp_keeps_a_saved_legacy_wireguard_setup_but_not_a_missing_one() -> Result<()>
+    {
+        let settings = test_settings(VpnConfig {
+            enabled: true,
+            ..VpnConfig::default()
+        });
+        let secrets = SecretsManager::from_key_bytes([63_u8; 32], true);
+
+        let saved = test_database().await?;
+        let store = ExtensionStore::new(&saved.pool);
+        insert_global_secret(&store, &secrets, "wireguard_config", "[Interface]").await?;
+        assert_eq!(
+            enable_default_download_protection(&settings, &saved.pool, &secrets).await?,
+            None
+        );
+        assert_eq!(active_profile_count(&saved.pool).await?, 0);
+
+        let missing = test_database().await?;
+        assert_eq!(
+            enable_default_download_protection(&settings, &missing.pool, &secrets)
+                .await?
+                .as_deref(),
+            Some(CLOUDFLARE_WARP_PROFILE_ID)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_egress_projects_only_an_active_strict_protected_builtin_profile() -> Result<()> {
         let database = test_database().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -6830,7 +7004,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7030,7 +7203,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7121,7 +7293,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7472,28 +7643,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warp_profile_requires_disclosure_acceptance() -> Result<()> {
-        let database = test_database().await?;
-        let secrets = SecretsManager::from_key_bytes([6u8; 32], true);
-
-        let err = ensure_cloudflare_warp_profile(
-            &database.pool,
-            &secrets,
-            CloudflareWarpProfileRequest {
-                accepted_disclosure: false,
-                profile_id: None,
-                name: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err.to_string().contains("disclosure must be accepted"));
-        assert_eq!(active_profile_count(&database.pool).await?, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn warp_profile_creation_stores_per_server_identity_and_blocks_runtime() -> Result<()> {
         let database = test_database().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -7503,7 +7652,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7564,7 +7712,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7620,7 +7767,6 @@ mod tests {
             &secrets,
             DownloadProtectionFirstRunRequest {
                 choice: DownloadProtectionFirstRunChoice::ProtectedDownloads,
-                accepted_warp_disclosure: true,
                 apply: true,
             },
             || async {
@@ -7668,32 +7814,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_run_protected_downloads_requires_warp_disclosure() -> Result<()> {
-        let settings = test_settings(VpnConfig::default());
-        let database = test_database().await?;
-        let secrets = SecretsManager::from_key_bytes([27u8; 32], true);
-
-        let err = apply_download_protection_first_run_choice_with_orchestrated_apply(
-            &settings,
-            &database.pool,
-            &secrets,
-            DownloadProtectionFirstRunRequest {
-                choice: DownloadProtectionFirstRunChoice::ProtectedDownloads,
-                accepted_warp_disclosure: false,
-                apply: true,
-            },
-            || async { Ok(()) },
-            || async { Ok(test_runtime_evidence_pass()) },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err.to_string().contains("disclosure must be accepted"));
-        assert_eq!(active_profile_count(&database.pool).await?, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn first_run_existing_stack_sets_external_routes_and_profile() -> Result<()> {
         let settings = test_settings(VpnConfig::default());
         let database = test_database().await?;
@@ -7705,7 +7825,6 @@ mod tests {
             &secrets,
             DownloadProtectionFirstRunRequest {
                 choice: DownloadProtectionFirstRunChoice::ExistingStack,
-                accepted_warp_disclosure: false,
                 apply: true,
             },
             || async { Ok(()) },
@@ -7754,7 +7873,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },
@@ -7774,7 +7892,6 @@ mod tests {
             &secrets,
             DownloadProtectionFirstRunRequest {
                 choice: DownloadProtectionFirstRunChoice::ExistingStack,
-                accepted_warp_disclosure: false,
                 apply: true,
             },
             move || {
@@ -7834,7 +7951,6 @@ mod tests {
             &secrets,
             DownloadProtectionFirstRunRequest {
                 choice: DownloadProtectionFirstRunChoice::SkipDownloads,
-                accepted_warp_disclosure: false,
                 apply: true,
             },
             || async { Ok(()) },
@@ -7878,7 +7994,6 @@ mod tests {
             &secrets,
             DownloadProtectionFirstRunRequest {
                 choice: DownloadProtectionFirstRunChoice::CustomVpn,
-                accepted_warp_disclosure: false,
                 apply: true,
             },
             || async { Ok(()) },
@@ -7910,7 +8025,6 @@ mod tests {
             &database.pool,
             &secrets,
             CloudflareWarpProfileRequest {
-                accepted_disclosure: true,
                 profile_id: None,
                 name: None,
             },

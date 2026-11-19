@@ -150,9 +150,7 @@ pub async fn first_run_setup(
     .await
     .map_err(|err| {
         let message = err.to_string();
-        if message.contains("disclosure must be accepted") {
-            ApiError::bad_request(message)
-        } else if message.contains("not found") {
+        if message.contains("not found") {
             ApiError::not_found(message)
         } else {
             ApiError::internal(message)
@@ -289,14 +287,7 @@ pub async fn ensure_warp_profile(
 ) -> ApiResult<Json<CloudflareWarpProfileResponse>> {
     let response = ensure_cloudflare_warp_profile(&state.db_pool, &state.secrets, request)
         .await
-        .map_err(|err| {
-            let message = err.to_string();
-            if message.contains("disclosure must be accepted") {
-                ApiError::bad_request(message)
-            } else {
-                ApiError::internal(message)
-            }
-        })?;
+        .map_err(|err| ApiError::internal(err.to_string()))?;
     Ok(Json(response))
 }
 
