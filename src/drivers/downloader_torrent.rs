@@ -1407,6 +1407,19 @@ fn qbittorrent_host_header(username: &str, endpoint: &Url, transport: &Url) -> O
     })
 }
 
+/// The Host header for a request to qBittorrent at `endpoint_url` sent through
+/// `transport_url`: the one the driver signs in with. qBittorrent checks it on
+/// every request, so requests after sign-in must carry it too.
+pub(crate) fn qbittorrent_request_host_header(
+    username: &str,
+    endpoint_url: &str,
+    transport_url: &str,
+) -> Option<String> {
+    let endpoint = Url::parse(endpoint_url).ok()?;
+    let transport = Url::parse(transport_url).ok()?;
+    qbittorrent_host_header(username, &endpoint, &transport)
+}
+
 fn ensure_same_origin(candidate: &Url, endpoint: &Url) -> Result<()> {
     let candidate_host = candidate
         .host_str()

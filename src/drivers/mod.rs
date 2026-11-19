@@ -11,9 +11,11 @@ pub(crate) use downloader_nzb::{
     NzbgetPauseSnapshot, pause_nzbget_for_rehome, resume_nzbget_after_rehome,
 };
 pub use downloader_torrent::DownloaderTorrentDriver;
-pub(crate) use downloader_torrent::bootstrap_qbittorrent_session_cookie;
 pub(crate) use downloader_torrent::{
     QbittorrentPauseSnapshot, pause_qbittorrent_for_rehome, resume_qbittorrent_after_rehome,
+};
+pub(crate) use downloader_torrent::{
+    bootstrap_qbittorrent_session_cookie, qbittorrent_request_host_header,
 };
 pub use driver_trait::{
     ActivitySnapshot, AddMediaOptions, AddMediaRequest, AddMediaResult, ApplyResult, ApplyStatus,

@@ -41,7 +41,9 @@ use crate::debrid::{
     DEBRID_EXTENSION_ID, DebridServiceKind, LEGACY_REAL_DEBRID_EXTENSION_ID,
     active_debrid_service_from_config, debrid_secret_exists_for_instance, is_debrid_extension_id,
 };
-use crate::drivers::{IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie};
+use crate::drivers::{
+    IndexerRegistryPatch, bootstrap_qbittorrent_session_cookie, qbittorrent_request_host_header,
+};
 use crate::extensions::account_setup::{AccountSetupSessionError, AccountSetupState};
 use crate::extensions::auto_managed::filter_auto_managed_runtime_missing;
 use crate::extensions::cloudstream_registry::{
@@ -5247,7 +5249,6 @@ impl ExtensionControlBinding {
             _ => None,
         }
     }
-
 }
 
 async fn build_extension_control_surface(
@@ -7975,7 +7976,6 @@ async fn resolve_extension_ui_proxy_target(
     let implementation = provider.implementation.unwrap_or_default();
     let implementation_key = implementation.trim().to_ascii_lowercase();
     let canonical_url = endpoint.canonical_url()?;
-    let host_header = extension_ui_proxy_host_header(&canonical_url, &base_url);
 
     // A marketplace stack member: its stack's code says how to sign in to its
     // page; the server knows no application here.
@@ -7998,6 +7998,7 @@ async fn resolve_extension_ui_proxy_target(
             }
             None => ExtensionUiUpstreamAuth::None,
         };
+        let host_header = proxy_request_host_header(&canonical_url, &base_url, &upstream_auth);
         return Ok(ExtensionUiProxyTarget {
             instance_id,
             endpoint_url: canonical_url,
@@ -8043,6 +8044,7 @@ async fn resolve_extension_ui_proxy_target(
         },
         _ => ExtensionUiUpstreamAuth::None,
     };
+    let host_header = proxy_request_host_header(&canonical_url, &base_url, &upstream_auth);
 
     Ok(ExtensionUiProxyTarget {
         instance_id,
@@ -8348,6 +8350,23 @@ fn extension_ui_proxy_host_header(canonical_url: &str, transport_url: &str) -> O
         return None;
     }
     Some(format!("{canonical_host}:{canonical_port}"))
+}
+
+/// The Host header for proxied requests to an app. A qBittorrent session gets
+/// the one Elixir signs in with: qBittorrent rejects any request whose Host
+/// names a port other than its own, which a host-published loopback address
+/// (a server running outside Docker) otherwise would.
+fn proxy_request_host_header(
+    canonical_url: &str,
+    transport_url: &str,
+    upstream_auth: &ExtensionUiUpstreamAuth,
+) -> Option<String> {
+    match upstream_auth {
+        ExtensionUiUpstreamAuth::QbittorrentSession { username, .. } => {
+            qbittorrent_request_host_header(username, canonical_url, transport_url)
+        }
+        _ => extension_ui_proxy_host_header(canonical_url, transport_url),
+    }
 }
 
 fn build_extension_ui_request_headers(
@@ -9898,10 +9917,53 @@ async fn fetch_registry_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_prowlarr_proxy_cleanup_from_manifest, missing_required_connector_targets};
+    use super::{
+        ExtensionUiUpstreamAuth, managed_prowlarr_proxy_cleanup_from_manifest,
+        missing_required_connector_targets, proxy_request_host_header,
+    };
     use crate::extensions::manifest::ExtensionManifest;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn proxied_qbittorrent_requests_name_its_own_webui_port() {
+        // A server outside Docker reaches the built-in qBittorrent on a
+        // host-published loopback port, and qBittorrent rejects (401) any
+        // request whose Host names a port other than its own.
+        let published = "http://127.0.0.1:55002/";
+        let qbittorrent = ExtensionUiUpstreamAuth::QbittorrentSession {
+            username: "elixir_test".to_string(),
+            password: "unused".to_string(),
+        };
+        assert_eq!(
+            proxy_request_host_header(published, published, &qbittorrent).as_deref(),
+            Some("localhost:8080")
+        );
+        // Reached on another address, it still names the provider's own.
+        assert_eq!(
+            proxy_request_host_header("http://svc-qbittorrent:8080/", published, &qbittorrent)
+                .as_deref(),
+            Some("svc-qbittorrent:8080")
+        );
+        // A qBittorrent Elixir did not set up keeps the address it was given.
+        let external = ExtensionUiUpstreamAuth::QbittorrentSession {
+            username: "admin".to_string(),
+            password: "unused".to_string(),
+        };
+        assert_eq!(
+            proxy_request_host_header(published, published, &external),
+            None
+        );
+        // Other apps are unchanged.
+        let nzbget = ExtensionUiUpstreamAuth::BasicAuth {
+            username: "nzbget".to_string(),
+            password: "unused".to_string(),
+        };
+        assert_eq!(
+            proxy_request_host_header(published, published, &nzbget),
+            None
+        );
+    }
 
     #[test]
     fn proxy_cleanup_manifest_extracts_names_and_tags() {
