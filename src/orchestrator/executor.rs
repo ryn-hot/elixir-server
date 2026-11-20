@@ -56,7 +56,7 @@ use crate::network::protection::{
     profile_kind_as_str,
 };
 use crate::orchestrator::model::ProviderEndpoint;
-use crate::orchestrator::naming::{build_aliases, container_name};
+use crate::orchestrator::naming::{build_aliases, container_name, instance_alias};
 use crate::runtime::model::{
     CONTAINER_SPEC_HASH_LABEL, CONTAINER_USER_ENV, CONTAINER_USER_LABEL, ContainerHandle,
     ContainerRuntimeMount, ContainerRuntimeState, ContainerSecurityOptions, ContainerSpec,
@@ -2413,9 +2413,10 @@ impl<'a> Executor<'a> {
         if let Some(setup) = stack_setup {
             let semantics = super::stack_setup::patch_semantics(&patch);
             let patch = patch.to_json()?;
-            // Its network identity as its peers reach it (a host-published
-            // endpoint is only the server's loopback view), as drivers get it.
-            let provider_url = peer_facing_endpoint(&self.store, &provider, &instance, &endpoint)
+            // Its address as its peers reach it (where they call it back):
+            // its own alias on the container network, never a host-published
+            // loopback port or a name another Elixir server shares.
+            let provider_url = peer_url_endpoint(&self.store, &provider, &instance, &endpoint)
                 .await?
                 .canonical_url()?;
             let evaluation = setup
@@ -3563,6 +3564,8 @@ async fn resolve_stack_indexer_apps(
             .await?
             .ok_or_else(|| anyhow!("stack member {member} has no instance"))?;
         let aliases = provider_host_aliases(store, &detail, &member_instance, &endpoint).await?;
+        // Not `peer_url_endpoint`: the stack finds an app it registered in
+        // Prowlarr by this URL, so a new host would orphan apps already set up.
         let peer_endpoint =
             peer_facing_endpoint(store, &detail.provider, &member_instance, &endpoint).await?;
         candidates.push((
@@ -3892,7 +3895,7 @@ async fn list_managed_provider_targets(
             })?;
         let aliases = provider_host_aliases(store, &detail, &instance, &endpoint).await?;
         let peer_endpoint =
-            peer_facing_endpoint(store, &detail.provider, &instance, &endpoint).await?;
+            peer_url_endpoint(store, &detail.provider, &instance, &endpoint).await?;
         candidates.push(ManagedProviderTarget {
             provider: detail.provider,
             instance,
@@ -4023,14 +4026,46 @@ async fn peer_facing_endpoint(
     }
 }
 
-async fn provider_host_aliases(
+/// The address Elixir writes into another container's own settings (a
+/// download client in Sonarr/Radarr, where a stack member's peers call it
+/// back). Every Elixir server on a Docker host shares `elixir_net`, and the
+/// names Elixir gives an instance there (`svc-<extension>-<instance>`, a
+/// manifest's `service_name` such as `elx-qbittorrent`) are the same on each,
+/// so Docker's DNS can answer with another server's container. The instance's
+/// own `svc-<short id>` alias is unique on the host and moves to a VPN gateway
+/// with the others, so a managed instance is named by it. Any other host (an
+/// external provider) is kept.
+async fn peer_url_endpoint(
     store: &ExtensionStore<'_>,
-    detail: &ProviderDetails,
+    provider: &Provider,
     instance: &crate::db::models::ExtensionInstance,
     endpoint: &ProviderEndpoint,
-) -> Result<Vec<String>> {
-    let extension = store.get_extension(&detail.extension_id).await?;
-    let service_name = extension.and_then(|extension| {
+) -> Result<ProviderEndpoint> {
+    let mut peer = peer_facing_endpoint(store, provider, instance, endpoint).await?;
+    if !endpoint_uses_container_network(&peer) {
+        return Ok(peer);
+    }
+    let (aliases, _) = build_aliases(
+        &instance.extension_id,
+        &instance.instance_name,
+        instance.instance_id,
+        manifest_service_name(store, &instance.extension_id).await?,
+    );
+    if aliases
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(peer.host.trim()))
+    {
+        peer.host = instance_alias(instance.instance_id);
+    }
+    Ok(peer)
+}
+
+async fn manifest_service_name(
+    store: &ExtensionStore<'_>,
+    extension_id: &str,
+) -> Result<Option<String>> {
+    let extension = store.get_extension(extension_id).await?;
+    Ok(extension.and_then(|extension| {
         serde_json::from_value::<ExtensionManifest>(extension.manifest_json)
             .ok()
             .and_then(|manifest| {
@@ -4040,7 +4075,16 @@ async fn provider_host_aliases(
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
             })
-    });
+    }))
+}
+
+async fn provider_host_aliases(
+    store: &ExtensionStore<'_>,
+    detail: &ProviderDetails,
+    instance: &crate::db::models::ExtensionInstance,
+    endpoint: &ProviderEndpoint,
+) -> Result<Vec<String>> {
+    let service_name = manifest_service_name(store, &detail.extension_id).await?;
     let (computed_aliases, _) = build_aliases(
         &detail.extension_id,
         &instance.instance_name,
@@ -10147,6 +10191,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_urls_name_a_managed_instance_by_its_own_alias() -> Result<()> {
+        // Another Elixir server on the same Docker host gives its NZBGet the
+        // same `elx-nzbget` and `svc-elixir-modules-nzbget-default` names on
+        // the shared network, so an address handed to Sonarr must not use them.
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(
+            &store,
+            "elixir.modules.nzbget",
+            json!({
+                "id": "elixir.modules.nzbget",
+                "version": "1.0.0",
+                "kind": "module",
+                "name": "NZBGet",
+                "provides": [{
+                    "capability": "downloader.nzb",
+                    "slot": "default",
+                    "implementation": "nzbget"
+                }],
+                "runtime": {
+                    "type": "container",
+                    "image": "example/nzbget:latest",
+                    "service_name": "elx-nzbget"
+                },
+                "networking": {
+                    "service_port": { "scheme": "http", "container_port": 6789 }
+                }
+            }),
+        )
+        .await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let instance = store.get_instance(instance_id).await?.expect("instance");
+        let provider_id = Uuid::new_v4();
+        store
+            .upsert_provider(&NewProvider {
+                provider_id,
+                instance_id,
+                capability: "downloader.nzb".to_string(),
+                slot_id: "default".to_string(),
+                cardinality: SlotCardinality::One,
+                implementation: Some("nzbget".to_string()),
+                scope_json: None,
+                endpoint_json: None,
+                health_state: ProviderHealthState::Healthy,
+            })
+            .await?;
+        let provider = store.get_provider(provider_id).await?.expect("provider");
+        let own = format!("http://{}:6789/", instance_alias(instance_id));
+        assert!(own.starts_with("http://svc-") && own.len() == "http://svc-123456:6789/".len());
+
+        let endpoint = |host: &str, port: u16, network: Option<&str>| {
+            ProviderEndpoint::new(
+                "http".to_string(),
+                host.to_string(),
+                port,
+                None,
+                network.map(str::to_string),
+            )
+        };
+        let peer_url = |endpoint: ProviderEndpoint| {
+            let store = &store;
+            let provider = &provider;
+            let instance = &instance;
+            async move {
+                peer_url_endpoint(store, provider, instance, &endpoint)
+                    .await?
+                    .canonical_url()
+            }
+        };
+        // Elixir's shared names for it, on the container network.
+        for host in [
+            "svc-elixir-modules-nzbget-default",
+            "elx-nzbget",
+            "ELX-NZBGET",
+        ] {
+            assert_eq!(
+                peer_url(endpoint(host, 6789, Some("elixir_net"))?).await?,
+                own,
+                "{host}"
+            );
+        }
+        // A server outside Docker stores a host-published loopback port; peers
+        // get the container-network address, under the instance's own alias.
+        assert_eq!(
+            peer_url(endpoint(
+                "127.0.0.1",
+                32_914,
+                Some(crate::orchestrator::model::HOST_RUNTIME_NETWORK)
+            )?)
+            .await?,
+            own
+        );
+        // An address Elixir did not name stays as it is.
+        assert_eq!(
+            peer_url(endpoint("nzbget.example", 6789, Some("elixir_net"))?).await?,
+            "http://nzbget.example:6789/"
+        );
+        assert_eq!(
+            peer_url(endpoint("192.168.1.5", 6789, None)?).await?,
+            "http://192.168.1.5:6789/"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resolve_downloader_credentials_injects_nzbget_settings() -> Result<()> {
         let database = setup_db().await?;
         let store = ExtensionStore::new(&database.pool);
@@ -10231,10 +10389,14 @@ mod tests {
             panic!("expected media manager tv patch");
         };
         let downloader = downloaders.first().expect("nzbget downloader");
+        let own_alias = ProviderEndpoint {
+            host: instance_alias(instance_id),
+            ..endpoint.clone()
+        };
         assert_eq!(
             downloader.url,
-            endpoint.canonical_url()?,
-            "expected legacy downloader host to be rewritten to canonical provider url"
+            own_alias.canonical_url()?,
+            "expected the downloader host to be rewritten to the instance's own alias"
         );
         let username = downloader
             .settings
