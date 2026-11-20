@@ -37,38 +37,11 @@ async fn native_http_arr_stack_one_click_on_a_clean_server() -> Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
     }
     std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o555))?;
+    // Only the library root, as main.rs creates it at startup. The server makes
+    // the apps' media folders and the downloads folder itself, and on Linux
+    // the apps and the built-in downloaders run as this server's user.
     let media = directory.join("media");
-    for dir in [
-        media.join("tv"),
-        media.join("movies"),
-        directory.join("downloads"),
-    ] {
-        std::fs::create_dir_all(dir)?;
-    }
-    // The apps run as their images' own user (911), not as this server's user:
-    // on Linux the media folders must be writable by them. (Docker Desktop on
-    // the Mac does not enforce this; a separate, pre-existing Linux concern.)
-    for dir in [media.join("tv"), media.join("movies")] {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
-    }
-    // The built-in NZBGet's folders, as the server creates them. On Linux the
-    // built-in qBittorrent image takes ownership of the shared downloads
-    // folder when it starts, so a server running as another user can lose the
-    // race to create them (a separate, pre-existing downloader issue).
-    // They stay writable for the downloaders' own users.
-    for folder in [
-        ".incomplete",
-        ".nzb",
-        ".queue",
-        ".tmp",
-        "movies",
-        "tv",
-        "anime",
-    ] {
-        let path = directory.join("downloads").join(folder);
-        std::fs::create_dir_all(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))?;
-    }
+    std::fs::create_dir_all(&media)?;
     let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/bundled");
     let db = database(&directory, None).await?;
     let sqlite_url = format!(

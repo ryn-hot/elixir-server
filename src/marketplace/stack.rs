@@ -240,10 +240,11 @@ pub(crate) fn check_members(stack: &ManifestStack, release_permissions: &[String
                 .ports
                 .iter()
                 .any(|port| port.host.is_some() || port.container == 0)
-            || runtime
-                .env
-                .iter()
-                .any(|env| env.from_secret.is_some() || env.value.is_none())
+            || runtime.env.iter().any(|env| {
+                env.from_secret.is_some()
+                    || env.value.is_none()
+                    || crate::runtime::model::CONTAINER_USER_ENV.contains(&env.name.as_str())
+            })
         {
             bail!(
                 "stack module '{}' selects a runtime control Elixir owns",
@@ -696,6 +697,14 @@ mod tests {
                     s.modules[0].runtime.as_mut().unwrap().env.push(
                         serde_json::from_value(json!({"name": "X", "from_secret": "instance:x"}))
                             .unwrap(),
+                    )
+                }),
+            ),
+            (
+                "container user",
+                Box::new(|s| {
+                    s.modules[0].runtime.as_mut().unwrap().env.push(
+                        serde_json::from_value(json!({"name": "PUID", "value": "0"})).unwrap(),
                     )
                 }),
             ),

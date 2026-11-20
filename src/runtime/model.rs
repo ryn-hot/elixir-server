@@ -7,6 +7,12 @@ pub const ELIXIR_DEPLOYMENT_ID_LABEL: &str = "elixir.deployment_id";
 pub const ELIXIR_EXTENSION_ID_LABEL: &str = "elixir.extension_id";
 pub const ELIXIR_INSTANCE_ID_LABEL: &str = "elixir.instance_id";
 pub const ELIXIR_MANAGED_LABEL: &str = "elixir.managed";
+/// The user (`uid:gid`) a container's app was started as, through
+/// [`CONTAINER_USER_ENV`]. Containers created before Elixir set it carry none.
+pub const CONTAINER_USER_LABEL: &str = "elixir.container_user";
+/// How linuxserver.io-style images choose the user their app runs as. Only
+/// Elixir sets these; without them the images use their own user (911).
+pub const CONTAINER_USER_ENV: [&str; 2] = ["PUID", "PGID"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerSpec {

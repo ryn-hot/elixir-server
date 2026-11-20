@@ -58,10 +58,11 @@ use crate::network::protection::{
 use crate::orchestrator::model::ProviderEndpoint;
 use crate::orchestrator::naming::{build_aliases, container_name};
 use crate::runtime::model::{
-    CONTAINER_SPEC_HASH_LABEL, ContainerHandle, ContainerRuntimeMount, ContainerRuntimeState,
-    ContainerSecurityOptions, ContainerSpec, ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL,
-    ELIXIR_EXTENSION_ID_LABEL, ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, EnvVar, PortMapping,
-    VolumeMount, VolumeMountSourceKind, apply_container_spec_fingerprint,
+    CONTAINER_SPEC_HASH_LABEL, CONTAINER_USER_ENV, CONTAINER_USER_LABEL, ContainerHandle,
+    ContainerRuntimeMount, ContainerRuntimeState, ContainerSecurityOptions, ContainerSpec,
+    ContainerTmpfsMount, ELIXIR_DEPLOYMENT_ID_LABEL, ELIXIR_EXTENSION_ID_LABEL,
+    ELIXIR_INSTANCE_ID_LABEL, ELIXIR_MANAGED_LABEL, EnvVar, PortMapping, VolumeMount,
+    VolumeMountSourceKind, apply_container_spec_fingerprint,
 };
 use crate::runtime::probe::ProbeRunner;
 use crate::runtime::{RuntimeManager, RuntimePaths};
@@ -142,6 +143,8 @@ pub struct Executor<'a> {
     runtime_paths: RuntimePaths,
     runtime_deployment_id: String,
     secrets: &'a SecretsManager,
+    /// The server's own user, when containers should run as it.
+    container_user: Option<ContainerUser>,
     wireguard_gateway_image: String,
     default_wireguard_config_secret: Option<String>,
     default_downloader_profile: DownloaderPerformanceProfile,
@@ -239,10 +242,52 @@ impl<'a> Executor<'a> {
             runtime_deployment_id: runtime_paths.deployment_id(),
             runtime_paths,
             secrets,
+            container_user: server_container_user(),
             wireguard_gateway_image: "qmcgaw/gluetun:v3.39.0".to_string(),
             default_wireguard_config_secret: None,
             default_downloader_profile: DownloaderPerformanceProfile::Balanced,
         }
+    }
+
+    /// Fixes the server's user for tests, whatever the host.
+    #[cfg(test)]
+    fn with_container_user(mut self, user: Option<ContainerUser>) -> Self {
+        self.container_user = user;
+        self
+    }
+
+    /// The user this container's app runs as: always the server's for a
+    /// marketplace stack member, the downloader rule for the built-in
+    /// qBittorrent and NZBGet, and the image's own user for anything else.
+    async fn runtime_container_user(
+        &self,
+        extension_id: &str,
+        container: &str,
+    ) -> Result<Option<ContainerUser>> {
+        if crate::marketplace::stack::is_stack_member_id(extension_id) {
+            return Ok(self.container_user);
+        }
+        if !is_qbittorrent_extension_id(extension_id) && !is_nzbget_extension_id(extension_id) {
+            return Ok(None);
+        }
+        let mut existing = None;
+        for name in [container.to_string(), format!("{container}-rollback")] {
+            if self.runtime.get_container_handle(&name).await?.is_some() {
+                existing = Some(
+                    self.runtime
+                        .describe_container_runtime_state(&name)
+                        .await?
+                        .map(|state| state.labels)
+                        .unwrap_or_default(),
+                );
+                break;
+            }
+        }
+        Ok(downloader_container_user(
+            existing.as_ref(),
+            downloads_owner(Path::new(&self.runtime_paths.downloads_root)),
+            self.container_user,
+        ))
     }
 
     pub fn with_wireguard_gateway_image(mut self, image: impl Into<String>) -> Self {
@@ -785,6 +830,10 @@ impl<'a> Executor<'a> {
         let volumes = prepared_volumes.volumes.clone();
         let runtime_volumes = prepared_volumes.volumes.clone();
         validate_runtime_security_mounts(&runtime.security, &runtime_volumes, &self.runtime_paths)?;
+        let container_user = self.runtime_container_user(&extension_id, &name).await?;
+        if container_user.is_some() {
+            prepare_bind_sources(&runtime_volumes, &self.runtime_paths).await?;
+        }
         if is_nzbget_extension_id(&extension_id) {
             prepare_nzbget_runtime_dirs(&runtime_volumes).await?;
         }
@@ -819,6 +868,9 @@ impl<'a> Executor<'a> {
         };
         if crate::marketplace::stack::is_stack_member_id(&extension_id) {
             apply_stack_sandbox(&mut spec, stack_member_memory_mb().await);
+        }
+        if let Some(user) = container_user {
+            apply_container_user(&mut spec, user);
         }
 
         let resolved_egress = self
@@ -5828,6 +5880,131 @@ fn apply_stack_sandbox(spec: &mut ContainerSpec, memory_mb: u64) {
     }
 }
 
+/// The user a linuxserver.io-style container runs its app as (`PUID`/`PGID`).
+/// Without one, those images use their own user (911): on a Linux server that
+/// runs as an ordinary user, the app then cannot write the server's media
+/// folders, and the downloaders take the shared downloads folder away from the
+/// server when they start (they chown it to their user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContainerUser {
+    uid: u32,
+    gid: u32,
+}
+
+/// Linux servers that run as an ordinary user run these containers as
+/// themselves. Docker Desktop on macOS does not enforce folder ownership, and
+/// a server running as root keeps the images' own user, as before.
+fn container_user_for(linux: bool, uid: u32, gid: u32) -> Option<ContainerUser> {
+    (linux && uid != 0).then_some(ContainerUser { uid, gid })
+}
+
+fn server_container_user() -> Option<ContainerUser> {
+    container_user_for(
+        cfg!(target_os = "linux"),
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+    )
+}
+
+fn container_user_label(labels: &HashMap<String, String>) -> Option<ContainerUser> {
+    let (uid, gid) = labels.get(CONTAINER_USER_LABEL)?.split_once(':')?;
+    Some(ContainerUser {
+        uid: uid.parse().ok()?,
+        gid: gid.parse().ok()?,
+    })
+}
+
+/// Runs the container's app as `user`, replacing any value from a manifest,
+/// and records the user on the container.
+fn apply_container_user(spec: &mut ContainerSpec, user: ContainerUser) {
+    spec.env
+        .retain(|env| !CONTAINER_USER_ENV.contains(&env.name.as_str()));
+    for (name, value) in CONTAINER_USER_ENV.iter().zip([user.uid, user.gid]) {
+        spec.env.push(EnvVar {
+            name: (*name).to_string(),
+            value: value.to_string(),
+        });
+    }
+    spec.labels.insert(
+        CONTAINER_USER_LABEL.to_string(),
+        format!("{}:{}", user.uid, user.gid),
+    );
+}
+
+/// Who owns the shared downloads folder, as far as the server can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadsOwner {
+    Missing,
+    Uid(u32),
+    Unreadable,
+}
+
+fn downloads_owner(path: &Path) -> DownloadsOwner {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => DownloadsOwner::Uid(metadata.uid()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DownloadsOwner::Missing,
+        Err(_) => DownloadsOwner::Unreadable,
+    }
+}
+
+/// The user a built-in downloader (qBittorrent, NZBGet) runs as. Existing
+/// installations stay exactly as they are: a downloader whose container exists
+/// keeps the user that container was created with (the images' own user for
+/// containers from before this rule). A downloader without a container takes
+/// the server's user only while the shared downloads folder is the server's or
+/// does not exist yet, so one added beside downloaders that already run as the
+/// images' user joins them instead of fighting over the folder. The
+/// downloaders chown that folder to their user on every start, which keeps
+/// the choice stable.
+fn downloader_container_user(
+    existing_container: Option<&HashMap<String, String>>,
+    downloads: DownloadsOwner,
+    server: Option<ContainerUser>,
+) -> Option<ContainerUser> {
+    if let Some(labels) = existing_container {
+        return container_user_label(labels);
+    }
+    let server = server?;
+    match downloads {
+        DownloadsOwner::Missing => Some(server),
+        DownloadsOwner::Uid(uid) if uid == server.uid => Some(server),
+        DownloadsOwner::Uid(_) | DownloadsOwner::Unreadable => None,
+    }
+}
+
+/// Creates a container's missing media and downloads folders as the server,
+/// so Docker does not create them as root when the container starts. Only
+/// folders inside the server's own media and downloads roots are created.
+async fn prepare_bind_sources(volumes: &[VolumeMount], paths: &RuntimePaths) -> Result<()> {
+    // Mount host paths are made absolute against the working directory.
+    let absolute = |path: &str| {
+        let path = Path::new(path);
+        match std::env::current_dir() {
+            Ok(cwd) if !path.is_absolute() => cwd.join(path),
+            _ => path.to_path_buf(),
+        }
+    };
+    let roots = [absolute(&paths.media_root), absolute(&paths.downloads_root)];
+    for volume in volumes
+        .iter()
+        .filter(|volume| volume.source_kind == VolumeMountSourceKind::Bind)
+    {
+        let source = absolute(&volume.host_path);
+        let source = source.as_path();
+        let inside_roots = roots.iter().any(|root| source.starts_with(root))
+            && !source
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir));
+        if inside_roots && !fs::try_exists(source).await? {
+            fs::create_dir_all(source)
+                .await
+                .with_context(|| format!("creating folder {}", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn extension_uses_managed_config_volume(extension_id: &str) -> bool {
     crate::marketplace::stack::is_stack_member_id(extension_id)
         || matches!(
@@ -9367,6 +9544,402 @@ mod tests {
         let password = secrets.decrypt(&password_secret.value_encrypted)?;
         assert_eq!(env_map.get("NZBGET_USER"), Some(&username));
         assert_eq!(env_map.get("NZBGET_PASS"), Some(&password));
+        Ok(())
+    }
+
+    fn this_user() -> ContainerUser {
+        ContainerUser {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        }
+    }
+
+    fn container_user_env(spec: &ContainerSpec) -> Vec<(String, String)> {
+        spec.env
+            .iter()
+            .filter(|env| CONTAINER_USER_ENV.contains(&env.name.as_str()))
+            .map(|env| (env.name.clone(), env.value.clone()))
+            .collect()
+    }
+
+    fn user_env(user: ContainerUser) -> Vec<(String, String)> {
+        vec![
+            ("PUID".to_string(), user.uid.to_string()),
+            ("PGID".to_string(), user.gid.to_string()),
+        ]
+    }
+
+    fn nzbget_runtime_with_downloads() -> ManifestRuntime {
+        let secret = |name: &str, key: &str| ManifestRuntimeEnv {
+            name: name.to_string(),
+            value: None,
+            from_secret: Some(format!("instance:{key}")),
+            optional: false,
+        };
+        ManifestRuntime {
+            r#type: "container".to_string(),
+            image: Some("example/nzbget:latest".to_string()),
+            network: None,
+            service_name: Some("elx-nzbget".to_string()),
+            ports: vec![ManifestRuntimePort {
+                container: 6789,
+                host: None,
+            }],
+            volumes: vec!["{downloads}:/downloads".to_string()],
+            env: vec![
+                secret("NZBGET_USER", "nzbget_username"),
+                secret("NZBGET_PASS", "nzbget_password"),
+            ],
+            egress: None,
+            security: Default::default(),
+        }
+    }
+
+    #[test]
+    fn containers_run_as_the_server_only_on_linux_and_not_as_root() {
+        assert_eq!(
+            container_user_for(true, 1000, 1001),
+            Some(ContainerUser {
+                uid: 1000,
+                gid: 1001
+            })
+        );
+        assert_eq!(container_user_for(true, 0, 0), None);
+        assert_eq!(container_user_for(false, 501, 20), None);
+    }
+
+    #[test]
+    fn the_container_user_replaces_manifest_values_and_is_recorded_on_the_container() {
+        let env = |name: &str, value: &str| EnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+        let mut spec = ContainerSpec {
+            name: "elx-test".to_string(),
+            image: "example:latest".to_string(),
+            network: "elixir_net".to_string(),
+            network_mode: None,
+            aliases: Vec::new(),
+            env: vec![env("PUID", "0"), env("TZ", "UTC"), env("PGID", "0")],
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            cap_drop: Vec::new(),
+            sysctls: HashMap::new(),
+            security: Default::default(),
+        };
+        let user = ContainerUser {
+            uid: 1000,
+            gid: 1001,
+        };
+        apply_container_user(&mut spec, user);
+        assert_eq!(container_user_env(&spec), user_env(user));
+        assert!(spec.env.iter().any(|e| e.name == "TZ" && e.value == "UTC"));
+        assert_eq!(spec.labels[CONTAINER_USER_LABEL], "1000:1001");
+        assert_eq!(container_user_label(&spec.labels), Some(user));
+        let mut garbled = HashMap::new();
+        garbled.insert(CONTAINER_USER_LABEL.to_string(), "1000".to_string());
+        assert_eq!(container_user_label(&garbled), None);
+    }
+
+    #[test]
+    fn downloaders_keep_their_containers_user_and_only_new_ones_take_the_servers() {
+        use DownloadsOwner::{Missing, Uid, Unreadable};
+        let server = Some(ContainerUser {
+            uid: 1000,
+            gid: 1000,
+        });
+        let before_this_rule = HashMap::new();
+        let mut as_server = HashMap::new();
+        as_server.insert(CONTAINER_USER_LABEL.to_string(), "1000:1000".to_string());
+        // A downloader whose container exists keeps the user it was created
+        // with, whoever owns the downloads folder now.
+        for downloads in [Missing, Uid(1000), Uid(911), Unreadable] {
+            assert_eq!(
+                downloader_container_user(Some(&before_this_rule), downloads, server),
+                None
+            );
+            assert_eq!(
+                downloader_container_user(Some(&as_server), downloads, server),
+                server
+            );
+        }
+        // Without a container: the server's user while the shared downloads
+        // folder is the server's or does not exist yet.
+        assert_eq!(downloader_container_user(None, Missing, server), server);
+        assert_eq!(downloader_container_user(None, Uid(1000), server), server);
+        assert_eq!(downloader_container_user(None, Uid(911), server), None);
+        assert_eq!(downloader_container_user(None, Unreadable, server), None);
+        // macOS, or a server running as root.
+        assert_eq!(downloader_container_user(None, Missing, None), None);
+    }
+
+    #[tokio::test]
+    async fn bind_sources_are_made_only_inside_the_media_and_downloads_roots() -> Result<()> {
+        let dir = TempDir::new()?;
+        let paths = RuntimePaths::from_roots(
+            dir.path()
+                .join("data/extensions")
+                .to_string_lossy()
+                .as_ref(),
+            dir.path().join("media").to_string_lossy().as_ref(),
+        );
+        let bind = |host: PathBuf, container: &str| VolumeMount {
+            source_kind: VolumeMountSourceKind::Bind,
+            host_path: host.to_string_lossy().to_string(),
+            container_path: container.to_string(),
+            read_only: false,
+        };
+        let media = PathBuf::from(&paths.media_root);
+        let downloads = PathBuf::from(&paths.downloads_root);
+        let volumes = vec![
+            bind(media.join("tv"), "/tv"),
+            bind(downloads.clone(), "/downloads"),
+            bind(dir.path().join("outside"), "/outside"),
+            bind(media.join("..").join("escape"), "/escape"),
+            VolumeMount {
+                source_kind: VolumeMountSourceKind::NamedVolume,
+                host_path: "elixir_cfg_test".to_string(),
+                container_path: "/config".to_string(),
+                read_only: false,
+            },
+        ];
+        prepare_bind_sources(&volumes, &paths).await?;
+        assert!(media.join("tv").is_dir());
+        assert!(downloads.is_dir());
+        assert!(!dir.path().join("outside").exists());
+        assert!(!dir.path().join("escape").exists());
+        assert!(!Path::new("elixir_cfg_test").exists());
+        // Existing folders are left as they are.
+        prepare_bind_sources(&volumes, &paths).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_downloader_runs_as_the_server_and_keeps_that_user() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data/extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().join("media").to_string_lossy().as_ref(),
+        );
+        let downloads = PathBuf::from(&paths.downloads_root);
+        assert!(!downloads.exists(), "a clean server");
+        let user = this_user();
+        for _ in 0..2 {
+            Executor::new(
+                &database.pool,
+                &probe,
+                &drivers,
+                &runtime,
+                paths.clone(),
+                &secrets,
+            )
+            .with_container_user(Some(user))
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.nzbget".to_string(),
+                "default".to_string(),
+                nzbget_runtime_with_downloads(),
+                None,
+                Vec::new(),
+            )
+            .await?;
+        }
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            assert_eq!(container_user_env(spec), user_env(user));
+            assert_eq!(container_user_label(&spec.labels), Some(user));
+        }
+        assert_eq!(
+            specs[0].labels[CONTAINER_SPEC_HASH_LABEL], specs[1].labels[CONTAINER_SPEC_HASH_LABEL],
+            "the second start keeps the container"
+        );
+        assert!(downloads.join(".nzb").is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_existing_downloader_keeps_the_images_user_after_the_server_updates() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        insert_extension(&store, "elixir.modules.nzbget", json!({})).await?;
+        let instance_id = Uuid::new_v4();
+        store
+            .create_instance(&NewExtensionInstance {
+                instance_id,
+                extension_id: "elixir.modules.nzbget".to_string(),
+                instance_name: "default".to_string(),
+                config_json: None,
+                enabled: true,
+            })
+            .await?;
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data/extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().join("media").to_string_lossy().as_ref(),
+        );
+        // Created before this rule, then started by an updated server whose
+        // downloads folder is its own: the container must stay as it is.
+        for user in [None, Some(this_user())] {
+            Executor::new(
+                &database.pool,
+                &probe,
+                &drivers,
+                &runtime,
+                paths.clone(),
+                &secrets,
+            )
+            .with_container_user(user)
+            .ensure_runtime_running(
+                instance_id,
+                "elixir.modules.nzbget".to_string(),
+                "default".to_string(),
+                nzbget_runtime_with_downloads(),
+                None,
+                Vec::new(),
+            )
+            .await?;
+        }
+        assert_eq!(
+            downloads_owner(Path::new(&paths.downloads_root)),
+            DownloadsOwner::Uid(this_user().uid)
+        );
+        let specs = runtime.specs();
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            assert!(container_user_env(spec).is_empty());
+            assert!(!spec.labels.contains_key(CONTAINER_USER_LABEL));
+        }
+        assert_eq!(
+            specs[0].labels[CONTAINER_SPEC_HASH_LABEL], specs[1].labels[CONTAINER_SPEC_HASH_LABEL],
+            "the existing container is not recreated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stack_members_run_as_the_server_and_it_makes_their_folders() -> Result<()> {
+        let database = setup_db().await?;
+        let store = ExtensionStore::new(&database.pool);
+        let member = "stack.0123456789abcdef.sonarr";
+        insert_extension(&store, member, json!({})).await?;
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let user = this_user();
+        // macOS (or a server running as root), then a Linux server.
+        for container_user in [None, Some(user)] {
+            let instance_id = Uuid::new_v4();
+            store
+                .create_instance(&NewExtensionInstance {
+                    instance_id,
+                    extension_id: member.to_string(),
+                    instance_name: instance_id.to_string(),
+                    config_json: None,
+                    enabled: true,
+                })
+                .await?;
+            let temp_dir = TempDir::new()?;
+            let paths = RuntimePaths::from_roots(
+                temp_dir
+                    .path()
+                    .join("data/extensions")
+                    .to_string_lossy()
+                    .as_ref(),
+                temp_dir.path().join("media").to_string_lossy().as_ref(),
+            );
+            let runtime_spec = ManifestRuntime {
+                r#type: "container".to_string(),
+                image: Some("example/sonarr:latest".to_string()),
+                network: None,
+                service_name: None,
+                ports: vec![ManifestRuntimePort {
+                    container: 8989,
+                    host: None,
+                }],
+                volumes: vec![
+                    "{downloads}:/downloads".to_string(),
+                    "{media}/tv:/tv".to_string(),
+                ],
+                env: vec![ManifestRuntimeEnv {
+                    name: "TZ".to_string(),
+                    value: Some("UTC".to_string()),
+                    from_secret: None,
+                    optional: false,
+                }],
+                egress: None,
+                security: Default::default(),
+            };
+            Executor::new(
+                &database.pool,
+                &probe,
+                &drivers,
+                &runtime,
+                paths.clone(),
+                &secrets,
+            )
+            .with_container_user(container_user)
+            .ensure_runtime_running(
+                instance_id,
+                member.to_string(),
+                instance_id.to_string(),
+                runtime_spec,
+                None,
+                Vec::new(),
+            )
+            .await?;
+            let spec = runtime.last_spec().expect("stack member spec");
+            assert_eq!(spec.cap_drop, vec!["ALL".to_string()]);
+            assert!(spec.security.no_new_privileges);
+            let tv = Path::new(&paths.media_root).join("tv");
+            match container_user {
+                Some(user) => {
+                    assert_eq!(container_user_env(&spec), user_env(user));
+                    assert_eq!(container_user_label(&spec.labels), Some(user));
+                    assert!(tv.is_dir());
+                    assert!(Path::new(&paths.downloads_root).is_dir());
+                }
+                None => {
+                    assert!(container_user_env(&spec).is_empty());
+                    assert!(!spec.labels.contains_key(CONTAINER_USER_LABEL));
+                    assert!(!tv.exists(), "left to Docker, as before");
+                }
+            }
+        }
         Ok(())
     }
 
