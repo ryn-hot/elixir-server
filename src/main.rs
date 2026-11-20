@@ -257,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Elixir server listening on http://{}", addr);
 
     let background_shutdown = CancellationToken::new();
+    // Marketplace stacks run their own setup once installed (no "Finish setup").
+    let _stack_setup_runner = elixir_server::http::handlers::extensions::spawn_stack_setup_runner(
+        state.clone(),
+        background_shutdown.clone(),
+    );
     let marketplace_startup =
         elixir_server::marketplace::startup::spawn_configured(&state, background_shutdown.clone());
     #[cfg(unix)]

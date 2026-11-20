@@ -10874,6 +10874,9 @@ mod tests {
                 primary_action_label: "Fix".to_string(),
                 auto_update: None,
                 optional_addons: Vec::new(),
+                bundle_id: None,
+                bundle_member_count: 0,
+                can_uninstall: false,
             },
             instances: vec![crate::db::models::ExtensionInstance {
                 instance_id,

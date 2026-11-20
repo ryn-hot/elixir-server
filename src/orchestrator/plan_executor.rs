@@ -21,6 +21,9 @@ pub struct PlannedStep {
     pub action: ExecutorAction,
 }
 
+/// How long a confirmed plan waits for the orchestrator's apply lock.
+const APPLY_LOCK_WAIT_SECONDS: u32 = 120;
+
 impl PlanExecutor {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }
@@ -31,8 +34,10 @@ impl PlanExecutor {
         let owner_id = Uuid::new_v4().to_string();
         let ttl = Duration::from_secs(self.state.settings.extensions.apply_lock_ttl_seconds.max(1));
 
+        // A background reconcile pass holds this lock for ~15-20 s every
+        // minute or so; wait it out rather than failing a confirmed plan.
         let mut acquired = false;
-        for _ in 0..10 {
+        for _ in 0..APPLY_LOCK_WAIT_SECONDS {
             if store.acquire_lock(APPLY_LOCK_NAME, &owner_id, ttl).await? {
                 acquired = true;
                 break;

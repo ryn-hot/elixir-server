@@ -90,6 +90,9 @@ use crate::state::AppState;
 
 mod control;
 mod control_contract;
+mod stack_setup;
+
+pub use stack_setup::{retry_setup as retry_stack_setup, spawn_runner as spawn_stack_setup_runner};
 
 use control_contract::{
     control_notice, control_policy_managed, control_policy_observed, control_policy_seeded,
@@ -396,6 +399,21 @@ pub struct ExtensionStatusSummaryItem {
     pub auto_update: Option<ExtensionAutoUpdateSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub optional_addons: Vec<ExtensionOptionalAddonSummaryItem>,
+    /// Set on a part of a bundle (a marketplace stack's apps, connectors and
+    /// setup): the top-level extension whose card stands for it. The app lists
+    /// only top-level cards and shows the parts on the bundle's own page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    /// On a bundle's top-level card: how many parts it has.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bundle_member_count: usize,
+    /// Whether the owner can uninstall it from its card. False for built-ins
+    /// and for a bundle's parts (uninstalling the bundle removes them).
+    pub can_uninstall: bool,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2170,6 +2188,19 @@ pub async fn uninstall_extension(
             "built-in extensions cannot be uninstalled; disable them instead",
         ));
     }
+    // This path cannot remove a marketplace install: its records, running
+    // code and stack belong to the marketplace's own uninstall. Refuse before
+    // touching anything, rather than half-removing it.
+    if extension_id.starts_with("elx:") {
+        return Err(ApiError::conflict(
+            "marketplace extensions are uninstalled with POST /api/v1/marketplace/installations/uninstall",
+        ));
+    }
+    if crate::marketplace::stack::is_stack_member_id(&extension_id) {
+        return Err(ApiError::conflict(
+            "this is part of an installed stack; uninstall the stack itself",
+        ));
+    }
     let existing = store
         .get_extension(&extension_id)
         .await
@@ -3326,6 +3357,7 @@ async fn build_extension_status_summary(
         }
     }
 
+    let setup_runs = stack_setup::latest_setup_runs(store).await?;
     let mut pending_blueprints = HashSet::new();
     let mut applied_blueprints = HashSet::new();
     for blueprint in desired_blueprints {
@@ -3374,7 +3406,14 @@ async fn build_extension_status_summary(
             .unwrap_or_default();
         let item = match extension.kind {
             ExtensionKind::Blueprint => {
-                summarize_blueprint_extension(&extension, &pending_blueprints)
+                summarize_blueprint_extension(
+                    &extension,
+                    &BlueprintSetups {
+                        pending: &pending_blueprints,
+                        applied: &applied_blueprints,
+                        runs: &setup_runs,
+                    },
+                )
             }
             ExtensionKind::Connector => {
                 summarize_connector_extension(
@@ -3404,6 +3443,7 @@ async fn build_extension_status_summary(
                     &BlueprintSetups {
                         pending: &pending_blueprints,
                         applied: &applied_blueprints,
+                        runs: &setup_runs,
                     },
                 )
                 .await?
@@ -3464,6 +3504,9 @@ async fn build_extension_status_summary(
         .await?;
     }
 
+    mark_bundles_and_uninstall(state, &mut items, &extensions_by_id, &manifests_by_id);
+    roll_up_bundles(&mut items);
+
     items.sort_by(|left, right| {
         extension_status_sort_order(&left.severity)
             .cmp(&extension_status_sort_order(&right.severity))
@@ -3474,9 +3517,10 @@ async fn build_extension_status_summary(
             })
     });
 
+    // A bundle's parts count through the bundle's own card.
     let needs_attention_count = items
         .iter()
-        .filter(|item| item.severity == "attention")
+        .filter(|item| item.severity == "attention" && item.bundle_id.is_none())
         .count();
 
     Ok(ExtensionStatusSummaryResponse {
@@ -3484,6 +3528,106 @@ async fn build_extension_status_summary(
         docker_runtime: summarize_docker_runtime(&runtime_snapshot),
         items,
     })
+}
+
+/// Ties each part of a marketplace stack (`stack.<hash>.*`) to the stack's
+/// own card, and says which cards can be uninstalled: not built-ins, and not
+/// a bundle's parts (uninstalling the bundle removes them).
+fn mark_bundles_and_uninstall(
+    state: &AppState,
+    items: &mut [ExtensionStatusSummaryItem],
+    extensions_by_id: &HashMap<String, Extension>,
+    manifests_by_id: &HashMap<String, ExtensionManifest>,
+) {
+    use crate::marketplace::stack::{derived_id, is_stack_member_id};
+    let bundles: Vec<(String, String)> = extensions_by_id
+        .keys()
+        .filter(|id| id.starts_with("elx:"))
+        .filter(|id| {
+            manifests_by_id
+                .get(*id)
+                .is_some_and(|manifest| manifest.stack.is_some())
+        })
+        .map(|id| (derived_id(id, ""), id.clone()))
+        .collect();
+    for item in items.iter_mut() {
+        let member = is_stack_member_id(&item.extension_id);
+        item.can_uninstall = !member && !extension_uninstall_is_protected(state, &item.extension_id);
+        if member {
+            item.bundle_id = bundles
+                .iter()
+                .find(|(prefix, _)| item.extension_id.starts_with(prefix.as_str()))
+                .map(|(_, bundle)| bundle.clone());
+        }
+    }
+}
+
+/// A bundle's card sums up its parts. While the bundle is still setting up
+/// (or its setup failed) its own status says so; once it is set up, a part
+/// that needs attention or is still starting shows on the bundle's card,
+/// naming the part. Optional add-ons offered by a part show there too.
+fn roll_up_bundles(items: &mut [ExtensionStatusSummaryItem]) {
+    let mut parts_by_bundle: HashMap<String, Vec<ExtensionStatusSummaryItem>> = HashMap::new();
+    for item in items.iter() {
+        if let Some(bundle) = &item.bundle_id {
+            parts_by_bundle
+                .entry(bundle.clone())
+                .or_default()
+                .push(item.clone());
+        }
+    }
+    let rank = |severity: &str| match severity {
+        "attention" => 2,
+        "progress" => 1,
+        _ => 0,
+    };
+    for item in items.iter_mut() {
+        let Some(parts) = parts_by_bundle.get(&item.extension_id) else {
+            continue;
+        };
+        item.bundle_member_count = parts.len();
+        if item.optional_addons.is_empty() {
+            item.optional_addons = parts
+                .iter()
+                .flat_map(|part| part.optional_addons.iter().cloned())
+                .collect();
+        }
+        if !item.enabled || rank(&item.severity) > 0 {
+            continue;
+        }
+        let worst = parts
+            .iter()
+            .filter(|part| part.enabled)
+            .map(|part| rank(&part.severity))
+            .max()
+            .unwrap_or(0);
+        if worst == 0 {
+            continue;
+        }
+        let flagged: Vec<&ExtensionStatusSummaryItem> = parts
+            .iter()
+            .filter(|part| part.enabled && rank(&part.severity) == worst)
+            .collect();
+        let names = flagged
+            .iter()
+            .map(|part| part.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (severity, code, label, several) = if worst == 2 {
+            ("attention", "bundle_part_attention", "Needs attention", "need attention")
+        } else {
+            ("progress", "bundle_part_starting", "Starting up", "are still starting")
+        };
+        item.severity = severity.to_string();
+        item.status_code = code.to_string();
+        item.label = label.to_string();
+        item.description = match flagged.as_slice() {
+            [part] => format!("{}: {}", part.name, part.description),
+            _ => format!("{} parts {several}: {names}.", flagged.len()),
+        };
+        item.primary_action = "open".to_string();
+        item.primary_action_label = "Open".to_string();
+    }
 }
 
 async fn ensure_auto_default_instances_for_installed_modules(
@@ -3653,7 +3797,7 @@ fn docker_runtime_last_failure_summary(
 
 fn summarize_blueprint_extension(
     extension: &Extension,
-    pending_blueprints: &HashSet<String>,
+    blueprint_setups: &BlueprintSetups<'_>,
 ) -> ExtensionStatusSummaryItem {
     if !extension.enabled {
         return disabled_extension_status(
@@ -3665,24 +3809,62 @@ fn summarize_blueprint_extension(
             "Enable",
         );
     }
-    if pending_blueprints.contains(&extension.extension_id) {
-        return attention_extension_status(
-            extension,
-            "pending_blueprint_setup",
-            "Needs setup",
-            "This stack is waiting for final setup before it is ready to use.",
-            "finish_setup",
-            "Finish setup",
-        );
-    }
-    ready_extension_status(
+    stack_setup_status(
         extension,
-        "ready",
-        "Ready",
+        &extension.extension_id,
+        blueprint_setups,
         "This stack is installed and ready to use.",
-        "open",
-        "Open",
     )
+}
+
+/// A stack's setup runs by itself once the stack is installed, so its cards
+/// never ask the owner to finish it: they say it is setting up, ready, or
+/// that it failed (with a retry button).
+fn stack_setup_status(
+    extension: &Extension,
+    setup_id: &str,
+    blueprint_setups: &BlueprintSetups<'_>,
+    ready_description: &str,
+) -> ExtensionStatusSummaryItem {
+    match stack_setup::setup_state(
+        setup_id,
+        blueprint_setups.pending,
+        blueprint_setups.applied,
+        blueprint_setups.runs,
+    ) {
+        stack_setup::StackSetupState::Done => ready_extension_status(
+            extension,
+            "ready",
+            "Ready",
+            ready_description,
+            "open",
+            "Open",
+        ),
+        stack_setup::StackSetupState::Failed(reason) => attention_extension_status(
+            extension,
+            "stack_setup_failed",
+            "Setup failed",
+            &format!("Setting up this stack's apps stopped: {reason}"),
+            "retry_setup",
+            "Retry setup",
+        ),
+        stack_setup::StackSetupState::Running => progress_extension_status(
+            extension,
+            "stack_setup_running",
+            "Setting up",
+            "Elixir is setting up this stack's apps and connecting them.",
+            "open",
+            "Open",
+        ),
+        stack_setup::StackSetupState::Preparing => progress_extension_status(
+            extension,
+            "stack_setup_preparing",
+            "Starting up",
+            "Elixir is preparing this stack's setup.",
+            "open",
+            "Open",
+        ),
+    }
 }
 
 async fn summarize_blueprint_optional_addons(
@@ -3800,6 +3982,7 @@ async fn summarize_blueprint_optional_addons(
 struct BlueprintSetups<'a> {
     pending: &'a HashSet<String>,
     applied: &'a HashSet<String>,
+    runs: &'a HashMap<String, OrchestratorRun>,
 }
 
 /// A module that declares no services never registers a provider, so the
@@ -3825,36 +4008,11 @@ fn serviceless_module_status(
         ));
     };
     let setup = crate::marketplace::stack::derived_id(&extension.extension_id, &stack.blueprint.id);
-    if blueprint_setups.applied.contains(&setup) {
-        return Some(ready_extension_status(
-            extension,
-            "ready",
-            "Ready",
-            "This stack is set up. Its apps are listed as separate extensions.",
-            "open",
-            "Open",
-        ));
-    }
-    if blueprint_setups.pending.contains(&setup) {
-        return Some(attention_extension_status(
-            extension,
-            "pending_stack_setup",
-            "Needs setup",
-            &format!(
-                "Use Finish setup on the {} blueprint card to configure this stack's apps.",
-                stack.blueprint.name
-            ),
-            "open",
-            "Open",
-        ));
-    }
-    Some(progress_extension_status(
+    Some(stack_setup_status(
         extension,
-        "stack_setup_preparing",
-        "Starting up",
-        "Elixir is preparing this stack's setup.",
-        "open",
-        "Open",
+        &setup,
+        blueprint_setups,
+        "This stack is set up and ready to use.",
     ))
 }
 
@@ -4156,6 +4314,10 @@ async fn cleanup_extension_downstream_state(
 struct ConnectorDownstreamVerification {
     present: Vec<String>,
     missing: Vec<String>,
+    /// Only public indexers were expected. Public sites come and go (offline,
+    /// behind Cloudflare protection, dropped from Prowlarr's definitions), so
+    /// some of them missing is normal; none at all is a problem.
+    best_effort: bool,
 }
 
 async fn verify_connector_downstream_state(
@@ -4167,6 +4329,7 @@ async fn verify_connector_downstream_state(
 ) -> anyhow::Result<Option<ConnectorDownstreamVerification>> {
     let mut expected_items: Vec<String> = Vec::new();
     let mut target_ref: Option<crate::extensions::manifest::ManifestCapabilityRef> = None;
+    let mut expects_proxies = false;
 
     for action in &manifest.actions {
         if action.r#type != "driver_patch" {
@@ -4192,6 +4355,7 @@ async fn verify_connector_downstream_state(
             IndexerRegistryPatch::RegisterIndexerProxies { proxies } => {
                 expected_items.extend(proxies.into_iter().map(|proxy| proxy.name));
                 target_ref = Some(target.clone());
+                expects_proxies = true;
             }
             _ => {}
         }
@@ -4225,7 +4389,10 @@ async fn verify_connector_downstream_state(
         .map(|value| normalize_connector_name(&value))
         .collect();
 
-    let mut verification = ConnectorDownstreamVerification::default();
+    let mut verification = ConnectorDownstreamVerification {
+        best_effort: !expects_proxies,
+        ..Default::default()
+    };
     for expected in expected_items {
         if actual_normalized.contains(&normalize_connector_name(&expected)) {
             verification.present.push(expected);
@@ -4335,10 +4502,10 @@ async fn summarize_connector_extension(
             })
         });
         if let Some(app) = installed_app {
-            return Ok(attention_extension_status(
+            return Ok(progress_extension_status(
                 extension,
                 "waiting_for_app_start",
-                "Needs setup",
+                "Waiting",
                 &format!("Waiting for {app} to start. Its card shows what it needs."),
                 "open",
                 "Open",
@@ -4347,10 +4514,10 @@ async fn summarize_connector_extension(
         return Ok(attention_extension_status(
             extension,
             "waiting_for_app",
-            "Needs setup",
+            "Missing app",
             "Install a compatible app to use this connector.",
-            "finish_setup",
-            "Finish setup",
+            "open",
+            "Open",
         ));
     }
 
@@ -4360,13 +4527,13 @@ async fn summarize_connector_extension(
             return Ok(attention_extension_status(
                 extension,
                 "waiting_for_dependency",
-                "Needs setup",
+                "Missing parts",
                 &format!(
                     "Required dependencies are missing: {}.",
                     missing_requires.join(", ")
                 ),
-                "finish_setup",
-                "Finish setup",
+                "open",
+                "Open",
             ));
         }
 
@@ -4402,6 +4569,26 @@ async fn summarize_connector_extension(
             }
         };
         if let Some(verification) = verification {
+            if !verification.missing.is_empty()
+                && verification.best_effort
+                && !verification.present.is_empty()
+            {
+                let total = verification.present.len() + verification.missing.len();
+                return Ok(ready_extension_status(
+                    extension,
+                    "downstream_partial",
+                    "Ready",
+                    &format!(
+                        "{} of {total} public indexers are in Prowlarr. Not available right now: {} \
+                         (their sites are offline, behind Cloudflare protection, or no longer \
+                         supported by Prowlarr).",
+                        verification.present.len(),
+                        verification.missing.join(", ")
+                    ),
+                    "open",
+                    "Open",
+                ));
+            }
             if !verification.missing.is_empty() {
                 return Ok(attention_extension_status(
                     extension,
@@ -4502,10 +4689,10 @@ async fn summarize_module_extension(
             attention_extension_status(
                 extension,
                 "missing_instance",
-                "Needs setup",
-                "Create an instance to start using this extension.",
+                "Not started",
+                "Start this extension to use it.",
                 "finish_setup",
-                "Finish setup",
+                "Start",
             ),
         )
         .await;
@@ -4599,13 +4786,13 @@ async fn summarize_module_extension(
             attention_extension_status(
                 extension,
                 "missing_required_secrets",
-                "Needs setup",
+                "Add details",
                 &format!(
-                    "Finish setup to add the {} required {noun} still missing.",
+                    "Add the {} required {noun} still missing.",
                     missing_secret_count
                 ),
-                "finish_setup",
-                "Finish setup",
+                "open",
+                "Add details",
             ),
         )
         .await;
@@ -4681,13 +4868,13 @@ async fn summarize_module_extension(
         return with_module_auto_update_summary(
             store,
             extension,
-            attention_extension_status(
+            progress_extension_status(
                 extension,
                 "provider_not_ready",
-                "Needs setup",
-                "This extension is still finishing setup.",
-                "finish_setup",
-                "Finish setup",
+                "Starting up",
+                "This extension is still starting.",
+                "open",
+                "Open",
             ),
         )
         .await;
@@ -4734,11 +4921,11 @@ async fn summarize_module_extension(
                 return with_module_auto_update_summary(
                     store,
                     extension,
-                    attention_extension_status(
+                    optional_extension_status(
                         extension,
                         "provider_setup_required",
-                        "Add account",
-                        "Add a debrid account to enable direct HTTPS debrid downloads.",
+                        "Not configured",
+                        "Optional. Add a debrid account to download through debrid over HTTPS.",
                         "open",
                         "Add account",
                     ),
@@ -4828,11 +5015,11 @@ async fn summarize_module_extension(
                     return with_module_auto_update_summary(
                         store,
                         extension,
-                        attention_extension_status(
+                        optional_extension_status(
                             extension,
                             "provider_setup_required",
-                            "Add provider",
-                            "Add at least one Usenet provider to start NZBGet downloads.",
+                            "Not configured",
+                            "Optional. Add a Usenet provider to download from Usenet.",
                             "open",
                             "Add provider",
                         ),
@@ -4843,11 +5030,11 @@ async fn summarize_module_extension(
                     return with_module_auto_update_summary(
                         store,
                         extension,
-                        attention_extension_status(
+                        optional_extension_status(
                             extension,
                             "provider_setup_required",
-                            "Activate provider",
-                            "Enable or add at least one active Usenet provider before NZBGet can download.",
+                            "Not configured",
+                            "Optional. Turn on or add a Usenet provider to download from Usenet.",
                             "open",
                             "Manage providers",
                         ),
@@ -4919,7 +5106,7 @@ fn extension_status_sort_order(severity: &str) -> usize {
     match severity {
         "progress" => 0,
         "attention" => 1,
-        "ready" => 2,
+        "ready" | "available" => 2,
         "disabled" => 3,
         _ => 4,
     }
@@ -4974,6 +5161,27 @@ fn attention_extension_status(
     extension_status_item(
         extension,
         "attention",
+        status_code,
+        label,
+        description,
+        primary_action,
+        primary_action_label,
+    )
+}
+
+/// Works as installed; more can be configured if the owner wants (an account,
+/// a provider). Shown with its own marker, never under "Needs attention".
+fn optional_extension_status(
+    extension: &Extension,
+    status_code: &str,
+    label: &str,
+    description: &str,
+    primary_action: &str,
+    primary_action_label: &str,
+) -> ExtensionStatusSummaryItem {
+    extension_status_item(
+        extension,
+        "available",
         status_code,
         label,
         description,
@@ -5063,6 +5271,9 @@ fn extension_status_item(
         primary_action_label: primary_action_label.to_string(),
         auto_update: None,
         optional_addons: Vec::new(),
+        bundle_id: None,
+        bundle_member_count: 0,
+        can_uninstall: false,
     }
 }
 
@@ -8925,6 +9136,9 @@ mod extension_ui_proxy_tests {
                     primary_action_label: "Open".to_string(),
                     auto_update: None,
                     optional_addons: Vec::new(),
+                    bundle_id: None,
+                    bundle_member_count: 0,
+                    can_uninstall: false,
                 },
                 instances: vec![ExtensionInstance {
                     instance_id,

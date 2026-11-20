@@ -7440,6 +7440,113 @@ async fn record_runtime_start(
 }
 
 #[tokio::test]
+async fn extension_status_summary_bundles_a_stacks_parts_under_its_own_card() -> Result<()> {
+    let (app, db_pool, _secrets) = status_test_app().await?;
+    let store = ExtensionStore::new(&db_pool);
+    let root = "elx:stackbundlefixture/arr-stack";
+    store
+        .upsert_extension(&status_test_extension(
+            root,
+            "Arr Stack",
+            ExtensionKind::Module,
+            json!({
+                "id": root, "version": "1.0.0", "kind": "module", "name": "Arr Stack",
+                "stack": {
+                    "modules": [],
+                    "blueprint": {
+                        "id": "setup", "version": "1.0.0", "kind": "blueprint",
+                        "name": "Arr Stack"
+                    }
+                }
+            }),
+        ))
+        .await?;
+    status_test_instance(&store, root).await?;
+    let setup = crate::marketplace::stack::derived_id(root, "setup");
+    store
+        .upsert_extension(&status_test_extension(
+            &setup,
+            "Arr Stack",
+            ExtensionKind::Blueprint,
+            json!({"id": setup, "version": "1.0.0", "kind": "blueprint", "name": "Arr Stack"}),
+        ))
+        .await?;
+    // A part that cannot work yet: no app provides what it configures.
+    let indexers = crate::marketplace::stack::derived_id(root, "public-indexers");
+    store
+        .upsert_extension(&status_test_extension(
+            &indexers,
+            "Prowlarr Public Indexers",
+            ExtensionKind::Connector,
+            json!({
+                "id": indexers, "version": "1.0.0", "kind": "connector",
+                "name": "Prowlarr Public Indexers",
+                "targets": [{"capability": "indexer.registry", "slot": "default"}],
+                "actions": []
+            }),
+        ))
+        .await?;
+    let desired_id = Uuid::new_v4();
+    store
+        .create_desired_blueprint(&NewDesiredBlueprint {
+            desired_id,
+            blueprint_extension_id: setup.clone(),
+            blueprint_version: "1.0.0".to_string(),
+            params_json: None,
+        })
+        .await?;
+
+    // While the stack sets itself up, its card says so; a part that is not
+    // ready yet does not turn the stack into "needs attention".
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "progress", "{stack}");
+    assert_eq!(stack["bundleMemberCount"], 2, "{stack}");
+    assert_eq!(stack["canUninstall"], true, "{stack}");
+    let part = extension_status_summary_item(&app, &indexers).await?;
+    assert_eq!(part["bundleId"], root, "{part}");
+    assert_eq!(part["canUninstall"], false, "{part}");
+    let setup_card = extension_status_summary_item(&app, &setup).await?;
+    assert_eq!(setup_card["bundleId"], root, "{setup_card}");
+
+    // Once set up, a part that needs attention shows on the stack's card,
+    // named, and counts once: through the stack, not again for the part.
+    store.mark_desired_applied(desired_id, true).await?;
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "attention", "{stack}");
+    assert_eq!(stack["statusCode"], "bundle_part_attention", "{stack}");
+    assert!(
+        stack["description"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Prowlarr Public Indexers: "),
+        "{stack}"
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/v1/extensions/status-summary").body(Body::empty())?)
+        .await?;
+    let body = body::to_bytes(response.into_body(), 1_048_576).await?;
+    let payload: Value = serde_json::from_slice(&body)?;
+    assert_eq!(payload["needsAttentionCount"], 1, "{payload}");
+
+    // The old uninstall path refuses a marketplace extension or a stack's
+    // part outright instead of half-removing it.
+    for id in ["elx:stackbundlefixture%2Farr-stack", indexers.as_str()] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/extensions/{id}/uninstall"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{id}");
+    }
+    assert!(store.get_extension(root).await?.is_some());
+    assert!(store.get_extension(&indexers).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn extension_status_summary_names_what_a_stack_and_its_downloader_wait_for() -> Result<()> {
     let (app, db_pool, _secrets) = status_test_app().await?;
     let store = ExtensionStore::new(&db_pool);
@@ -7475,19 +7582,41 @@ async fn extension_status_summary_names_what_a_stack_and_its_downloader_wait_for
             params_json: None,
         })
         .await?;
+    // Offered: the server runs the setup by itself, so the card says it is
+    // setting up and never asks the owner to finish it.
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "progress", "{stack}");
+    assert_eq!(stack["statusCode"], "stack_setup_running", "{stack}");
+    assert_ne!(stack["label"], "Needs setup", "{stack}");
+    store.mark_desired_applied(desired_id, true).await?;
+    let stack = extension_status_summary_item(&app, root).await?;
+    assert_eq!(stack["severity"], "ready", "{stack}");
+    // A setup run that failed shows the reason and a retry button.
+    let run_id = Uuid::new_v4();
+    store
+        .create_run(&NewOrchestratorRun {
+            run_id,
+            source: "blueprint".to_string(),
+            status: OrchestratorRunStatus::Failed,
+            phase: Some("failed".to_string()),
+            plan_json: Some(json!({
+                "plan_id": run_id,
+                "blueprint_id": crate::marketplace::stack::derived_id(root, "setup"),
+            })),
+            error: Some("Prowlarr did not become healthy".to_string()),
+        })
+        .await?;
     let stack = extension_status_summary_item(&app, root).await?;
     assert_eq!(stack["severity"], "attention", "{stack}");
-    assert_eq!(stack["statusCode"], "pending_stack_setup", "{stack}");
+    assert_eq!(stack["statusCode"], "stack_setup_failed", "{stack}");
+    assert_eq!(stack["primaryAction"], "retry_setup", "{stack}");
     assert!(
         stack["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("Arr Stack blueprint card"),
+            .contains("Prowlarr did not become healthy"),
         "{stack}"
     );
-    store.mark_desired_applied(desired_id, true).await?;
-    let stack = extension_status_summary_item(&app, root).await?;
-    assert_eq!(stack["severity"], "ready", "{stack}");
 
     // Any other module without services is ready once its instance exists.
     store
@@ -7730,9 +7859,12 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
 
     // Prowlarr is an Arr Stack member, read through the stack's own code; its
     // indexer list has none of the connector's indexers yet.
-    let stack = stack_stand_in(|_member: &str, operation: &str, _request: &Value| {
+    let prowlarr_indexers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let listed = prowlarr_indexers.clone();
+    let stack = stack_stand_in(move |_member: &str, operation: &str, _request: &Value| {
         Ok(match operation {
-            "indexer_names" | "indexer_proxy_names" => json!({ "names": [] }),
+            "indexer_names" => json!({ "names": listed.lock().unwrap().clone() }),
+            "indexer_proxy_names" => json!({ "names": [] }),
             other => anyhow::bail!("the stand-in Prowlarr has no {other}"),
         })
     });
@@ -7872,6 +8004,21 @@ async fn extension_status_summary_marks_public_indexer_connector_attention_when_
             .contains("AnimeTosho"),
         "expected missing downstream description: {connector}"
     );
+
+    // Some public sites are unreachable (offline, behind Cloudflare): with the
+    // rest in Prowlarr the connector works, so it is ready and names the
+    // missing ones instead of asking for attention.
+    prowlarr_indexers
+        .lock()
+        .unwrap()
+        .push("SubsPlease".to_string());
+    let connector =
+        extension_status_summary_item(&app, "elixir.connectors.prowlarr_public_indexers").await?;
+    assert_eq!(connector["severity"], "ready", "{connector}");
+    assert_eq!(connector["statusCode"], "downstream_partial", "{connector}");
+    let description = connector["description"].as_str().unwrap_or_default();
+    assert!(description.starts_with("1 of 2 public indexers"), "{connector}");
+    assert!(description.contains("AnimeTosho"), "{connector}");
     Ok(())
 }
 
@@ -25502,14 +25649,21 @@ async fn extension_status_summary_marks_nzbget_provider_setup_required() -> Resu
         nzbget.get("statusCode").and_then(Value::as_str),
         Some("provider_setup_required")
     );
+    // Optional: NZBGet works once a provider is added, but nothing is wrong
+    // without one, so it is marked, not listed under "Needs attention".
+    assert_eq!(
+        nzbget.get("severity").and_then(Value::as_str),
+        Some("available")
+    );
     assert_eq!(
         nzbget.get("label").and_then(Value::as_str),
-        Some("Add provider")
+        Some("Not configured")
     );
     assert_eq!(
         nzbget.get("primaryActionLabel").and_then(Value::as_str),
         Some("Add provider")
     );
+    assert_eq!(nzbget.get("canUninstall").and_then(Value::as_bool), Some(false));
 
     Ok(())
 }

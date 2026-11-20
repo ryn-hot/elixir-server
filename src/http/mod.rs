@@ -304,6 +304,10 @@ pub fn router(state: AppState) -> Router {
             post(handlers::extensions::uninstall_extension),
         )
         .route(
+            "/api/v1/extension-setup/retry",
+            post(handlers::extensions::retry_stack_setup),
+        )
+        .route(
             "/api/v1/extensions/:id/instances",
             post(handlers::extensions::create_instance),
         )
