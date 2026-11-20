@@ -45,6 +45,7 @@ pub(in crate::marketplace) use native_tests::http::mutate_cached_fixture_bytes;
 mod task;
 #[cfg(test)]
 mod tests;
+mod uninstall;
 
 /// Trusted local allocation, never supplied by a peer or HTTP DTO.
 #[derive(Clone)]
@@ -332,6 +333,8 @@ struct State {
     invocation: Option<Arc<invocation::Entry>>,
     restoration: Option<Arc<restoration::Entry>>,
     stopped: bool,
+    /// An owner uninstall holds the slot: nothing new may start.
+    uninstalling: bool,
 }
 impl State {
     fn current(&self) -> Option<&Arc<Entry>> {
@@ -447,6 +450,7 @@ impl Service {
             .lock()
             .map_err(|_| anyhow::anyhow!("install owner unavailable"))?;
         Ok(!state.stopped
+            && !state.uninstalling
             && state.entry.is_none()
             && state.invocation.is_none()
             && state.restoration.is_none()
@@ -568,6 +572,9 @@ impl Service {
             .map_err(|_| anyhow::anyhow!("install owner unavailable"))?;
         if state.stopped {
             bail!("marketplace installation is stopping");
+        }
+        if state.uninstalling {
+            bail!("an extension is being uninstalled");
         }
         if state.invocation.is_some() || state.restoration.is_some() {
             bail!("original installed call or its result is still owned");

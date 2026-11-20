@@ -665,6 +665,12 @@ pub trait RuntimeManager: Send + Sync {
     ) -> anyhow::Result<()> {
         anyhow::bail!("runtime does not support private file volumes")
     }
+    /// Removes one named volume Elixir created for an instance it is
+    /// uninstalling (its app's private `/config`). A missing volume is fine;
+    /// one still used by a container is refused, never forced.
+    async fn remove_named_volume(&self, _name: &str) -> anyhow::Result<()> {
+        anyhow::bail!("runtime cannot remove named volumes")
+    }
     async fn get_container_handle(&self, name: &str) -> anyhow::Result<Option<ContainerHandle>>;
     async fn start_container(&self, handle: &ContainerHandle) -> anyhow::Result<()>;
     async fn exec_container_command(

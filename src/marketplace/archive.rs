@@ -418,6 +418,53 @@ pub(in crate::marketplace) async fn persist_compiled(
     Ok(archive)
 }
 
+/// Uninstall: deletes these committed releases from the owner archive under
+/// its OS lease, after the same identity checks as every reopen. Anything
+/// unexpected in the archive fails before a byte is removed. Returns how many
+/// releases were deleted (an absent one is skipped).
+pub(in crate::marketplace) async fn remove_releases(
+    path: &Path,
+    releases: Vec<Digest>,
+) -> Result<usize> {
+    // Removal only frees space: never refuse it because the archive grew past
+    // a smaller configured budget. The release count still bounds the scan.
+    let budget = ArchiveBudget {
+        bytes: u64::MAX / 2,
+        releases: 4096,
+    };
+    let path = path.to_owned();
+    let expires = Instant::now() + std::time::Duration::from_secs(120);
+    tokio::task::spawn_blocking(move || {
+        let store = Store::open(&path, budget, expires)?;
+        let directory = store.releases();
+        let mut removed = 0;
+        for release in releases {
+            let name = release.to_string()[7..].to_owned();
+            if !release_name(&name) {
+                bail!("invalid source archive release name");
+            }
+            let target = directory.join(&name);
+            match fs::symlink_metadata(&target) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
+            if inspect(&target, false, expires)?.name() != name {
+                bail!("source archive directory identity mismatch");
+            }
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+            for entry in names(&target, 8)? {
+                fs::remove_file(target.join(entry))?;
+            }
+            fs::remove_dir(&target)?;
+            removed += 1;
+        }
+        sync_directory(&directory)?;
+        Ok(removed)
+    })
+    .await?
+}
+
 // Rehash committed disk bytes, including after an idempotent retry or crash.
 // The returned information still cannot authorize installation or public seeding.
 pub async fn verify_retained(

@@ -69,7 +69,7 @@ impl Entry {
     pub(super) fn request_stop(&self) {
         self.stop.send_replace(true);
     }
-    async fn cancel(&self) -> Result<()> {
+    pub(super) async fn cancel(&self) -> Result<()> {
         self.request_stop();
         timeout(STOP_GRACE, async {
             let mut original = self.task.lock().await;
@@ -257,6 +257,7 @@ impl Service {
             .lock()
             .map_err(|_| anyhow::anyhow!("installed call owner unavailable"))?;
         if state.stopped
+            || state.uninstalling
             || state.entry.is_some()
             || state.invocation.is_some()
             || state.restoration.is_some()

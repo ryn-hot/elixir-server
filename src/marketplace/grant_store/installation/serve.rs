@@ -63,6 +63,9 @@ pub(in crate::marketplace) struct ServeHost {
     configuration: InstalledRuntime,
     members: Option<Arc<dyn StackMembers>>,
     slots: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<Option<Slot>>>>>,
+    /// Instances being uninstalled: no call may start, and a running call
+    /// fails at its next binding check (every 500 ms).
+    retiring: std::sync::Mutex<std::collections::HashSet<Uuid>>,
 }
 
 impl ServeHost {
@@ -78,6 +81,69 @@ impl ServeHost {
             configuration,
             members,
             slots: Default::default(),
+            retiring: Default::default(),
+        }
+    }
+
+    fn require_serving(&self, instance: Uuid) -> Result<()> {
+        if self
+            .retiring
+            .lock()
+            .map_err(|_| anyhow::anyhow!("extension executors unavailable"))?
+            .contains(&instance)
+        {
+            bail!("this extension is being uninstalled");
+        }
+        Ok(())
+    }
+
+    /// Uninstall, before its records go: no new call may start for these
+    /// instances, a running call is cut off, and each executor is stopped.
+    /// Waits at most `wait` for a running call to give up its executor.
+    pub(in crate::marketplace) async fn retire(
+        &self,
+        instances: &[Uuid],
+        wait: Duration,
+    ) -> Result<()> {
+        self.retiring
+            .lock()
+            .map_err(|_| anyhow::anyhow!("extension executors unavailable"))?
+            .extend(instances.iter().copied());
+        for instance in instances {
+            let slot = self
+                .slots
+                .lock()
+                .map_err(|_| anyhow::anyhow!("extension executors unavailable"))?
+                .get(instance)
+                .cloned();
+            let Some(slot) = slot else { continue };
+            let mut held = tokio::time::timeout(wait, slot.lock())
+                .await
+                .context("the extension's running call did not stop in time")?;
+            if let Some(old) = held.take()
+                && let Err(error) = old.session.stop().await
+            {
+                // Its container is removed with the server's other leftover
+                // executors (`remove_orphans`) once nothing holds it.
+                tracing::warn!(%instance, "could not stop an uninstalled extension's executor: {error:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends a retirement. After a completed uninstall the instances' slots
+    /// are dropped; after a failed one the extension serves again (its
+    /// executor starts on the next call).
+    pub(in crate::marketplace) fn finish_retirement(&self, instances: &[Uuid], removed: bool) {
+        if removed && let Ok(mut slots) = self.slots.lock() {
+            for instance in instances {
+                slots.remove(instance);
+            }
+        }
+        if let Ok(mut retiring) = self.retiring.lock() {
+            for instance in instances {
+                retiring.remove(instance);
+            }
         }
     }
 
@@ -123,11 +189,13 @@ impl ServeHost {
         budget: InstallBudget,
         arguments: RuntimeJson,
     ) -> Result<ServeOutcome> {
+        self.require_serving(instance)?;
         let binding =
             InstalledBinding::load_configured(&self.database, home, extension, instance, budget)
                 .await?;
         let slot = self.slot(instance)?;
         let mut held = slot.lock().await;
+        self.require_serving(instance)?;
         let capsule = binding.material(&self.database).await?;
         let descriptor = capsule.descriptor()?;
         let release = Digest::of(canonical::to_vec(&descriptor)?);
@@ -147,6 +215,8 @@ impl ServeHost {
             stack: extension.as_str(),
             members: self.members.as_deref(),
             checked: None,
+            host: self,
+            instance,
         };
         if held.is_none() {
             let session = self
@@ -337,11 +407,14 @@ struct ServeBroker<'a> {
     stack: &'a str,
     members: Option<&'a dyn StackMembers>,
     checked: Option<Instant>,
+    host: &'a ServeHost,
+    instance: Uuid,
 }
 
 #[async_trait::async_trait]
 impl Broker for ServeBroker<'_> {
     async fn current(&mut self) -> Result<()> {
+        self.host.require_serving(self.instance)?;
         if self.checked.is_none_or(|last| last.elapsed() >= CHECK) {
             self.binding.current(self.database).await?;
             self.checked = Some(Instant::now());

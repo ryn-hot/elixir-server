@@ -91,6 +91,38 @@ pub(super) async fn lock_budget(
     }
     Ok(value)
 }
+/// Uninstall: gives back the deleted journals' entries and bytes in the SAME
+/// transaction that deleted them, then proves the ledger matches the table.
+pub(super) async fn release(
+    tx: &mut Transaction<'_, Any>,
+    ledger: Ledger,
+    removed_entries: i64,
+    removed_bytes: i64,
+) -> Result<()> {
+    let entries = ledger
+        .entries
+        .checked_sub(removed_entries)
+        .filter(|n| *n >= 0)
+        .context("installation budget entries underflow")?;
+    let bytes = ledger
+        .bytes
+        .checked_sub(removed_bytes)
+        .filter(|n| *n >= 0)
+        .context("installation budget bytes underflow")?;
+    if ledger.revision >= MAX_REVISION {
+        bail!("installation revision exhausted");
+    }
+    let changed=sqlx::query("UPDATE marketplace_installation_budget SET revision=revision+1,entries=$1,encoded_bytes=$2 WHERE singleton=1 AND revision=$3")
+        .bind(entries).bind(bytes).bind(ledger.revision).execute(&mut **tx).await?.rows_affected();
+    if changed != 1 {
+        bail!("installation budget revision changed");
+    }
+    let actual:(i64,i64)=sqlx::query_as("SELECT COUNT(*),CAST(COALESCE(SUM(encoded_bytes),0) AS BIGINT) FROM marketplace_installations").fetch_one(&mut **tx).await?;
+    if actual != (entries, bytes) {
+        bail!("installation budget differs from its journals after uninstall");
+    }
+    Ok(())
+}
 pub(super) async fn load(
     tx: &mut Transaction<'_, Any>,
     driver: DatabaseDriver,

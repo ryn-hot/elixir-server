@@ -18,6 +18,8 @@ pub(super) mod compiled;
 
 #[path = "cancellation_tests.rs"]
 mod cancellation_tests;
+#[path = "uninstall_tests.rs"]
+mod uninstall_tests;
 
 pub(super) async fn signed_fixture() -> Result<serde_json::Value> {
     signed_fixture_version("1.0.0").await

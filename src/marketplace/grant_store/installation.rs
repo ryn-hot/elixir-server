@@ -29,6 +29,7 @@ pub(in crate::marketplace) mod sharing;
 pub(in crate::marketplace) mod standing;
 mod store;
 pub(in crate::marketplace) mod targets;
+pub(in crate::marketplace) mod uninstall;
 pub(in crate::marketplace) use configured::InstallTarget;
 use record::{Capsule, Journal, MAX_REVISION, Material, ROW_BYTES, Stored};
 

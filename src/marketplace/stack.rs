@@ -429,24 +429,271 @@ pub(crate) struct StackReconcile {
     pub images_ready: usize,
     pub setups_offered: usize,
     pub members_disabled: usize,
+    /// Members of a stack that no longer exists, removed with their apps.
+    pub members_removed: usize,
+}
+
+/// One stack pass at a time: `reconcile_once` runs from the loop, install
+/// handlers and the updater, and overlapping passes would race on member rows
+/// and could offer the same "Finish setup" twice. Uninstalling a stack holds
+/// the same lock, so a pass that listed the stack before it was removed cannot
+/// write its members back afterwards.
+static PASS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Holds off stack passes (see [`PASS`]).
+pub(crate) async fn exclusive_pass() -> tokio::sync::MutexGuard<'static, ()> {
+    PASS.lock().await
+}
+
+/// Container work for a stack's members. The server uses its Docker runtime;
+/// tests use a recording fake.
+#[async_trait::async_trait]
+pub(crate) trait MemberRuntime: Send + Sync {
+    /// Stops and removes a member instance's containers and its app's private
+    /// `/config` volume. Media and downloads folders are bind mounts and are
+    /// never touched.
+    async fn remove_member_runtime(&self, instance: uuid::Uuid) -> Result<()>;
+}
+
+/// What a stack reconcile pass needs from the runtime.
+#[async_trait::async_trait]
+pub(crate) trait StackRuntime: MemberRuntime {
+    async fn ensure_image(&self, image: &str) -> Result<()>;
+}
+
+/// The containers the orchestrator gives one instance (the same names
+/// `OrchestratorService::remove_instance_runtime` removes) and the instance's
+/// managed config volume.
+pub(crate) async fn remove_instance_containers(
+    runtime: &dyn crate::runtime::RuntimeManager,
+    instance: uuid::Uuid,
+) -> Result<()> {
+    let base = crate::orchestrator::naming::container_name(instance);
+    for name in [
+        base.clone(),
+        format!("{base}-rollback"),
+        format!("{base}-vpn"),
+        format!("{base}-vpn-rollback"),
+    ] {
+        if let Some(handle) = runtime.get_container_handle(&name).await? {
+            let _ = runtime.stop_container(&handle).await;
+            runtime.remove_container(&handle).await?;
+        }
+    }
+    runtime
+        .remove_named_volume(&crate::orchestrator::executor::config_volume_name(instance))
+        .await
+}
+
+#[async_trait::async_trait]
+impl MemberRuntime for crate::runtime::docker::DockerRuntimeManager {
+    async fn remove_member_runtime(&self, instance: uuid::Uuid) -> Result<()> {
+        remove_instance_containers(self, instance).await
+    }
+}
+
+#[async_trait::async_trait]
+impl StackRuntime for crate::runtime::docker::DockerRuntimeManager {
+    async fn ensure_image(&self, image: &str) -> Result<()> {
+        self.ensure_pinned_image(image).await.map(|_| ())
+    }
+}
+
+/// `stack.<8 hex>.`: every derived member ID of one stack starts with it.
+pub(crate) fn member_prefix(stack_extension_id: &str) -> String {
+    let id = derived_id(stack_extension_id, "x");
+    id[..id.len() - 1].to_owned()
+}
+
+fn member_prefix_of(member_extension_id: &str) -> Option<String> {
+    let (stack, member) = split_member_id(member_extension_id)?;
+    (member_name(member).is_ok() && valid_stack_hash(stack))
+        .then(|| format!("{STACK_MEMBER_PREFIX}{stack}."))
+}
+
+fn valid_stack_hash(hash: &str) -> bool {
+    hash.len() == 8
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_member_prefix(prefix: &str) -> bool {
+    prefix
+        .strip_prefix(STACK_MEMBER_PREFIX)
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(valid_stack_hash)
+}
+
+/// Derived member rows a removal deleted.
+#[derive(Debug, Default)]
+pub(crate) struct RemovedMembers {
+    pub extensions: Vec<String>,
+    pub instances: Vec<uuid::Uuid>,
+}
+
+/// One instance's operational rows inside the caller's transaction: its
+/// providers (and the bindings that use them), provider and instance secrets,
+/// settings saved under its instance or provider ID, and the instance itself
+/// (its logs and other dependants go with it through their foreign keys).
+pub(crate) async fn delete_instance_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    instance: uuid::Uuid,
+) -> Result<()> {
+    let instance = instance.to_string();
+    let providers: Vec<(String,)> =
+        sqlx::query_as("SELECT provider_id FROM providers WHERE instance_id=$1")
+            .bind(&instance)
+            .fetch_all(&mut **tx)
+            .await?;
+    for (provider,) in providers {
+        sqlx::query("DELETE FROM bindings WHERE consumer_provider_id=$1 OR target_provider_id=$1")
+            .bind(&provider)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM secrets WHERE scope='provider' AND scope_id=$1")
+            .bind(&provider)
+            .execute(&mut **tx)
+            .await?;
+        // UUIDs hold no LIKE wildcards: only keys ending in this exact ID.
+        sqlx::query("DELETE FROM extension_settings WHERE setting_key LIKE $1")
+            .bind(format!("%{provider}"))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM providers WHERE provider_id=$1")
+            .bind(&provider)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM secrets WHERE scope='instance' AND scope_id=$1")
+        .bind(&instance)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM extension_settings WHERE setting_key LIKE $1")
+        .bind(format!("%{instance}"))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM extension_instances WHERE instance_id=$1")
+        .bind(&instance)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Every derived member row of one stack, inside the caller's transaction:
+/// the members' instances (see [`delete_instance_rows`]), the setup's desired
+/// blueprint and the member rows themselves. Built-in extensions the stack
+/// uses never start with `stack.` and are left alone. The caller removes the
+/// returned instances' containers after it commits.
+pub(crate) async fn delete_member_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    prefix: &str,
+) -> Result<RemovedMembers> {
+    if !valid_member_prefix(prefix) {
+        bail!("invalid stack member prefix");
+    }
+    // A fixed-length prefix compare: `LIKE` would treat `_` as a wildcard.
+    let query = format!(
+        "SELECT extension_id FROM extensions WHERE SUBSTR(extension_id,1,{})=$1 ORDER BY extension_id",
+        prefix.len()
+    );
+    let members: Vec<(String,)> = sqlx::query_as(&query)
+        .bind(prefix)
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut removed = RemovedMembers::default();
+    for (member,) in members {
+        if !is_stack_member_id(&member) || BUILT_IN_STACK_REFERENCES.contains(&member.as_str()) {
+            bail!("refusing to remove '{member}' as a stack member");
+        }
+        let instances: Vec<(String,)> =
+            sqlx::query_as("SELECT instance_id FROM extension_instances WHERE extension_id=$1")
+                .bind(&member)
+                .fetch_all(&mut **tx)
+                .await?;
+        for (instance,) in instances {
+            let instance: uuid::Uuid = instance.trim().parse()?;
+            delete_instance_rows(tx, instance).await?;
+            removed.instances.push(instance);
+        }
+        sqlx::query("DELETE FROM desired_blueprints WHERE blueprint_extension_id=$1")
+            .bind(&member)
+            .execute(&mut **tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM extensions WHERE extension_id=$1")
+            .bind(&member)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        if deleted != 1 {
+            bail!("stack member '{member}' changed while it was being removed");
+        }
+        removed.extensions.push(member);
+    }
+    Ok(removed)
+}
+
+/// Removes the members' containers and config volumes after their rows are
+/// gone. A failure is logged: the orchestrator removes leftover managed
+/// containers at its next start. Returns how many could not be removed.
+pub(crate) async fn remove_member_runtimes<R: MemberRuntime + ?Sized>(
+    runtime: &R,
+    instances: &[uuid::Uuid],
+) -> usize {
+    let mut failed = 0;
+    for instance in instances {
+        if let Err(error) = runtime.remove_member_runtime(*instance).await {
+            failed += 1;
+            tracing::warn!(%instance, "could not remove a removed stack app's container: {error:#}");
+        }
+    }
+    failed
+}
+
+/// Removes every member of a stack that no longer exists: rows first (one
+/// transaction), then containers.
+pub(crate) async fn remove_members<R: MemberRuntime + ?Sized>(
+    pool: &sqlx::AnyPool,
+    runtime: &R,
+    prefix: &str,
+) -> Result<RemovedMembers> {
+    if !valid_member_prefix(prefix) {
+        bail!("invalid stack member prefix");
+    }
+    let mut tx = pool.begin().await?;
+    // Take the writer position before reading (SQLite cannot upgrade a
+    // reader while another connection writes).
+    let lock = format!(
+        "UPDATE extensions SET installed_at=installed_at WHERE SUBSTR(extension_id,1,{})=$1",
+        prefix.len()
+    );
+    sqlx::query(&lock).bind(prefix).execute(&mut *tx).await?;
+    let removed = delete_member_rows(&mut tx, prefix).await?;
+    tx.commit().await?;
+    remove_member_runtimes(runtime, &removed.instances).await;
+    Ok(removed)
 }
 
 /// Idempotent: for every enabled marketplace extension that declares a stack,
 /// write its derived member rows, make each pinned image present, and offer
-/// its setup once ("Finish setup"). Members whose stack is no longer enabled
-/// are switched off. Runs before each orchestrator reconcile, so it also
-/// recovers after a crash between activation and this step.
+/// its setup once ("Finish setup"). Members of a stack that is switched off
+/// are switched off; members of a stack that no longer exists are removed with
+/// their apps. Runs before each orchestrator reconcile, so it also recovers
+/// after a crash between activation and this step.
 pub(crate) async fn reconcile(
     pool: &sqlx::AnyPool,
     docker: &crate::runtime::docker::DockerRuntimeManager,
 ) -> Result<StackReconcile> {
+    reconcile_with(pool, docker).await
+}
+
+pub(crate) async fn reconcile_with(
+    pool: &sqlx::AnyPool,
+    runtime: &dyn StackRuntime,
+) -> Result<StackReconcile> {
     use crate::db::models::ExtensionTrustLevel;
     use crate::extensions::store::{ExtensionStore, NewDesiredBlueprint, NewExtension};
-    // `reconcile_once` runs from the loop, install handlers and the updater.
-    // Overlapping passes would race on member rows and could offer the same
-    // "Finish setup" twice, so one pass runs at a time.
-    static PASS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     let _pass = PASS.lock().await;
     let store = ExtensionStore::new(pool);
     let extensions = store.list_extensions().await?;
@@ -475,8 +722,8 @@ pub(crate) async fn reconcile(
                 .as_ref()
                 .and_then(|runtime| runtime.image.as_deref())
             {
-                docker
-                    .ensure_pinned_image(image)
+                runtime
+                    .ensure_image(image)
                     .await
                     .with_context(|| format!("stack image for '{}'", member.id))?;
                 summary.images_ready += 1;
@@ -519,15 +766,72 @@ pub(crate) async fn reconcile(
             }
         }
     }
-    for orphan in extensions.iter().filter(|row| {
-        row.enabled && is_stack_member_id(&row.extension_id) && !wanted.contains(&row.extension_id)
-    }) {
-        store
-            .set_extension_enabled(&orphan.extension_id, false)
-            .await?;
-        summary.members_disabled += 1;
+    // Every marketplace extension that still exists, switched on or not.
+    let stacks: BTreeSet<String> = extensions
+        .iter()
+        .filter(|row| row.extension_id.starts_with("elx:"))
+        .map(|row| member_prefix(&row.extension_id))
+        .collect();
+    let mut gone = BTreeSet::new();
+    let mut gone_enabled = Vec::new();
+    for orphan in extensions
+        .iter()
+        .filter(|row| is_stack_member_id(&row.extension_id) && !wanted.contains(&row.extension_id))
+    {
+        match member_prefix_of(&orphan.extension_id) {
+            Some(prefix) if !stacks.contains(&prefix) => {
+                gone.insert(prefix);
+                if orphan.enabled {
+                    gone_enabled.push(orphan.extension_id.as_str());
+                }
+            }
+            _ if orphan.enabled => {
+                store
+                    .set_extension_enabled(&orphan.extension_id, false)
+                    .await?;
+                summary.members_disabled += 1;
+            }
+            _ => {}
+        }
     }
-    Ok(summary)
+    if gone.is_empty() {
+        return Ok(summary);
+    }
+    // The orchestrator's apply lock keeps a setup run or reconcile pass from
+    // starting these apps again while they are removed. If one is running,
+    // they are only switched off now and the next pass removes them.
+    let owner = uuid::Uuid::new_v4().to_string();
+    let lock = crate::orchestrator::lock::APPLY_LOCK_NAME;
+    if !store
+        .acquire_lock(lock, &owner, std::time::Duration::from_secs(300))
+        .await?
+    {
+        for member in gone_enabled {
+            store.set_extension_enabled(member, false).await?;
+            summary.members_disabled += 1;
+        }
+        return Ok(summary);
+    }
+    let mut result = Ok(());
+    for prefix in gone {
+        match remove_members(pool, runtime, &prefix).await {
+            Ok(removed) => {
+                tracing::info!(
+                    members = removed.extensions.len(),
+                    "removed the apps of a container stack that is no longer installed"
+                );
+                summary.members_removed += removed.extensions.len();
+            }
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
+    if let Err(error) = store.release_lock(lock, &owner).await {
+        tracing::warn!("could not release the orchestrator lock after a stack pass: {error:#}");
+    }
+    result.map(|()| summary)
 }
 
 #[cfg(test)]

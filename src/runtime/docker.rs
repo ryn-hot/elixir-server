@@ -4246,6 +4246,19 @@ impl RuntimeManager for DockerRuntimeManager {
         Ok(())
     }
 
+    async fn remove_named_volume(&self, name: &str) -> Result<()> {
+        if self.inspect_named_volume(name).await?.is_none() {
+            return Ok(());
+        }
+        // No `--force`: Docker refuses a volume a container still uses.
+        self.run_capture(&["volume".to_string(), "rm".to_string(), name.to_string()])
+            .await?;
+        if self.inspect_named_volume(name).await?.is_some() {
+            bail!("volume {name} still exists after removal");
+        }
+        Ok(())
+    }
+
     async fn get_container_handle(&self, name: &str) -> Result<Option<ContainerHandle>> {
         if let Some(id) = self.find_container_id(name).await? {
             return Ok(Some(ContainerHandle {

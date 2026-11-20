@@ -349,6 +349,10 @@ pub(crate) fn installation_routes() -> Router<AppState> {
         .route(
             "/api/v1/marketplace/installations/:id/actions",
             post(action).layer(DefaultBodyLimit::max(management::MAX_ACTION_BYTES)),
+        )
+        .route(
+            "/api/v1/marketplace/installations/uninstall",
+            post(uninstall::uninstall).layer(DefaultBodyLimit::max(uninstall::MAX_UNINSTALL_BYTES)),
         );
     #[cfg(feature = "private-test-network")]
     let routes = routes.route(
@@ -362,6 +366,7 @@ pub(crate) fn installation_routes() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests;
+mod uninstall;
 #[cfg(test)]
 pub(crate) use tests::{
     authenticated_first_run_fixture, authenticated_fixture, authenticated_fixture_with_settings,

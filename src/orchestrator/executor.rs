@@ -6093,7 +6093,7 @@ fn extension_requires_runtime_volume(extension_id: &str) -> bool {
     is_nzbget_extension_id(extension_id)
 }
 
-fn config_volume_name(instance_id: Uuid) -> String {
+pub(crate) fn config_volume_name(instance_id: Uuid) -> String {
     format!("elixir_cfg_{}", instance_id.simple())
 }
 

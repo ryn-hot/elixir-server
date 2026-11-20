@@ -199,6 +199,18 @@ pub struct OrchestratorService {
     core_extensions: Vec<String>,
 }
 
+/// Uninstalling a marketplace stack removes each app's containers the normal
+/// way, then the app's private config volume.
+#[async_trait::async_trait]
+impl crate::marketplace::stack::MemberRuntime for OrchestratorService {
+    async fn remove_member_runtime(&self, instance: uuid::Uuid) -> Result<()> {
+        self.remove_instance_runtime(instance).await?;
+        self.runtime
+            .remove_named_volume(&crate::orchestrator::executor::config_volume_name(instance))
+            .await
+    }
+}
+
 impl OrchestratorService {
     pub fn new(
         pool: AnyPool,

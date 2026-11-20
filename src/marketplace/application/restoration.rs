@@ -90,6 +90,7 @@ impl Service {
             .lock()
             .map_err(|_| anyhow::anyhow!("installed restoration owner unavailable"))?;
         if state.stopped
+            || state.uninstalling
             || state.restoration.is_some()
             || state.entry.is_some()
             || state.completed.is_some()

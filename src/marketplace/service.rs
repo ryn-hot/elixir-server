@@ -22,6 +22,10 @@ pub use startup::StartupView;
 #[cfg(unix)]
 mod providers;
 #[cfg(unix)]
+mod uninstall;
+#[cfg(unix)]
+pub(crate) use uninstall::{UninstallError, UninstallOptions, Uninstalled};
+#[cfg(unix)]
 pub(crate) use super::application::InstalledCall;
 #[cfg(unix)]
 pub(crate) use providers::{SOURCE_PROVIDER_ENDPOINT, SourceProviderDescriptor};

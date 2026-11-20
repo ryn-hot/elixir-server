@@ -80,6 +80,7 @@ fn management_http_futures_keep_the_existing_128_kib_frame_bound() {
         ("status", status_frame(status)),
         ("current", current_frame(current)),
         ("action", action_frame(action)),
+        ("uninstall", mutation_frame(super::uninstall::uninstall)),
     ] {
         assert!(
             bytes <= 128 * 1024,
