@@ -1057,7 +1057,13 @@ impl<'a> Executor<'a> {
             };
 
             if let Err(err) = self
-                .finalize_runtime_storage(instance_id, &extension_id, &handle, &runtime_volumes)
+                .finalize_runtime_storage(
+                    instance_id,
+                    &extension_id,
+                    &handle,
+                    &runtime_volumes,
+                    container_user_label(&spec.labels),
+                )
                 .await
             {
                 if let Some(handle) = self.runtime.get_container_handle(&name).await? {
@@ -1185,8 +1191,14 @@ impl<'a> Executor<'a> {
         }
 
         let handle = self.runtime.ensure_container(&spec).await?;
-        self.finalize_runtime_storage(instance_id, &extension_id, &handle, &runtime_volumes)
-            .await?;
+        self.finalize_runtime_storage(
+            instance_id,
+            &extension_id,
+            &handle,
+            &runtime_volumes,
+            container_user_label(&spec.labels),
+        )
+        .await?;
         persist_runtime_config(&self.store, instance_id, &runtime_volumes).await?;
         if current_version.is_none() {
             self.store
@@ -1538,7 +1550,13 @@ impl<'a> Executor<'a> {
         };
 
         if let Err(err) = self
-            .finalize_runtime_storage(instance_id, extension_id, &handle, runtime_volumes)
+            .finalize_runtime_storage(
+                instance_id,
+                extension_id,
+                &handle,
+                runtime_volumes,
+                container_user_label(&spec.labels),
+            )
             .await
         {
             self.restore_rehome_rollback(container_name, &rollback_name, backup_created)
@@ -2113,12 +2131,17 @@ impl<'a> Executor<'a> {
             .join(relative))
     }
 
+    /// `container_user` is the user recorded on the container. Its runtime
+    /// folders go to that user directly: right after a start, the image may
+    /// not have given `/config` to it yet, so copying `/config`'s owner
+    /// could hand the folders to the image's old user.
     async fn finalize_runtime_storage(
         &self,
         instance_id: Uuid,
         extension_id: &str,
         handle: &ContainerHandle,
         volumes: &[VolumeMount],
+        container_user: Option<ContainerUser>,
     ) -> Result<()> {
         let uses_named_config = volumes.iter().any(|volume| {
             volume.container_path == "/config"
@@ -2130,9 +2153,13 @@ impl<'a> Executor<'a> {
 
         let directories = required_named_runtime_directories(extension_id, volumes);
         if !directories.is_empty() {
+            let owner = match container_user {
+                Some(user) => format!("{}:{}", user.uid, user.gid),
+                None => "/config".to_string(),
+            };
             let ownership_corrected = self
                 .runtime
-                .ensure_container_directories_owned_like(handle, "/config", &directories)
+                .ensure_container_directories_owned_like(handle, &owner, &directories)
                 .await
                 .with_context(|| {
                     format!(
@@ -6620,9 +6647,17 @@ mod tests {
         runtime_states: Mutex<HashMap<String, ContainerRuntimeState>>,
         renames: Mutex<Vec<(String, String)>>,
         removals: Mutex<Vec<String>>,
+        directory_owners: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl CaptureRuntime {
+        fn directory_owners(&self) -> Vec<(String, Vec<String>)> {
+            self.directory_owners
+                .lock()
+                .expect("capture runtime lock")
+                .clone()
+        }
+
         fn set_runtime_state(&self, state: ContainerRuntimeState) {
             self.runtime_states
                 .lock()
@@ -6828,9 +6863,13 @@ mod tests {
         async fn ensure_container_directories_owned_like(
             &self,
             _handle: &ContainerHandle,
-            _reference_path: &str,
-            _paths: &[String],
+            owner: &str,
+            paths: &[String],
         ) -> Result<bool> {
+            self.directory_owners
+                .lock()
+                .expect("capture runtime lock")
+                .push((owner.to_string(), paths.to_vec()));
             Ok(false)
         }
     }
@@ -9780,6 +9819,11 @@ mod tests {
             "the second start keeps the container"
         );
         assert!(downloads.join(".nzb").is_dir());
+        let owners = runtime.directory_owners();
+        assert_eq!(owners.len(), 2);
+        for (owner, _) in owners {
+            assert_eq!(owner, format!("{}:{}", user.uid, user.gid));
+        }
         Ok(())
     }
 
@@ -9846,6 +9890,75 @@ mod tests {
         assert_eq!(
             specs[0].labels[CONTAINER_SPEC_HASH_LABEL], specs[1].labels[CONTAINER_SPEC_HASH_LABEL],
             "the existing container is not recreated"
+        );
+        let owners = runtime.directory_owners();
+        assert_eq!(owners.len(), 2);
+        for (owner, _) in owners {
+            assert_eq!(owner, "/config", "as before this rule");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_folders_go_to_the_containers_user_not_to_the_owner_of_config() -> Result<()> {
+        let database = setup_db().await?;
+        let secrets = SecretsManager::from_key_bytes([8u8; 32], true);
+        let probe = StubProbe::default();
+        let drivers = DriverRegistry::new();
+        let runtime = CaptureRuntime::default();
+        let temp_dir = TempDir::new()?;
+        let paths = RuntimePaths::from_roots(
+            temp_dir
+                .path()
+                .join("data/extensions")
+                .to_string_lossy()
+                .as_ref(),
+            temp_dir.path().join("media").to_string_lossy().as_ref(),
+        );
+        let instance_id = Uuid::new_v4();
+        let volumes = prepare_runtime_volumes(
+            "elixir.modules.qbittorrent",
+            instance_id,
+            &["{downloads}:/downloads".to_string()],
+            &paths,
+        )?
+        .volumes;
+        let handle = ContainerHandle {
+            id: "capture".to_string(),
+            name: container_name(instance_id),
+        };
+        let executor = Executor::new(
+            &database.pool,
+            &probe,
+            &drivers,
+            &runtime,
+            paths.clone(),
+            &secrets,
+        );
+        // Right after a start the image may not have given /config to its
+        // user yet, so a known user is set directly; without one, as before.
+        let user = ContainerUser {
+            uid: 1000,
+            gid: 1000,
+        };
+        for container_user in [Some(user), None] {
+            executor
+                .finalize_runtime_storage(
+                    instance_id,
+                    "elixir.modules.qbittorrent",
+                    &handle,
+                    &volumes,
+                    container_user,
+                )
+                .await?;
+        }
+        let incomplete = vec![QBITTORRENT_INCOMPLETE_DIR.to_string()];
+        assert_eq!(
+            runtime.directory_owners(),
+            vec![
+                ("1000:1000".to_string(), incomplete.clone()),
+                ("/config".to_string(), incomplete),
+            ]
         );
         Ok(())
     }

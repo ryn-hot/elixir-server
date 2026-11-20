@@ -719,10 +719,13 @@ pub trait RuntimeManager: Send + Sync {
         handle: &ContainerHandle,
         paths: &[String],
     ) -> anyhow::Result<()>;
+    /// Makes `paths` in the container and gives them `owner`: a path in the
+    /// container whose owner is copied, or an explicit `uid:gid`. Returns
+    /// whether an owner changed.
     async fn ensure_container_directories_owned_like(
         &self,
         handle: &ContainerHandle,
-        reference_path: &str,
+        owner: &str,
         paths: &[String],
     ) -> anyhow::Result<bool>;
 }

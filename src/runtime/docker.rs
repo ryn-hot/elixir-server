@@ -4466,7 +4466,7 @@ impl RuntimeManager for DockerRuntimeManager {
     async fn ensure_container_directories_owned_like(
         &self,
         handle: &ContainerHandle,
-        reference_path: &str,
+        owner: &str,
         paths: &[String],
     ) -> Result<bool> {
         if paths.is_empty() {
@@ -4478,15 +4478,20 @@ impl RuntimeManager for DockerRuntimeManager {
             handle.name.clone(),
             "sh".to_string(),
             "-lc".to_string(),
-            "set -e; owner=\"$(stat -c '%u:%g' \"$1\")\"; shift; changed=0; for path in \"$@\"; do mkdir -p \"$path\"; current=\"$(stat -c '%u:%g' \"$path\")\"; if [ \"$current\" != \"$owner\" ]; then chown -R \"$owner\" \"$path\"; changed=1; fi; done; printf '%s' \"$changed\"".to_string(),
+            OWN_CONTAINER_DIRECTORIES_SCRIPT.to_string(),
             "elixir-runtime-init".to_string(),
-            reference_path.to_string(),
+            owner.to_string(),
         ];
         args.extend(paths.iter().cloned());
         let output = self.run_capture(&args).await?;
         Ok(output.stdout.trim() == "1")
     }
 }
+
+/// Makes each path (`$2`…) and gives it the owner `$1`: a path in the
+/// container whose owner is copied, or an explicit `uid:gid`. Prints 1 when
+/// it changed an owner.
+const OWN_CONTAINER_DIRECTORIES_SCRIPT: &str = "set -e; owner=\"$1\"; case \"$owner\" in /*) owner=\"$(stat -c '%u:%g' \"$owner\")\";; esac; shift; changed=0; for path in \"$@\"; do mkdir -p \"$path\"; current=\"$(stat -c '%u:%g' \"$path\")\"; if [ \"$current\" != \"$owner\" ]; then chown -R \"$owner\" \"$path\"; changed=1; fi; done; printf '%s' \"$changed\"";
 
 struct CommandOutput {
     stdout: String,
@@ -4891,6 +4896,41 @@ mod tests {
     use crate::runtime::model::ContainerSecurityOptions;
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
+
+    /// GNU `stat`, as in the downloader images.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_folder_owner_is_copied_from_a_path_or_given_as_uid_and_gid() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let run = |owner: &str, path: &std::path::Path| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(OWN_CONTAINER_DIRECTORIES_SCRIPT)
+                .arg("elixir-runtime-init")
+                .arg(owner)
+                .arg(path)
+                .output()
+        };
+        // SAFETY: plain getters with no arguments.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let given = run(
+            &format!("{uid}:{gid}"),
+            &dir.path().join("given/.incomplete"),
+        )?;
+        assert!(given.status.success(), "{given:?}");
+        assert_eq!(given.stdout, b"0", "made, and already that owner");
+        assert!(dir.path().join("given/.incomplete").is_dir());
+        let copied = run(&dir.path().to_string_lossy(), &dir.path().join("copied"))?;
+        assert!(copied.status.success(), "{copied:?}");
+        assert_eq!(copied.stdout, b"0");
+        if uid != 0 {
+            // A given owner is used as it is, not read from a path: this
+            // user may not give a folder to root.
+            let root = run("0:0", &dir.path().join("root"))?;
+            assert!(!root.status.success(), "{root:?}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_quarantine_success_requires_owned_immutable_identity_and_natural_exit() -> Result<()>

@@ -207,6 +207,21 @@ async fn native_http_arr_stack_one_click_on_a_clean_server() -> Result<()> {
             bearer: Some(format!("Bearer {token}")),
         })
         .await?;
+        // qBittorrent's partial downloads go to the server's user as well,
+        // even though its first start finds /config still the image's.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let paths = crate::runtime::RuntimePaths::from_roots(
+                &state.settings.extensions.storage_root,
+                &state.settings.library.local_root,
+            );
+            let incomplete = Path::new(&paths.downloads_root).join(".incomplete");
+            // SAFETY: a plain getter with no arguments.
+            let server = unsafe { libc::geteuid() };
+            let owner = std::fs::metadata(&incomplete)?.uid();
+            assert_eq!(owner, server, "{}", incomplete.display());
+        }
         state.marketplace.shutdown().await?;
         Ok::<_, anyhow::Error>(())
     }))
