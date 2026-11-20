@@ -163,15 +163,12 @@ async fn run_due_setups(state: &AppState) -> anyhow::Result<()> {
         {
             continue;
         }
-        let due = match runs.get(id) {
-            Some(run) if run.status == OrchestratorRunStatus::Running => false,
-            Some(run) if run.status == OrchestratorRunStatus::Failed => {
-                let reason = run.error.as_deref().unwrap_or_default();
-                reason.contains(APPLY_LOCK_BUSY)
-                    || (reason == INTERRUPTED_BY_RESTART && mark_retried(id))
-            }
-            _ => pending.contains(id),
-        };
+        let due = setup_is_due(
+            runs.get(id),
+            pending.contains(id),
+            applied.contains(id),
+            || mark_retried(id),
+        );
         if !due {
             continue;
         }
@@ -184,6 +181,28 @@ async fn run_due_setups(state: &AppState) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the runner should start this setup now. A finished setup is never
+/// started again: confirming a setup records its own applied row and leaves
+/// the stack's original offer pending beside it, so an offer only counts
+/// while no applied row exists. `retry_after_restart` is asked only for a run
+/// a restart cut short, and says yes once per process.
+fn setup_is_due(
+    latest_run: Option<&OrchestratorRun>,
+    offered: bool,
+    applied: bool,
+    retry_after_restart: impl FnOnce() -> bool,
+) -> bool {
+    match latest_run {
+        Some(run) if run.status == OrchestratorRunStatus::Running => false,
+        Some(run) if run.status == OrchestratorRunStatus::Failed => {
+            let reason = run.error.as_deref().unwrap_or_default();
+            reason.contains(APPLY_LOCK_BUSY)
+                || (reason == INTERRUPTED_BY_RESTART && retry_after_restart())
+        }
+        _ => offered && !applied,
+    }
 }
 
 /// True the first time it is called for `setup_id` in this process.
@@ -351,5 +370,31 @@ mod tests {
         );
         let running = HashMap::from([(setup.to_string(), run(OrchestratorRunStatus::Running, None))]);
         assert_eq!(setup_state(setup, &none, &applied, &running), StackSetupState::Running);
+    }
+
+    #[test]
+    fn a_finished_setup_is_not_started_again() {
+        let never = || -> bool { panic!("only a run a restart cut short may ask to retry") };
+        let completed = run(OrchestratorRunStatus::Completed, None);
+        // Offered and never run: start it.
+        assert!(setup_is_due(None, true, false, never));
+        // Confirming wrote an applied row beside the stack's pending offer:
+        // the setup is done, whatever the leftover offer says.
+        assert!(!setup_is_due(Some(&completed), true, true, never));
+        assert!(!setup_is_due(None, true, true, never));
+        assert!(!setup_is_due(None, false, false, never));
+        // Running now: leave it alone.
+        let running = run(OrchestratorRunStatus::Running, None);
+        assert!(!setup_is_due(Some(&running), true, false, never));
+        // A busy lock retries even after confirm wrote its applied row.
+        let busy = run(OrchestratorRunStatus::Failed, Some(APPLY_LOCK_BUSY));
+        assert!(setup_is_due(Some(&busy), false, true, never));
+        // A real failure waits for the owner.
+        let failed = run(OrchestratorRunStatus::Failed, Some("Prowlarr did not start"));
+        assert!(!setup_is_due(Some(&failed), true, true, never));
+        // A restart retries once, as the callback decides.
+        let cut_short = run(OrchestratorRunStatus::Failed, Some(INTERRUPTED_BY_RESTART));
+        assert!(setup_is_due(Some(&cut_short), false, true, || true));
+        assert!(!setup_is_due(Some(&cut_short), false, true, || false));
     }
 }
