@@ -2667,7 +2667,7 @@ impl DockerRuntimeManager {
                 .pointer("/HostConfig/NetworkMode")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if current != network_mode {
+            if !self.network_mode_matches(network_mode, current).await? {
                 bail!(
                     "container '{}' has network mode '{}' but expected '{}'; recreate to fix",
                     spec.name,
@@ -2725,6 +2725,30 @@ impl DockerRuntimeManager {
         }
 
         Ok(())
+    }
+
+    /// Docker Engine on Linux records `--network container:<name>` as
+    /// `container:<full id>`, while Docker Desktop may keep the name. Both share
+    /// the desired namespace only while that ID is the named container's current
+    /// one; a sidecar recreated since has a new ID and still mismatches.
+    async fn network_mode_matches(&self, desired: &str, actual: &str) -> Result<bool> {
+        if actual == desired {
+            return Ok(true);
+        }
+        let (Some(target), Some(actual_id)) = (
+            desired.strip_prefix("container:"),
+            actual.strip_prefix("container:"),
+        ) else {
+            return Ok(false);
+        };
+        if immutable_id(target) || !immutable_id(actual_id) {
+            return Ok(false);
+        }
+        let current_id = self
+            .find_container_id(target)
+            .await
+            .with_context(|| format!("resolving network namespace container '{target}'"))?;
+        Ok(current_id.as_deref() == Some(actual_id))
     }
 
     fn container_spec_hash_mismatch(
@@ -6563,6 +6587,91 @@ if(verb==='create'){
             }
         });
         assert!(!DockerRuntimeManager::aliases_conflict(&spec, &inspect));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_vpn_namespace_matches_by_name_or_the_sidecars_current_id() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sidecar_id = format!("40729d4a{}", "b".repeat(56));
+        let recreated_id = "c".repeat(64);
+        let dir = tempfile::tempdir()?;
+        let cli = dir.path().join("docker");
+        std::fs::write(
+            &cli,
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+echo "$*" >> "$dir/calls"
+[ "$1" = ps ] && [ "$5" = 'name=^/elx-db14ba-vpn$' ] || exit 2
+cat "$dir/vpn-id" 2>/dev/null
+exit 0
+"#,
+        )?;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700))?;
+        let runtime = DockerRuntimeManager::new(Some(cli.to_string_lossy().into_owned()));
+        let spec = ContainerSpec {
+            name: "elx-db14ba".to_string(),
+            image: "example:latest".to_string(),
+            network: String::new(),
+            network_mode: Some("container:elx-db14ba-vpn".to_string()),
+            aliases: Vec::new(),
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            labels: HashMap::new(),
+            command: Vec::new(),
+            cap_add: Vec::new(),
+            devices: Vec::new(),
+            cap_drop: Vec::new(),
+            sysctls: HashMap::new(),
+            security: Default::default(),
+        };
+        let attached = |mode: &str| json!({"HostConfig": {"NetworkMode": mode}});
+        let calls = || std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        let lookup = "ps -a --no-trunc --filter name=^/elx-db14ba-vpn$ --format {{.ID}}\n";
+
+        // Docker Desktop keeps the name: no lookup needed.
+        runtime
+            .ensure_container_attached(&spec, &attached("container:elx-db14ba-vpn"))
+            .await?;
+        assert_eq!(calls(), "");
+
+        // Docker Engine 29 records the sidecar's full ID.
+        std::fs::write(dir.path().join("vpn-id"), format!("{sidecar_id}\n"))?;
+        runtime
+            .ensure_container_attached(&spec, &attached(&format!("container:{sidecar_id}")))
+            .await?;
+        assert_eq!(calls(), lookup);
+
+        // Real mismatches still ask for a recreate.
+        for (mode, sidecar) in [
+            // The sidecar was recreated, so the old namespace is gone.
+            (format!("container:{sidecar_id}"), Some(recreated_id.as_str())),
+            // The sidecar no longer exists.
+            (format!("container:{sidecar_id}"), None),
+            // A different named container.
+            ("container:elx-638073-vpn".to_string(), Some(sidecar_id.as_str())),
+            // A different mode altogether.
+            ("bridge".to_string(), Some(sidecar_id.as_str())),
+            (String::new(), Some(sidecar_id.as_str())),
+        ] {
+            match sidecar {
+                Some(id) => std::fs::write(dir.path().join("vpn-id"), format!("{id}\n"))?,
+                None => std::fs::remove_file(dir.path().join("vpn-id"))?,
+            }
+            let err = runtime
+                .ensure_container_attached(&spec, &attached(&mode))
+                .await
+                .expect_err(&format!("network mode '{mode}' must not match"));
+            assert!(
+                err.to_string().contains("expected 'container:elx-db14ba-vpn'"),
+                "{err:#}"
+            );
+        }
+        // Only the ID forms looked the sidecar up.
+        assert_eq!(calls(), lookup.repeat(3));
+        Ok(())
     }
 
     #[test]
