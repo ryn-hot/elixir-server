@@ -103,6 +103,8 @@ use crate::{
     state::AppState,
 };
 
+/// The provider implementation name of the built-in qBittorrent.
+const QBITTORRENT_IMPLEMENTATION: &str = "qbittorrent";
 const QBITTORRENT_STAGING_RESOLVER_VERSION: &str = "rr5a-qbittorrent-staging-v1";
 const QBITTORRENT_SELECTION_POLICY_VERSION: &str = "rr5b-qbittorrent-file-priority-v1";
 const HTTP_STREAM_BROKER_RESOLVER_VERSION: &str = "ess5-http-stream-broker-v1";
@@ -1669,9 +1671,14 @@ async fn load_qbittorrent_progress(
         };
         let torrent = if let Some(release) = staged_releases.get(&id) {
             Some(
-                load_qbittorrent_torrent_evidence(&state.db_pool, record, release, item)
-                    .await
-                    .map_err(ApiError::from)?,
+                load_qbittorrent_torrent_evidence(
+                    &state.db_pool,
+                    record.implementation.as_deref(),
+                    release,
+                    item,
+                )
+                .await
+                .map_err(ApiError::from)?,
             )
         } else {
             None
@@ -1684,8 +1691,8 @@ async fn load_qbittorrent_progress(
             local_path: string_field(item, "content_path")
                 .or_else(|| string_field(item, "save_path")),
             progress: item.get("progress").and_then(Value::as_f64),
-            downloaded_bytes: number_field(item, "downloaded"),
-            total_bytes: number_field(item, "total_size"),
+            downloaded_bytes: qbittorrent_chosen_bytes_done(item),
+            total_bytes: number_field(item, "size").or_else(|| number_field(item, "total_size")),
             remaining_bytes: number_field(item, "amount_left"),
             download_rate_bps: number_field(item, "dlspeed"),
             upload_rate_bps: number_field(item, "upspeed"),
@@ -1695,6 +1702,18 @@ async fn load_qbittorrent_progress(
         });
     }
     Ok(progress)
+}
+
+/// Finished bytes of the files Elixir chose to download. qBittorrent's
+/// `downloaded` and `total_size` count the whole torrent, skipped files
+/// included, so they would hold a progress bar below 100% for good.
+fn qbittorrent_chosen_bytes_done(item: &Value) -> Option<u64> {
+    number_field(item, "completed")
+        .or_else(|| {
+            let size = number_field(item, "size")?;
+            Some(size.saturating_sub(number_field(item, "amount_left")?))
+        })
+        .or_else(|| number_field(item, "downloaded"))
 }
 
 pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
@@ -1835,6 +1854,29 @@ pub(crate) async fn process_stale_qbittorrent_acquisition_releases(
                 | AcquisitionReleaseState::Cancelled
                 | AcquisitionReleaseState::Completed
         ) {
+            continue;
+        }
+        // A torrent qBittorrent reports finished, or broken, is settled here
+        // exactly as reading the progress route settles it. Nothing else reads
+        // that route, so without this a finished download never reached import.
+        if !qbittorrent_submission_bookkeeping_pending(&release)
+            && (qbittorrent_torrent_is_complete(&torrent_info)
+                || qbittorrent_torrent_is_failed(&torrent_info))
+        {
+            if let Err(err) = load_qbittorrent_torrent_evidence(
+                &state.db_pool,
+                Some(QBITTORRENT_IMPLEMENTATION),
+                &release,
+                &torrent_info,
+            )
+            .await
+            {
+                tracing::warn!(
+                    release_id = %release.release_id,
+                    torrent_hash = torrent_hash,
+                    "qBittorrent finished-torrent check failed: {err:#}"
+                );
+            }
             continue;
         }
         if release.state != state_before_refresh || release.state == AcquisitionReleaseState::Ready
@@ -2197,7 +2239,7 @@ fn qbittorrent_metadata_backoff(attempts: u32) -> Duration {
 
 async fn load_qbittorrent_torrent_evidence(
     pool: &sqlx::AnyPool,
-    record: &DownloadBrokerProviderRecord,
+    provider_implementation: Option<&str>,
     release: &AcquisitionRelease,
     torrent_info: &Value,
 ) -> anyhow::Result<DownloadBrokerTorrentEvidence> {
@@ -2210,8 +2252,13 @@ async fn load_qbittorrent_torrent_evidence(
         .unwrap_or_else(|| release.clone());
     let mut files = list_release_files(pool, release.release_id).await?;
     let runtime_state = qbittorrent_runtime_state(&release, &files, torrent_info);
-    let mut evidence =
-        qbittorrent_torrent_evidence(record, &release, &files, torrent_info, &runtime_state);
+    let mut evidence = qbittorrent_torrent_evidence(
+        provider_implementation,
+        &release,
+        &files,
+        torrent_info,
+        &runtime_state,
+    );
 
     if runtime_state == "completed" && release.state != AcquisitionReleaseState::Completed {
         let coverage_plan =
@@ -2229,8 +2276,13 @@ async fn load_qbittorrent_torrent_evidence(
             .await?
             .unwrap_or(release);
         files = list_release_files(pool, release.release_id).await?;
-        evidence =
-            qbittorrent_torrent_evidence(record, &release, &files, torrent_info, "completed");
+        evidence = qbittorrent_torrent_evidence(
+            provider_implementation,
+            &release,
+            &files,
+            torrent_info,
+            "completed",
+        );
     } else if runtime_state == "failed" && release.state != AcquisitionReleaseState::Failed {
         let coverage_plan =
             merge_qbittorrent_runtime_evidence(release.coverage_plan.clone(), &evidence);
@@ -2255,8 +2307,13 @@ async fn load_qbittorrent_torrent_evidence(
                 .await?
                 .unwrap_or(release);
             files = list_release_files(pool, release.release_id).await?;
-            evidence =
-                qbittorrent_torrent_evidence(record, &release, &files, torrent_info, "failed");
+            evidence = qbittorrent_torrent_evidence(
+                provider_implementation,
+                &release,
+                &files,
+                torrent_info,
+                "failed",
+            );
         } else {
             mark_qbittorrent_release_failed(
                 pool,
@@ -2422,7 +2479,7 @@ fn qbittorrent_runtime_state(
 }
 
 fn qbittorrent_torrent_evidence(
-    record: &DownloadBrokerProviderRecord,
+    provider_implementation: Option<&str>,
     release: &AcquisitionRelease,
     files: &[AcquisitionReleaseFile],
     torrent_info: &Value,
@@ -2484,7 +2541,7 @@ fn qbittorrent_torrent_evidence(
         .unwrap_or_else(|| "pending".to_string());
     DownloadBrokerTorrentEvidence {
         provider_name: Some("qBittorrent".to_string()),
-        provider_implementation: record.implementation.clone(),
+        provider_implementation: provider_implementation.map(str::to_string),
         torrent_hash: string_field(torrent_info, "hash")
             .or_else(|| release.download_id.clone())
             .unwrap_or_default(),
@@ -4731,7 +4788,12 @@ async fn persist_qbittorrent_priority_decision(
                 confidence: entry.confidence,
                 score: entry.score,
                 reason: entry.reason.clone(),
-                state: if decision.is_approved() && selected {
+                // A rejected claim stays rejected. When a release is reused,
+                // its rows include those of earlier requests the owner
+                // cancelled; reviving them gives one file two claims.
+                state: if entry.state == ReleaseCoverageState::Rejected {
+                    ReleaseCoverageState::Rejected
+                } else if decision.is_approved() && selected {
                     ReleaseCoverageState::Selected
                 } else if decision.is_approved() {
                     entry.state
@@ -4810,7 +4872,12 @@ async fn sync_qbittorrent_target_states(
             .iter()
             .map(|file| (file.release_file_id, file))
             .collect::<HashMap<_, _>>();
-        for entry in coverage {
+        // Rejected claims (an earlier, cancelled request for a reused
+        // release) leave their targets as they are.
+        for entry in coverage
+            .iter()
+            .filter(|entry| entry.state != ReleaseCoverageState::Rejected)
+        {
             let selected = entry
                 .release_file_id
                 .and_then(|release_file_id| files_by_id.get(&release_file_id))
@@ -4851,7 +4918,10 @@ async fn sync_qbittorrent_target_states(
                 decision.review_reasons.join(", ")
             )
         };
-        for entry in coverage {
+        for entry in coverage
+            .iter()
+            .filter(|entry| entry.state != ReleaseCoverageState::Rejected)
+        {
             if !touched_targets.insert(entry.target_id) {
                 continue;
             }
@@ -8643,7 +8713,7 @@ mod tests {
 
         let evidence = load_qbittorrent_torrent_evidence(
             &database.pool,
-            &resolved.record,
+            resolved.record.implementation.as_deref(),
             &release,
             &json!({
                 "hash": TEST_HASH,
@@ -8692,6 +8762,274 @@ mod tests {
             Some("/downloads/Show/Season 01/Show.S01E01.1080p.WEB-DL-GROUP.mkv")
         );
         Ok(())
+    }
+
+    /// A release whose file policy is applied, as a downloading torrent's is,
+    /// with qBittorrent answering `torrents/info` with `torrent`.
+    async fn setup_downloading_qbittorrent_release(
+        database: &Database,
+        torrent: Value,
+    ) -> anyhow::Result<AcquisitionRelease> {
+        let resolved = setup_qbittorrent_resolved(database).await?;
+        let (subscription, targets) = setup_series_subscription(database, 1..=1).await?;
+        let release = setup_staged_qbittorrent_release(
+            database,
+            &resolved,
+            subscription.subscription_id,
+            "Show.S01E01.1080p.WEB-DL-GROUP",
+        )
+        .await?;
+        let rows = vec![json!({
+            "index": 0,
+            "name": "Show/Season 01/Show.S01E01.1080p.WEB-DL-GROUP.mkv",
+            "size": 1_500_000_000u64,
+            "priority": 1,
+            "progress": torrent.get("progress").and_then(Value::as_f64).unwrap_or(0.0)
+        })];
+        persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let refinement =
+            refine_tv_qbittorrent_coverage(&database.pool, &release, TEST_HASH, &targets, &files)
+                .await?;
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        persist_qbittorrent_priority_decision(
+            &database.pool,
+            &release,
+            &files,
+            &coverage,
+            &refinement,
+            &decision,
+            true,
+        )
+        .await?;
+        let (mut fixture, _requests) = start_qbittorrent_priority_fixture(rows).await?;
+        fixture.torrent_info_rows = json!([torrent]);
+        configure_qbittorrent_priority_fixture_endpoint(database, &resolved, fixture).await?;
+        let release = get_release(&database.pool, release.release_id)
+            .await?
+            .context("downloading release")?;
+        assert_eq!(release.state, AcquisitionReleaseState::Ready);
+        Ok(release)
+    }
+
+    #[tokio::test]
+    async fn qbittorrent_reused_release_keeps_a_cancelled_claim_rejected() -> anyhow::Result<()> {
+        // The owner cancelled an earlier request for this torrent and asked
+        // again; the new request reuses the release, old claim and all.
+        // Applying file priorities must not revive the old claim, or the
+        // import finds two claims on one file and stops. (The Incredibles.)
+        let database = setup_db().await?;
+        let resolved = setup_qbittorrent_resolved(&database).await?;
+        let (subscription, targets) = setup_movie_subscription(&database, "Movie").await?;
+        let (_, cancelled) = setup_movie_subscription(&database, "Movie").await?;
+        let cancelled_target = cancelled[0].target_id;
+        let release = setup_staged_qbittorrent_release_for(
+            &database,
+            &resolved,
+            subscription.subscription_id,
+            MediaType::Movie,
+            "Movie",
+            "movies",
+            "Movie.2026.1080p.BluRay-GROUP",
+        )
+        .await?;
+        let rows = vec![
+            json!({ "index": 0, "name": "Movie.2026.1080p.BluRay/Movie.2026.1080p.BluRay-GROUP.mkv", "size": 8_000_000_000u64, "priority": 1, "progress": 0.0 }),
+            json!({ "index": 1, "name": "Movie.2026.1080p.BluRay/Movie.2026.1080p.BluRay-GROUP.Dub.dts", "size": 1_300_000_000u64, "priority": 1, "progress": 0.0 }),
+        ];
+        persist_qbittorrent_release_file_rows(&database.pool, &release, TEST_HASH, &rows).await?;
+        let files = list_release_files(&database.pool, release.release_id).await?;
+        let main_file = files
+            .iter()
+            .find(|file| file.provider_file_id.as_deref() == Some("0"))
+            .context("main file")?
+            .release_file_id;
+        let cancelled_reason = "User requested acquisition removal from Acquisition.";
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id: release.release_id,
+                release_file_id: Some(main_file),
+                target_id: cancelled_target,
+                coverage_kind: ReleaseCoverageKind::Movie,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some(cancelled_reason.to_string()),
+                state: ReleaseCoverageState::Rejected,
+                verified_by: Some("user_cancelled".to_string()),
+            },
+        )
+        .await?;
+        update_target_state(
+            &database.pool,
+            cancelled_target,
+            AcquisitionTargetStateUpdate {
+                state: AcquisitionTargetState::Excluded,
+                state_reason: Some(cancelled_reason.to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let refinement = refine_movie_qbittorrent_coverage(
+            &database.pool,
+            &release,
+            TEST_HASH,
+            &targets,
+            &files,
+        )
+        .await?;
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        let decision = decide_qbittorrent_file_priority(&release, &refinement, &files, &coverage);
+        assert!(decision.is_approved());
+        persist_qbittorrent_priority_decision(
+            &database.pool,
+            &release,
+            &files,
+            &coverage,
+            &refinement,
+            &decision,
+            true,
+        )
+        .await?;
+
+        let coverage = list_release_coverage(&database.pool, release.release_id).await?;
+        let old = coverage
+            .iter()
+            .find(|row| row.target_id == cancelled_target)
+            .context("cancelled claim")?;
+        assert_eq!(old.state, ReleaseCoverageState::Rejected);
+        let selected = coverage
+            .iter()
+            .filter(|row| row.state == ReleaseCoverageState::Selected)
+            .map(|row| row.target_id)
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec![targets[0].target_id]);
+        let old_target =
+            crate::acquisition::subscriptions::get_target(&database.pool, cancelled_target)
+                .await?
+                .context("cancelled target")?;
+        assert_eq!(old_target.state, AcquisitionTargetState::Excluded);
+        assert_eq!(old_target.state_reason.as_deref(), Some(cancelled_reason));
+        let new_target =
+            crate::acquisition::subscriptions::get_target(&database.pool, targets[0].target_id)
+                .await?
+                .context("new target")?;
+        assert_eq!(new_target.state, AcquisitionTargetState::Submitted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qbittorrent_background_pass_completes_a_finished_torrent() -> anyhow::Result<()> {
+        // Nothing reads the progress route in production, so the background
+        // pass alone must notice a finished torrent and hand it to import.
+        let database = setup_db().await?;
+        let release = setup_downloading_qbittorrent_release(
+            &database,
+            json!({
+                "hash": TEST_HASH,
+                "state": "stalledUP",
+                "progress": 1.0,
+                "dlspeed": 0,
+                "category": "series",
+                "save_path": "/downloads",
+                "content_path": "/downloads/Show"
+            }),
+        )
+        .await?;
+        let state = setup_state_for_database(&database)?;
+
+        assert_eq!(
+            process_stale_qbittorrent_acquisition_releases(&state, 10).await?,
+            0
+        );
+
+        let completed = get_release(&database.pool, release.release_id)
+            .await?
+            .context("completed release")?;
+        assert_eq!(completed.state, AcquisitionReleaseState::Completed);
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert_eq!(jobs[0].state, ReleaseJobState::Completed);
+        assert!(!jobs[0].active);
+        let pending =
+            crate::acquisition::imports::list_import_pending_release_jobs(&database.pool, 10)
+                .await?;
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.job.release_job_id == jobs[0].release_job_id),
+            "the finished torrent waits for import"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qbittorrent_background_pass_leaves_a_downloading_torrent_alone() -> anyhow::Result<()>
+    {
+        let database = setup_db().await?;
+        let release = setup_downloading_qbittorrent_release(
+            &database,
+            json!({
+                "hash": TEST_HASH,
+                "state": "downloading",
+                "progress": 0.78,
+                "dlspeed": 11_000_000,
+                "num_seeds": 2,
+                "category": "series",
+                "save_path": "/downloads",
+                "content_path": "/downloads/Show"
+            }),
+        )
+        .await?;
+        let state = setup_state_for_database(&database)?;
+
+        assert_eq!(
+            process_stale_qbittorrent_acquisition_releases(&state, 10).await?,
+            0
+        );
+
+        let still = get_release(&database.pool, release.release_id)
+            .await?
+            .context("downloading release")?;
+        assert_eq!(still.state, AcquisitionReleaseState::Downloading);
+        let jobs = list_release_jobs(&database.pool, release.release_id).await?;
+        assert!(jobs[0].active);
+        assert_ne!(jobs[0].state, ReleaseJobState::Completed);
+        assert!(
+            crate::acquisition::imports::list_import_pending_release_jobs(&database.pool, 10)
+                .await?
+                .is_empty(),
+            "a torrent still downloading is not offered to import"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qbittorrent_progress_counts_only_the_chosen_files() {
+        // The Incredibles: a 9.07 GB movie chosen, two 1.31 GB audio tracks
+        // skipped. qBittorrent's whole-torrent numbers stop at 78%.
+        let finished = json!({
+            "size": 9_067_645_799u64,
+            "total_size": 11_680_420_951u64,
+            "completed": 9_067_645_799u64,
+            "downloaded": 9_071_102_464u64,
+            "amount_left": 0,
+            "progress": 1.0
+        });
+        assert_eq!(
+            qbittorrent_chosen_bytes_done(&finished),
+            Some(9_067_645_799)
+        );
+        // Without `completed`, the chosen size less what is left.
+        let older = json!({ "size": 1_000u64, "amount_left": 250u64, "downloaded": 900u64 });
+        assert_eq!(qbittorrent_chosen_bytes_done(&older), Some(750));
+        // Without either, the raw download count is all there is.
+        assert_eq!(
+            qbittorrent_chosen_bytes_done(&json!({ "downloaded": 42u64 })),
+            Some(42)
+        );
     }
 
     #[tokio::test]
@@ -10206,7 +10544,7 @@ mod tests {
         let runtime_state = qbittorrent_runtime_state(&release, &files, &torrent_info);
         assert_eq!(runtime_state, "waiting_metadata");
         let evidence = qbittorrent_torrent_evidence(
-            &resolved.record,
+            resolved.record.implementation.as_deref(),
             &release,
             &files,
             &torrent_info,
@@ -10652,7 +10990,7 @@ mod tests {
         });
         let runtime_state = qbittorrent_runtime_state(&stale, &files, &torrent_info);
         let evidence = qbittorrent_torrent_evidence(
-            &resolved.record,
+            resolved.record.implementation.as_deref(),
             &stale,
             &files,
             &torrent_info,

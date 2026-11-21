@@ -2030,7 +2030,12 @@ async fn retry_release_for_review(
                 .await
                 .map_err(ApiError::from)?;
             let mut target_ids = BTreeSet::new();
-            for row in &coverage {
+            // A rejected claim's target (an earlier request the owner
+            // cancelled, on a reused release) is not part of this import.
+            for row in coverage
+                .iter()
+                .filter(|row| row.state != ReleaseCoverageState::Rejected)
+            {
                 if target_ids.insert(row.target_id) {
                     update_target_state(
                         pool,
@@ -6094,6 +6099,103 @@ mod tests {
             .expect("target");
         assert_eq!(target.state, AcquisitionTargetState::Submitted);
         assert!(target.next_search_after.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rr8d_retry_import_leaves_a_cancelled_requests_target_alone() -> Result<()> {
+        // A reused release keeps the claim of an earlier request the owner
+        // cancelled. Retrying the import must not bring that request back.
+        let database = setup_db().await?;
+        let (release_id, target_id) = setup_release(&database).await?;
+        seed_blocked_import_run(
+            &database,
+            release_id,
+            target_id,
+            "/tmp/elixir-rr8d/Example.Show.S01E01.mkv",
+        )
+        .await?;
+        let cancelled = create_subscription(
+            &database.pool,
+            NewAcquisitionSubscription {
+                media_type: MediaType::Series,
+                title: "Example Show".to_string(),
+                year: Some(2024),
+                external_ids: None,
+                idempotency_key: None,
+                request_mode: None,
+                request_scope: None,
+                scope: None,
+                metadata_policy: None,
+                completion_policy: None,
+                monitor_policy: Default::default(),
+                route_policy: AcquisitionRoutePolicy::DebridFirst,
+                source_provider_id: None,
+                release_delay_seconds: None,
+                quality_profile: None,
+                metadata_refresh_after: None,
+                candidate_search_after: None,
+            },
+        )
+        .await?;
+        let cancelled_target = upsert_subscription_targets(
+            &database.pool,
+            cancelled.subscription_id,
+            vec![NewAcquisitionTarget {
+                target_key: Some("S01E01".to_string()),
+                media_type: Some(MediaType::Series),
+                title: Some("Pilot".to_string()),
+                season_number: Some(1),
+                episode_number: Some(1),
+                absolute_episode_number: None,
+                air_date: None,
+                air_time: None,
+                metadata: None,
+                state: Some(AcquisitionTargetState::Excluded),
+                next_search_after: None,
+            }],
+        )
+        .await?[0]
+            .target_id;
+        upsert_release_coverage(
+            &database.pool,
+            NewAcquisitionReleaseCoverage {
+                coverage_id: None,
+                release_id,
+                release_file_id: None,
+                target_id: cancelled_target,
+                coverage_kind: ReleaseCoverageKind::SingleEpisode,
+                confidence: ReleaseConfidence::High,
+                score: Some(1.0),
+                reason: Some("User requested acquisition removal from Acquisition.".to_string()),
+                state: ReleaseCoverageState::Rejected,
+                verified_by: Some("user_cancelled".to_string()),
+            },
+        )
+        .await?;
+
+        retry_release_for_review(
+            &database.pool,
+            Uuid::new_v4(),
+            release_id,
+            RetryAcquisitionReleaseRequest {
+                mode: RetryMode::Import,
+                reason: Some("retry local import".to_string()),
+                next_search_after: None,
+                clear_suppression: false,
+            },
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let current = get_target(&database.pool, target_id)
+            .await?
+            .expect("target");
+        assert_eq!(current.state, AcquisitionTargetState::Submitted);
+        let old = get_target(&database.pool, cancelled_target)
+            .await?
+            .expect("cancelled target");
+        assert_eq!(old.state, AcquisitionTargetState::Excluded);
         Ok(())
     }
 

@@ -47,6 +47,7 @@ use crate::{
     },
     artwork::ArtworkService,
     db::models::MediaType,
+    extensions::managed_paths::DOWNLOADS_ROOT,
     library::{
         AcquisitionLibraryImport, AcquisitionLibraryImportAuthority, AcquisitionLibraryImportFile,
         AcquisitionLibraryImportFileResult, AcquisitionLibraryTargetScaffold, LinkerService,
@@ -245,6 +246,10 @@ pub struct ImportCoordinatorStats {
 pub struct AcquisitionImportPathPolicy {
     approved_roots: Vec<PathBuf>,
     allow_unrestricted: bool,
+    /// Where this server keeps the folder its downloaders mount at
+    /// `/downloads`. qBittorrent and NZBGet report their files by that
+    /// in-container path, so the import reads them from here instead.
+    downloads_root: Option<PathBuf>,
 }
 
 impl AcquisitionImportPathPolicy {
@@ -252,6 +257,7 @@ impl AcquisitionImportPathPolicy {
         Self {
             approved_roots,
             allow_unrestricted: false,
+            downloads_root: None,
         }
     }
 
@@ -260,7 +266,14 @@ impl AcquisitionImportPathPolicy {
         Self {
             approved_roots: Vec::new(),
             allow_unrestricted: true,
+            downloads_root: None,
         }
+    }
+
+    /// Reads downloader paths under `/downloads` from `root` on this server.
+    pub fn with_downloads_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.downloads_root = Some(root.into());
+        self
     }
 
     fn from_state(state: &AppState) -> Self {
@@ -268,10 +281,33 @@ impl AcquisitionImportPathPolicy {
             &state.settings.extensions.storage_root,
             &state.settings.library.local_root,
         );
+        let downloads_root = PathBuf::from(&paths.downloads_root);
+        // The root may contain `..`; a canonical one keeps imported paths tidy.
+        let server_downloads = std::fs::canonicalize(&downloads_root).unwrap_or(downloads_root);
         Self::new(vec![
             PathBuf::from(paths.downloads_root),
             PathBuf::from(paths.media_root),
         ])
+        .with_downloads_root(server_downloads)
+    }
+
+    /// Where a file a downloader reported lives on this server. Downloaders
+    /// run in containers that mount the server's downloads folder at
+    /// `/downloads`, so their `/downloads/...` is a file under
+    /// `downloads_root` here. Any other path is returned unchanged.
+    fn server_path(&self, reported: &str) -> String {
+        let Some(root) = self.downloads_root.as_deref() else {
+            return reported.to_string();
+        };
+        if root == Path::new(DOWNLOADS_ROOT) {
+            return reported.to_string();
+        }
+        match Path::new(reported).strip_prefix(DOWNLOADS_ROOT) {
+            Ok(rest) if !rest.as_os_str().is_empty() => {
+                root.join(rest).to_string_lossy().to_string()
+            }
+            _ => reported.to_string(),
+        }
     }
 }
 
@@ -336,7 +372,7 @@ pub async fn run_acquisition_import_iteration_with_services(
     };
 
     for candidate in candidates {
-        let result = prepare_import_run_for_completed_job(pool, &candidate).await?;
+        let result = prepare_import_run_for_completed_job(pool, &candidate, path_policy).await?;
         let blocked = result.blocked;
         let run = result.run.clone();
         if result.created {
@@ -429,6 +465,7 @@ struct PreparedImportRun {
 async fn prepare_import_run_for_completed_job(
     pool: &AnyPool,
     candidate: &CompletedReleaseJobForImport,
+    path_policy: &AcquisitionImportPathPolicy,
 ) -> Result<PreparedImportRun> {
     let coverage = list_release_coverage(pool, candidate.release.release_id).await?;
     let release_files = list_release_files(pool, candidate.release.release_id).await?;
@@ -560,7 +597,9 @@ async fn prepare_import_run_for_completed_job(
         }
 
         let local_path =
-            resolve_completed_file_local_path(pool, &candidate.job, file, selected_count).await?;
+            resolve_completed_file_local_path(pool, &candidate.job, file, selected_count)
+                .await?
+                .map(|path| path_policy.server_path(&path));
         let Some(local_path) = local_path else {
             let reason = "selected release file has no completed local path evidence";
             upsert_import_file_link(
@@ -6262,6 +6301,79 @@ mod tests {
             .await?
             .expect("target");
         assert_eq!(imported_target.state, AcquisitionTargetState::Imported);
+        Ok(())
+    }
+
+    #[test]
+    fn downloader_paths_are_read_from_the_servers_downloads_folder() {
+        let policy = AcquisitionImportPathPolicy::unrestricted()
+            .with_downloads_root("/srv/elixir/data/downloads");
+        assert_eq!(
+            policy.server_path("/downloads/Movie (2004)/Movie.mkv"),
+            "/srv/elixir/data/downloads/Movie (2004)/Movie.mkv"
+        );
+        // Only the downloaders' own folder is mapped.
+        for unchanged in [
+            "/srv/elixir/data/downloads/Movie.mkv",
+            "/downloadsx/Movie.mkv",
+            "/media/Movie.mkv",
+            "/downloads",
+        ] {
+            assert_eq!(policy.server_path(unchanged), unchanged);
+        }
+        // A server that itself sees the folder at `/downloads` keeps the path.
+        let in_container =
+            AcquisitionImportPathPolicy::unrestricted().with_downloads_root("/downloads");
+        assert_eq!(
+            in_container.server_path("/downloads/Movie.mkv"),
+            "/downloads/Movie.mkv"
+        );
+        // Without a known downloads folder, nothing is mapped.
+        assert_eq!(
+            AcquisitionImportPathPolicy::unrestricted().server_path("/downloads/Movie.mkv"),
+            "/downloads/Movie.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn rr8a_downloader_container_path_is_found_on_the_server() -> Result<()> {
+        // qBittorrent reports `/downloads/...`, the folder as its container
+        // sees it; the file itself is under the server's downloads folder.
+        let dir = tempdir()?;
+        let downloads = dir.path().join("downloads");
+        let server_file = downloads.join("Show/Show.S01E01.1080p.WEB-DL-GROUP.mkv");
+        let fixture = setup_completed_release(
+            TORRENT_DEFAULT_LOGICAL_ID,
+            Some(server_file.to_string_lossy().to_string()),
+            ReleaseCoverageState::Submitted,
+            Some(true),
+        )
+        .await?;
+        sqlx::query::<sqlx::Any>(
+            "UPDATE acquisition_release_files SET provider_metadata_json = $1 WHERE release_id = $2",
+        )
+        .bind(json!({ "localPath": "/downloads/Show/Show.S01E01.1080p.WEB-DL-GROUP.mkv" }).to_string())
+        .bind(fixture.release_id.to_string())
+        .execute(&fixture.database.pool)
+        .await?;
+
+        let policy = AcquisitionImportPathPolicy::unrestricted().with_downloads_root(&downloads);
+        run_acquisition_import_iteration_with_policy(&fixture.database.pool, 10, &policy).await?;
+
+        let run = get_import_run_by_release_job(&fixture.database.pool, fixture.job_id)
+            .await?
+            .expect("import run");
+        let links = list_import_file_links(&fixture.database.pool, run.import_run_id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].local_path.as_deref(),
+            Some(server_file.to_string_lossy().as_ref())
+        );
+        assert_ne!(
+            links[0].mismatch_class.as_deref(),
+            Some("missing_local_file")
+        );
+        assert_eq!(run.state, AcquisitionImportRunState::Imported);
         Ok(())
     }
 

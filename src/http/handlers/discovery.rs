@@ -928,12 +928,17 @@ struct AcquisitionQbittorrentTorrent {
     progress: Option<f64>,
     #[serde(default)]
     downloaded: Option<u64>,
+    /// Bytes of the chosen files that are finished.
+    #[serde(default)]
+    completed: Option<u64>,
     #[serde(default)]
     dlspeed: Option<u64>,
     #[serde(default)]
     upspeed: Option<u64>,
+    /// Every file in the torrent, including the ones Elixir chose to skip.
     #[serde(default)]
     total_size: Option<u64>,
+    /// Only the files Elixir chose to download.
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -7558,7 +7563,14 @@ fn qbittorrent_acquisition_progress(
     if hash.is_empty() {
         return None;
     }
-    let total_size = torrent.total_size.or(torrent.size);
+    // Measure against the files Elixir chose to download. `total_size` and
+    // `downloaded` count the whole torrent, so a skipped extra (an alternate
+    // audio track, a sample) would hold the bar below 100% for good.
+    let total_size = torrent.size.or(torrent.total_size);
+    let downloaded_bytes = torrent
+        .completed
+        .or_else(|| Some(torrent.size?.saturating_sub(torrent.amount_left?)))
+        .or(torrent.downloaded);
     let progress_percent = torrent
         .progress
         .map(|value| (value * 100.0).clamp(0.0, 100.0))
@@ -7597,7 +7609,7 @@ fn qbittorrent_acquisition_progress(
         progress_percent,
         eta_seconds: torrent.eta.filter(|value| *value > 0),
         size_bytes: total_size,
-        downloaded_bytes: torrent.downloaded,
+        downloaded_bytes,
         remaining_bytes: torrent.amount_left,
         download_rate_bps: torrent.dlspeed,
         upload_rate_bps: torrent.upspeed,
@@ -10152,6 +10164,46 @@ mod tests {
     use super::*;
     use crate::{config::DatabaseConfig, db::Database};
     use std::fs;
+
+    #[test]
+    fn qbittorrent_progress_counts_only_the_chosen_files() {
+        // The Incredibles: a 9.07 GB movie chosen, two 1.31 GB audio tracks
+        // skipped. Measured against the whole torrent it stopped at 78%.
+        let torrent: AcquisitionQbittorrentTorrent = serde_json::from_value(json!({
+            "hash": "a43490d99b82e5d1c58e5fb8165cec1087c319c9",
+            "state": "stalledUP",
+            "size": 9_067_645_799u64,
+            "total_size": 11_680_420_951u64,
+            "completed": 9_067_645_799u64,
+            "downloaded": 9_071_102_464u64,
+            "amount_left": 0,
+            "progress": 1.0
+        }))
+        .expect("torrent");
+        let progress = qbittorrent_acquisition_progress(&torrent).expect("progress");
+        assert_eq!(progress.size_bytes, Some(9_067_645_799));
+        assert_eq!(progress.downloaded_bytes, Some(9_067_645_799));
+        assert_eq!(progress.progress_percent, Some(100.0));
+        assert_eq!(
+            source_downloader_progress_percent_from_bytes(&progress),
+            Some(100.0)
+        );
+
+        // Halfway through the chosen file, without `completed`.
+        let torrent: AcquisitionQbittorrentTorrent = serde_json::from_value(json!({
+            "hash": "a43490d99b82e5d1c58e5fb8165cec1087c319c9",
+            "state": "downloading",
+            "size": 1_000u64,
+            "total_size": 3_000u64,
+            "downloaded": 600u64,
+            "amount_left": 500u64
+        }))
+        .expect("torrent");
+        let progress = qbittorrent_acquisition_progress(&torrent).expect("progress");
+        assert_eq!(progress.size_bytes, Some(1_000));
+        assert_eq!(progress.downloaded_bytes, Some(500));
+        assert_eq!(progress.progress_percent, Some(50.0));
+    }
 
     #[test]
     fn alm3_anime_scope_preview_includes_only_target_season_aliases() {
