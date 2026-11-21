@@ -6403,8 +6403,9 @@ if(verb==='create'){
                 memory_limit_mb: u64::MAX,
                 ..spec.clone()
             },
+            // Source jobs allow 64 MiB-1 TiB; one MiB past the ceiling fails.
             QuarantineMarketplaceVolumeSpec {
-                memory_limit_mb: 257,
+                memory_limit_mb: 1024 * 1024 + 1,
                 ..spec.clone()
             },
             QuarantineMarketplaceVolumeSpec {

@@ -1,5 +1,6 @@
 //! Synthetic OCI reports for lifecycle guards; actual native test is opt-in.
 use super::*;
+use crate::marketplace::runtime::application_http::{CPU_MILLICORES, MEMORY_BYTES};
 use elixir_marketplace::identity::Digest;
 use serde_json::json;
 
@@ -28,7 +29,8 @@ fn fixture(profile: &ApplicationHttpProfile) -> (ContainerHandle, Value) {
             "OOMKilled":false,"Dead":false,"Pid":0,"ExitCode":0,"Error":""},
         "HostConfig":{"NetworkMode":spec.network_mode,"ReadonlyRootfs":true,
             "SecurityOpt":["no-new-privileges:true"],"Privileged":false,"CapAdd":null,"CapDrop":["ALL"],
-            "Memory":96*1024*1024,"MemorySwap":96*1024*1024,"NanoCpus":90_000_000,
+            "Memory":MEMORY_BYTES,"MemorySwap":MEMORY_BYTES,
+            "NanoCpus":i64::from(CPU_MILLICORES)*1_000_000,
             "PidsLimit":64,"ShmSize":1024*1024,"LogConfig":{"Type":"none","Config":{}},
             "Ulimits":[{"Name":"core","Soft":0,"Hard":0},{"Name":"nofile","Soft":64,"Hard":64},
                 {"Name":"fsize","Soft":1,"Hard":1}],
